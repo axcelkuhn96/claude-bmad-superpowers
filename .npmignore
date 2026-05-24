@@ -1,0 +1,8 @@
+.cache/
+.git/
+.github/
+node_modules/
+test/
+*.log
+*.swp
+*Zone.Identifier

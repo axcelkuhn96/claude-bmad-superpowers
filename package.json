@@ -1,0 +1,47 @@
+{
+  "name": "claude-bmad-superpowers",
+  "version": "0.1.0",
+  "description": "Workflow PT-BR para Claude Code que une BMAD + Superpowers: refinar ideias, planejar com agentes BMAD e executar com disciplina Superpowers (TDD, brainstorming, subagents).",
+  "type": "module",
+  "bin": {
+    "claude-bmad-superpowers": "bin/cli.js",
+    "cbs": "bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "base/",
+    "overrides/",
+    "README.md",
+    "INSTALL.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/smoke.js"
+  },
+  "keywords": [
+    "claude-code",
+    "claude",
+    "bmad",
+    "bmad-method",
+    "superpowers",
+    "anthropic",
+    "agentic",
+    "ai-agents",
+    "ptbr",
+    "brasil"
+  ],
+  "author": "axcel",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/axcel/claude-bmad-superpowers"
+  },
+  "bugs": {
+    "url": "https://github.com/axcel/claude-bmad-superpowers/issues"
+  },
+  "homepage": "https://github.com/axcel/claude-bmad-superpowers#readme"
+}
