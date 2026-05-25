@@ -18,6 +18,16 @@ Mesmo se a ideia for trivial, mal-formulada, ou se você concluir que **não dev
 - Seção sem conteúdo real: escreva 1 linha tipo "Sem dúvidas bloqueantes" ou "Nada não-encontrado relevante".
 - Nunca termine antes do `# Versão curta`.
 
+## ⚠️ ORDEM DE FASES (não pule)
+
+1. Intake
+2. Coleta de contexto (memória + Explore subagent obrigatórios)
+3. Detecção BMAD
+4. Gap analysis (classifica dúvidas)
+5. **Alinhamento prévio — PARE, mostre resumo, espere `ok`** (exceto modo auto)
+6. Entrega do prompt (5 seções)
+7. Loop de iteração ("ajustar algo?")
+
 ## Princípios não-negociáveis
 
 1. **Específico, executável, validável.** Sem escopo aberto.
@@ -77,11 +87,46 @@ Se não, recomende `/instalar-bmad` no prompt final.
 
 Classifique cada dúvida:
 
-**Bloqueantes** — sem a resposta a implementação pode sair errada. **PERGUNTE** antes de seguir.
+**Bloqueantes** — sem a resposta a implementação pode sair errada.
 
-**Não-bloqueantes** — dá pra assumir com risco baixo. Anote como `SUPOSIÇÃO`.
+**Não-bloqueantes** — dá pra assumir com risco baixo.
 
-### Fase 5 — Entrega
+### Fase 5 — Alinhamento prévio (OBRIGATÓRIO antes de gerar prompt)
+
+**Pare aqui e espere o usuário confirmar antes de avançar pra Fase 6.**
+
+Emita um resumo curto pra alinhar **antes** de gastar tokens com o prompt completo. Formato:
+
+```
+## Alinhamento
+
+**Entendi:**
+- [3-5 bullets do que vou criar/mudar]
+- [escopo: o que inclui e o que NÃO inclui]
+
+**Decisões que precisam de OK seu:**
+1. [decisão 1] → minha sugestão: [X] (por quê: [...])
+2. [decisão 2] → minha sugestão: [Y]
+3. [decisão 3] → **bloqueante**: não consigo assumir, preciso de resposta sua
+
+**Tradeoffs visíveis:**
+- [tradeoff A vs B se houver — explicite o custo de cada lado]
+
+Posso gerar o prompt premium agora? Responda:
+- `ok` / `pode` → gero com essas decisões
+- `muda X pra Y` / qualquer ajuste → re-emite o alinhamento com a mudança aplicada e pergunta de novo
+- Pra dúvidas bloqueantes não respondidas: não gere o prompt — pergunte direto.
+```
+
+**Regras desta fase:**
+- Listar **TODAS** as decisões não-triviais aqui, mesmo as que viraria SUPOSIÇÃO. Usuário decide se aceita ou muda.
+- Nunca gere o prompt direto pulando essa fase, mesmo em caso "trivial".
+- Se o usuário ajustar, **re-emite só o bloco `## Alinhamento`** com a mudança — não dispare o prompt ainda.
+- Só passe pra Fase 6 quando o usuário responder `ok` / `pode` / equivalente.
+
+(Exceção: se a skill foi invocada em modo `auto` — vide `/refinar-auto` — pule esta fase e marque tudo como SUPOSIÇÃO no prompt.)
+
+### Fase 6 — Entrega do prompt
 
 Responda **sempre** neste formato:
 
@@ -185,7 +230,7 @@ Use Superpowers pra brainstorming disciplinado, plano, TDD, debugging, subagents
 [mesma essência em 1/3 do tamanho]
 ```
 
-### Fase 6 — Loop de iteração (OBRIGATÓRIO no fim)
+### Fase 7 — Loop de iteração (OBRIGATÓRIO no fim)
 
 Depois de emitir as 5 seções, **sempre** pergunte literalmente:
 

@@ -2,6 +2,13 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.2.7] - 2026-05-24
+
+### Adicionado
+- **Fase 5 — Alinhamento prévio** no `refinador-de-prompt`: ANTES de gerar o prompt premium, skill agora emite um resumo curto (`## Alinhamento` com "Entendi" + "Decisões que precisam de OK seu" + "Tradeoffs") e **PARA**, esperando o usuário confirmar. Usuário decide tudo ANTES do prompt — não vê suposições enterradas só depois.
+- Loop de iteração que era Fase 6 virou Fase 7. Pra ajustar antes do prompt, basta dizer o que mudar na fase de alinhamento. Pra ajustar depois, mesma coisa via loop final.
+- `/refinar-auto` continua pulando a Fase 5 (assume tudo e vai direto — esse é o propósito do auto).
+
 ## [0.2.6] - 2026-05-24
 
 ### Adicionado
