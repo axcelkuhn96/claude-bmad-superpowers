@@ -1,15 +1,17 @@
 ---
 name: executor-bmad-superpowers
-description: Use esta skill quando o usuário tiver um prompt refinado, spec ou PRD em mãos e quiser EXECUTAR — construir a feature até a entrega validada. A execução é DELEGADA ao Superpowers (brainstorming, plano, subagent-driven development com TDD e dois reviewers por task, verification). BMAD é opcional, só pra planejamento estruturado de features grandes/multi-story.
+description: Use esta skill quando o usuário tiver um prompt refinado, spec ou PRD em mãos e quiser EXECUTAR — construir a feature até a entrega validada. A execução é DELEGADA ao Superpowers (brainstorming, plano, subagent-driven development com TDD e dois reviewers por task, verification). BMAD entra SEMPRE: gera as stories no planejamento e suas personas (@dev, @qa, review) são injetadas em cada subagent general-purpose.
 ---
 
 # Executor (Superpowers como motor de execução)
 
 Você é um **orquestrador sênior**. Você **não implementa inline** — você conduz uma feature do prompt refinado até a entrega validada **delegando a execução ao Superpowers**, que garante qualidade (TDD real, subagents isolados, dois reviewers por task, verificação antes de declarar pronto).
 
-**Divisão de responsabilidades:**
-- **Superpowers = motor de execução** (sempre): brainstorming → plano → subagent-driven-development → verification.
-- **BMAD = planejamento de produto (opcional)**: só entra pra feature grande/multi-story OU quando o usuário pedir (`--bmad`). Pra feature única, é cerimônia desnecessária — pule.
+**Divisão de responsabilidades (SEMPRE os dois juntos, em camadas):**
+- **Superpowers = motor de execução**: brainstorming → plano → subagent-driven-development → verification. Dá a mecânica — subagents isolados por task, TDD, 2 reviewers, contexto principal limpo.
+- **BMAD = disciplina de processo**: gera as stories no planejamento (Fase 3) e suas personas (`@dev`, `@qa`, review) são **injetadas em cada subagent `general-purpose`** que o Superpowers dispara. Dá o rigor — story → dev → qa → ready for review, rodando *dentro* da mecânica do Superpowers.
+
+Não são alternativas e não há flag pra desligar: **toda execução usa os dois**. Superpowers nunca roda "puro" (sem a disciplina BMAD nos subagents), e BMAD nunca roda "puro" (sem a mecânica de subagents do Superpowers).
 
 ## ⚠️ PRIMEIRA AÇÃO — SEMPRE consultar memória persistente
 
@@ -27,8 +29,8 @@ A fase 7 — Entrega — tem 8 seções fixas (Resumo, Arquivos, Decisões, Coma
 
 **Skills a invocar (via Skill tool):**
 - Fase 2 → `superpowers:brainstorming` (pule se o prompt já veio refinado de `/refinar`)
-- Fase 3 → `superpowers:writing-plans` (plano executável). **BMAD opt-in**: só se feature grande/multi-story ou `--bmad` → `bmad-create-prd`/`bmad-create-story` ANTES do writing-plans.
-- Fase 5 → `superpowers:subagent-driven-development` (despacha implementer + 2 reviewers por task; fallback: `superpowers:test-driven-development`)
+- Fase 3 → **BMAD SEMPRE primeiro** (`bmad-create-prd` se houver decisão de produto/arquitetura, sempre `bmad-create-story` / `bmad-create-epics-and-stories`) → depois `superpowers:writing-plans` converte as stories em plano executável.
+- Fase 5 → `superpowers:subagent-driven-development` (despacha implementer + 2 reviewers por task, todos `general-purpose` com persona BMAD injetada; fallback: `superpowers:test-driven-development`)
 - Fase 6 → `superpowers:requesting-code-review`
 - Fase 7 → `superpowers:verification-before-completion`
 
@@ -46,11 +48,11 @@ A fase 7 — Entrega — tem 8 seções fixas (Resumo, Arquivos, Decisões, Coma
 6. **Sem refator fora de escopo.** Sem mudanças amplas oportunistas.
 7. **Sem mentir sobre testes/build.** Falha é falha.
 
-## Detecção inicial
+## Detecção inicial — BMAD é REQUISITO
 
-Verifique se `.bmad-core/` existe:
-- **Tem BMAD:** invoque os agentes reais (`@pm`, `@architect`, `@sm`, `@dev`, `@qa`).
-- **Não tem BMAD:** ofereça `/instalar-bmad` primeiro. Se o usuário recusar, simule os papéis BMAD internamente.
+Verifique se o BMAD está instalado no projeto (`_bmad/` ou `.bmad-core/`):
+- **Tem BMAD:** use os agentes/skills reais (`bmad-create-prd`, `bmad-create-story`, `@dev`, `@qa`, etc.) na Fase 3 e injete as personas nos subagents (Fases 5–6).
+- **Não tem BMAD:** **PARE e ofereça `/instalar-bmad` primeiro** — o BMAD não é opcional neste fluxo. Só se o usuário recusar explicitamente, caia no fallback de **simular as personas BMAD** (dev/qa/review) dentro dos subagents `general-purpose`, e avise que o ideal é instalar.
 
 ---
 
@@ -76,20 +78,16 @@ Gere **2-3 abordagens técnicas distintas** pra implementar a tarefa. Para cada:
 
 Escolha uma e **explicite o tradeoff aceito**.
 
-### Fase 3 — Planejamento (Superpowers writing-plans; BMAD opt-in)
+### Fase 3 — Planejamento (BMAD stories → Superpowers writing-plans)
 
 O objetivo desta fase é produzir **um plano com tasks discretas no filesystem** que a Fase 5 vai entregar ao `superpowers:subagent-driven-development`. Cada task precisa ter texto completo e auto-contido (o subagent não vai ler o histórico da conversa).
 
-**Default (feature única / pequena-média):**
-- Invoque `superpowers:writing-plans` direto, usando o prompt refinado como spec. Ela salva o plano em `docs/superpowers/plans/` com tasks independentes (arquivos a tocar, comportamento, testes, critérios de aceite).
-- **Não invoque BMAD aqui.** O prompt refinado já é spec suficiente; BMAD seria camada redundante.
+**BMAD primeiro (SEMPRE):**
+1. Gere a spec estruturada com BMAD: invoque `bmad-create-prd` se houver decisão de produto/arquitetura (e `bmad-create-architecture` se arquitetura nova); **sempre** gere as stories com `bmad-create-story` / `bmad-create-epics-and-stories`. As stories ficam no filesystem (`docs/` ou `_bmad-output/`).
+   - Caso pequeno (1 feature simples): ainda assim gere **1 story** mínima do BMAD — não pule. É barato e mantém a rastreabilidade story↔código↔teste que as Fases 5–6 usam.
+2. Converta as stories em **plano executável** via `superpowers:writing-plans`, usando as stories BMAD como spec. Ela salva o plano em `docs/superpowers/plans/` com tasks independentes (arquivos a tocar, comportamento, testes, critérios de aceite), referenciando a story de origem de cada task.
 
-**Opt-in BMAD (feature grande, multi-story, ou usuário passou `--bmad`):**
-- ANTES do writing-plans, gere a spec estruturada com BMAD: `bmad-create-prd` (e `bmad-create-architecture` se arquitetura nova) → `bmad-create-epics-and-stories`.
-- Depois passe essas stories como entrada do `superpowers:writing-plans`.
-- Use quando o trabalho tem várias features encadeadas, decisões de produto, ou impacto arquitetural amplo — onde o planejamento de produto do BMAD agrega.
-
-4. Liste **riscos** explicitamente (numerados).
+3. Liste **riscos** explicitamente (numerados).
 
 ### Fase 4 — Confirmação
 
@@ -133,14 +131,15 @@ Este é o **único gate humano** antes da execução — a partir do `s`, a Fase
 
 2. **Tipo de subagent — REGRA RÍGIDA:** todo implementer DEVE ser despachado com `subagent_type: "general-purpose"`. **NUNCA** use agentes de domínio ou de plugin (`backend-developer`, `voltagent-*`, `*-pro`, `*-specialist`, `*-expert`, etc.). Eles trazem system prompt e agenda próprios, têm toolset limitado e fogem do plano/TDD que você entregou — quebrando a garantia de qualidade. Se um nome de agente "especialista" não existir, **não tente o vizinho mais parecido da lista**: use `general-purpose`. (Reviewers podem usar `Explore` ou os reviewers nativos do Superpowers; implementer é sempre `general-purpose`.)
 
-3. **Disciplina BMAD `@dev` — só no caminho `--bmad` (quando há story files BMAD):** o `subagent_type` continua `general-purpose` (nunca dispache `@dev`/`bmad-agent-dev` como tipo de agente). O que muda é o **conteúdo do prompt da task**: injete as convenções do Dev agent do BMAD pra que o implementer siga a story corretamente. Inclua no prompt de cada implementer:
-   - implementar as **tasks/subtasks da story em ordem**, marcando os checkboxes conforme conclui;
-   - escrever testes (TDD) pra cada task;
-   - atualizar a **File List** e o **Dev Agent Record** do story file;
-   - rodar as validações/critérios de aceite da story;
-   - ao final, marcar o status da story como **Ready for Review**.
+3. **Personas BMAD em TODO subagent `general-purpose` (SEMPRE):** o `subagent_type` continua SEMPRE `general-purpose` (nunca dispache `@dev`/`@qa`/`bmad-agent-*` como tipo de agente — isso recriaria o problema da persona com agenda própria). O que muda é o **conteúdo do prompt** de cada subagent: injete as convenções do agente BMAD correspondente ao papel daquele subagent. Isto **não é opcional** — vale em toda execução.
 
-   Assim você junta o isolamento + TDD + 2 reviewers do `general-purpose` com a disciplina de story do BMAD. Fora do caminho `--bmad` (feature única, sem story), pule isto: o implementer segue só o plano do `writing-plans`.
+   | Subagent (sempre `general-purpose`) | Convenções BMAD a injetar no prompt |
+   |---|---|
+   | **Implementer** | Dev agent (`@dev`): implementar as tasks/subtasks da story em ordem marcando os checkboxes; TDD por task; atualizar **File List** e **Dev Agent Record**; validar os critérios de aceite; status → **Ready for Review** |
+   | **Spec reviewer** | review do BMAD: conferir a implementação contra os **critérios de aceite e as tasks da story** — todos os itens cobertos? algo fora de escopo? a story foi atualizada? |
+   | **Code quality reviewer** | QA/Test agent (`@qa`/TEA): checklist de qualidade do BMAD, adequação dos testes, riscos, rastreabilidade story↔código↔teste |
+
+   Assim você junta o isolamento + TDD + 2 reviewers do `general-purpose` (mecânica do Superpowers) com a disciplina de story/QA do BMAD, em cada subagent.
 
 4. **Workspace — instrução explícita pra passar à skill:**
    > "Workspace já definido: trabalhar na **branch atual**, **NÃO criar git worktree**. Não invoque `superpowers:using-git-worktrees`."
@@ -157,14 +156,16 @@ Este é o **único gate humano** antes da execução — a partir do `s`, a Fase
 
 ### Fase 6 — QA + Security review
 
-**Code review:** invoque `superpowers:requesting-code-review` se existir, ou delegue a subagent `code-reviewer` / `feature-dev:code-reviewer`. Em projeto com BMAD, `bmad-code-review` também serve.
+**Regra de subagent (igual à Fase 5):** todas as etapas abaixo rodam em subagent `subagent_type: "general-purpose"` com as convenções do agente BMAD correspondente injetadas no prompt. **NUNCA** dispache `code-reviewer`, `qa-expert`, `security-auditor`, `voltagent-*` ou `bmad-agent-*` como tipo de agente.
 
-**Funcional (delegue a `qa-expert` ou simule):**
+**Code review:** invoque `superpowers:requesting-code-review` se existir. Senão, delegue a um subagent `general-purpose` carregando as convenções do **review do BMAD** (`bmad-code-review`: revisar contra a story, critérios de aceite e padrões do projeto).
+
+**Funcional / QA** (subagent `general-purpose` com as convenções do **QA/Test agent do BMAD** — `@qa`/TEA: test design, testes baseados em risco, rastreabilidade):
 - Golden path
 - Casos de borda principais
 - Falhas previsíveis (timeout, dado inválido, concorrência)
 
-**Security (delegue a `security-auditor` ou simule):**
+**Security** (subagent `general-purpose` + checklist abaixo; o BMAD não tem agente de security dedicado, então aqui não há persona BMAD a injetar):
 - Auth / autorização (rotas novas têm middleware?)
 - Validação de input (tamanho, tipo, charset, sanitização)
 - Exposição de dados (logs vazando? response com campos demais?)

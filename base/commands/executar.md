@@ -9,7 +9,7 @@ description: Executa um prompt refinado (ou PRD) — BMAD planeja, e a implement
 
 **Lembrete:** o executor é um ORQUESTRADOR — ele NÃO implementa inline. A implementação (Fase 5) é delegada ao `superpowers:subagent-driven-development`, que despacha implementer + 2 reviewers por task. Trabalhar na branch atual, sem worktree. Há um ponto de parada ("Posso implementar? [s/N]") antes da execução.
 
-**BMAD é opt-in:** por padrão o planejamento usa só `superpowers:writing-plans` (o prompt refinado já é spec). Passe `--bmad` no comando, ou deixe o executor ativar BMAD automaticamente só se a feature for grande/multi-story.
+**BMAD + Superpowers sempre juntos:** o planejamento (Fase 3) SEMPRE gera as stories com BMAD e converte em plano via `superpowers:writing-plans`. Na execução, cada subagent `general-purpose` carrega a persona BMAD correspondente (`@dev` no implementer, review/`@qa` nos reviewers). Não há flag pra desligar — Superpowers é o motor, BMAD é a disciplina injetada nele.
 
 Prompt/spec:
 

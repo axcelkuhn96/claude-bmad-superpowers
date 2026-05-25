@@ -2,6 +2,29 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.5.0] - 2026-05-25
+
+### Mudança de arquitetura — BMAD + Superpowers SEMPRE juntos
+- **Revertido o opt-in da v0.4.0.** Decisão do usuário: BMAD e Superpowers passam a rodar **sempre em conjunto, em camadas**, sem flag pra desligar. Superpowers é o **motor** (subagents isolados por task, TDD, 2 reviewers, contexto limpo); BMAD é a **disciplina** (gera as stories no planejamento e suas personas `@dev`/`@qa`/review são injetadas em cada subagent `general-purpose`). Nenhum dos dois roda "puro".
+- **Fase 3 sempre BMAD primeiro:** `bmad-create-prd` (se houver produto/arquitetura) + `bmad-create-story`/`epics-and-stories` → `superpowers:writing-plans` converte em plano. Mesmo caso pequeno gera ao menos 1 story (rastreabilidade story↔código↔teste).
+- **Detecção inicial:** BMAD vira requisito — sem BMAD, o executor para e oferece `/instalar-bmad`; só simula as personas se o usuário recusar.
+- **Removido `--bmad`** como opt-in dos comandos `executar.md`/`piloto.md` e da skill (agora é o comportamento padrão).
+- README repositionado: BMAD deixa de ser "opcional" e passa a "sempre em conjunto com Superpowers".
+
+### Adicionado
+- **Novo comando `/revisar`** (8º comando): revisa tudo que foi feito (mudanças da branch / working tree) com code review + QA + security, delegando a subagents `general-purpose` com as personas BMAD injetadas (`bmad-code-review`, `@qa`/TEA). Read-only por padrão — emite relatório com achados por severidade e veredito de merge, e só corrige (via `subagent-driven-development`) com OK do usuário.
+
+## [0.4.3] - 2026-05-25
+
+### Adicionado
+- **Personas BMAD estendidas a TODOS os subagents `general-purpose`** (antes só o implementer). No caminho `--bmad`, cada subagent continua sendo `general-purpose` (regra rígida mantida — nunca dispachar `@dev`/`@qa`/`bmad-agent-*`/`code-reviewer`/`qa-expert` como tipo de agente), mas o prompt injeta as convenções do agente BMAD correspondente ao papel:
+  - **Implementer** → Dev agent (`@dev`)
+  - **Spec reviewer** → review do BMAD (conferir contra critérios de aceite e tasks da story)
+  - **Code quality reviewer** + **QA da Fase 6** → QA/Test agent (`@qa`/TEA: test design, testes baseados em risco, rastreabilidade)
+  - **Code review da Fase 6** → review do BMAD (`bmad-code-review`)
+  - **Security** → sem equivalente no BMAD; segue `general-purpose` + checklist.
+- Fase 6 ganhou regra de subagent explícita (igual à Fase 5): tudo roda em `general-purpose`, nunca em agente de domínio/plugin.
+
 ## [0.4.2] - 2026-05-25
 
 ### Adicionado

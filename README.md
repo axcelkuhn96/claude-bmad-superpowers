@@ -2,15 +2,15 @@
 
 > Workflow PT-BR para [Claude Code](https://claude.com/claude-code): **refina sua ideia com a memória do projeto e entrega pra uma execução de qualidade** — TDD real, subagents isolados e dois reviewers por task.
 
-Um pacote de **3 skills** e **7 comandos** em português que amarram três coisas que já funcionam bem, cada uma no seu nível:
+Um pacote de **3 skills** e **8 comandos** em português que amarram três coisas que já funcionam bem, cada uma no seu nível:
 
 | Camada | Quem faz | Papel |
 |---|---|---|
 | **Front-end PT-BR** (o diferencial) | skills deste pacote | Refina sua ideia com alinhamento + memória, e faz discovery sem tocar código |
 | **Motor de execução** | [Superpowers](https://github.com/obra/superpowers) | brainstorming → plano → subagents com TDD + 2 reviews → verificação. Garante "desenvolver certo, sem erro" |
-| **Planejamento de produto** (opcional) | [BMAD-METHOD](https://github.com/bmad-code-org/BMAD-METHOD) | PRD, épicos, stories — pra discovery e features grandes/multi-story |
+| **Disciplina de processo** (sempre) | [BMAD-METHOD](https://github.com/bmad-code-org/BMAD-METHOD) | Gera as stories no planejamento e injeta as personas (`@dev`, `@qa`, review) em cada subagent do Superpowers |
 
-Em vez de competir, cada peça fica no que faz bem: **você refina em português, o Superpowers executa com rigor, o BMAD ajuda quando o escopo é de produto.**
+Em vez de competir, cada peça fica no que faz bem: **você refina em português, e a execução roda sempre com o Superpowers como motor + o BMAD como disciplina injetada dentro dele** (story → `@dev` → review/`@qa`).
 
 ---
 
@@ -50,7 +50,7 @@ npx claude-bmad-superpowers instalar
 
 Isso faz, em ordem:
 
-1. **Skills + comandos** → copia as 3 skills e 7 comandos pra `~/.claude/skills/` e `~/.claude/commands/`.
+1. **Skills + comandos** → copia as 3 skills e 8 comandos pra `~/.claude/skills/` e `~/.claude/commands/`.
 2. **Superpowers** → detecta/instala o plugin via marketplace do Claude Code (ou te mostra o comando exato se precisar rodar dentro do app).
 3. **BMAD** → instala no diretório atual se você estiver dentro de um projeto (interativo). Pra pular: `--apenas-global`.
 
@@ -80,6 +80,7 @@ cbs status
 | Ideia crua, sem querer perguntas | `/refinar-auto <ideia>` | Igual ao `/refinar` mas assume tudo não-crítico (marca as suposições) |
 | Prompt/spec em mãos | `/executar <prompt>` | Superpowers executa com rigor: plano → subagents + TDD → verify |
 | Atalho fim-a-fim | `/piloto <ideia>` | `/refinar` + `/executar` numa conversa só |
+| Quer revisar o que foi feito | `/revisar [escopo]` | Code review + QA + security das mudanças (subagents `general-purpose` + personas BMAD). Reporta achados; só corrige com seu OK. |
 
 Comandos de manutenção:
 
@@ -88,7 +89,7 @@ Comandos de manutenção:
 | `/instalar-bmad` | Instala o BMAD no projeto atual (delega pra `cbs instalar-bmad`, interativo) |
 | `/atualizar` | Atualiza o pacote + Superpowers + BMAD dos projetos registrados |
 
-> **`--bmad`** em `/executar` ou `/piloto` força o planejamento estruturado do BMAD (PRD/épicos/stories) antes do plano. Por padrão é opt-in — só vale a pena em feature grande/multi-story.
+> **BMAD roda sempre** em `/executar` e `/piloto`: o planejamento gera as stories com BMAD antes do plano do Superpowers, e cada subagent de execução carrega a persona BMAD do seu papel. Não há flag pra desligar — é o comportamento padrão.
 
 ---
 
@@ -106,11 +107,13 @@ Comandos de manutenção:
 /executar    →  prompt → código entregue
                 mem-search
                 → executor (orquestrador, NÃO implementa inline)
-                  → superpowers:writing-plans  (plano com tasks)
+                  → BMAD gera stories (bmad-create-prd/story)
+                  → superpowers:writing-plans  (stories → plano com tasks)
                   → 🛑 "Posso implementar? [s/N]"
                   → superpowers:subagent-driven-development
-                       · implementer subagent (TDD, contexto isolado) por task
-                       · spec reviewer + code quality reviewer por task
+                       · implementer general-purpose + persona @dev (TDD, isolado) por task
+                       · spec reviewer + code quality reviewer general-purpose
+                         + personas review/@qa do BMAD, por task
                   → superpowers:verification-before-completion
                   → entrega com checklist
 
@@ -155,7 +158,7 @@ claude: [mem-search → refina (alinhamento, você OK) →
 
 - **`investigador-de-ideia`** — modo discovery/discussão. **Proíbe edição de código-fonte** (só escreve em `docs/`). Faz enquadramento → investigação leve (Explore) → 3-5 abordagens com tradeoffs → análise BMAD analyst+pm → recomendação → opcional PRD draft. Use quando ainda está decidindo *o quê* fazer.
 
-- **`executor-bmad-superpowers`** — orquestrador que **não implementa inline**. Delega a execução ao Superpowers (`writing-plans` → `subagent-driven-development` → `verification-before-completion`), com ponto de parada pedindo OK antes de codar. BMAD entra só opt-in.
+- **`executor-bmad-superpowers`** — orquestrador que **não implementa inline**. Delega a execução ao Superpowers (`writing-plans` → `subagent-driven-development` → `verification-before-completion`), com ponto de parada pedindo OK antes de codar. BMAD entra **sempre**: gera as stories no planejamento e injeta `@dev`/`@qa`/review em cada subagent.
 
 ---
 
@@ -167,16 +170,26 @@ Sem claude-mem, as skills marcam "Memória: não disponível" e seguem normalmen
 
 ---
 
-## BMAD: quando entra
+## BMAD + Superpowers: sempre juntos
 
-BMAD **não fica no caminho da execução de feature única** (seria cerimônia redundante — o prompt refinado já é spec suficiente pro Superpowers). Ele entra em dois lugares:
+BMAD e Superpowers **rodam sempre em conjunto**, em camadas — não são alternativas e não há flag pra desligar:
 
 1. **Discovery** (`/investigar`) — perspectivas analyst/pm pra avaliar produto/mercado.
-2. **Features grandes/multi-story** — com `--bmad`, gera PRD → épicos → stories antes do plano de execução.
+2. **Execução** (`/executar`, `/piloto`) — BMAD gera as stories antes do plano, e suas personas são injetadas nos subagents do Superpowers (ver abaixo).
 
-### E o `@dev` do BMAD?
+### Como BMAD entra sem virar uma persona solta
 
-O BMAD tem um agente Dev (`@dev`), mas ele **não é dispachado como tipo de agente** — isso traria uma persona com agenda própria pra dentro da execução, fugindo do plano/TDD (mesmo problema de usar `voltagent-*` como implementer). Em vez disso, no caminho `--bmad`, as **convenções do `@dev`** (seguir as tasks/subtasks da story, marcar checkboxes, atualizar File List + Dev Agent Record, status → Ready for Review) são **injetadas no prompt do implementer `general-purpose`**. Resultado: você mantém o isolamento + TDD + 2 reviewers do Superpowers e ainda ganha a disciplina de story do BMAD. Sem `--bmad`, o implementer segue só o plano do `writing-plans`.
+O BMAD tem agentes (`@dev`, `@qa`/TEA, etc.), mas eles **nunca são dispachados como tipo de agente** — isso traria uma persona com agenda própria pra dentro da execução, fugindo do plano/TDD (mesmo problema de usar `voltagent-*` como implementer). Em vez disso, **todo subagent continua `general-purpose`** e as **convenções do agente BMAD correspondente ao papel** são injetadas no prompt:
+
+| Subagent (`general-purpose`) | Persona BMAD injetada |
+|---|---|
+| Implementer | `@dev` — tasks/subtasks da story, File List, Dev Agent Record, Ready for Review |
+| Spec reviewer | review BMAD — confere contra critérios de aceite e tasks da story |
+| Code quality reviewer / QA | `@qa`/TEA — test design, testes baseados em risco, rastreabilidade |
+| Code review | `bmad-code-review` |
+| Security | sem equivalente BMAD — `general-purpose` + checklist |
+
+Resultado: você mantém o isolamento + TDD + 2 reviewers do Superpowers (o motor) e ainda ganha a disciplina de story/QA do BMAD (o processo) em cada etapa. Por isso o BMAD é **requisito** — sem ele instalado, o executor para e oferece `/instalar-bmad`.
 
 Pra instalar no projeto:
 
