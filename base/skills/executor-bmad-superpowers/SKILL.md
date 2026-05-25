@@ -19,6 +19,15 @@ Se uma fase for trivial pro caso (ex.: 1 arquivo, sem stories), ainda assim emit
 
 A fase 7 — Entrega — tem 8 seções fixas (Resumo, Arquivos, Decisões, Comandos, Testes, Validação manual, Riscos, Próximos passos). Emita todas, mesmo que algumas tenham "Nenhum/N/A".
 
+**Skills a invocar (via Skill tool) quando disponíveis no ambiente — não simule se a skill real existir:**
+- Fase 2 → `superpowers:brainstorming`
+- Fase 3 → `bmad-create-prd` / `bmad-create-architecture` / `bmad-create-story` (ou agentes `bmad-agent-*`)
+- Fase 5 → `superpowers:test-driven-development` (e `superpowers:systematic-debugging` se travar)
+- Fase 6 → `superpowers:requesting-code-review`
+- Fase 7 → `superpowers:verification-before-completion`
+
+**Fase 4 é PONTO DE PARADA**: pergunte "Posso implementar? [s/N]" e espere resposta (exceto modo `--auto`).
+
 ## Princípios não-negociáveis
 
 1. **Plano antes de código.** Sempre.
@@ -49,6 +58,8 @@ Verifique se `.bmad-core/` existe:
 
 ### Fase 2 — Brainstorming técnico (Superpowers)
 
+**Invoque a skill `superpowers:brainstorming` se ela existir no ambiente.** Caso contrário, faça o brainstorming manualmente seguindo o padrão abaixo.
+
 Gere **2-3 abordagens técnicas distintas** pra implementar a tarefa. Para cada:
 - Resumo da abordagem (estrutura, arquivos principais)
 - Prós / Contras
@@ -59,18 +70,18 @@ Escolha uma e **explicite o tradeoff aceito**.
 
 ### Fase 3 — Plano BMAD
 
-**Com BMAD instalado:**
+**Com BMAD instalado** (skills `bmad-*` disponíveis no ambiente) — invoque as skills reais via Skill tool:
 
-1. Invoque `@pm` → gere/atualize PRD curto em `docs/prd-<slug>.md` (objetivo, usuário, critérios)
-2. Invoque `@architect` → escolha arquitetura, padrões, decisões técnicas em `docs/arquitetura-<slug>.md`
-3. Invoque `@sm` (scrum master) → quebre em **stories pequenas** (`docs/stories/<slug>-<n>.md`), cada uma com:
-   - Objetivo
-   - Critérios de aceite
-   - Definition of Done
-   - Testes esperados
+1. `bmad-create-prd` (ou skill `bmad-agent-pm`) → PRD curto em `docs/`/`_bmad-output/` (objetivo, usuário, critérios)
+2. `bmad-create-architecture` (ou `bmad-agent-architect`) → decisões técnicas, padrões
+3. `bmad-create-epics-and-stories` ou `bmad-create-story` (ou `bmad-agent-sm`) → **stories pequenas** com objetivo, critérios de aceite, Definition of Done, testes esperados
 4. Identifique **riscos** explicitamente (lista numerada)
 
-**Sem BMAD:** gere os mesmos artefatos manualmente em `docs/` simulando os papéis.
+**Escala pelo tamanho da tarefa:**
+- Tarefa pequena (1-2 arquivos, util isolado): invoque ao menos `bmad-create-story` pra ter a story formal. PRD/arquitetura completos são opcionais — registre "Caso pequeno: PRD/arquitetura dispensados, só story".
+- Tarefa média/grande: invoque PRD + arquitetura + stories.
+
+**Sem BMAD instalado:** gere os mesmos artefatos manualmente em `docs/` simulando os papéis, e recomende `/instalar-bmad` no fim.
 
 ### Fase 4 — Confirmação
 
@@ -102,9 +113,15 @@ Tradeoff aceito: [...]
 2. ...
 ```
 
-**Aguarde aprovação** a menos que o usuário tenha pedido `--auto`. Em modo auto, prossiga mas marque as decisões assumidas explicitamente.
+**🛑 PONTO DE PARADA OBRIGATÓRIO.** Termine sua mensagem AQUI com a pergunta literal:
+
+> **"Posso implementar? [s/N]"**
+
+Não escreva nenhum arquivo, não rode TDD, não avance pra Fase 5 antes do usuário responder `s`. Exceção única: usuário invocou em modo `--auto` — aí prossiga marcando decisões assumidas. "continue" do usuário em resposta a essa pergunta conta como `s`.
 
 ### Fase 5 — Implementação TDD (Superpowers)
+
+**Invoque a skill `superpowers:test-driven-development` se ela existir no ambiente** — ela rege o ciclo. Caso contrário, siga o ciclo manualmente abaixo.
 
 Para cada story:
 
@@ -120,9 +137,11 @@ Para cada story:
 - ❌ Não escreva 5 testes de uma vez sem código — escreva um, implemente, próximo.
 - ❌ Não refatore arquivo que não está no escopo da story.
 - ✅ Delegue investigação pesada (mapear como X funciona) a subagent `Explore`.
-- ✅ Use subagent `code-reviewer` ou `feature-dev:code-reviewer` em pontos de checkpoint.
+- ✅ Use `superpowers:systematic-debugging` se um teste falhar de forma inesperada.
 
 ### Fase 6 — QA + Security review
+
+**Code review:** invoque `superpowers:requesting-code-review` se existir, ou delegue a subagent `code-reviewer` / `feature-dev:code-reviewer`. Em projeto com BMAD, `bmad-code-review` também serve.
 
 **Funcional (delegue a `qa-expert` ou simule):**
 - Golden path
@@ -142,6 +161,8 @@ Para cada story:
 Corrija o que encontrar antes de declarar pronto.
 
 ### Fase 7 — Entrega
+
+**ANTES de declarar pronto:** invoque `superpowers:verification-before-completion` se existir — ela exige rodar os comandos de verificação e confirmar a saída ANTES de afirmar sucesso. Sem ela, rode manualmente os testes/build e cole a saída real. **Nunca afirme "passou" sem evidência.**
 
 Reporte ao usuário **sempre** neste formato:
 

@@ -2,6 +2,17 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.2.9] - 2026-05-24
+
+### Corrigido
+- **Executor agora invoca as skills Superpowers/BMAD formais**, não só aplica o método. Análise da sessão `bcf5870f` mostrou TDD real mas sem invocar `superpowers:test-driven-development`, e plano sem invocar agentes/skills BMAD. Mudanças:
+  - Fase 2 → invoca `superpowers:brainstorming`
+  - Fase 3 → invoca skills BMAD reais (`bmad-create-prd`, `bmad-create-architecture`, `bmad-create-story`, ou agentes `bmad-agent-*`), escalando pelo tamanho da tarefa
+  - Fase 5 → invoca `superpowers:test-driven-development` (+ `systematic-debugging` se travar)
+  - Fase 6 → invoca `superpowers:requesting-code-review`
+  - Fase 7 → invoca `superpowers:verification-before-completion` antes de declarar pronto
+- **Fase 4 virou PONTO DE PARADA HARD**: executor agora termina a mensagem com "Posso implementar? [s/N]" e espera resposta antes de tocar em código. Antes emitia o cabeçalho mas seguia direto codando.
+
 ## [0.2.8] - 2026-05-24
 
 ### Corrigido
