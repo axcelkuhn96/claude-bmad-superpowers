@@ -133,12 +133,21 @@ Este é o **único gate humano** antes da execução — a partir do `s`, a Fase
 
 2. **Tipo de subagent — REGRA RÍGIDA:** todo implementer DEVE ser despachado com `subagent_type: "general-purpose"`. **NUNCA** use agentes de domínio ou de plugin (`backend-developer`, `voltagent-*`, `*-pro`, `*-specialist`, `*-expert`, etc.). Eles trazem system prompt e agenda próprios, têm toolset limitado e fogem do plano/TDD que você entregou — quebrando a garantia de qualidade. Se um nome de agente "especialista" não existir, **não tente o vizinho mais parecido da lista**: use `general-purpose`. (Reviewers podem usar `Explore` ou os reviewers nativos do Superpowers; implementer é sempre `general-purpose`.)
 
-3. **Workspace — instrução explícita pra passar à skill:**
+3. **Disciplina BMAD `@dev` — só no caminho `--bmad` (quando há story files BMAD):** o `subagent_type` continua `general-purpose` (nunca dispache `@dev`/`bmad-agent-dev` como tipo de agente). O que muda é o **conteúdo do prompt da task**: injete as convenções do Dev agent do BMAD pra que o implementer siga a story corretamente. Inclua no prompt de cada implementer:
+   - implementar as **tasks/subtasks da story em ordem**, marcando os checkboxes conforme conclui;
+   - escrever testes (TDD) pra cada task;
+   - atualizar a **File List** e o **Dev Agent Record** do story file;
+   - rodar as validações/critérios de aceite da story;
+   - ao final, marcar o status da story como **Ready for Review**.
+
+   Assim você junta o isolamento + TDD + 2 reviewers do `general-purpose` com a disciplina de story do BMAD. Fora do caminho `--bmad` (feature única, sem story), pule isto: o implementer segue só o plano do `writing-plans`.
+
+4. **Workspace — instrução explícita pra passar à skill:**
    > "Workspace já definido: trabalhar na **branch atual**, **NÃO criar git worktree**. Não invoque `superpowers:using-git-worktrees`."
 
    (O usuário trabalha em branch dedicada — worktree é dispensado de propósito.)
 
-4. **Se `subagent-driven-development` não existir** no ambiente (Superpowers não instalado), aí sim caia no fallback: invoque `superpowers:test-driven-development` se existir, ou faça TDD manual (teste falha → código mínimo → verde), delegando investigação pesada a subagent `Explore` (`general-purpose` pra implementação). Recomende instalar Superpowers no fim.
+5. **Se `subagent-driven-development` não existir** no ambiente (Superpowers não instalado), aí sim caia no fallback: invoque `superpowers:test-driven-development` se existir, ou faça TDD manual (teste falha → código mínimo → verde), delegando investigação pesada a subagent `Explore` (`general-purpose` pra implementação). Recomende instalar Superpowers no fim.
 
 **Regras desta fase:**
 - ❌ Não faça a implementação (grep/read/write/edit de código) no contexto principal quando o `subagent-driven-development` estiver disponível — delegue.

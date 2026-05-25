@@ -174,6 +174,10 @@ BMAD **não fica no caminho da execução de feature única** (seria cerimônia 
 1. **Discovery** (`/investigar`) — perspectivas analyst/pm pra avaliar produto/mercado.
 2. **Features grandes/multi-story** — com `--bmad`, gera PRD → épicos → stories antes do plano de execução.
 
+### E o `@dev` do BMAD?
+
+O BMAD tem um agente Dev (`@dev`), mas ele **não é dispachado como tipo de agente** — isso traria uma persona com agenda própria pra dentro da execução, fugindo do plano/TDD (mesmo problema de usar `voltagent-*` como implementer). Em vez disso, no caminho `--bmad`, as **convenções do `@dev`** (seguir as tasks/subtasks da story, marcar checkboxes, atualizar File List + Dev Agent Record, status → Ready for Review) são **injetadas no prompt do implementer `general-purpose`**. Resultado: você mantém o isolamento + TDD + 2 reviewers do Superpowers e ainda ganha a disciplina de story do BMAD. Sem `--bmad`, o implementer segue só o plano do `writing-plans`.
+
 Pra instalar no projeto:
 
 ```bash

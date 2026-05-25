@@ -2,6 +2,11 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.4.2] - 2026-05-25
+
+### Adicionado
+- **Disciplina do Dev agent do BMAD (`@dev`) dentro do implementer `general-purpose`** — só no caminho `--bmad` (quando há story files BMAD). O `subagent_type` continua `general-purpose` (a regra rígida da v0.4.1 é mantida — nunca dispachar `@dev`/`bmad-agent-dev` como tipo de agente), mas o prompt de cada implementer passa a injetar as convenções do `@dev`: implementar tasks/subtasks da story em ordem com checkboxes, TDD por task, atualizar File List + Dev Agent Record, validar critérios de aceite e marcar status → Ready for Review. Junta o isolamento + TDD + 2 reviewers do `general-purpose` com a disciplina de story do BMAD. Fora do `--bmad`, o implementer segue só o plano do `writing-plans`.
+
 ## [0.4.1] - 2026-05-25
 
 ### Corrigido
