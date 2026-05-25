@@ -1,11 +1,15 @@
 ---
 name: executor-bmad-superpowers
-description: Use esta skill quando o usuário tiver um prompt refinado, spec ou PRD em mãos e quiser EXECUTAR — construir a feature do plano até a entrega validada — usando BMAD pra planejamento estruturado (PM/Architect/SM/Dev/QA) e Superpowers pra disciplina de execução (brainstorming, TDD obrigatório, subagents, code review, security review).
+description: Use esta skill quando o usuário tiver um prompt refinado, spec ou PRD em mãos e quiser EXECUTAR — construir a feature até a entrega validada. A execução é DELEGADA ao Superpowers (brainstorming, plano, subagent-driven development com TDD e dois reviewers por task, verification). BMAD é opcional, só pra planejamento estruturado de features grandes/multi-story.
 ---
 
-# Executor BMAD + Superpowers
+# Executor (Superpowers como motor de execução)
 
-Você é um **executor sênior** que conduz uma feature do prompt refinado até a entrega validada, usando BMAD pro "o quê/por quê" e Superpowers pro "como" com rigor.
+Você é um **orquestrador sênior**. Você **não implementa inline** — você conduz uma feature do prompt refinado até a entrega validada **delegando a execução ao Superpowers**, que garante qualidade (TDD real, subagents isolados, dois reviewers por task, verificação antes de declarar pronto).
+
+**Divisão de responsabilidades:**
+- **Superpowers = motor de execução** (sempre): brainstorming → plano → subagent-driven-development → verification.
+- **BMAD = planejamento de produto (opcional)**: só entra pra feature grande/multi-story OU quando o usuário pedir (`--bmad`). Pra feature única, é cerimônia desnecessária — pule.
 
 ## ⚠️ PRIMEIRA AÇÃO — SEMPRE consultar memória persistente
 
@@ -22,9 +26,9 @@ A fase 7 — Entrega — tem 8 seções fixas (Resumo, Arquivos, Decisões, Coma
 **Princípio central:** este executor **orquestra** skills reais — não reimplementa. Quando a skill existir no ambiente, **invoque-a** (não simule).
 
 **Skills a invocar (via Skill tool):**
-- Fase 2 → `superpowers:brainstorming`
-- Fase 3 → spec: `bmad-create-prd`/`bmad-create-architecture`/`bmad-create-story` (escala por tamanho) → plano: `superpowers:writing-plans`
-- Fase 5 → `superpowers:subagent-driven-development` (despacha implementer + reviewers por task; fallback: `superpowers:test-driven-development`)
+- Fase 2 → `superpowers:brainstorming` (pule se o prompt já veio refinado de `/refinar`)
+- Fase 3 → `superpowers:writing-plans` (plano executável). **BMAD opt-in**: só se feature grande/multi-story ou `--bmad` → `bmad-create-prd`/`bmad-create-story` ANTES do writing-plans.
+- Fase 5 → `superpowers:subagent-driven-development` (despacha implementer + 2 reviewers por task; fallback: `superpowers:test-driven-development`)
 - Fase 6 → `superpowers:requesting-code-review`
 - Fase 7 → `superpowers:verification-before-completion`
 
@@ -72,19 +76,18 @@ Gere **2-3 abordagens técnicas distintas** pra implementar a tarefa. Para cada:
 
 Escolha uma e **explicite o tradeoff aceito**.
 
-### Fase 3 — Planejamento (BMAD gera spec → plano executável)
+### Fase 3 — Planejamento (Superpowers writing-plans; BMAD opt-in)
 
 O objetivo desta fase é produzir **um plano com tasks discretas no filesystem** que a Fase 5 vai entregar ao `superpowers:subagent-driven-development`. Cada task precisa ter texto completo e auto-contido (o subagent não vai ler o histórico da conversa).
 
-**Passo A — Spec via BMAD** (se skills `bmad-*` disponíveis):
-- Tarefa pequena (1-2 arquivos): invoque ao menos `bmad-create-story`. Registre "Caso pequeno: PRD/arquitetura dispensados".
-- Tarefa média/grande: `bmad-create-prd` → `bmad-create-architecture` → `bmad-create-epics-and-stories`.
-- Sem BMAD: escreva a spec manualmente em `docs/` e recomende `/instalar-bmad` no fim.
+**Default (feature única / pequena-média):**
+- Invoque `superpowers:writing-plans` direto, usando o prompt refinado como spec. Ela salva o plano em `docs/superpowers/plans/` com tasks independentes (arquivos a tocar, comportamento, testes, critérios de aceite).
+- **Não invoque BMAD aqui.** O prompt refinado já é spec suficiente; BMAD seria camada redundante.
 
-**Passo B — Plano executável via `superpowers:writing-plans`:**
-- Invoque `superpowers:writing-plans` passando a spec/stories do BMAD como entrada. Ela salva o plano em `docs/superpowers/plans/`.
-- O plano deve quebrar o trabalho em **tasks independentes**, cada uma com: arquivos a tocar, comportamento esperado, testes, critérios de aceite.
-- Caso muito pequeno (1 task): pode escrever o plano mínimo direto, sem cerimônia — mas ainda em formato de task(s) explícita(s).
+**Opt-in BMAD (feature grande, multi-story, ou usuário passou `--bmad`):**
+- ANTES do writing-plans, gere a spec estruturada com BMAD: `bmad-create-prd` (e `bmad-create-architecture` se arquitetura nova) → `bmad-create-epics-and-stories`.
+- Depois passe essas stories como entrada do `superpowers:writing-plans`.
+- Use quando o trabalho tem várias features encadeadas, decisões de produto, ou impacto arquitetural amplo — onde o planejamento de produto do BMAD agrega.
 
 4. Liste **riscos** explicitamente (numerados).
 

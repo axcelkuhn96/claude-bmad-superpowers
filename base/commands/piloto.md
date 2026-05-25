@@ -25,7 +25,7 @@ A própria skill `refinador-de-prompt` faz o loop de iteração ("ajustar algo? 
 
 ## Etapa 3 — Executar (invoque Skill tool de novo)
 
-Invoque a ferramenta `Skill` com `skill: "executor-bmad-superpowers"` passando o prompt final aprovado. A skill orquestra as 7 fases — e a implementação (Fase 5) é **delegada ao `superpowers:subagent-driven-development`** (subagents isolados por task, contexto principal limpo, branch atual sem worktree). Haverá outro ponto de parada ("Posso implementar? [s/N]") antes de tocar código.
+Invoque a ferramenta `Skill` com `skill: "executor-bmad-superpowers"` passando o prompt final aprovado. A skill orquestra as fases — e a implementação é **delegada ao `superpowers:subagent-driven-development`** (subagents isolados por task, contexto principal limpo, branch atual sem worktree). Planejamento usa `superpowers:writing-plans` por padrão; BMAD só se a feature for grande/multi-story ou `--bmad`. Haverá outro ponto de parada ("Posso implementar? [s/N]") antes de tocar código.
 
 Entrada do usuário:
 

@@ -2,6 +2,15 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.4.0] - 2026-05-24
+
+### Reposicionamento (decisão de arquitetura)
+- **Superpowers vira a espinha dorsal da execução; BMAD vira opt-in.** Validado por sessão real (`f992fd4b`): a delegação ao `subagent-driven-development` funciona (implementer subagent assume a implementação, contexto principal limpo). Conclusão: empilhar refinador + BMAD-story + writing-plans era cerimônia redundante pra feature única.
+- **Fase 3 do executor**: default agora é só `superpowers:writing-plans` (o prompt refinado já é spec). BMAD (`bmad-create-prd`/`create-story`) só entra opt-in — feature grande/multi-story ou flag `--bmad`.
+- **BMAD reposicionado** pra camada de discovery/planejamento de produto (`/investigar`, features grandes), fora do caminho de execução de feature única.
+- README reescrito deixando claro: front-end PT-BR (refinar+memória) é o diferencial, Superpowers é o motor de qualidade, BMAD é planejamento de produto opcional.
+- `executar.md`/`piloto.md`: documentam `--bmad` como opt-in.
+
 ## [0.3.0] - 2026-05-24
 
 ### Mudança de arquitetura

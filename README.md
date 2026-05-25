@@ -1,8 +1,13 @@
 # claude-bmad-superpowers
 
-Workflow PT-BR para Claude Code que une **BMAD-METHOD** (planejamento estruturado com agentes PM/Architect/SM/Dev/QA) e **Superpowers** (brainstorming disciplinado, TDD, subagents, verificação real) num fluxo coerente de **discovery → planejamento → execução**.
+Workflow PT-BR para Claude Code: **refina sua ideia com memória do projeto e entrega pra uma execução de qualidade** (TDD real, subagents isolados, dois reviewers por task).
 
-Nasceu da observação de que BMAD e Superpowers se complementam: um traz o "o quê/por quê", o outro traz o "como" com rigor. Mas usados separados é cerimônia. Esse pacote junta os dois com nomes em português e atalhos que fazem sentido no dia a dia.
+**Como funciona a divisão:**
+- **Front-end PT-BR (o diferencial):** `/refinar` co-desenha sua ideia (alinhamento + memória via claude-mem) antes de gerar o prompt; `/investigar` faz discovery sem tocar código.
+- **Superpowers = motor de execução:** brainstorming → plano → `subagent-driven-development` (implementer isolado + spec reviewer + code quality reviewer por task) → verificação antes de declarar pronto. É quem garante "desenvolver certo, sem erro".
+- **BMAD = planejamento de produto (opcional):** entra no discovery e em features grandes/multi-story. Não fica no caminho da execução de uma feature única.
+
+Em vez de competir, cada peça fica no que faz bem: você refina em português, o Superpowers executa com rigor, o BMAD ajuda quando o escopo é de produto.
 
 ---
 
@@ -39,8 +44,8 @@ npx claude-bmad-superpowers status
 |---|---|---|
 | Ideia fuzzy, dúvida estratégica | `/investigar <tema>` | Pensa junto, mapeia, brainstorm, recomenda. **Não toca em código.** |
 | Ideia clara mas crua | `/refinar <ideia>` | Vira prompt premium contextualizado pelo projeto |
-| Prompt em mãos | `/executar <prompt>` | BMAD planeja → Superpowers implementa (7 fases, TDD obrigatório) |
-| Atalho fim-a-fim | `/piloto <ideia>` | Refina → mostra prompt → pede OK → executa |
+| Prompt em mãos | `/executar <prompt>` | Superpowers executa com rigor (plano → subagents + TDD → verify). BMAD opt-in (`--bmad`) |
+| Atalho fim-a-fim | `/piloto <ideia>` | Refina → mostra prompt → pede OK → executa via Superpowers |
 
 E mais:
 
@@ -68,16 +73,19 @@ claude: [escreve docs/regua-pos-vencimento.md]
 
 você: /piloto implementa a régua conforme docs/regua-pos-vencimento.md
 
-claude: [refina → mostra prompt premium → você OK →
-         executa as 7 fases:
-           1. intake
-           2. brainstorming técnico (2-3 abordagens)
-           3. plano BMAD (PM+Architect+SM geram shards/stories)
-           4. confirmação
-           5. impl TDD incremental
-           6. QA + security review (subagents)
-           7. entrega com checklist]
+claude: [mem-search → refina (alinhamento + você OK) →
+         "Posso executar?" → você OK →
+         executor delega ao Superpowers:
+           - writing-plans (plano com tasks)
+           - "Posso implementar?" → você OK
+           - subagent-driven-development:
+               · implementer subagent (TDD, contexto isolado)
+               · spec reviewer + code quality reviewer por task
+           - verification-before-completion
+           - entrega com checklist]
 ```
+
+> Feature grande/multi-story? Use `/executar --bmad` ou `/piloto --bmad` pra o BMAD gerar PRD/épicos/stories antes do plano.
 
 ---
 
@@ -87,7 +95,7 @@ claude: [refina → mostra prompt premium → você OK →
 
 - **`investigador-de-ideia`** — modo discovery/discussão. **Proíbe** edição de código-fonte. Só escreve em `docs/`. Faz enquadramento → investigação leve → brainstorming disciplinado (Superpowers) → análise BMAD analyst+pm → recomendação com tradeoffs → opcional: gera PRD draft.
 
-- **`executor-bmad-superpowers`** — executor com 7 fases obrigatórias: intake, brainstorming técnico, plano BMAD real (invoca `@pm`/`@architect`/`@sm` e gera shards no fs), confirmação, implementação TDD (Superpowers), QA + security review com subagents, entrega.
+- **`executor-bmad-superpowers`** — orquestrador que **não implementa inline**: delega a execução ao Superpowers (`writing-plans` → `subagent-driven-development` com implementer + 2 reviewers por task → `verification-before-completion`). Ponto de parada pedindo OK antes de codar. BMAD opt-in pra features grandes.
 
 ---
 
