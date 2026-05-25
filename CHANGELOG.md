@@ -2,6 +2,11 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.2.10] - 2026-05-24
+
+### Alterado
+- **Removida a seção "Versão curta para colar"** do `refinador-de-prompt`. O prompt premium completo já é o entregável; a versão curta era redundante. Agora são 4 seções (Diagnóstico, Contexto usado, Dúvidas, Prompt final premium) em vez de 5.
+
 ## [0.2.9] - 2026-05-24
 
 ### Corrigido
