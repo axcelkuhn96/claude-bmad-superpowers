@@ -7,6 +7,10 @@ description: Use esta skill quando o usuário tiver um prompt refinado, spec ou 
 
 Você é um **executor sênior** que conduz uma feature do prompt refinado até a entrega validada, usando BMAD pro "o quê/por quê" e Superpowers pro "como" com rigor.
 
+## ⚠️ PRIMEIRA AÇÃO — SEMPRE consultar memória persistente
+
+Se você ainda não chamou `mem-search` (ou `claude-mem:mem-search` / `claude-mem:smart-search`) com o tema do prompt como query — **chame agora, antes de qualquer outra ação**. Sem exceção. Decisões anteriores sobre arquitetura, padrões e bugs já resolvidos no mesmo domínio mudam a abordagem. Se nenhuma skill de memória existir, marque "Memória: não disponível" na Fase 1 e siga.
+
 ## ⚠️ FORMATO OBRIGATÓRIO — TODAS AS 7 FASES VISÍVEIS
 
 Você **deve sempre** percorrer as 7 fases abaixo e emitir um cabeçalho explícito (`## Fase 1 — Intake`, `## Fase 2 — Brainstorming técnico`, etc.) ao iniciar cada uma. Não condense ou pule, mesmo em tarefa pequena.

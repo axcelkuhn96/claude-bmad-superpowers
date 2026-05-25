@@ -2,9 +2,10 @@
 description: Executa um prompt refinado (ou PRD) usando BMAD pra planejar e Superpowers pra implementar com TDD, subagents e security review.
 ---
 
-**AÇÃO OBRIGATÓRIA AGORA:** invoque a ferramenta `Skill` com `skill: "executor-bmad-superpowers"` antes de qualquer outra coisa. Não responda nem rode outras tools antes da invocação. A skill define o fluxo das 7 fases obrigatórias.
+**ORDEM OBRIGATÓRIA — sem julgamento, sem exceção:**
 
-Passe o prompt/spec abaixo como contexto pra skill.
+1. **PRIMEIRO**: invoque `Skill` com `skill: "mem-search"` passando o tema/intent extraído do prompt como query. Sem exceção. Se `mem-search` não existir, tente `claude-mem:mem-search`; se nenhuma existir, registre "Memória: não disponível".
+2. **SÓ DEPOIS**: invoque `Skill` com `skill: "executor-bmad-superpowers"`, passando o prompt + resumo curto da memória (ou "nada relevante").
 
 **Lembrete:** TDD não é opcional quando há lógica testável. Subagents (`Explore`, `code-reviewer`, `security-auditor`) são default pra proteger contexto.
 

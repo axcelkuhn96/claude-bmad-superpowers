@@ -2,7 +2,10 @@
 description: Mesma skill do /refinar, mas assume tudo que não for crítico (sem perguntar). Marca as suposições explicitamente.
 ---
 
-**AÇÃO OBRIGATÓRIA AGORA:** invoque a ferramenta `Skill` com `skill: "refinador-de-prompt"` antes de qualquer outra coisa. Passe a entrada do usuário abaixo + a instrução de modo auto.
+**ORDEM OBRIGATÓRIA — sem julgamento, sem exceção:**
+
+1. **PRIMEIRO**: invoque `Skill` com `skill: "mem-search"` passando a entrada do usuário como query. Sem exceção. Se `mem-search` não existir, tente `claude-mem:mem-search`; se nenhuma existir, registre "Memória: não disponível".
+2. **SÓ DEPOIS**: invoque `Skill` com `skill: "refinador-de-prompt"`, passando a entrada + resumo da memória + a instrução de modo auto abaixo.
 
 **Modo auto** (passar no contexto pra skill):
 - **PULA a Fase 5 (Alinhamento prévio)** — não pare pra confirmar, vá direto pro prompt.

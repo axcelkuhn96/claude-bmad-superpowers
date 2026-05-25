@@ -2,6 +2,14 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.2.8] - 2026-05-24
+
+### Corrigido
+- **`mem-search` agora é obrigatório em primeiro lugar**, sem julgamento. Análise da sessão `5954fb4b` mostrou 0/3 invocações de claude-mem mesmo com a v0.2.5 mandando. Reforço em duas camadas:
+  - **Nos 5 slash commands**: ordem numerada explícita — "1. PRIMEIRO invoque Skill mem-search. 2. SÓ DEPOIS invoque a skill principal."
+  - **No topo das 3 SKILL.md**: novo bloco "⚠️ PRIMEIRA AÇÃO — SEMPRE consultar memória persistente" antes do bloco de formato obrigatório.
+- Espera-se agora que `mem-search` apareça como primeira tool call em cada slash command.
+
 ## [0.2.7] - 2026-05-24
 
 ### Adicionado

@@ -2,11 +2,15 @@
 description: Fluxo completo fim-a-fim — refina a ideia em prompt premium, mostra pro usuário, pede OK, e depois executa com BMAD + Superpowers.
 ---
 
-**FLUXO OBRIGATÓRIO em duas invocações de Skill tool:**
+**FLUXO OBRIGATÓRIO — invocações sequenciais da Skill tool:**
 
-## Etapa 1 — Refinar (invoque Skill tool AGORA)
+## Etapa 0 — Memória (PRIMEIRO de tudo)
 
-Invoque a ferramenta `Skill` com `skill: "refinador-de-prompt"` passando a entrada do usuário abaixo. Aguarde a skill produzir o prompt final premium no formato dela (5 seções).
+Invoque `Skill` com `skill: "mem-search"` passando a entrada do usuário como query. Sem exceção, mesmo se parecer trivial. Se não existir, tente `claude-mem:mem-search`; se nenhuma existir, registre "Memória: não disponível" e siga.
+
+## Etapa 1 — Refinar
+
+Invoque `Skill` com `skill: "refinador-de-prompt"` passando a entrada do usuário + resumo da memória. Aguarde a skill produzir o prompt final premium no formato dela (5 seções, após alinhamento prévio).
 
 Se a skill emitir dúvidas bloqueantes, **PERGUNTE** ao usuário e pare aqui até a resposta.
 
