@@ -4,7 +4,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { ARQ_PROJETOS_BMAD, existe, garantirDir } from './caminhos.js';
 
-const CANDIDATOS_BMAD = ['.bmad-core', '.bmad', 'bmad-core'];
+const CANDIDATOS_BMAD = ['_bmad', '.bmad-core', '.bmad', 'bmad-core'];
 
 export async function temBmadAqui(dir) {
   for (const c of CANDIDATOS_BMAD) {
