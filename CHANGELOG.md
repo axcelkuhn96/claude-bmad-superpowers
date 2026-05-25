@@ -2,6 +2,14 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.2.1] - 2026-05-24
+
+### Corrigido
+- **Detecção do Superpowers** agora lê `~/.claude/plugins/installed_plugins.json` em vez de tentar `claude /plugin list` (que não funciona fora do app). Detecta de verdade.
+- **Instalação do Superpowers** não tenta mais via CLI (não funciona pra plugins). Mostra instruções claras: `/plugin marketplace add obra/superpowers-marketplace` + `/plugin install superpowers@superpowers-marketplace`.
+- **BMAD install nunca mais cai em Quick Update**: passa `--action install` (ou `update`, dependendo do que o usuário escolher) explicitamente. Antes o BMAD entrava em `quick-update` quando detectava instalação prévia, ignorando `--tools claude-code` (resultando em "No IDE selected").
+- **`instalar-bmad` agora pergunta** quando BMAD já existe: reinstalar do zero / update / pular. Flags `--force` e `--update` pra modo não-interativo.
+
 ## [0.2.0] - 2026-05-24
 
 ### Adicionado

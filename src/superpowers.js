@@ -1,8 +1,13 @@
 // Detecção e instalação do plugin Superpowers
 // IMPORTANTE: usamos execFile (não exec/shell) pra evitar injeção. Args vão como array.
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { RAIZ_CLAUDE } from './caminhos.js';
+
 const rodar = promisify(execFile);
+const ARQ_PLUGINS = path.join(RAIZ_CLAUDE, 'plugins', 'installed_plugins.json');
 
 export async function temBinarioClaude() {
   const cmd = process.platform === 'win32' ? 'where' : 'which';
@@ -14,46 +19,45 @@ export async function temBinarioClaude() {
   }
 }
 
+/**
+ * Detecta se Superpowers está instalado lendo o registry de plugins do Claude Code.
+ * Estrutura: ~/.claude/plugins/installed_plugins.json — { plugins: { "nome@marketplace": [...] } }
+ */
 export async function plugInstalado(nome) {
   try {
-    const { stdout } = await rodar('claude', ['/plugin', 'list'], { timeout: 10000 });
-    return stdout.toLowerCase().includes(nome.toLowerCase());
+    const buf = await fs.readFile(ARQ_PLUGINS, 'utf8');
+    const json = JSON.parse(buf);
+    const chaves = Object.keys(json.plugins || {});
+    return chaves.some((k) => k.toLowerCase().includes(nome.toLowerCase()));
   } catch {
-    return null;
+    return false;
   }
 }
 
+const INSTRUCOES_SUPERPOWERS = `
+   Pra instalar o Superpowers, dentro do Claude Code rode:
+
+     /plugin marketplace add obra/superpowers-marketplace
+     /plugin install superpowers@superpowers-marketplace
+
+   (a instalação via CLI fora do Claude Code não funciona pra plugins)
+`;
+
 export async function tentarInstalarSuperpowers() {
-  const ok = await temBinarioClaude();
-  if (!ok) {
-    console.log('⚠  CLI `claude` não encontrada no PATH.');
-    console.log('   Dentro do Claude Code, rode manualmente:');
-    console.log('     /plugin install superpowers@obra\n');
+  if (await plugInstalado('superpowers')) {
+    console.log('✓ Plugin Superpowers já está instalado.\n');
     return;
   }
-
-  console.log('→ Tentando instalar plugin Superpowers...');
-  try {
-    await rodar('claude', ['/plugin', 'install', 'superpowers@obra'], { timeout: 60000 });
-    console.log('✓ Plugin Superpowers solicitado (confirme dentro do Claude Code se necessário).\n');
-  } catch {
-    console.log('⚠  Não consegui instalar via CLI. Dentro do Claude Code, rode:');
-    console.log('     /plugin install superpowers@obra\n');
-  }
+  console.log('⚠  Plugin Superpowers não detectado em ~/.claude/plugins/.');
+  console.log(INSTRUCOES_SUPERPOWERS);
 }
 
 export async function tentarAtualizarSuperpowers() {
-  const ok = await temBinarioClaude();
-  if (!ok) {
-    console.log('⚠  CLI `claude` não encontrada — pule a atualização do Superpowers.');
+  if (!(await plugInstalado('superpowers'))) {
+    console.log('⚠  Plugin Superpowers não instalado.');
+    console.log(INSTRUCOES_SUPERPOWERS);
     return;
   }
-  console.log('→ Tentando atualizar plugin Superpowers...');
-  try {
-    await rodar('claude', ['/plugin', 'update', 'superpowers@obra'], { timeout: 60000 });
-    console.log('✓ Plugin Superpowers atualizado (ou já estava na última).');
-  } catch {
-    console.log('⚠  Não consegui atualizar via CLI. Dentro do Claude Code, rode:');
-    console.log('     /plugin update superpowers@obra');
-  }
+  console.log('→ Pra atualizar o Superpowers, dentro do Claude Code rode:');
+  console.log('     /plugin update superpowers@superpowers-marketplace\n');
 }
