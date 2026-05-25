@@ -55,11 +55,18 @@ export async function instalarBmad(args = []) {
     }
   }
 
-  // sempre passar --action install OU update (NUNCA quick-update — pra IDE wiring funcionar)
+  // máximo não-interativo:
+  // --action install/update (NUNCA quick-update — pra IDE wiring funcionar)
+  // --tools claude-code (escreve agentes em .claude/skills do projeto)
+  // --modules bmm,core (fixa lista — pula tela de seleção)
+  // --yes (aceita defaults onde houver)
+  // sem --custom-source (sinaliza ao BMAD pra não perguntar sobre custom modules)
   const bmadArgs = [
     '--yes', 'bmad-method', 'install',
     '--action', acao,
     '--tools', 'claude-code',
+    '--modules', 'bmm,core',
+    '--yes',
   ];
   // extras do usuário (filtra nossos próprios flags)
   const nossosFlags = new Set(['--force', '-f', '--update', '-u']);

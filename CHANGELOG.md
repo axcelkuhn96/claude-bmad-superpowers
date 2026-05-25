@@ -2,6 +2,11 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.2.2] - 2026-05-24
+
+### Corrigido
+- **BMAD install agora 100% não-interativo no caminho feliz**: passa `--modules bmm,core` explicitamente, fixando os módulos oficiais. Isso pula a tela de seleção de módulos E a pergunta sobre custom/community modules (que aparecia mesmo com `--yes`).
+
 ## [0.2.1] - 2026-05-24
 
 ### Corrigido
