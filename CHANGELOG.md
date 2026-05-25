@@ -2,6 +2,14 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.5.1] - 2026-05-25
+
+### Corrigido (consistência de docs)
+- **INSTALL.md** atualizado: 7 → **8 commands**; marcador descrito como rodapé (não header); passo do Superpowers agora diz "detecta e mostra o comando" (não "instala via CLI"); `.bmad-core/` → `_bmad/` e BMAD marcado como requisito do `/executar`.
+- **Comando do Superpowers padronizado** em todos os docs: `/plugin marketplace add obra/superpowers-marketplace` + `/plugin install superpowers@superpowers-marketplace` (antes o INSTALL.md tinha `superpowers@obra`, que não bate com o nome real do marketplace).
+- **README**: passo 2 da instalação não promete mais "instala" o plugin — diz "detecta e mostra o comando exato" (plugins não instalam via CLI fora do app).
+- **Descrição do pacote (package.json) e do repo GitHub** atualizadas: removido "BMAD opcional"; agora "Superpowers (motor) + BMAD (disciplina) integrados".
+
 ## [0.5.0] - 2026-05-25
 
 ### Mudança de arquitetura — BMAD + Superpowers SEMPRE juntos

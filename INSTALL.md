@@ -23,10 +23,10 @@ cbs instalar
 
 1. Detecta o diretório `~/.claude/` (cria se faltar).
 2. Copia as 3 skills pra `~/.claude/skills/`.
-3. Copia os 7 commands pra `~/.claude/commands/`.
-4. Marca cada arquivo com header `<!-- claude-bmad-superpowers:base vX.Y.Z -->` (usado pelo update).
-5. Tenta instalar o plugin **Superpowers** via `claude /plugin install` (instrui você se não conseguir).
-6. Grava versão instalada em `~/.claude/cbs-overrides/.versao-instalada`.
+3. Copia os 8 commands pra `~/.claude/commands/`.
+4. Marca cada arquivo com um rodapé `<!-- claude-bmad-superpowers:base vX.Y.Z -->` (usado pelo update pra saber o que pode sobrescrever).
+5. **Detecta** o plugin **Superpowers** (lendo `~/.claude/plugins/installed_plugins.json`); se não estiver instalado, mostra o comando exato pra rodar dentro do Claude Code (plugins não instalam via CLI fora do app).
+6. Grava a versão instalada no registro de `~/.claude/cbs-overrides/`.
 
 ## Verificar instalação
 
@@ -43,7 +43,7 @@ Deve listar:
 
 ## Por projeto que vai usar BMAD
 
-BMAD é per-project (escreve em `.bmad-core/`, `docs/prd.md`, etc.):
+BMAD é per-project (escreve em `_bmad/`, `docs/`, etc.) e é **requisito** do `/executar` — sem ele, o executor para e pede pra instalar:
 
 ```bash
 cd meu-projeto
@@ -62,7 +62,8 @@ O Claude Code precisa estar no PATH. A CLI tenta `which claude` (Unix) / `where 
 Dentro do Claude Code:
 
 ```text
-/plugin install superpowers@obra
+/plugin marketplace add obra/superpowers-marketplace
+/plugin install superpowers@superpowers-marketplace
 ```
 
 ### "Permission denied" no Linux/Mac

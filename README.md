@@ -51,7 +51,7 @@ npx claude-bmad-superpowers instalar
 Isso faz, em ordem:
 
 1. **Skills + comandos** → copia as 3 skills e 8 comandos pra `~/.claude/skills/` e `~/.claude/commands/`.
-2. **Superpowers** → detecta/instala o plugin via marketplace do Claude Code (ou te mostra o comando exato se precisar rodar dentro do app).
+2. **Superpowers** → detecta o plugin; se não estiver instalado, mostra o comando exato pra rodar **dentro do Claude Code** (instalação de plugin não funciona via CLI fora do app).
 3. **BMAD** → instala no diretório atual se você estiver dentro de um projeto (interativo). Pra pular: `--apenas-global`.
 
 > Atalho: depois de instalar, os binários `claude-bmad-superpowers` e `cbs` ficam disponíveis. Use `cbs` pra digitar menos.
