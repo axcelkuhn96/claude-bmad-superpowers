@@ -2,6 +2,20 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.2.4] - 2026-05-24
+
+### Corrigido
+- **Slash commands agora FORÇAM invocação da Skill tool**. Texto antigo "Invoque a skill X" era ambíguo — o LLM lia como "trabalhe nessa pegada" e improvisava sem chamar o Skill tool. Novo texto: "AÇÃO OBRIGATÓRIA AGORA: invoque a ferramenta `Skill` com `skill: \"<nome>\"` antes de qualquer outra coisa". Validado em análise de JSONL: sessões antigas tinham 0 Skill tool calls; agora deve ter ≥1 por slash command.
+
+## [0.2.3] - 2026-05-24
+
+### Corrigido
+- **Skills agora seguem formato rígido sempre**, independente do tamanho da tarefa. Adicionada seção `## ⚠️ FORMATO OBRIGATÓRIO` no topo de cada SKILL.md:
+  - `refinador-de-prompt`: sempre emite Diagnóstico/Contexto/Dúvidas/Prompt final/Versão curta — mesmo se recomendar "não faça"
+  - `investigador-de-ideia`: sempre as 6 fases com cabeçalho explícito
+  - `executor-bmad-superpowers`: sempre as 7 fases com cabeçalho + 8 seções fixas na entrega
+- Antes, em casos pequenos, as skills adaptavam pra resposta livre — útil mas não auditável. Agora estrutura é fixa, conteúdo se adapta.
+
 ## [0.2.2] - 2026-05-24
 
 ### Corrigido

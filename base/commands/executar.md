@@ -2,9 +2,9 @@
 description: Executa um prompt refinado (ou PRD) usando BMAD pra planejar e Superpowers pra implementar com TDD, subagents e security review.
 ---
 
-Invoque a skill `executor-bmad-superpowers` com o prompt/spec abaixo.
+**AÇÃO OBRIGATÓRIA AGORA:** invoque a ferramenta `Skill` com `skill: "executor-bmad-superpowers"` antes de qualquer outra coisa. Não responda nem rode outras tools antes da invocação. A skill define o fluxo das 7 fases obrigatórias.
 
-Execute as **7 fases obrigatórias**: intake → brainstorming técnico → plano BMAD (PM/Architect/SM com artefatos em `docs/`) → confirmação → implementação TDD → QA + security review (subagents) → entrega no formato definido.
+Passe o prompt/spec abaixo como contexto pra skill.
 
 **Lembrete:** TDD não é opcional quando há lógica testável. Subagents (`Explore`, `code-reviewer`, `security-auditor`) são default pra proteger contexto.
 

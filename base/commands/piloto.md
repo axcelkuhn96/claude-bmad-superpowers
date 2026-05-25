@@ -2,31 +2,26 @@
 description: Fluxo completo fim-a-fim — refina a ideia em prompt premium, mostra pro usuário, pede OK, e depois executa com BMAD + Superpowers.
 ---
 
-Execute o fluxo completo em duas etapas:
+**FLUXO OBRIGATÓRIO em duas invocações de Skill tool:**
 
-## Etapa 1 — Refinar
+## Etapa 1 — Refinar (invoque Skill tool AGORA)
 
-Invoque a skill `refinador-de-prompt` com a entrada do usuário.
+Invoque a ferramenta `Skill` com `skill: "refinador-de-prompt"` passando a entrada do usuário abaixo. Aguarde a skill produzir o prompt final premium no formato dela (5 seções).
 
-Siga o fluxo completo, incluindo Explore subagent obrigatório e detecção BMAD.
-
-Se houver dúvidas bloqueantes, **PERGUNTE** e pare aqui até o usuário responder.
-
-Apresente o **prompt final premium** no formato da skill.
+Se a skill emitir dúvidas bloqueantes, **PERGUNTE** ao usuário e pare aqui até a resposta.
 
 ## Etapa 2 — Aguardar OK
 
-Pergunte ao usuário: **"Posso executar este prompt? [s/N/editar]"**
+Após o prompt final aparecer, pergunte literalmente:
+**"Posso executar este prompt? [s/N/editar]"**
 
-- `s` → siga pra etapa 3
-- `N` → pare
-- `editar` → ajuste com base no feedback e volte a perguntar
+- `s` → siga pra Etapa 3
+- `N` → pare (sem invocar executor)
+- `editar` → re-invoque `refinador-de-prompt` com o feedback do usuário e volte a perguntar
 
-## Etapa 3 — Executar
+## Etapa 3 — Executar (invoque Skill tool de novo)
 
-Invoque a skill `executor-bmad-superpowers` passando o prompt final aprovado.
-
-Execute as 7 fases obrigatórias até a entrega.
+Invoque a ferramenta `Skill` com `skill: "executor-bmad-superpowers"` passando o prompt final aprovado. A skill vai executar as 7 fases obrigatórias.
 
 Entrada do usuário:
 
