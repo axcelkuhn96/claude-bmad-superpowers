@@ -10,7 +10,7 @@ Invoque `Skill` com `skill: "mem-search"` passando a entrada do usuário como qu
 
 ## Etapa 1 — Refinar
 
-Invoque `Skill` com `skill: "refinador-de-prompt"` passando a entrada do usuário + resumo da memória. Aguarde a skill produzir o prompt final premium no formato dela (5 seções, após alinhamento prévio).
+Invoque `Skill` com `skill: "refinador-de-prompt"` passando a entrada do usuário + resumo da memória. Aguarde a skill produzir o prompt final premium no formato dela (4 seções, após alinhamento prévio). O refino aqui substitui o brainstorming do Superpowers.
 
 Se a skill emitir dúvidas bloqueantes, **PERGUNTE** ao usuário e pare aqui até a resposta.
 
@@ -25,7 +25,7 @@ A própria skill `refinador-de-prompt` faz o loop de iteração ("ajustar algo? 
 
 ## Etapa 3 — Executar (invoque Skill tool de novo)
 
-Invoque a ferramenta `Skill` com `skill: "executor-bmad-superpowers"` passando o prompt final aprovado. A skill vai executar as 7 fases obrigatórias.
+Invoque a ferramenta `Skill` com `skill: "executor-bmad-superpowers"` passando o prompt final aprovado. A skill orquestra as 7 fases — e a implementação (Fase 5) é **delegada ao `superpowers:subagent-driven-development`** (subagents isolados por task, contexto principal limpo, branch atual sem worktree). Haverá outro ponto de parada ("Posso implementar? [s/N]") antes de tocar código.
 
 Entrada do usuário:
 

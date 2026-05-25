@@ -19,14 +19,18 @@ Se uma fase for trivial pro caso (ex.: 1 arquivo, sem stories), ainda assim emit
 
 A fase 7 — Entrega — tem 8 seções fixas (Resumo, Arquivos, Decisões, Comandos, Testes, Validação manual, Riscos, Próximos passos). Emita todas, mesmo que algumas tenham "Nenhum/N/A".
 
-**Skills a invocar (via Skill tool) quando disponíveis no ambiente — não simule se a skill real existir:**
+**Princípio central:** este executor **orquestra** skills reais — não reimplementa. Quando a skill existir no ambiente, **invoque-a** (não simule).
+
+**Skills a invocar (via Skill tool):**
 - Fase 2 → `superpowers:brainstorming`
-- Fase 3 → `bmad-create-prd` / `bmad-create-architecture` / `bmad-create-story` (ou agentes `bmad-agent-*`)
-- Fase 5 → `superpowers:test-driven-development` (e `superpowers:systematic-debugging` se travar)
+- Fase 3 → spec: `bmad-create-prd`/`bmad-create-architecture`/`bmad-create-story` (escala por tamanho) → plano: `superpowers:writing-plans`
+- Fase 5 → `superpowers:subagent-driven-development` (despacha implementer + reviewers por task; fallback: `superpowers:test-driven-development`)
 - Fase 6 → `superpowers:requesting-code-review`
 - Fase 7 → `superpowers:verification-before-completion`
 
-**Fase 4 é PONTO DE PARADA**: pergunte "Posso implementar? [s/N]" e espere resposta (exceto modo `--auto`).
+**Fase 4 é PONTO DE PARADA**: pergunte "Posso implementar? [s/N]" e espere resposta (exceto modo `--auto`). Depois disso, a execução é contínua.
+
+**Sem worktree:** trabalhar sempre na branch atual; não invocar `superpowers:using-git-worktrees`.
 
 ## Princípios não-negociáveis
 
@@ -68,20 +72,21 @@ Gere **2-3 abordagens técnicas distintas** pra implementar a tarefa. Para cada:
 
 Escolha uma e **explicite o tradeoff aceito**.
 
-### Fase 3 — Plano BMAD
+### Fase 3 — Planejamento (BMAD gera spec → plano executável)
 
-**Com BMAD instalado** (skills `bmad-*` disponíveis no ambiente) — invoque as skills reais via Skill tool:
+O objetivo desta fase é produzir **um plano com tasks discretas no filesystem** que a Fase 5 vai entregar ao `superpowers:subagent-driven-development`. Cada task precisa ter texto completo e auto-contido (o subagent não vai ler o histórico da conversa).
 
-1. `bmad-create-prd` (ou skill `bmad-agent-pm`) → PRD curto em `docs/`/`_bmad-output/` (objetivo, usuário, critérios)
-2. `bmad-create-architecture` (ou `bmad-agent-architect`) → decisões técnicas, padrões
-3. `bmad-create-epics-and-stories` ou `bmad-create-story` (ou `bmad-agent-sm`) → **stories pequenas** com objetivo, critérios de aceite, Definition of Done, testes esperados
-4. Identifique **riscos** explicitamente (lista numerada)
+**Passo A — Spec via BMAD** (se skills `bmad-*` disponíveis):
+- Tarefa pequena (1-2 arquivos): invoque ao menos `bmad-create-story`. Registre "Caso pequeno: PRD/arquitetura dispensados".
+- Tarefa média/grande: `bmad-create-prd` → `bmad-create-architecture` → `bmad-create-epics-and-stories`.
+- Sem BMAD: escreva a spec manualmente em `docs/` e recomende `/instalar-bmad` no fim.
 
-**Escala pelo tamanho da tarefa:**
-- Tarefa pequena (1-2 arquivos, util isolado): invoque ao menos `bmad-create-story` pra ter a story formal. PRD/arquitetura completos são opcionais — registre "Caso pequeno: PRD/arquitetura dispensados, só story".
-- Tarefa média/grande: invoque PRD + arquitetura + stories.
+**Passo B — Plano executável via `superpowers:writing-plans`:**
+- Invoque `superpowers:writing-plans` passando a spec/stories do BMAD como entrada. Ela salva o plano em `docs/superpowers/plans/`.
+- O plano deve quebrar o trabalho em **tasks independentes**, cada uma com: arquivos a tocar, comportamento esperado, testes, critérios de aceite.
+- Caso muito pequeno (1 task): pode escrever o plano mínimo direto, sem cerimônia — mas ainda em formato de task(s) explícita(s).
 
-**Sem BMAD instalado:** gere os mesmos artefatos manualmente em `docs/` simulando os papéis, e recomende `/instalar-bmad` no fim.
+4. Liste **riscos** explicitamente (numerados).
 
 ### Fase 4 — Confirmação
 
@@ -93,51 +98,48 @@ Apresente ao usuário, antes de qualquer edição de código:
 Abordagem escolhida: [...]
 Tradeoff aceito: [...]
 
-## Artefatos gerados
-- docs/prd-<slug>.md
-- docs/arquitetura-<slug>.md
-- docs/stories/<slug>-1.md
-- docs/stories/<slug>-2.md
-- ...
+## Plano executável
+- docs/superpowers/plans/<data>-<feature>.md  (ou stories BMAD)
+- Tasks: [lista numerada das tasks discretas]
 
 ## Arquivos prováveis a alterar
 - src/...
-- src/...
 
 ## Testes pretendidos
-- unit: ...
-- integração: ...
+- unit / integração: ...
 
 ## Riscos
 1. ...
-2. ...
 ```
 
 **🛑 PONTO DE PARADA OBRIGATÓRIO.** Termine sua mensagem AQUI com a pergunta literal:
 
 > **"Posso implementar? [s/N]"**
 
-Não escreva nenhum arquivo, não rode TDD, não avance pra Fase 5 antes do usuário responder `s`. Exceção única: usuário invocou em modo `--auto` — aí prossiga marcando decisões assumidas. "continue" do usuário em resposta a essa pergunta conta como `s`.
+Não escreva nenhum arquivo, não invoque a execução, não avance pra Fase 5 antes do usuário responder `s`. Exceção única: modo `--auto`. "continue" conta como `s`.
 
-### Fase 5 — Implementação TDD (Superpowers)
+Este é o **único gate humano** antes da execução — a partir do `s`, a Fase 5 roda de forma contínua (a skill de execução não pausa entre tasks).
 
-**Invoque a skill `superpowers:test-driven-development` se ela existir no ambiente** — ela rege o ciclo. Caso contrário, siga o ciclo manualmente abaixo.
+### Fase 5 — Execução DELEGADA (não implemente inline)
 
-Para cada story:
+**Esta é a mudança central: você NÃO implementa no contexto principal.** Você delega ao Superpowers, que dispacha subagents isolados por task e mantém seu contexto limpo pra coordenação.
 
-1. **Escreva o teste primeiro** — confirme que ele falha pelo motivo certo.
-2. **Implemente o mínimo** pra passar.
-3. **Refatore** dentro do escopo da story (não fora).
-4. **Rode o teste isolado** — verde.
-5. **Rode a suíte completa** — sem regressão.
-6. Commit lógico (se em git workflow) ou ponto de salvamento.
+1. **Invoque a skill `superpowers:subagent-driven-development`** passando o plano da Fase 3.
+   - Ela vai: ler o plano, extrair as tasks, e **por task** despachar 1 implementer subagent (contexto isolado, TDD) + spec reviewer + code quality reviewer, com loop de correção.
+   - O contexto principal só **orquestra** (coordena subagents, responde perguntas deles, marca progresso). Não faça grep/read/write de implementação aqui.
 
-**Regras:**
-- ❌ Não pule testes "porque é simples".
-- ❌ Não escreva 5 testes de uma vez sem código — escreva um, implemente, próximo.
-- ❌ Não refatore arquivo que não está no escopo da story.
-- ✅ Delegue investigação pesada (mapear como X funciona) a subagent `Explore`.
-- ✅ Use `superpowers:systematic-debugging` se um teste falhar de forma inesperada.
+2. **Workspace — instrução explícita pra passar à skill:**
+   > "Workspace já definido: trabalhar na **branch atual**, **NÃO criar git worktree**. Não invoque `superpowers:using-git-worktrees`."
+
+   (O usuário trabalha em branch dedicada — worktree é dispensado de propósito.)
+
+3. **Se `subagent-driven-development` não existir** no ambiente (Superpowers não instalado), aí sim caia no fallback: invoque `superpowers:test-driven-development` se existir, ou faça TDD manual (teste falha → código mínimo → verde), delegando investigação pesada a subagent `Explore`. Recomende instalar Superpowers no fim.
+
+**Regras desta fase:**
+- ❌ Não faça a implementação (grep/read/write/edit de código) no contexto principal quando o `subagent-driven-development` estiver disponível — delegue.
+- ❌ Não crie worktree.
+- ✅ Responda perguntas dos subagents (eles podem pedir contexto antes de codar).
+- ✅ Trate status BLOCKED/NEEDS_CONTEXT dos subagents conforme a skill manda (dar contexto, re-despachar, ou escalar pra você).
 
 ### Fase 6 — QA + Security review
 

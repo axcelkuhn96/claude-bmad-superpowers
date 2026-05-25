@@ -2,6 +2,16 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.3.0] - 2026-05-24
+
+### Mudança de arquitetura
+- **Executor agora DELEGA ao Superpowers real em vez de reimplementar.** Diagnóstico (sessões `bcf5870f`/`609f0c5d`/`89756461`): o executor descrevia brainstorming/TDD/subagent na própria SKILL.md e o modelo fazia tudo inline no contexto principal — os subagents quase não disparavam e o contexto poluía. Pesquisa na fonte primária (Superpowers v5.1.0) mostrou que `subagent-driven-development` mantém o contexto principal só como orquestrador e despacha implementer + 2 reviewers por task.
+- **Fase 3 (Planejamento):** BMAD gera spec/stories → `superpowers:writing-plans` converte em plano executável com tasks discretas.
+- **Fase 5 (Execução):** agora **delega a `superpowers:subagent-driven-development`** — implementer subagent isolado por task + spec reviewer + code quality reviewer. O contexto principal só orquestra. Fallback pra TDD manual se Superpowers ausente.
+- **Sem worktree:** instrução explícita pra trabalhar na branch atual (não invocar `using-git-worktrees`), conforme preferência do usuário.
+- Removida a prosa que reimplementava RED-GREEN e regras de subagent inline (agora vêm das skills reais).
+- `executar.md` e `piloto.md` ajustados pra refletir a delegação.
+
 ## [0.2.10] - 2026-05-24
 
 ### Alterado
