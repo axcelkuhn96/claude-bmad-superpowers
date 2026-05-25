@@ -2,6 +2,12 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.2.6] - 2026-05-24
+
+### Adicionado
+- **Loop de iteração no `/refinar`** (Fase 6 do `refinador-de-prompt`): depois de emitir o prompt, skill SEMPRE pergunta "Quer ajustar algo? `ok` pra fechar ou diga o que mudar". Permite co-decidir sem rodar `/refinar` do zero várias vezes. Aceita `ok`/`pode`/`tá bom`/`fechado` como sinal de fim. Qualquer outro texto = ajuste → re-emite formato completo.
+- `/piloto` ajustado pra esperar o `ok` do loop do refinador antes de perguntar "executar agora?".
+
 ## [0.2.5] - 2026-05-24
 
 ### Adicionado

@@ -12,12 +12,12 @@ Se a skill emitir dúvidas bloqueantes, **PERGUNTE** ao usuário e pare aqui at�
 
 ## Etapa 2 — Aguardar OK
 
-Após o prompt final aparecer, pergunte literalmente:
-**"Posso executar este prompt? [s/N/editar]"**
+A própria skill `refinador-de-prompt` faz o loop de iteração ("ajustar algo? ok pra fechar..."). Quando o usuário fechar com `ok` (ou equivalente), pergunte literalmente:
+
+**"Posso executar agora? [s/N]"**
 
 - `s` → siga pra Etapa 3
 - `N` → pare (sem invocar executor)
-- `editar` → re-invoque `refinador-de-prompt` com o feedback do usuário e volte a perguntar
 
 ## Etapa 3 — Executar (invoque Skill tool de novo)
 

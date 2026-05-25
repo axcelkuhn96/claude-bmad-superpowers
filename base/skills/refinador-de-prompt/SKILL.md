@@ -185,6 +185,19 @@ Use Superpowers pra brainstorming disciplinado, plano, TDD, debugging, subagents
 [mesma essência em 1/3 do tamanho]
 ```
 
+### Fase 6 — Loop de iteração (OBRIGATÓRIO no fim)
+
+Depois de emitir as 5 seções, **sempre** pergunte literalmente:
+
+> **Quer ajustar algo no prompt? Responda `ok` pra fechar ou diga o que mudar.**
+
+Comportamento:
+- **`ok` / `pode` / `tá bom` / `fechado`** → encerre sem mais saída. O usuário vai colar o prompt em `/executar` ou `/piloto`.
+- **Qualquer ajuste** (ex.: "muda a regra X", "tira essa parte", "adiciona Y nos critérios", "trocar BMAD por simples") → **re-emita o formato COMPLETO** (todas as 5 seções) com a mudança aplicada, e pergunte de novo "ajustar algo?". Repita até `ok`.
+- Se o ajuste mudar premissa grande (ex.: "na verdade quero outra coisa"), reinicie do diagnóstico — não tente remendar.
+
+Esse loop existe pra você co-decidir sem ter que rodar `/refinar` várias vezes do zero.
+
 ## Regras de qualidade
 
 - Prompt final precisa ser executável **sem** depender do histórico desta conversa.
