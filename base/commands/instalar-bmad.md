@@ -1,37 +1,38 @@
 ---
-description: Instala BMAD-METHOD no projeto atual (per-project) via npx, detecta a stack e registra o projeto pro /atualizar conhecer.
+description: Instala BMAD-METHOD no projeto atual e registra para o /atualizar conhecer. Como BMAD é interativo, delega a CLI npx que roda no terminal do usuário.
 ---
 
-Você vai instalar o BMAD-METHOD no diretório atual do usuário.
+O BMAD-METHOD tem um instalador **interativo** (perguntas em TTY) que o Claude Code não navega bem direto. Por isso, a forma certa é rodar via CLI do pacote — o `!` faz o comando rodar no terminal do usuário com TTY real, e a saída volta pra mim.
 
 ## Passos
 
-1. Confirme que o usuário está no diretório certo do projeto (mostre `pwd`).
+1. Confirme o diretório com o usuário (mostre `pwd`).
 
-2. Pergunte se confirma instalar BMAD ali. Se sim:
+2. Se for o diretório certo, peça para o usuário rodar (ou rode você via `!`):
 
-3. Rode:
-   ```bash
-   npx bmad-method install
    ```
-   Acompanhe a saída e responda às perguntas do instalador BMAD se aparecerem (stack, etc.) consultando o usuário.
-
-4. Após instalar, verifique se `.bmad-core/` (ou `.bmad/`) foi criado.
-
-5. Registre o projeto no índice global pra o `/atualizar` saber dele depois:
-   ```bash
-   mkdir -p ~/.claude/cbs-overrides
-   echo "$(pwd)" >> ~/.claude/cbs-overrides/.projetos-bmad
+   ! npx claude-bmad-superpowers instalar-bmad
    ```
-   (Mas só se ainda não estiver registrado — confira antes.)
 
-6. Mostre os agentes BMAD disponíveis (geralmente: `@analyst`, `@pm`, `@architect`, `@sm`, `@dev`, `@qa`).
+   Esse comando vai:
+   - Rodar `npx bmad-method install --tools claude-code` no diretório atual (com prompts interativos)
+   - Após sucesso, registrar o projeto em `~/.claude/cbs-overrides/.projetos-bmad`
+   - Listar os agentes BMAD disponíveis
 
-7. Diga ao usuário que agora ele pode usar `/refinar`, `/executar` ou `/piloto` e essas skills vão invocar os agentes BMAD automaticamente.
+3. Acompanhe a saída. Se o BMAD perguntar coisas (módulos, idioma, etc.), oriente o usuário a responder.
+
+4. Após terminar, confirme:
+   - `.bmad-core/` (ou `.bmad/`) existe no diretório
+   - Linha do diretório está em `~/.claude/cbs-overrides/.projetos-bmad`
+
+5. Diga ao usuário que agora ele pode usar `/refinar`, `/executar` ou `/piloto` e essas skills vão invocar os agentes BMAD automaticamente.
 
 ## Se algo der errado
 
-Se `npx bmad-method install` falhar:
-- Confira `node --version` (precisa 18+)
-- Confira se tem `git` instalado (BMAD usa)
-- Mostre o erro ao usuário e sugira reportar em https://github.com/bmadcode/BMAD-METHOD/issues
+- `npx bmad-method install` falhar:
+  - Confira `node --version` (precisa 18+)
+  - Confira se tem `git` instalado
+  - Reportar em https://github.com/bmad-code-org/BMAD-METHOD/issues
+
+- `npx claude-bmad-superpowers` não encontrado:
+  - O pacote pode não estar publicado ainda — rode pelo clone local: `node /caminho/do/clone/bin/cli.js instalar-bmad`

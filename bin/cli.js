@@ -4,6 +4,7 @@ import { instalar } from '../src/instalar.js';
 import { atualizar } from '../src/atualizar.js';
 import { remover } from '../src/remover.js';
 import { status } from '../src/status.js';
+import { instalarBmad } from '../src/instalar-bmad.js';
 
 const SUBCOMANDOS = {
   instalar,
@@ -14,6 +15,8 @@ const SUBCOMANDOS = {
   uninstall: remover,
   remove: remover,
   status,
+  'instalar-bmad': instalarBmad,
+  'install-bmad': instalarBmad,
 };
 
 const AJUDA = `claude-bmad-superpowers — workflow BMAD + Superpowers para Claude Code
@@ -22,10 +25,21 @@ Uso:
   npx claude-bmad-superpowers <comando>
 
 Comandos:
-  instalar    Instala skills, commands e plugin Superpowers em ~/.claude/
-  atualizar   Atualiza tudo, preservando customizações em cbs-overrides/
-  remover     Desinstala skills/commands do pacote (preserva overrides)
-  status      Mostra versão instalada, skills/commands ativos, plugins, BMAD
+  instalar         Instala TUDO: skills + commands (global) + Superpowers (plugin) + BMAD (no cwd)
+  instalar-bmad    Instala apenas BMAD-METHOD no diretório atual e registra o projeto
+  atualizar        Self-update + skills/commands + Superpowers + BMAD nos projetos registrados
+  remover          Desinstala skills/commands do pacote (preserva overrides)
+  status           Mostra versão instalada, skills/commands ativos, plugins, BMAD
+
+Flags do instalar:
+  --apenas-global       Não instala BMAD no cwd (skills/commands/Superpowers somente)
+  --skip-bmad           Idem
+  --skip-superpowers    Não tenta instalar o plugin Superpowers
+
+Flags do atualizar:
+  --skip-self-update    Não tenta atualizar o próprio pacote (git pull ou npx @latest)
+  --skip-bmad           Não pergunta sobre atualizar BMAD nos projetos
+  --auto-bmad, -y       Atualiza BMAD em todos os projetos sem perguntar
 
 Aliases: install/update/uninstall/remove também funcionam.
 Atalho:  cbs <comando>  (se instalado globalmente)

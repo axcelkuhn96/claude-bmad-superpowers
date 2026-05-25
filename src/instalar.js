@@ -7,6 +7,8 @@ import {
   garantirDir, lerVersaoPacote, existe,
 } from './caminhos.js';
 import { tentarInstalarSuperpowers } from './superpowers.js';
+import { instalarBmad } from './instalar-bmad.js';
+import { temBmadAqui } from './bmad.js';
 
 function rodapeParaArquivo(p, versao) {
   if (!p.endsWith('.md')) return '';
@@ -39,11 +41,13 @@ async function copiarArvore(origemBase, destinoBase, versao) {
   }
 }
 
-export async function instalar(_args = []) {
+export async function instalar(args = []) {
   console.log('🚀 claude-bmad-superpowers — instalando...\n');
 
   const versao = await lerVersaoPacote();
   console.log(`Versão do pacote: ${versao}`);
+  const pularBmad = args.includes('--apenas-global') || args.includes('--skip-bmad');
+  const pularSuperpowers = args.includes('--skip-superpowers');
 
   await garantirDir(RAIZ_CLAUDE);
   await garantirDir(DIR_SKILLS);
@@ -89,31 +93,51 @@ Convenção: se você criar um arquivo aqui com o mesmo caminho relativo de um a
     await fs.writeFile(readmeOverrides, conteudo, 'utf8');
   }
 
-  console.log('✓ Skills e commands instalados.\n');
+  console.log('━━━ Etapa 1/3: skills e commands ━━━ ✓\n');
 
-  // plugin Superpowers
-  await tentarInstalarSuperpowers();
+  // ━━━ Etapa 2: plugin Superpowers ━━━
+  if (!pularSuperpowers) {
+    console.log('━━━ Etapa 2/3: plugin Superpowers ━━━');
+    await tentarInstalarSuperpowers();
+  } else {
+    console.log('(Superpowers pulado por --skip-superpowers)\n');
+  }
+
+  // ━━━ Etapa 3: BMAD no diretório atual ━━━
+  if (!pularBmad) {
+    const cwd = process.cwd();
+    const jaTem = await temBmadAqui(cwd);
+    console.log(`━━━ Etapa 3/3: BMAD em ${cwd} ━━━`);
+    if (jaTem) {
+      console.log(`✓ BMAD já instalado em ${cwd} (${jaTem}).`);
+      console.log('  Pra atualizar: npx claude-bmad-superpowers atualizar --auto-bmad\n');
+    } else {
+      console.log('BMAD é per-project (escreve em .bmad-core/, docs/, etc.)');
+      console.log('O instalador é interativo — responda as perguntas conforme aparecerem.\n');
+      try {
+        await instalarBmad([]);
+      } catch (e) {
+        console.log(`⚠  Erro ao instalar BMAD: ${e.message}`);
+        console.log('   Você pode rodar depois:  npx claude-bmad-superpowers instalar-bmad\n');
+      }
+    }
+  } else {
+    console.log('(BMAD pulado por --apenas-global / --skip-bmad)');
+    console.log('Pra instalar BMAD num projeto depois:  cd <projeto> && npx claude-bmad-superpowers instalar-bmad\n');
+  }
 
   // mensagem final
   console.log(`
 ✓ Instalação concluída.
 
-Próximos passos:
-  1. Em cada projeto que vai usar BMAD:
-       cd <seu-projeto>
-       claude
-       > /instalar-bmad
+Use no dia a dia:
+  /investigar <tema>     → discovery sem código
+  /refinar <ideia>       → ideia vira prompt premium
+  /executar <prompt>     → BMAD planeja, Superpowers implementa
+  /piloto <ideia>        → fluxo completo (refina + executa)
 
-  2. Use no dia a dia:
-       /investigar <tema>     → discovery sem código
-       /refinar <ideia>       → ideia vira prompt premium
-       /executar <prompt>     → BMAD planeja, Superpowers implementa
-       /piloto <ideia>        → fluxo completo (refina + executa)
-
-  3. Verificar instalação:
-       npx claude-bmad-superpowers status
-
-  4. Atualizar mais tarde:
-       npx claude-bmad-superpowers atualizar
+Verificar:    npx claude-bmad-superpowers status
+Atualizar:    npx claude-bmad-superpowers atualizar
+Mais BMAD:    cd <outro-projeto> && npx claude-bmad-superpowers instalar-bmad
 `);
 }
