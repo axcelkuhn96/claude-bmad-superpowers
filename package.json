@@ -1,6 +1,6 @@
 {
   "name": "claude-bmad-superpowers",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Workflow PT-BR para Claude Code que une BMAD + Superpowers: refinar ideias, planejar com agentes BMAD e executar com disciplina Superpowers (TDD, brainstorming, subagents).",
   "type": "module",
   "bin": {

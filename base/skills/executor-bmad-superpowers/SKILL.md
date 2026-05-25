@@ -131,12 +131,14 @@ Este é o **único gate humano** antes da execução — a partir do `s`, a Fase
    - Ela vai: ler o plano, extrair as tasks, e **por task** despachar 1 implementer subagent (contexto isolado, TDD) + spec reviewer + code quality reviewer, com loop de correção.
    - O contexto principal só **orquestra** (coordena subagents, responde perguntas deles, marca progresso). Não faça grep/read/write de implementação aqui.
 
-2. **Workspace — instrução explícita pra passar à skill:**
+2. **Tipo de subagent — REGRA RÍGIDA:** todo implementer DEVE ser despachado com `subagent_type: "general-purpose"`. **NUNCA** use agentes de domínio ou de plugin (`backend-developer`, `voltagent-*`, `*-pro`, `*-specialist`, `*-expert`, etc.). Eles trazem system prompt e agenda próprios, têm toolset limitado e fogem do plano/TDD que você entregou — quebrando a garantia de qualidade. Se um nome de agente "especialista" não existir, **não tente o vizinho mais parecido da lista**: use `general-purpose`. (Reviewers podem usar `Explore` ou os reviewers nativos do Superpowers; implementer é sempre `general-purpose`.)
+
+3. **Workspace — instrução explícita pra passar à skill:**
    > "Workspace já definido: trabalhar na **branch atual**, **NÃO criar git worktree**. Não invoque `superpowers:using-git-worktrees`."
 
    (O usuário trabalha em branch dedicada — worktree é dispensado de propósito.)
 
-3. **Se `subagent-driven-development` não existir** no ambiente (Superpowers não instalado), aí sim caia no fallback: invoque `superpowers:test-driven-development` se existir, ou faça TDD manual (teste falha → código mínimo → verde), delegando investigação pesada a subagent `Explore`. Recomende instalar Superpowers no fim.
+4. **Se `subagent-driven-development` não existir** no ambiente (Superpowers não instalado), aí sim caia no fallback: invoque `superpowers:test-driven-development` se existir, ou faça TDD manual (teste falha → código mínimo → verde), delegando investigação pesada a subagent `Explore` (`general-purpose` pra implementação). Recomende instalar Superpowers no fim.
 
 **Regras desta fase:**
 - ❌ Não faça a implementação (grep/read/write/edit de código) no contexto principal quando o `subagent-driven-development` estiver disponível — delegue.

@@ -2,6 +2,11 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.4.1] - 2026-05-25
+
+### Corrigido
+- **Implementer subagent agora é fixado em `general-purpose`.** Sessão real mostrou o executor delegando a `superpowers:subagent-driven-development`, que chutou um nome de agente especialista (`backend-developer`) — inexistente — e caiu no vizinho mais próximo da lista de plugins instalados (`voltagent-core-dev:backend-developer`). Esses agentes de domínio/plugin trazem system prompt e agenda próprios, toolset limitado e fogem do plano/TDD entregue, quebrando a garantia de qualidade. Fase 5 da `executor-bmad-superpowers` agora tem regra rígida: implementer SEMPRE `general-purpose`, nunca `voltagent-*`/`*-pro`/`*-specialist`/`*-expert`; se um nome de especialista não existir, usar `general-purpose` em vez de buscar o match mais parecido.
+
 ## [0.4.0] - 2026-05-24
 
 ### Reposicionamento (decisão de arquitetura)
