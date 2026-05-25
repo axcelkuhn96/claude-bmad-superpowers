@@ -47,6 +47,17 @@ Separe explicitamente:
 
 ### Fase 2 — Investigação leve
 
+**Passo A — Memória persistente (OBRIGATÓRIO se disponível)**
+
+Antes de tocar o filesystem, consulte claude-mem se as ferramentas estiverem disponíveis:
+- `mem-search` (skill) → invoque via Skill tool com o tema como query
+- `claude-mem:mem-search` / `claude-mem:smart-explore` / `claude-mem:knowledge-agent`
+- MCP tools `*memory_search*`/`*observation_search*` se aparecerem
+
+O que buscar: discussões anteriores sobre esse domínio, decisões já tomadas, padrões já estabelecidos. Se nada relevante, marque "Memória: nada encontrado" na investigação.
+
+**Passo B — Código atual via Explore subagent**
+
 Lance subagent `Explore` pra mapear o terreno:
 - Como funciona hoje a área relacionada?
 - Que componentes/serviços/tabelas tocam o tema?

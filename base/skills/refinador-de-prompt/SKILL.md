@@ -42,11 +42,22 @@ Extraia da ideia crua:
 
 **Fontes na ordem:**
 
-1. **Memória persistente** — se houver ferramentas tipo claude-mem disponíveis, consulte:
-   - stack, arquitetura, decisões anteriores
-   - regras de negócio do produto
+1. **Memória persistente (claude-mem) — OBRIGATÓRIO quando disponível**
+
+   Se você vir QUALQUER uma dessas skills/tools no seu ambiente, **invoque-as antes de tudo**:
+   - `mem-search` (skill) → invoque via Skill tool com o tema da ideia como query
+   - `claude-mem:mem-search`, `claude-mem:smart-explore`, `claude-mem:learn-codebase` → use a mais relevante
+   - Qualquer MCP tool `*memory_search*`, `*observation_search*`, `*search*` do claude-mem
+   - Skill `claude-mem:knowledge-agent` → consulte se a ideia parecer tocar em domínio já trabalhado
+
+   O que extrair da memória:
+   - stack, arquitetura, decisões anteriores sobre esse domínio
+   - regras de negócio do produto já discutidas
    - preferências do usuário registradas
    - integrações importantes
+   - histórico de bugs/soluções relacionados
+
+   Se nenhuma ferramenta de memória aparecer disponível, marque "NÃO ENCONTRADO: memória persistente" no contexto e siga.
 
 2. **CLAUDE.md** (raiz do projeto e ancestrais)
 

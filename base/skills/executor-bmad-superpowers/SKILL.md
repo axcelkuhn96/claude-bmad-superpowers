@@ -38,9 +38,10 @@ Verifique se `.bmad-core/` existe:
 ### Fase 1 — Intake
 
 1. Leia o prompt/spec recebido por inteiro.
-2. Identifique ambiguidade bloqueante.
-3. Se houver, **PERGUNTE** antes de seguir. Não chute.
-4. Confirme escopo em 1 parágrafo.
+2. **Memória (se disponível)**: invoque `mem-search` ou `claude-mem:*` skills com o tema, pra recuperar histórico de discussões/decisões/bugs relacionados. Se nada relevante, marque "Memória: nada encontrado".
+3. Identifique ambiguidade bloqueante.
+4. Se houver, **PERGUNTE** antes de seguir. Não chute.
+5. Confirme escopo em 1 parágrafo.
 
 ### Fase 2 — Brainstorming técnico (Superpowers)
 

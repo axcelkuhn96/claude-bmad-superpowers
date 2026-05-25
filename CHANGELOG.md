@@ -2,6 +2,11 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.2.5] - 2026-05-24
+
+### Adicionado
+- **Integração explícita com claude-mem** nas 3 skills. Antes era genérico ("se houver memória, consulte"); agora é imperativo com nomes específicos: `mem-search`, `claude-mem:mem-search`, `claude-mem:smart-explore`, `claude-mem:knowledge-agent`, MCP tools `*memory_search*` etc. Se nenhuma aparecer disponível, marca "Memória: nada encontrado" e segue. Antes o LLM ignorava o claude-mem mesmo instalado.
+
 ## [0.2.4] - 2026-05-24
 
 ### Corrigido
