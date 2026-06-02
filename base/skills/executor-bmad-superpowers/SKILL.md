@@ -87,7 +87,12 @@ O objetivo desta fase é produzir **um plano com tasks discretas no filesystem**
    - Caso pequeno (1 feature simples): ainda assim gere **1 story** mínima do BMAD — não pule. É barato e mantém a rastreabilidade story↔código↔teste que as Fases 5–6 usam.
 2. Converta as stories em **plano executável** via `superpowers:writing-plans`, usando as stories BMAD como spec. Ela salva o plano em `docs/superpowers/plans/` com tasks independentes (arquivos a tocar, comportamento, testes, critérios de aceite), referenciando a story de origem de cada task.
 
-3. Liste **riscos** explicitamente (numerados).
+3. **Classifique cada task por domínio** (etapa nova — alimenta a injeção da Fase 5). Domínio implementado como rulebook em `~/.claude/personas/dominios/`:
+   - **frontend** — qualquer task que toca UI, componente React/Vue/Svelte, página, CSS, design system, estado visual. Sinais: caminhos `src/components/`, `src/app/`, `pages/`, `.tsx`/`.vue`/`.svelte`; story menciona tela/componente/UI/UX/design/visual.
+
+   Tasks que não batem com frontend seguem só com `@dev` BMAD puro (comportamento padrão — nenhum rulebook extra). Marque o domínio explicitamente em cada task do plano apenas quando bater com frontend (ex.: `- Task 3: implementar tela de listagem (domínio: frontend)`). Se uma task atravessa domínios (ex.: criar endpoint + UI), divida em duas tasks separadas — a parte UI ganha o rulebook frontend, a parte API não.
+
+4. Liste **riscos** explicitamente (numerados).
 
 ### Fase 4 — Confirmação
 
@@ -141,12 +146,38 @@ Este é o **único gate humano** antes da execução — a partir do `s`, a Fase
 
    Assim você junta o isolamento + TDD + 2 reviewers do `general-purpose` (mecânica do Superpowers) com a disciplina de story/QA do BMAD, em cada subagent.
 
-4. **Workspace — instrução explícita pra passar à skill:**
+4. **Rulebook de DOMÍNIO empilhado em cima do `@dev` (quando aplicável):** se a task foi marcada com domínio na Fase 3, leia o rulebook correspondente e **inclua o conteúdo dele dentro do prompt do implementer** (e do code quality reviewer, no caso de QA específico de domínio).
+
+   Caminhos de leitura (em ordem — primeiro encontrado vence):
+   - `~/.claude/cbs-overrides/personas/dominios/<dominio>.md` (override do usuário)
+   - `~/.claude/personas/dominios/<dominio>.md` (base instalada)
+
+   Domínio implementado nesta versão:
+   - **frontend** → carregar `frontend.md`. **Obrigatório:** no prompt do implementer, instruir explicitamente a invocar a skill oficial `frontend-design` (plugin `claude-plugins-official`) ANTES de codar, e seguir a ordem do rulebook (Passo 1 = detectar design system existente; Passo 2A ou 2B conforme detecção). Sem essa skill, a UI gerada cai em "AI slop" — não é opcional.
+
+   Forma da injeção no prompt do implementer (estrutura):
+   ```
+   You are a BMAD Dev agent (@dev persona): [...convenções padrão @dev...]
+
+   This task is in the **frontend** domain. You MUST also:
+   1. Invoke the `frontend-design` skill (Skill tool) before writing any UI code — it loads the official aesthetics guidance.
+   2. Follow the rulebook below LITERALLY — especially the "ORDEM DE OPERAÇÃO" (detect existing design system FIRST, only commit to a new bold direction if none exists).
+
+   <frontend-rulebook>
+   [conteúdo completo de ~/.claude/personas/dominios/frontend.md inline aqui]
+   </frontend-rulebook>
+   ```
+
+   Não resuma o rulebook — passe o conteúdo completo. O subagent não tem contexto da conversa, só o prompt.
+
+   Tasks **sem domínio marcado** seguem só com `@dev` BMAD puro (comportamento herdado).
+
+5. **Workspace — instrução explícita pra passar à skill:**
    > "Workspace já definido: trabalhar na **branch atual**, **NÃO criar git worktree**. Não invoque `superpowers:using-git-worktrees`."
 
    (O usuário trabalha em branch dedicada — worktree é dispensado de propósito.)
 
-5. **Se `subagent-driven-development` não existir** no ambiente (Superpowers não instalado), aí sim caia no fallback: invoque `superpowers:test-driven-development` se existir, ou faça TDD manual (teste falha → código mínimo → verde), delegando investigação pesada a subagent `Explore` (`general-purpose` pra implementação). Recomende instalar Superpowers no fim.
+6. **Se `subagent-driven-development` não existir** no ambiente (Superpowers não instalado), aí sim caia no fallback: invoque `superpowers:test-driven-development` se existir, ou faça TDD manual (teste falha → código mínimo → verde), delegando investigação pesada a subagent `Explore` (`general-purpose` pra implementação). Recomende instalar Superpowers no fim.
 
 **Regras desta fase:**
 - ❌ Não faça a implementação (grep/read/write/edit de código) no contexto principal quando o `subagent-driven-development` estiver disponível — delegue.

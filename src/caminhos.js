@@ -14,6 +14,7 @@ export const HOME = os.homedir();
 export const RAIZ_CLAUDE = path.join(HOME, '.claude');
 export const DIR_SKILLS = path.join(RAIZ_CLAUDE, 'skills');
 export const DIR_COMMANDS = path.join(RAIZ_CLAUDE, 'commands');
+export const DIR_PERSONAS = path.join(RAIZ_CLAUDE, 'personas');
 export const DIR_OVERRIDES = path.join(RAIZ_CLAUDE, 'cbs-overrides');
 export const ARQ_VERSAO_INSTALADA = path.join(DIR_OVERRIDES, '.versao-instalada');
 export const ARQ_PROJETOS_BMAD = path.join(DIR_OVERRIDES, '.projetos-bmad');

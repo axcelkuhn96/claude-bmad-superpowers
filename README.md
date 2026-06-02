@@ -2,13 +2,14 @@
 
 > Workflow PT-BR para [Claude Code](https://claude.com/claude-code): **refina sua ideia com a memória do projeto e entrega pra uma execução de qualidade** — TDD real, subagents isolados e dois reviewers por task.
 
-Um pacote de **3 skills** e **8 comandos** em português que amarram três coisas que já funcionam bem, cada uma no seu nível:
+Um pacote de **3 skills** e **8 comandos** em português que amarram quatro camadas, cada uma no seu nível:
 
 | Camada | Quem faz | Papel |
 |---|---|---|
 | **Front-end PT-BR** (o diferencial) | skills deste pacote | Refina sua ideia com alinhamento + memória, e faz discovery sem tocar código |
 | **Motor de execução** | [Superpowers](https://github.com/obra/superpowers) | brainstorming → plano → subagents com TDD + 2 reviews → verificação. Garante "desenvolver certo, sem erro" |
 | **Disciplina de processo** (sempre) | [BMAD-METHOD](https://github.com/bmad-code-org/BMAD-METHOD) | Gera as stories no planejamento e injeta as personas (`@dev`, `@qa`, review) em cada subagent do Superpowers |
+| **Expertise por domínio** (quando aplicável) | rulebooks em `personas/dominios/` + skills oficiais | Em cima do `@dev`, empilha regras específicas do domínio (ex.: frontend invoca a skill oficial `frontend-design` e detecta o design system do projeto pra evitar IA-genérico). |
 
 Em vez de competir, cada peça fica no que faz bem: **você refina em português, e a execução roda sempre com o Superpowers como motor + o BMAD como disciplina injetada dentro dele** (story → `@dev` → review/`@qa`).
 
@@ -24,6 +25,7 @@ Em vez de competir, cada peça fica no que faz bem: **você refina em português
 - [As 3 skills](#as-3-skills)
 - [Memória (claude-mem)](#memória-claude-mem)
 - [BMAD: quando entra](#bmad-quando-entra)
+- [Rulebooks de domínio](#rulebooks-de-domínio-frontend-)
 - [CLI de referência](#cli-de-referência)
 - [Customização que sobrevive a updates](#customização-que-sobrevive-a-updates)
 - [Desinstalar](#desinstalar)
@@ -50,7 +52,7 @@ npx claude-bmad-superpowers instalar
 
 Isso faz, em ordem:
 
-1. **Skills + comandos** → copia as 3 skills e 8 comandos pra `~/.claude/skills/` e `~/.claude/commands/`.
+1. **Skills + comandos + rulebooks de domínio** → copia as 3 skills, 8 comandos e os rulebooks (`personas/dominios/*.md`) pra `~/.claude/skills/`, `~/.claude/commands/` e `~/.claude/personas/`.
 2. **Superpowers** → detecta o plugin; se não estiver instalado, mostra o comando exato pra rodar **dentro do Claude Code** (instalação de plugin não funciona via CLI fora do app).
 3. **BMAD** → instala no diretório atual se você estiver dentro de um projeto (interativo). Pra pular: `--apenas-global`.
 
@@ -108,10 +110,13 @@ Comandos de manutenção:
                 mem-search
                 → executor (orquestrador, NÃO implementa inline)
                   → BMAD gera stories (bmad-create-prd/story)
+                  → classifica domínio por task (frontend, …)
                   → superpowers:writing-plans  (stories → plano com tasks)
                   → 🛑 "Posso implementar? [s/N]"
                   → superpowers:subagent-driven-development
-                       · implementer general-purpose + persona @dev (TDD, isolado) por task
+                       · implementer general-purpose
+                         + persona @dev (TDD, isolado)
+                         + rulebook do domínio (se aplicável — ex. frontend invoca skill oficial frontend-design)
                        · spec reviewer + code quality reviewer general-purpose
                          + personas review/@qa do BMAD, por task
                   → superpowers:verification-before-completion
@@ -197,6 +202,46 @@ Pra instalar no projeto:
 cd meu-projeto
 cbs instalar-bmad        # interativo, registra o projeto pro /atualizar
 ```
+
+---
+
+## Rulebooks de domínio (frontend, …)
+
+Em cima do `@dev` BMAD, o executor empilha um **rulebook específico de domínio** quando a task envolve uma área onde "código bom" tem regras próprias. O subagent continua `general-purpose` — o conteúdo do rulebook é injetado no prompt, mesmo trick do persona-as-instructions.
+
+**Onde mora:** `~/.claude/personas/dominios/<dominio>.md` (base) e `~/.claude/cbs-overrides/personas/dominios/<dominio>.md` (override do usuário — sobrescreve o base por arquivo). O `/atualizar` preserva o que tá em `cbs-overrides/`.
+
+### Frontend (implementado nesta versão)
+
+Quando a task é de UI:
+
+1. **Skill oficial `frontend-design`** (do plugin `claude-plugins-official` da Anthropic) é invocada SEMPRE pelo implementer antes de codar. Sem ela, a saída cai em "AI slop" (purple gradients, Inter por toda parte, dashboards genéricos).
+2. **Detecção de design system primeiro.** Antes de qualquer pensamento estético, o subagent procura no projeto: Tailwind config, theme/tokens, biblioteca UI (shadcn, Radix, etc.), componentes recorrentes, Storybook, motion lib, modo dark/light, i18n.
+3. **Modo dual:**
+   - **Padrão existe** → segue o padrão do projeto rigorosamente (reusa primitivos, tipografia, motion, escala de espaçamento). A skill `frontend-design` entra como checklist técnico de qualidade (estados, hierarquia, acessibilidade), **não** como sugestão de mudar o tom.
+   - **Padrão NÃO existe** → aí sim comita a uma direção estética distinta (brutalista, editorial, refinada, etc.) via `frontend-design` e estabelece tokens já em config.
+4. **Anti-IA-genérico em ambos os modos:** sem lorem, sem emoji como ícone, estados completos obrigatórios (loading/empty/error/foco/disabled), contraste AA, hierarquia tipográfica deliberada, copy alinhada ao i18n do projeto.
+5. **DRY de CSS / nomenclatura:** token > literal, 3+ repetições → extrair (cn / cva / utility / componente), naming consistente com o projeto, um conceito = um nome, tokens duplicados em arquivos diferentes são sinalizados.
+6. **Loop de validação visual obrigatório** antes de Ready for Review: dev server up + golden path + 2 estados + dark mode + teclado + 1 breakpoint mobile, anotados no Dev Agent Record. Se o ambiente é headless, declara isso explicitamente — nunca alega "validei" sem ter rodado.
+
+> **Não vai sempre te dar Linear/Stripe/Vercel.** Vercel é referência de *disciplina* de execução, não fórmula. Se seu projeto já tem um padrão, o subagent segue ele; se não tem, aí sim comita uma direção bold.
+
+### Customizar pro seu projeto
+
+Quer endurecer regras (ex.: bloquear instalar shadcn novo, exigir biblioteca de ícones específica, exigir uso do design system X)? Crie:
+
+```bash
+~/.claude/cbs-overrides/personas/dominios/frontend.md
+```
+
+Esse arquivo sobrescreve o base por completo. O `/atualizar` não toca nele. Você pode começar copiando o base:
+
+```bash
+cp ~/.claude/personas/dominios/frontend.md ~/.claude/cbs-overrides/personas/dominios/frontend.md
+# edita, adiciona suas regras
+```
+
+Tasks que não envolvem UI seguem só com o `@dev` BMAD padrão (comportamento herdado das versões anteriores) — frontend é o único domínio com rulebook próprio nesta versão.
 
 ---
 

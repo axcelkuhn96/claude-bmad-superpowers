@@ -24,9 +24,10 @@ cbs instalar
 1. Detecta o diretório `~/.claude/` (cria se faltar).
 2. Copia as 3 skills pra `~/.claude/skills/`.
 3. Copia os 8 commands pra `~/.claude/commands/`.
-4. Marca cada arquivo com um rodapé `<!-- claude-bmad-superpowers:base vX.Y.Z -->` (usado pelo update pra saber o que pode sobrescrever).
-5. **Detecta** o plugin **Superpowers** (lendo `~/.claude/plugins/installed_plugins.json`); se não estiver instalado, mostra o comando exato pra rodar dentro do Claude Code (plugins não instalam via CLI fora do app).
-6. Grava a versão instalada no registro de `~/.claude/cbs-overrides/`.
+4. Copia os rulebooks de domínio (`personas/dominios/*.md`) pra `~/.claude/personas/` — injetados no prompt dos subagents `general-purpose` quando a task pertence ao domínio (ex.: frontend).
+5. Marca cada arquivo com um rodapé `<!-- claude-bmad-superpowers:base vX.Y.Z -->` (usado pelo update pra saber o que pode sobrescrever).
+6. **Detecta** o plugin **Superpowers** (lendo `~/.claude/plugins/installed_plugins.json`); se não estiver instalado, mostra o comando exato pra rodar dentro do Claude Code (plugins não instalam via CLI fora do app).
+7. Grava a versão instalada no registro de `~/.claude/cbs-overrides/`.
 
 ## Verificar instalação
 

@@ -2,7 +2,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
-  RAIZ_BASE, DIR_SKILLS, DIR_COMMANDS, DIR_OVERRIDES,
+  RAIZ_BASE, DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_OVERRIDES,
   ARQ_VERSAO_INSTALADA, MARCADOR, RAIZ_CLAUDE,
   garantirDir, lerVersaoPacote, existe,
 } from './caminhos.js';
@@ -52,9 +52,11 @@ export async function instalar(args = []) {
   await garantirDir(RAIZ_CLAUDE);
   await garantirDir(DIR_SKILLS);
   await garantirDir(DIR_COMMANDS);
+  await garantirDir(DIR_PERSONAS);
   await garantirDir(DIR_OVERRIDES);
   await garantirDir(path.join(DIR_OVERRIDES, 'skills'));
   await garantirDir(path.join(DIR_OVERRIDES, 'commands'));
+  await garantirDir(path.join(DIR_OVERRIDES, 'personas'));
 
   // copia skills
   const origemSkills = path.join(RAIZ_BASE, 'skills');
@@ -68,6 +70,13 @@ export async function instalar(args = []) {
   if (await existe(origemCmds)) {
     console.log('→ Copiando commands...');
     await copiarArvore(origemCmds, DIR_COMMANDS, versao);
+  }
+
+  // copia personas (rulebooks de domínio injetados nos subagents)
+  const origemPersonas = path.join(RAIZ_BASE, 'personas');
+  if (await existe(origemPersonas)) {
+    console.log('→ Copiando personas de domínio...');
+    await copiarArvore(origemPersonas, DIR_PERSONAS, versao);
   }
 
   // registra versão

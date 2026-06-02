@@ -4,7 +4,7 @@ import path from 'node:path';
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import {
-  RAIZ_BASE, DIR_SKILLS, DIR_COMMANDS, ARQ_VERSAO_INSTALADA,
+  RAIZ_BASE, DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, ARQ_VERSAO_INSTALADA,
   MARCADOR, lerVersaoPacote, lerVersaoInstalada, existe, garantirDir,
 } from './caminhos.js';
 import { tentarAtualizarSuperpowers } from './superpowers.js';
@@ -89,6 +89,9 @@ export async function atualizar(args = []) {
   }
   if (await existe(path.join(RAIZ_BASE, 'commands'))) {
     await atualizarArvore(path.join(RAIZ_BASE, 'commands'), DIR_COMMANDS, versaoNova, resultado);
+  }
+  if (await existe(path.join(RAIZ_BASE, 'personas'))) {
+    await atualizarArvore(path.join(RAIZ_BASE, 'personas'), DIR_PERSONAS, versaoNova, resultado);
   }
   await fs.writeFile(ARQ_VERSAO_INSTALADA, versaoNova + '\n', 'utf8');
   console.log(`✓ ${resultado.atualizado.length} arquivo(s) do base atualizado(s) (v${versaoNova}).`);

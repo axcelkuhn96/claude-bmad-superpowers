@@ -2,6 +2,25 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.6.0] - 2026-06-02
+
+### Adicionado — Rulebook de domínio frontend
+- **Nova camada `personas/dominios/` no pacote.** Em cima do `@dev` BMAD (que já é injetado em todo subagent `general-purpose` desde a v0.4.3), o executor agora empilha um **rulebook específico de domínio** quando a task pertence ao domínio. Mesmo padrão persona-as-instructions — o `subagent_type` continua SEMPRE `general-purpose`. Nesta versão, **só frontend** está implementado; tasks de outros domínios seguem só com `@dev` puro (comportamento herdado).
+- **Fase 3 agora classifica cada task como frontend ou não.** A marcação alimenta a Fase 5.
+- **Fase 5 carrega o rulebook do domínio** de `~/.claude/cbs-overrides/personas/dominios/<dominio>.md` (se existir) ou `~/.claude/personas/dominios/<dominio>.md` e cola o conteúdo completo no prompt do implementer subagent.
+
+### Frontend rulebook (`base/personas/dominios/frontend.md`)
+- **Skill oficial `frontend-design`** (plugin `claude-plugins-official`) é obrigatória — instruída explicitamente no prompt do implementer ANTES de codar UI. Sem ela, a saída cai em "AI slop".
+- **Modo dual — não impõe estética sempre.** Passo 1: detectar o design system existente do projeto (Tailwind config / theme / componentes / Storybook / motion / tema). Passo 2A: **se existe padrão**, segui-lo rigorosamente (reusa primitivos, mantém tipografia, motion, escala de espaçamento; `frontend-design` entra como checklist técnico de estados/hierarquia/qualidade, NÃO como licença pra "redesenhar bold"). Passo 2B: **só quando não há padrão**, comita a uma direção estética distinta via `frontend-design` e estabelece tokens já em config.
+- **Anti-IA-genérico vale nos dois modos**: sem lorem ipsum, sem emoji como ícone, estados completos obrigatórios (loading/empty/error/foco/disabled), acessibilidade AA, hierarquia tipográfica deliberada, copy alinhada ao i18n do projeto.
+- **Padronização de CSS / nomenclatura — DRY de estilo**: token > literal (hex hardcoded só com justificativa); 3+ repetições de classes → extrair (cn/cva/utility/componente); naming consistente (kebab-case CSS modules, BEM se o projeto é BEM, data-attributes Radix-style); um conceito = um nome (não introduzir sinônimos); não duplicar tokens em arquivos diferentes; animação e breakpoints têm nome também. Varredura final do diff antes de fechar a story.
+- **Loop de validação visual obrigatório**: dev server up + golden path + 2 estados + dark mode + teclado + mobile breakpoint, anotados no Dev Agent Record. Se ambiente headless, declarar explicitamente "não validado visualmente".
+
+### Mudou
+- **CLI**: `instalar`, `atualizar` e `remover` agora tratam `base/personas/` (copia pra `~/.claude/personas/`, preserva customizações em `~/.claude/cbs-overrides/personas/`, remove apenas arquivos com marcador).
+- **`caminhos.js`**: novo constant `DIR_PERSONAS` (`~/.claude/personas/`).
+- **README** atualizado com seção sobre rulebooks de domínio e como sobrescrever.
+
 ## [0.5.1] - 2026-05-25
 
 ### Corrigido (consistência de docs)
