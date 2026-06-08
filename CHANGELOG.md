@@ -2,6 +2,18 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.7.0] - 2026-06-08
+
+### Adicionado — Rulebook de domínio database
+- **Novo rulebook `base/personas/dominios/database.md`.** Segundo domínio com expertise própria (depois do frontend), empilhado em cima do `@dev` BMAD. Diferente do frontend, **não há skill oficial** a invocar — a expertise (DBA sênior + SQL pro) está destilada no próprio rulebook, self-contained.
+- **Cobre** (task de feature, não DBA-ops): detecção de schema/ORM/migration antes de qualquer DDL; modo dual (seguir padrão existente × greenfield); regras inegociáveis (migration reversível, queries parametrizadas, índice em FK, sem N+1, sem `SELECT *`, dinheiro em `numeric`, transação atômica, filtro de tenant); loop de validação (up/down + EXPLAIN + isolamento de tenant).
+- **Apêndices de profundidade (estilo enciclopédico):** especificidades por RDBMS (PostgreSQL, MySQL/MariaDB, SQL Server, Oracle, SQLite); NoSQL (MongoDB, Redis); PK uuid×autoincremento (incl. uuidv7/ULID); leitura de plano de execução (EXPLAIN); migrations zero-downtime (expand→migrate→contract); padrões de query avançados (CTEs, window functions, keyset pagination); data warehousing (star schema, SCD); guia por ORM (Prisma, TypeORM, SQLAlchemy/Alembic, Django, ActiveRecord, GORM).
+
+### Mudou
+- **Fase 3 do executor** agora classifica tasks também como **database** (sinais: `migrations/`, `prisma/schema.prisma`, `db/migrate/`, `alembic/`, `.sql`, models/repositories; menção a tabela/coluna/query/índice/migração/schema).
+- **Fase 5 do executor** carrega `database.md` e injeta o conteúdo completo no prompt do implementer **e** do code quality reviewer (QA de banco: índices, plano de execução, rollback, isolamento de tenant). Como não há skill oficial, a instrução é seguir o rulebook destilado literalmente.
+- **README** atualizado: seção "Database (implementado nesta versão)" e heading dos rulebooks agora lista frontend + database.
+
 ## [0.6.0] - 2026-06-02
 
 ### Adicionado — Rulebook de domínio frontend

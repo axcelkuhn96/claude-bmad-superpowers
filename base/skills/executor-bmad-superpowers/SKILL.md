@@ -89,8 +89,9 @@ O objetivo desta fase é produzir **um plano com tasks discretas no filesystem**
 
 3. **Classifique cada task por domínio** (etapa nova — alimenta a injeção da Fase 5). Domínio implementado como rulebook em `~/.claude/personas/dominios/`:
    - **frontend** — qualquer task que toca UI, componente React/Vue/Svelte, página, CSS, design system, estado visual. Sinais: caminhos `src/components/`, `src/app/`, `pages/`, `.tsx`/`.vue`/`.svelte`; story menciona tela/componente/UI/UX/design/visual.
+   - **database** — qualquer task que toca schema, migration, query, modelo/ORM, índice ou transação. Sinais: `migrations/`, `prisma/schema.prisma`, `db/migrate/`, `alembic/`, arquivos `.sql`, models/entities/repositories; story menciona tabela/coluna/query/índice/migração/banco/schema.
 
-   Tasks que não batem com frontend seguem só com `@dev` BMAD puro (comportamento padrão — nenhum rulebook extra). Marque o domínio explicitamente em cada task do plano apenas quando bater com frontend (ex.: `- Task 3: implementar tela de listagem (domínio: frontend)`). Se uma task atravessa domínios (ex.: criar endpoint + UI), divida em duas tasks separadas — a parte UI ganha o rulebook frontend, a parte API não.
+   Tasks que não batem com nenhum domínio seguem só com `@dev` BMAD puro (comportamento padrão — nenhum rulebook extra). Marque o domínio explicitamente em cada task do plano quando bater com um domínio conhecido (ex.: `- Task 3: implementar tela de listagem (domínio: frontend)`; `- Task 2: criar migration e índices da tabela pedidos (domínio: database)`). Se uma task atravessa domínios (ex.: criar endpoint + UI, ou migration + tela), divida em tasks separadas — cada parte ganha o rulebook do seu domínio (a API pura, sem rulebook).
 
 4. Liste **riscos** explicitamente (numerados).
 
@@ -152,10 +153,11 @@ Este é o **único gate humano** antes da execução — a partir do `s`, a Fase
    - `~/.claude/cbs-overrides/personas/dominios/<dominio>.md` (override do usuário)
    - `~/.claude/personas/dominios/<dominio>.md` (base instalada)
 
-   Domínio implementado nesta versão:
+   Domínios implementados nesta versão:
    - **frontend** → carregar `frontend.md`. **Obrigatório:** no prompt do implementer, instruir explicitamente a invocar a skill oficial `frontend-design` (plugin `claude-plugins-official`) ANTES de codar, e seguir a ordem do rulebook (Passo 1 = detectar design system existente; Passo 2A ou 2B conforme detecção). Sem essa skill, a UI gerada cai em "AI slop" — não é opcional.
+   - **database** → carregar `database.md`. **Não há skill oficial** — a expertise (DBA + SQL pro) está destilada no próprio rulebook. No prompt do implementer, instruir a seguir a ordem do rulebook (Passo 1 = detectar schema/ORM/migration existentes ANTES de escrever DDL; Passo 2A ou 2B conforme detecção) e a tratar as "Regras inegociáveis" como travas (reversibilidade de migration, queries parametrizadas, índice em FK, transação atômica, filtro de tenant). Injete o conteúdo também no **code quality reviewer** (QA de banco: confere índices, plano de execução, rollback, isolamento de tenant).
 
-   Forma da injeção no prompt do implementer (estrutura):
+   Forma da injeção no prompt do implementer (estrutura — exemplo frontend; para database, troque a skill obrigatória pela instrução de seguir o rulebook destilado, já que não há skill):
    ```
    You are a BMAD Dev agent (@dev persona): [...convenções padrão @dev...]
 
@@ -167,6 +169,8 @@ Este é o **único gate humano** antes da execução — a partir do `s`, a Fase
    [conteúdo completo de ~/.claude/personas/dominios/frontend.md inline aqui]
    </frontend-rulebook>
    ```
+
+   Para **database** não há skill a invocar — o passo 1 vira "Follow the rulebook below LITERALLY, starting from ORDEM DE OPERAÇÃO (detect the existing schema/ORM/migration tool FIRST) and treat the 'Regras inegociáveis' as hard gates", seguido do `<database-rulebook>...</database-rulebook>` com o conteúdo completo.
 
    Não resuma o rulebook — passe o conteúdo completo. O subagent não tem contexto da conversa, só o prompt.
 

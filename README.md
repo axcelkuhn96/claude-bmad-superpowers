@@ -205,7 +205,7 @@ cbs instalar-bmad        # interativo, registra o projeto pro /atualizar
 
 ---
 
-## Rulebooks de domínio (frontend, …)
+## Rulebooks de domínio (frontend, database, …)
 
 Em cima do `@dev` BMAD, o executor empilha um **rulebook específico de domínio** quando a task envolve uma área onde "código bom" tem regras próprias. O subagent continua `general-purpose` — o conteúdo do rulebook é injetado no prompt, mesmo trick do persona-as-instructions.
 
@@ -226,6 +226,18 @@ Quando a task é de UI:
 
 > **Não vai sempre te dar Linear/Stripe/Vercel.** Vercel é referência de *disciplina* de execução, não fórmula. Se seu projeto já tem um padrão, o subagent segue ele; se não tem, aí sim comita uma direção bold.
 
+### Database (implementado nesta versão)
+
+Quando a task toca schema, migration, query, modelo/ORM, índice ou transação. Diferente do frontend, **não há skill oficial** — a expertise (DBA sênior + SQL pro) está destilada no próprio rulebook (`database.md`), self-contained.
+
+1. **Detecção do schema/ORM primeiro.** Antes de qualquer DDL, o subagent identifica: RDBMS e driver, ORM/query-builder (Prisma, TypeORM, SQLAlchemy/Alembic, Django, ActiveRecord, GORM…), ferramenta de migration, convenção de nomes (snake_case? plural? PK uuid/serial?), tipos, multi-tenant, soft-delete, índices existentes.
+2. **Modo dual:**
+   - **Padrão existe** → segue rigorosamente (mesma ferramenta de migration, naming, tipos, multi-tenancy, soft-delete). Nunca edita migration já aplicada — cria nova forward.
+   - **Greenfield** → estabelece e documenta a convenção (ferramenta de migration, naming, PK strategy, tipos) já na primeira migration.
+3. **Regras inegociáveis (valem sempre):** migration reversível (ou rollback explícito); queries **sempre** parametrizadas (anti SQL-injection); índice em toda FK; sem N+1; sem `SELECT *`; dinheiro em `numeric`; operação multi-passo em transação atômica; filtro de tenant em schema multi-tenant; backfill em lote pra não travar produção.
+4. **Loop de validação obrigatório** antes de Ready for Review: migration up + down num banco limpo, testes com casos de borda, `EXPLAIN` nas queries que importam (confirmar uso de índice), e teste de isolamento de tenant. Se o ambiente não tem banco, declara isso — nunca alega "validei" sem ter rodado.
+5. **Injetado também no QA reviewer:** o code quality reviewer recebe o rulebook pra conferir índices, plano de execução, rollback e isolamento de tenant.
+
 ### Customizar pro seu projeto
 
 Quer endurecer regras (ex.: bloquear instalar shadcn novo, exigir biblioteca de ícones específica, exigir uso do design system X)? Crie:
@@ -241,7 +253,7 @@ cp ~/.claude/personas/dominios/frontend.md ~/.claude/cbs-overrides/personas/domi
 # edita, adiciona suas regras
 ```
 
-Tasks que não envolvem UI seguem só com o `@dev` BMAD padrão (comportamento herdado das versões anteriores) — frontend é o único domínio com rulebook próprio nesta versão.
+Mesma mecânica vale pro `database.md` (e qualquer domínio futuro): `~/.claude/cbs-overrides/personas/dominios/<dominio>.md` sobrescreve o base e sobrevive ao `/atualizar`. Tasks que não batem com **frontend** nem **database** seguem só com o `@dev` BMAD padrão (comportamento herdado).
 
 ---
 
