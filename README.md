@@ -113,8 +113,9 @@ Comandos de manutenção:
                   → BMAD gera stories (bmad-create-prd/story)
                   → classifica domínio por task (frontend, …)
                   → superpowers:writing-plans  (stories → plano com tasks)
-                  → 🛑 "Posso implementar? [s/N]"
+                  → 🛑 "Posso implementar? [s/N]" + "Modelo: atual ou sonnet?"
                   → superpowers:subagent-driven-development
+                       (dispara os subagents no modelo escolhido no gate)
                        · implementer general-purpose
                          + persona @dev (TDD, isolado)
                          + ponytail (transversal, sempre — menor superfície)
@@ -284,6 +285,15 @@ Enquanto os rulebooks de domínio são **por-task** (só entram quando a task é
 ### Orquestração: teammate e ultracode
 
 O motor padrão da execução é o `superpowers:subagent-driven-development`. Pra orquestrações maiores, o executor pode **escalar** (sem trocar o motor): **teammate** — subagent persistente e endereçável (via `SendMessage`), bom pra um reviewer/consultor que acompanha várias tasks sem re-explicar o contexto; **ultracode** (Workflow) — fan-out multi-agente determinístico com verificação, bom pra N tasks independentes em paralelo (requer opt-in explícito). O gate humano ("Posso implementar?") e a injeção BMAD/ponytail/domínio valem em qualquer caminho.
+
+### Gate de modelo (atual ou sonnet)
+
+No mesmo ponto de parada da Fase 4, junto do "Posso implementar?", o executor pergunta **em qual modelo rodar os subagents de execução**:
+
+- **atual** (padrão) — a skill `subagent-driven-development` usa o tiering próprio dela (task mecânica → modelo barato, julgamento → padrão, review final da branch → o mais capaz), partindo do modelo da sessão.
+- **sonnet** — o executor injeta uma restrição global e a skill dispara **todos** os implementer e reviewer subagents em Sonnet. Bom pra padronizar/economizar numa feature grande ou mais mecânica.
+
+A escolha vale só pra aquela execução — o dispatch de subagent aceita o modelo explícito, então o que você pedir no gate é o que roda.
 
 ---
 

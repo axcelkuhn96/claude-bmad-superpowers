@@ -2,6 +2,17 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.9.0] - 2026-07-02
+
+### Adicionado — Gate de modelo na execução
+- **Novo gate na Fase 4 do executor:** junto do "Posso implementar? [s/N]", o executor pergunta em qual modelo rodar os subagents de execução — **atual** ou **sonnet** (duas opções só).
+  - **atual** (padrão): sem override — a skill `superpowers:subagent-driven-development` segue o tiering próprio dela (mecânico → barato, julgamento → padrão, review final → mais capaz) a partir do modelo da sessão.
+  - **sonnet**: o executor injeta uma restrição global e a skill dispara **todos** os implementer/reviewer subagents em `model: sonnet` (bom pra padronizar/economizar em feature grande ou mecânica).
+- **Base do mecanismo:** a `subagent-driven-development` (v6.1.0) lê as restrições globais antes de disparar e especifica o modelo explicitamente em cada subagent — então o gate é enforçável por-subagent, não só no nível de sessão. Modo `--auto` assume `s` + modelo **atual**.
+
+### Mudou
+- **Fase 5 do executor:** novo passo 6.1 que repassa a escolha do gate como restrição global pro Superpowers (e ao fallback manual). **README:** diagrama do pipeline cita o gate de modelo + nova subseção "Gate de modelo (atual ou sonnet)".
+
 ## [0.8.0] - 2026-07-02
 
 ### Adicionado — Rulebook transversal ponytail (anti-over-engineering)

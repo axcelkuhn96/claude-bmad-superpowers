@@ -127,13 +127,21 @@ Tradeoff aceito: [...]
 
 ## Riscos
 1. ...
+
+## Modelo de execução
+- Subagents (implementer + reviewers): **[atual]** ou **[sonnet]**?
 ```
 
-**🛑 PONTO DE PARADA OBRIGATÓRIO.** Termine sua mensagem AQUI com a pergunta literal:
+**🛑 PONTO DE PARADA OBRIGATÓRIO.** Termine sua mensagem AQUI com as duas perguntas literais:
 
 > **"Posso implementar? [s/N]"**
+> **"Modelo pros subagents de execução — atual ou sonnet? [atual]"**
 
-Não escreva nenhum arquivo, não invoque a execução, não avance pra Fase 5 antes do usuário responder `s`. Exceção única: modo `--auto`. "continue" conta como `s`.
+**Gate de modelo:** você pode mandar o Superpowers disparar os subagents com o modelo que o usuário pedir. Duas opções só:
+- **atual** (padrão) → não passe override; a skill `subagent-driven-development` segue o tiering próprio dela (mecânico → barato, julgamento → padrão, review final → mais capaz) a partir do modelo da sessão.
+- **sonnet** → o usuário quer economizar/padronizar; na Fase 5 você injeta a restrição global de modelo (ver passo 6.1) pra a skill disparar **todos** os implementer e reviewer subagents em `sonnet`.
+
+Não escreva nenhum arquivo, não invoque a execução, não avance pra Fase 5 antes do usuário responder `s`. Exceção única: modo `--auto` (assume `s` + modelo **atual**). "continue" conta como `s` + **atual**.
 
 Este é o **único gate humano** antes da execução — a partir do `s`, a Fase 5 roda de forma contínua (a skill de execução não pausa entre tasks).
 
@@ -196,6 +204,13 @@ Este é o **único gate humano** antes da execução — a partir do `s`, a Fase
 
 6. **Workspace — instrução explícita pra passar à skill:**
    > "Workspace já definido: trabalhar na **branch atual**, **NÃO criar git worktree**. Não invoque `superpowers:using-git-worktrees`."
+
+6.1. **Modelo — restrição global (conforme o gate da Fase 4):** a skill `subagent-driven-development` lê as **restrições globais** antes de disparar a Task 1 e especifica o modelo explicitamente em cada subagent. Repasse a escolha do usuário como restrição global:
+   - Usuário escolheu **atual** → **não** passe override de modelo. Deixe o tiering próprio da skill rodar (ela usa modelo barato pra task mecânica, padrão pra julgamento, o mais capaz pro review final da branch).
+   - Usuário escolheu **sonnet** → passe a restrição literal:
+     > "Restrição global de modelo: dispare **TODOS** os subagents implementer e reviewer com `model: sonnet` (inclusive o review final da branch). Não use o modelo da sessão nem faça tiering — o usuário fixou Sonnet pra esta execução."
+
+   Só existem essas duas opções (atual/sonnet). No fallback manual (passo 7, sem `subagent-driven-development`), aplique a mesma escolha ao despachar os subagents `Explore`/`general-purpose` você mesmo (`model: sonnet` quando o usuário pediu sonnet).
 
    (O usuário trabalha em branch dedicada — worktree é dispensado de propósito.)
 
