@@ -2,6 +2,18 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.8.0] - 2026-07-02
+
+### Adicionado — Rulebook transversal ponytail (anti-over-engineering)
+- **Novo rulebook `base/personas/ponytail.md`.** Diferente dos rulebooks de domínio (frontend/database, que são **por-task**), o ponytail é **transversal** — injetado no prompt de **todo** subagent implementer/reviewer, em qualquer task. Importa a filosofia [ponytail](https://github.com/DietrichGebert/ponytail) ("lazy senior developer"): entender o problema por completo e **depois** subir uma escada de decisão de 7 degraus (existe? já no codebase? stdlib? nativo? dep instalada? 1 linha? só então build) pra escrever o mínimo.
+- **Piso de segurança inegociável:** ponytail corta código desnecessário, **jamais** validação, tratamento de erro, segurança, acessibilidade ou teste. Inclui níveis (`lite`/`full`/`ultra`/`off`, padrão `full`) e checklist de over-engineering pro reviewer.
+- **Nova seção "Orquestração: teammate vs ultracode"** no executor e no README: guia conceitual de quando escalar a orquestração pra **teammate** (subagent persistente e endereçável via `SendMessage`) ou **ultracode** (Workflow multi-agente determinístico), sem trocar o motor `subagent-driven-development`.
+
+### Mudou
+- **Executor:** novo princípio não-negociável ("Menor superfície (ponytail)"). **Fase 5** injeta o `ponytail.md` completo (incondicional) em todo implementer, empilhado `@dev` → ponytail → domínio; caminho com precedência de override (`cbs-overrides` → base), igual aos domínios. **Fase 6** injeta o ponytail no code review pra sinalizar over-engineering sem afrouxar o piso de segurança.
+- **README:** nova camada "Anti-over-engineering (sempre, transversal)" na tabela; seção "Ponytail: menos código, mesma segurança"; ponytail citado no diagrama do pipeline.
+- **Distribuição:** zero mudança de CLI — o `instalar`/`atualizar` já copia `base/personas/` recursivamente, então o `ponytail.md` é distribuído e coberto pelo fluxo de override automaticamente.
+
 ## [0.7.0] - 2026-06-08
 
 ### Adicionado — Rulebook de domínio database

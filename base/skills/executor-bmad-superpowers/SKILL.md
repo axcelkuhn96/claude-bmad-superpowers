@@ -47,6 +47,16 @@ A fase 7 — Entrega — tem 8 seções fixas (Resumo, Arquivos, Decisões, Coma
 5. **Artefatos no filesystem** (PRD, shards, stories em `docs/`) — não só no chat.
 6. **Sem refator fora de escopo.** Sem mudanças amplas oportunistas.
 7. **Sem mentir sobre testes/build.** Falha é falha.
+8. **Menor superfície (ponytail).** Antes de construir, suba a escada: reusar > stdlib/nativo > dependência já instalada > 1 linha inline > só então build mínimo. Cortar código desnecessário — **NUNCA** validação, tratamento de erro, segurança, acessibilidade ou teste. Injetado como rulebook transversal em todo subagent (ver Fase 5).
+
+## Orquestração: teammate vs ultracode
+
+Você é o orquestrador do contexto principal. O **motor padrão** da Fase 5 continua sendo `superpowers:subagent-driven-development` — as opções abaixo são **escalonamento**, não substituição. O gate humano da Fase 4 e a injeção BMAD → ponytail → domínio valem **em qualquer caso**.
+
+- **teammate** — subagent **persistente e endereçável** (dispare com `name` e continue via `SendMessage`), que mantém o contexto entre mensagens. Bom pra um reviewer/consultor de domínio que acompanha **várias tasks relacionadas** sem re-explicar o contexto, ou um "arquiteto" consultado repetidamente ao longo da execução.
+- **ultracode (Workflow)** — fan-out **multi-agente determinístico** com estágios de verificação. Bom quando há **N tasks independentes** rodando em paralelo com verificação estruturada (ex.: aplicar o mesmo padrão em muitos arquivos, revisão por dimensões). Requer **opt-in explícito** do usuário (keyword `ultracode` ou pedido direto) — não acione por conta própria.
+
+**Regra de bolso:** poucas tasks sequenciais/dependentes → `subagent-driven-development` puro. Muitas tasks independentes → considere **ultracode**. Reviewer/consultor de vida longa → **teammate**. Em todos os casos, cada subagent implementer continua `general-purpose` com `@dev` + ponytail (+ domínio) injetados.
 
 ## Detecção inicial — BMAD é REQUISITO
 
@@ -147,7 +157,15 @@ Este é o **único gate humano** antes da execução — a partir do `s`, a Fase
 
    Assim você junta o isolamento + TDD + 2 reviewers do `general-purpose` (mecânica do Superpowers) com a disciplina de story/QA do BMAD, em cada subagent.
 
-4. **Rulebook de DOMÍNIO empilhado em cima do `@dev` (quando aplicável):** se a task foi marcada com domínio na Fase 3, leia o rulebook correspondente e **inclua o conteúdo dele dentro do prompt do implementer** (e do code quality reviewer, no caso de QA específico de domínio).
+4. **Rulebook TRANSVERSAL ponytail (SEMPRE, em TODO implementer):** diferente do rulebook de domínio (condicional à marcação da Fase 3), este é **incondicional** — vale em toda task. Leia o `ponytail.md` (mesma precedência de caminho dos domínios) e **injete o conteúdo completo** no prompt de todo implementer, em bloco `<ponytail-rulebook>...</ponytail-rulebook>`, empilhado **abaixo** de qualquer rulebook de domínio.
+
+   Caminhos de leitura (primeiro encontrado vence):
+   - `~/.claude/cbs-overrides/personas/ponytail.md` (override do usuário)
+   - `~/.claude/personas/ponytail.md` (base instalada)
+
+   **Ordem de empilhamento no prompt:** `@dev` (base BMAD) → **ponytail** (transversal, sempre) → domínio frontend/database (se a task foi marcada). O ponytail governa *quanto* código o subagent escreve (menor superfície); o piso de segurança dele é inegociável e **vence** o corte em conflito. Nível padrão: `full` (só mude se o usuário pedir `lite`/`ultra`/`off` explicitamente). Não resuma — passe o conteúdo completo.
+
+5. **Rulebook de DOMÍNIO empilhado em cima do `@dev` (quando aplicável):** se a task foi marcada com domínio na Fase 3, leia o rulebook correspondente e **inclua o conteúdo dele dentro do prompt do implementer** (e do code quality reviewer, no caso de QA específico de domínio).
 
    Caminhos de leitura (em ordem — primeiro encontrado vence):
    - `~/.claude/cbs-overrides/personas/dominios/<dominio>.md` (override do usuário)
@@ -176,12 +194,12 @@ Este é o **único gate humano** antes da execução — a partir do `s`, a Fase
 
    Tasks **sem domínio marcado** seguem só com `@dev` BMAD puro (comportamento herdado).
 
-5. **Workspace — instrução explícita pra passar à skill:**
+6. **Workspace — instrução explícita pra passar à skill:**
    > "Workspace já definido: trabalhar na **branch atual**, **NÃO criar git worktree**. Não invoque `superpowers:using-git-worktrees`."
 
    (O usuário trabalha em branch dedicada — worktree é dispensado de propósito.)
 
-6. **Se `subagent-driven-development` não existir** no ambiente (Superpowers não instalado), aí sim caia no fallback: invoque `superpowers:test-driven-development` se existir, ou faça TDD manual (teste falha → código mínimo → verde), delegando investigação pesada a subagent `Explore` (`general-purpose` pra implementação). Recomende instalar Superpowers no fim.
+7. **Se `subagent-driven-development` não existir** no ambiente (Superpowers não instalado), aí sim caia no fallback: invoque `superpowers:test-driven-development` se existir, ou faça TDD manual (teste falha → código mínimo → verde), delegando investigação pesada a subagent `Explore` (`general-purpose` pra implementação). Recomende instalar Superpowers no fim.
 
 **Regras desta fase:**
 - ❌ Não faça a implementação (grep/read/write/edit de código) no contexto principal quando o `subagent-driven-development` estiver disponível — delegue.
@@ -193,7 +211,7 @@ Este é o **único gate humano** antes da execução — a partir do `s`, a Fase
 
 **Regra de subagent (igual à Fase 5):** todas as etapas abaixo rodam em subagent `subagent_type: "general-purpose"` com as convenções do agente BMAD correspondente injetadas no prompt. **NUNCA** dispache `code-reviewer`, `qa-expert`, `security-auditor`, `voltagent-*` ou `bmad-agent-*` como tipo de agente.
 
-**Code review:** invoque `superpowers:requesting-code-review` se existir. Senão, delegue a um subagent `general-purpose` carregando as convenções do **review do BMAD** (`bmad-code-review`: revisar contra a story, critérios de aceite e padrões do projeto).
+**Code review:** invoque `superpowers:requesting-code-review` se existir. Senão, delegue a um subagent `general-purpose` carregando as convenções do **review do BMAD** (`bmad-code-review`: revisar contra a story, critérios de aceite e padrões do projeto). **Injete também o `ponytail.md`** (mesma precedência de caminho da Fase 5) no prompt do reviewer, instruindo a usar o checklist de over-engineering (seção 4 do rulebook) pra sinalizar abstração especulativa, wrapper de 1 chamada, camadas a mais e reimplementação do que a lib já faz — **sem** afrouxar o piso de segurança (validação/erro/segurança/acessibilidade/teste nunca são "código a cortar").
 
 **Funcional / QA** (subagent `general-purpose` com as convenções do **QA/Test agent do BMAD** — `@qa`/TEA: test design, testes baseados em risco, rastreabilidade):
 - Golden path

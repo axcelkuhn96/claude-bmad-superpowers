@@ -10,6 +10,7 @@ Um pacote de **3 skills** e **8 comandos** em português que amarram quatro cama
 | **Motor de execução** | [Superpowers](https://github.com/obra/superpowers) | brainstorming → plano → subagents com TDD + 2 reviews → verificação. Garante "desenvolver certo, sem erro" |
 | **Disciplina de processo** (sempre) | [BMAD-METHOD](https://github.com/bmad-code-org/BMAD-METHOD) | Gera as stories no planejamento e injeta as personas (`@dev`, `@qa`, review) em cada subagent do Superpowers |
 | **Expertise por domínio** (quando aplicável) | rulebooks em `personas/dominios/` + skills oficiais | Em cima do `@dev`, empilha regras específicas do domínio (ex.: frontend invoca a skill oficial `frontend-design` e detecta o design system do projeto pra evitar IA-genérico). |
+| **Anti-over-engineering** (sempre, transversal) | rulebook `personas/ponytail.md` | Injetado em **todo** subagent implementer/reviewer: sobe uma escada de decisão (reusar > stdlib > nativo > dep > 1 linha > só então build) pra escrever o **mínimo** — sem nunca cortar validação, erro, segurança ou teste. |
 
 Em vez de competir, cada peça fica no que faz bem: **você refina em português, e a execução roda sempre com o Superpowers como motor + o BMAD como disciplina injetada dentro dele** (story → `@dev` → review/`@qa`).
 
@@ -116,6 +117,7 @@ Comandos de manutenção:
                   → superpowers:subagent-driven-development
                        · implementer general-purpose
                          + persona @dev (TDD, isolado)
+                         + ponytail (transversal, sempre — menor superfície)
                          + rulebook do domínio (se aplicável — ex. frontend invoca skill oficial frontend-design)
                        · spec reviewer + code quality reviewer general-purpose
                          + personas review/@qa do BMAD, por task
@@ -254,6 +256,34 @@ cp ~/.claude/personas/dominios/frontend.md ~/.claude/cbs-overrides/personas/domi
 ```
 
 Mesma mecânica vale pro `database.md` (e qualquer domínio futuro): `~/.claude/cbs-overrides/personas/dominios/<dominio>.md` sobrescreve o base e sobrevive ao `/atualizar`. Tasks que não batem com **frontend** nem **database** seguem só com o `@dev` BMAD padrão (comportamento herdado).
+
+---
+
+## Ponytail: menos código, mesma segurança
+
+Enquanto os rulebooks de domínio são **por-task** (só entram quando a task é de frontend/database), o **ponytail é transversal** — injetado no prompt de **todo** subagent implementer/reviewer, em qualquer task. Ele importa a filosofia [ponytail](https://github.com/DietrichGebert/ponytail) ("lazy senior developer") pra dentro da execução: entender o problema por completo e **depois** escrever o mínimo que resolve.
+
+**A escada de decisão** (antes de criar qualquer código novo, pare no primeiro "sim"):
+
+1. Isso precisa existir?
+2. Já está no codebase (dá pra reusar)?
+3. A stdlib/linguagem resolve?
+4. É feature nativa da plataforma/framework?
+5. Uma dependência **já instalada** resolve?
+6. Dá em uma linha?
+7. Só então — construa o mínimo.
+
+**Piso de segurança (inegociável):** ponytail corta *código desnecessário*, jamais qualidade. Validação de input, tratamento de erro, segurança, acessibilidade e testes **nunca** entram no corte. Se um "corte" remove isso, não é ponytail — é bug.
+
+**Níveis:** `lite` (só não-duplicar) · `full` (padrão, escada completa) · `ultra` (agressivo) · `off` (desliga o corte, mas o piso de segurança continua). O executor roda em `full`; peça outro nível explicitamente se quiser.
+
+**Onde mora:** `~/.claude/personas/ponytail.md` (base). Pra endurecer/afrouxar pro seu jeito sem perder no update, crie `~/.claude/cbs-overrides/personas/ponytail.md` — sobrescreve o base e sobrevive ao `/atualizar`.
+
+> Ordem de empilhamento no prompt do subagent: `@dev` (BMAD) → **ponytail** (transversal) → domínio frontend/database (se aplicável).
+
+### Orquestração: teammate e ultracode
+
+O motor padrão da execução é o `superpowers:subagent-driven-development`. Pra orquestrações maiores, o executor pode **escalar** (sem trocar o motor): **teammate** — subagent persistente e endereçável (via `SendMessage`), bom pra um reviewer/consultor que acompanha várias tasks sem re-explicar o contexto; **ultracode** (Workflow) — fan-out multi-agente determinístico com verificação, bom pra N tasks independentes em paralelo (requer opt-in explícito). O gate humano ("Posso implementar?") e a injeção BMAD/ponytail/domínio valem em qualquer caminho.
 
 ---
 
