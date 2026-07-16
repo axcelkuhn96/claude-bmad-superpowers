@@ -95,6 +95,8 @@ Classifique cada dúvida:
 
 **Não-bloqueantes** — dá pra assumir com risco baixo.
 
+> **Escalar pro grelhar:** se as dúvidas bloqueantes forem **muitas e interdependentes** (uma decisão destrava outras — uma árvore, não uma lista), invoque `Skill` com `skill: "grelhar"` antes do Alinhamento, pra resolver os galhos um a um. Quando voltar, as decisões já vêm fechadas e a Fase 5 vira confirmação rápida. (No `/piloto` a grelha já roda antes — aqui é só pro `/refinar` standalone.)
+
 ### Fase 5 — Alinhamento prévio (OBRIGATÓRIO antes de gerar prompt)
 
 **Pare aqui e espere o usuário confirmar antes de avançar pra Fase 6.**

@@ -2,6 +2,21 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.10.0] - 2026-07-16
+
+### Adicionado — 3 skills adaptadas de mattpocock/skills (agora 6 skills, 11 comandos)
+- **`grelhar` (skill) + `/grelhar` (comando)** — interrogatório implacável (grilling): **uma pergunta por vez com resposta recomendada**, descendo a árvore de decisão até entendimento compartilhado. Distingue **fato** (busca sozinha via Explore/Read/Grep) de **decisão** (pergunta ao usuário). Não implementa nem gera prompt — ao fechar, sugere `/refinar`, `/executar` ou `/mapear`.
+- **`wayfinder` (skill) + `/mapear` (comando)** — pra trabalho grande demais pra uma sessão só e ainda nebuloso. Cartografa um **mapa de decisões** em `docs/mapas/<slug>.md` (adaptado do issue tracker do original pra markdown local) e resolve **tickets** (pesquisa/protótipo/grelhar/tarefa) um a um, com "névoa de guerra", fronteira, HITL×AFK e "uma decisão por sessão". Evolução do `/investigar`; planeja **decisões, não deliverables**; proíbe editar código de aplicação.
+- **`handoff` (skill) + `/handoff` (comando)** — compacta a conversa num **documento de continuação** pra outro agente/sessão retomar sem reler o histórico. **Referencia** artefatos (specs/planos/commits/diffs) por caminho em vez de duplicar, **redige** segredos (API keys, senhas, PII) e inclui seção "Skills sugeridas". Salva em `docs/handoffs/` (se houver `docs/`) ou no diretório temporário do SO.
+
+### Mudou — grelhar entra no pipeline do `/piloto`
+- **`/piloto` agora é `grelhar` → `refinar` → OK → `executar`.** Nova **Etapa 1 (Grelhar)** roda o interrogatório antes de refinar, pra afiar as decisões antes de gastar tokens gerando o prompt. A grelha se auto-escala (ideia trivial fecha em 1-2 perguntas; grande destrincha vários galhos) e, se o escopo for grande demais, oferece `/mapear`. A **Etapa 2 (Refinar)** recebe as decisões fechadas e o "Alinhamento" da refinador vira **confirmação rápida** — sem reabrir as mesmas perguntas. Etapas renumeradas (executar virou Etapa 4).
+- **`refinador-de-prompt`:** nota na Fase 4 (Gap analysis) pra **escalar pro `grelhar`** quando as dúvidas bloqueantes forem muitas e interdependentes (árvore, não lista) — vale pro `/refinar` standalone.
+- **README:** contagem "6 skills e 11 comandos"; tabela "Como usar" com `/mapear`, `/grelhar`, `/handoff`; diagrama do pipeline com os 3 novos fluxos e o `/piloto` incluindo grelhar; seção "As 6 skills" com os 3 novos verbetes.
+
+### Distribuição
+- Zero mudança de CLI — o `instalar`/`atualizar` já copia `base/skills/` e `base/commands/` recursivamente, então as 3 skills e os 3 comandos são distribuídos e cobertos pelo fluxo de override automaticamente. Mensagens de ajuda do instalador atualizadas.
+
 ## [0.9.0] - 2026-07-02
 
 ### Adicionado — Gate de modelo na execução

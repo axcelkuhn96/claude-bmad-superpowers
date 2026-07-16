@@ -141,9 +141,12 @@ Convenção: se você criar um arquivo aqui com o mesmo caminho relativo de um a
 
 Use no dia a dia:
   /investigar <tema>     → discovery sem código
+  /mapear <ideia>        → escopo grande vira mapa de decisões (wayfinder)
+  /grelhar <tema>        → interrogatório até entendimento compartilhado
   /refinar <ideia>       → ideia vira prompt premium
   /executar <prompt>     → BMAD planeja, Superpowers implementa
-  /piloto <ideia>        → fluxo completo (refina + executa)
+  /piloto <ideia>        → fluxo completo (grelha + refina + executa)
+  /handoff [foco]        → doc de continuação pra outra sessão
 
 Verificar:    npx claude-bmad-superpowers status
 Atualizar:    npx claude-bmad-superpowers atualizar
