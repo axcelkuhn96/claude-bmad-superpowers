@@ -80,7 +80,7 @@ cbs status
 |---|---|---|
 | Ideia fuzzy, dúvida estratégica | `/investigar <tema>` | Pensa junto, mapeia o código, brainstorm, recomenda. **Não toca em código.** |
 | Trabalho grande demais pra 1 sessão | `/mapear <ideia>` | Cartografa um mapa de decisões em `docs/mapas/`, resolve ticket por ticket (wayfinder). Evolução do `/investigar`. **Não toca em código.** |
-| Quer stress-testar um plano/decisão | `/grelhar <tema>` | Interrogatório implacável, uma pergunta por vez com resposta recomendada, até entendimento compartilhado. **Não implementa.** |
+| Quer stress-testar um plano/decisão | `/grelhar <tema>` | Interrogatório implacável, uma pergunta por vez **no seletor do CLI** (opções + recomendação marcada), até entendimento compartilhado. **Não implementa.** |
 | Ideia clara mas crua | `/refinar <ideia>` | Co-desenha com você (alinhamento + memória) e gera um prompt premium |
 | Ideia crua, sem querer perguntas | `/refinar-auto <ideia>` | Igual ao `/refinar` mas assume tudo não-crítico (marca as suposições) |
 | Prompt/spec em mãos | `/executar <prompt>` | Superpowers executa com rigor: plano → subagents + TDD → verify |
@@ -111,7 +111,8 @@ Comandos de manutenção:
                 docs/mapas/ → tickets (pesquisa/protótipo/grelhar/tarefa) 1 a 1
 
 /grelhar     →  interrogatório (não implementa)
-                mem-search → 1 pergunta por vez (c/ recomendação) →
+                mem-search → 1 pergunta por vez NO SELETOR DO CLI
+                  (2-4 opções c/ tradeoff + "(Recomendado)" na primeira) →
                 busca fatos sozinho, pergunta só decisões → entendimento compartilhado
 
 /refinar     →  ideia → prompt premium
@@ -184,7 +185,7 @@ claude: [mem-search → refina (alinhamento, você OK) →
 
 - **`executor-bmad-superpowers`** — orquestrador que **não implementa inline**. Delega a execução ao Superpowers (`writing-plans` → `subagent-driven-development` → `verification-before-completion`), com ponto de parada pedindo OK antes de codar. BMAD entra **sempre**: gera as stories no planejamento e injeta `@dev`/`@qa`/review em cada subagent.
 
-- **`grelhar`** *(novo)* — interrogatório implacável (grilling), **uma pergunta por vez com resposta recomendada**, descendo a árvore de decisão até haver entendimento compartilhado. Busca **fatos** sozinha (Explore/Read/Grep) e pergunta só as **decisões**. Não implementa. **Faz parte do `/piloto`** (roda antes do refinar) e pode ser escalada pelo `/refinar` quando as decisões são muitas e interdependentes. Adaptada de [mattpocock/skills](https://github.com/mattpocock/skills).
+- **`grelhar`** *(novo)* — interrogatório implacável (grilling), **uma pergunta por vez no seletor interativo do CLI**: cada pergunta traz 2-4 opções pra debate, com a recomendação marcada `(Recomendado)` e o **tradeoff de cada opção** na descrição. Busca **fatos** sozinha (Explore/Read/Grep) e pergunta só as **decisões**. Não implementa. **Faz parte do `/piloto`** (roda antes do refinar) e pode ser escalada pelo `/refinar` quando as decisões são muitas e interdependentes. Adaptada de [mattpocock/skills](https://github.com/mattpocock/skills).
 
 - **`wayfinder`** *(novo)* — pra trabalho grande demais pra uma sessão só e ainda nebuloso. Cartografa um **mapa de decisões** em `docs/mapas/` e resolve **tickets** (pesquisa/protótipo/grelhar/tarefa) um a um, com "névoa de guerra" e fronteira. Evolução do `/investigar`. Planeja **decisões, não deliverables**. Adaptada de [mattpocock/skills](https://github.com/mattpocock/skills).
 

@@ -2,6 +2,16 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.11.0] - 2026-07-16
+
+### Mudou — grelhar agora pergunta no seletor interativo do CLI
+- **Toda pergunta da `grelhar` vai pela ferramenta `AskUserQuestion`** (seletor interativo), nunca mais como texto corrido. Cada pergunta traz **2 a 4 opções concretas** pra alimentar o debate, com a **recomendação como primeira opção** marcada `(Recomendado)` — e o **tradeoff de cada opção** na descrição (o que ganha × o que custa). O usuário sempre tem "Other" automático pra responder livre.
+- **Uma pergunta por chamada, ainda.** A ferramenta aceita até 4 por vez, mas a skill manda **uma** — mandar várias atordoa e impede resolver as dependências da árvore de decisão em ordem.
+- **Novas regras de montagem:** `header` curto (máx. 12 chars) pra área da decisão; **proibido opção-espantalho** (toda alternativa precisa ser defensável por alguém sensato); usar `preview` quando a decisão for comparar algo concreto (dois formatos de código, shapes de dado, layouts), que renderiza lado a lado; se o usuário escolher "Other" e abrir premissa nova, **reordenar a árvore** antes de seguir.
+- **Fallback preservado:** fora do Claude Code (sem `AskUserQuestion`), a skill cai pro formato texto — uma pergunta por vez, recomendação explícita e alternativas numeradas com tradeoff.
+- **Anti-padrões novos:** perguntar em texto corrido tendo o seletor; várias perguntas numa chamada; opção espantalho; pergunta sem tradeoff na descrição.
+- **README** e descrição da skill/comando atualizados pra refletir o seletor.
+
 ## [0.10.0] - 2026-07-16
 
 ### Adicionado — 3 skills adaptadas de mattpocock/skills (agora 6 skills, 11 comandos)

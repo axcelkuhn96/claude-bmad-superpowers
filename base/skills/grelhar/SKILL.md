@@ -1,6 +1,6 @@
 ---
 name: grelhar
-description: Use esta skill quando o usuário quiser ser interrogado ("grelhado") sobre um plano, decisão, design ou ideia até não sobrar dúvida — ou usar gatilhos como "me grelha", "me interroga", "stress-test", "pega no pé das decisões". Interrogatório implacável, uma pergunta por vez, descendo a árvore de decisão até haver entendimento compartilhado. Não age antes disso.
+description: Use esta skill quando o usuário quiser ser interrogado ("grelhado") sobre um plano, decisão, design ou ideia até não sobrar dúvida — ou usar gatilhos como "me grelha", "me interroga", "stress-test", "pega no pé das decisões". Interrogatório implacável, uma pergunta por vez no seletor interativo do CLI (AskUserQuestion) com opções sugeridas e recomendação marcada, descendo a árvore de decisão até haver entendimento compartilhado. Não age antes disso.
 ---
 
 # Grelhar
@@ -17,7 +17,7 @@ Se ainda não chamou `mem-search` (ou `claude-mem:mem-search` / `claude-mem:smar
 
 1. **Uma pergunta por vez.** Espere a resposta antes da próxima. Jogar várias perguntas juntas confunde e quebra o método — é o erro clássico.
 2. **Fato você busca; decisão você pergunta.** Se a resposta pode ser encontrada no ambiente (filesystem, código, docs, ferramentas), **vá buscar sozinho** — não terceirize pro usuário o que você consegue verificar. Só as **decisões** (o que depende do julgamento/preferência dele) vão pra ele.
-3. **Cada pergunta vem com resposta recomendada.** Nunca pergunte no vácuo: proponha sua melhor resposta e o porquê, pra o usuário reagir ("concordo" / "não, é assim"). Isso dá estrutura sem impor conclusão.
+3. **Pergunte pelo seletor do CLI, com opções.** Toda pergunta vai pela ferramenta **`AskUserQuestion`** (seletor interativo), **nunca** como texto corrido. Cada pergunta leva **2 a 4 opções concretas** pra alimentar o debate, com a sua **recomendação como primeira opção**, marcada `(Recomendado)`. Isso dá estrutura sem impor conclusão — e o usuário sempre pode escolher "Other" pra responder livre.
 4. **Desça a árvore de decisão em ordem.** Resolva dependências uma a uma: uma decisão que destrava outras vem primeiro. Não pule pra folha antes de resolver o galho.
 5. **Não aja até o usuário confirmar entendimento compartilhado.** Grelhar não implementa, não escreve código, não gera o prompt final. Só quando o usuário confirmar "fechou / entendemos" é que você oferece o próximo passo.
 
@@ -37,20 +37,40 @@ Não despeje esse mapa inteiro na tela — ele serve pra você ordenar as pergun
 
 ### Fase 3 — Interrogatório (o loop)
 
-Repita, **uma pergunta por vez**:
+Repita, **uma pergunta por vez**, sempre via **`AskUserQuestion`**.
 
-```
-Pergunta [n]: [a decisão em aberto, específica]
-Minha recomendação: [sua melhor resposta] — porque [motivo curto].
-[se relevante] Fatos que já confirmei: [o que você buscou sozinho].
-```
+**Como montar cada pergunta:**
 
-Espere a resposta. Então:
+| Campo | Como preencher |
+|---|---|
+| `question` | A decisão em aberto, específica e fechada. Se houver fato que você já confirmou e que embasa a escolha, diga-o aqui em 1 linha ("Hoje o projeto já usa X"). |
+| `header` | Rótulo curto da área da decisão (**máx. 12 chars**): ex. `Auth`, `Cache`, `Schema`, `Escopo`. |
+| `options` | **2 a 4** posições **genuinamente viáveis**. A **primeira é a sua recomendação**, com `(Recomendado)` no fim do label. |
+| `description` (de cada opção) | O **tradeoff** dessa escolha — o que ela ganha e o que ela custa. É isso que alimenta o debate. |
+| `multiSelect` | `false` por padrão (decisão é excludente). `true` só quando as opções realmente se somam. |
+
+**Regras de montagem:**
+- **Uma pergunta por chamada.** A ferramenta aceita até 4, mas mandar várias quebra o método — atordoa e impede resolver dependências em ordem. Mande **uma**.
+- **Nada de espantalho.** Toda opção precisa ser uma posição que alguém sensato defenderia. Opção fraca de enfeite não é debate, é teatro.
+- **Não repita a recomendação no corpo** — ela já é a primeira opção. Use o `description` pra dizer o *porquê*.
+- **Use `preview`** quando a decisão for sobre algo concreto de comparar (dois formatos de código, dois shapes de dado, dois layouts): o preview renderiza lado a lado e sobe muito a qualidade da escolha. Só funciona em pergunta single-select.
+- O usuário sempre tem **"Other"** automaticamente — não crie uma opção "outro".
+
+**Depois de cada resposta:**
 - Registre a decisão tomada.
 - Se a resposta abrir novos galhos, encaixe-os na ordem e continue.
 - Se a resposta fechar um galho, siga pro próximo galho não resolvido.
+- Se o usuário escolher "Other" e a resposta abrir uma premissa nova, **reordene a árvore** antes de seguir.
 
 Continue até **não sobrar decisão em aberto** relevante ao destino.
+
+**Fallback:** se `AskUserQuestion` não existir neste ambiente (fora do Claude Code), aí sim caia pro texto corrido — uma pergunta por vez, recomendação explícita e alternativas numeradas:
+
+```
+Pergunta [n]: [a decisão em aberto]
+Minha recomendação: [X] — porque [motivo].
+Alternativas: (a) [...] — tradeoff [...]  (b) [...] — tradeoff [...]
+```
 
 ### Fase 4 — Fechamento
 
@@ -76,8 +96,11 @@ Fechou? Se sim, próximo passo sugerido:
 
 ## Anti-padrões
 
-- ❌ Perguntar várias coisas de uma vez.
+- ❌ Perguntar em **texto corrido** quando `AskUserQuestion` está disponível.
+- ❌ Mandar **várias perguntas** numa chamada só (a ferramenta aceita, o método não).
+- ❌ Opção **espantalho** — alternativa fraca só pra encher o seletor.
+- ❌ Pergunta **sem tradeoff** nas descrições (vira chute, não debate).
 - ❌ Perguntar o que você poderia ter descoberto lendo o código.
-- ❌ Perguntar sem oferecer sua recomendação.
+- ❌ Perguntar sem marcar qual é a sua recomendação.
 - ❌ Começar a implementar / gerar prompt antes do "fechou".
 - ❌ Pular um galho-dependência pra ir direto num detalhe folha.
