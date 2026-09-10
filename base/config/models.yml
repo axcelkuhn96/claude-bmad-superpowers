@@ -1,0 +1,17 @@
+# claude-bmad-superpowers — modelo por papel (lido por /executar e /piloto)
+#
+# Copiado pelo instalador pra ~/.claude/cbs-overrides/models.yml SÓ se não existir.
+# Edite a cópia em cbs-overrides/ — o /atualizar nunca sobrescreve.
+#
+# Valores aceitos: sonnet | opus | fable | haiku | inherit
+#   inherit = usa o modelo da sessão atual do Claude Code
+#
+# Override pontual por argumento do comando:
+#   /executar models=implementer:sonnet,reviewer:opus <prompt>
+#   /piloto modelo=opus <ideia>            (todos os papéis)
+
+implementer: sonnet      # implementa cada task (TDD)
+reviewer: opus           # task reviewer / re-reviewer por task
+final_review: opus       # review final da branch (código + segurança + cobertura)
+e2e: sonnet              # validação E2E / browser (Playwright)
+investigar: inherit      # /investigar, /grelhar, /mapear (discovery)

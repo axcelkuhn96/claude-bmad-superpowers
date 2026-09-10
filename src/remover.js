@@ -81,7 +81,7 @@ export async function remover(args = []) {
 
   console.log(`✓ ${alvos.length} arquivo(s) removido(s).`);
   console.log('\nPra remover o plugin Superpowers (dentro do Claude Code):');
-  console.log('    /plugin uninstall superpowers@obra\n');
-  console.log('Pra remover BMAD de um projeto:');
-  console.log('    rm -rf <projeto>/.bmad-core <projeto>/docs/prd.md  # ou similar\n');
+  console.log('    /plugin uninstall superpowers@superpowers-marketplace\n');
+  console.log('Pra remover BMAD de um projeto (apaga _bmad/ e .claude/skills/bmad-*, preserva _bmad-output/):');
+  console.log('    npx bmad-method uninstall --directory <projeto> -y\n');
 }

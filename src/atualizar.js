@@ -10,6 +10,7 @@ import {
 import { tentarAtualizarSuperpowers } from './superpowers.js';
 import { listarProjetosBmad, atualizarBmadEmProjeto, limparProjetosInvalidos } from './bmad.js';
 import { tentarSelfUpdate } from './auto-update.js';
+import { garantirModelsOverride } from './instalar.js';
 
 async function arquivoTemMarcador(p) {
   try {
@@ -55,6 +56,17 @@ async function atualizarArvore(origemBase, destinoBase, versao, resultado) {
   }
 }
 
+// --projetos /a,/b  ou  --projetos=/a,/b  → lista de caminhos absolutos normalizados
+function lerFlagProjetos(args) {
+  let valor = null;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--projetos') valor = args[i + 1] || '';
+    else if (args[i].startsWith('--projetos=')) valor = args[i].slice('--projetos='.length);
+  }
+  if (valor === null) return null;
+  return valor.split(',').map((p) => p.trim()).filter(Boolean).map((p) => path.resolve(p));
+}
+
 async function perguntar(pergunta) {
   const rl = readline.createInterface({ input, output });
   const resp = await rl.question(pergunta);
@@ -93,6 +105,9 @@ export async function atualizar(args = []) {
   if (await existe(path.join(RAIZ_BASE, 'personas'))) {
     await atualizarArvore(path.join(RAIZ_BASE, 'personas'), DIR_PERSONAS, versaoNova, resultado);
   }
+  const models = await garantirModelsOverride();
+  if (models.acao === 'criado') resultado.atualizado.push(models.destino);
+  else if (models.acao === 'preservado') resultado.preservado.push(models.destino);
   await fs.writeFile(ARQ_VERSAO_INSTALADA, versaoNova + '\n', 'utf8');
   console.log(`✓ ${resultado.atualizado.length} arquivo(s) do base atualizado(s) (v${versaoNova}).`);
   if (resultado.preservado.length > 0) {
@@ -119,15 +134,29 @@ export async function atualizar(args = []) {
       console.log(`Projetos BMAD registrados (${validos.length}):`);
       for (const p of validos) console.log(`  - ${p}`);
 
-      const auto = args.includes('--auto-bmad') || args.includes('-y');
+      // --projetos a,b,c restringe a lista (usado pelo /atualizar depois de perguntar ao usuário)
+      const filtro = lerFlagProjetos(args);
+      const candidatos = filtro ? validos.filter((p) => filtro.includes(p)) : validos;
+      if (filtro) {
+        const desconhecidos = filtro.filter((p) => !validos.includes(p));
+        for (const p of desconhecidos) console.log(`⚠  ${p}: não está no registro. Ignorado.`);
+      }
+
+      const auto = args.includes('--auto-bmad') || args.includes('-y') || Boolean(filtro);
       let modo = auto ? 'todos' : null;
+      if (!modo && !process.stdin.isTTY) {
+        // sem terminal (ex.: rodando via ferramenta Bash do Claude Code) não dá pra perguntar:
+        // comporta como --auto-bmad. Pra não tocar nos projetos, use --skip-bmad.
+        console.log('\n(sem TTY: atualizando BMAD em todos os projetos registrados, como --auto-bmad; use --skip-bmad ou --projetos pra restringir)');
+        modo = 'todos';
+      }
       if (!modo) {
         modo = await perguntar('\nAtualizar BMAD em [t]odos / [s]elecionar / [n]ão? [n] ');
         if (!modo) modo = 'n';
       }
 
       let alvos = [];
-      if (modo.startsWith('t')) alvos = validos;
+      if (modo.startsWith('t')) alvos = candidatos;
       else if (modo.startsWith('s')) {
         for (const p of validos) {
           const r = await perguntar(`  Atualizar em ${p}? [s/N] `);

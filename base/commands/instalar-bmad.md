@@ -15,15 +15,21 @@ O BMAD-METHOD tem um instalador **interativo** (perguntas em TTY) que o Claude C
    ```
 
    Esse comando vai:
-   - Rodar `npx bmad-method install --tools claude-code` no diretório atual (com prompts interativos)
+   - Rodar `npx bmad-method install --directory <dir> --action install --tools claude-code --modules bmm,core --communication-language pt-BR --document-output-language pt-BR --yes` no diretório atual (agentes e documentos em português)
    - Após sucesso, registrar o projeto em `~/.claude/cbs-overrides/.projetos-bmad`
    - Listar os agentes BMAD disponíveis
 
-3. Acompanhe a saída. Se o BMAD perguntar coisas (módulos, idioma, etc.), oriente o usuário a responder.
+   Se BMAD já existir no diretório, a CLI pergunta `[r]einstalar / [u]pdate / [p]ular`. Flags equivalentes:
+   - `--update` (`-u`): `bmad-method install --action update`
+   - `--force` (`-f`): reinstala do zero — roda `bmad-method uninstall` (apaga `_bmad/` e `.claude/skills/bmad-*`, preserva `_bmad-output/`) e pede confirmação; `-y` confirma sem perguntar
+
+3. Acompanhe a saída. Se o BMAD perguntar algo que a flag `--yes` não cobriu, oriente o usuário a responder.
 
 4. Após terminar, confirme:
-   - `.bmad-core/` (ou `.bmad/`) existe no diretório
+   - `_bmad/` existe no diretório (versão em `_bmad/_config/manifest.yaml`)
+   - `.claude/skills/bmad-*` foram criadas (skills `bmad-agent-dev`, `bmad-prd`, `bmad-create-epics-and-stories`, etc.)
    - Linha do diretório está em `~/.claude/cbs-overrides/.projetos-bmad`
+   - `npx claude-bmad-superpowers status` lista o projeto com a versão do BMAD
 
 5. Diga ao usuário que agora ele pode usar `/refinar`, `/executar` ou `/piloto` e essas skills vão invocar os agentes BMAD automaticamente.
 

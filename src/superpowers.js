@@ -34,6 +34,27 @@ export async function plugInstalado(nome) {
   }
 }
 
+/**
+ * Versões instaladas de um plugin: [{ chave, scope, version, projectPath, installPath }]
+ * (o mesmo plugin pode aparecer em vários marketplaces/escopos)
+ */
+export async function versoesPlugin(nome) {
+  try {
+    const buf = await fs.readFile(ARQ_PLUGINS, 'utf8');
+    const json = JSON.parse(buf);
+    const out = [];
+    for (const [chave, entradas] of Object.entries(json.plugins || {})) {
+      if (!chave.toLowerCase().includes(nome.toLowerCase())) continue;
+      for (const e of Array.isArray(entradas) ? entradas : []) {
+        out.push({ chave, scope: e.scope, version: e.version, projectPath: e.projectPath, installPath: e.installPath });
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 const INSTRUCOES_SUPERPOWERS = `
    Pra instalar o Superpowers, dentro do Claude Code rode:
 

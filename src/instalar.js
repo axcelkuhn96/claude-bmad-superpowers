@@ -28,6 +28,17 @@ async function copiarComMarcador(origem, destino, versao) {
   await fs.writeFile(destino, limpo + rodapeParaArquivo(destino, versao), 'utf8');
 }
 
+// models.yml (modelo por papel) é do usuário: copia o default SÓ se não existir
+export async function garantirModelsOverride() {
+  const origem = path.join(RAIZ_BASE, 'config', 'models.yml');
+  const destino = path.join(DIR_OVERRIDES, 'models.yml');
+  if (!(await existe(origem))) return { acao: 'sem-default', destino };
+  if (await existe(destino)) return { acao: 'preservado', destino };
+  await garantirDir(DIR_OVERRIDES);
+  await fs.copyFile(origem, destino);
+  return { acao: 'criado', destino };
+}
+
 async function copiarArvore(origemBase, destinoBase, versao) {
   const entradas = await fs.readdir(origemBase, { withFileTypes: true });
   for (const ent of entradas) {
@@ -79,6 +90,11 @@ export async function instalar(args = []) {
     await copiarArvore(origemPersonas, DIR_PERSONAS, versao);
   }
 
+  // models.yml default → cbs-overrides/ (nunca sobrescreve)
+  const models = await garantirModelsOverride();
+  if (models.acao === 'criado') console.log('→ Criando cbs-overrides/models.yml (modelo por papel, default do pacote)...');
+  else if (models.acao === 'preservado') console.log('✓ cbs-overrides/models.yml já existe — preservado.');
+
   // registra versão
   await fs.writeFile(ARQ_VERSAO_INSTALADA, versao + '\n', 'utf8');
 
@@ -94,7 +110,9 @@ Use pra customizar skills/commands do pacote sem perder no update:
 \`\`\`
 ~/.claude/cbs-overrides/
 ├── skills/<nome>/SKILL.md   ← substitui ou complementa o base
-└── commands/<nome>.md       ← substitui o base
+├── commands/<nome>.md       ← substitui o base
+├── personas/<caminho>.md    ← substitui personas/ (ponytail, dominios/, review/)
+└── models.yml               ← modelo por papel (implementer, reviewer, ...)
 \`\`\`
 
 Convenção: se você criar um arquivo aqui com o mesmo caminho relativo de um arquivo do base, ele tem prioridade.
@@ -121,7 +139,7 @@ Convenção: se você criar um arquivo aqui com o mesmo caminho relativo de um a
       console.log(`✓ BMAD já instalado em ${cwd} (${jaTem}).`);
       console.log('  Pra atualizar: npx claude-bmad-superpowers atualizar --auto-bmad\n');
     } else {
-      console.log('BMAD é per-project (escreve em .bmad-core/, docs/, etc.)');
+      console.log('BMAD é per-project (escreve em _bmad/, _bmad-output/ e .claude/skills/bmad-*)');
       console.log('O instalador é interativo — responda as perguntas conforme aparecerem.\n');
       try {
         await instalarBmad([]);

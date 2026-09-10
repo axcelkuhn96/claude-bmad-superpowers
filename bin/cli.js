@@ -29,17 +29,24 @@ Comandos:
   instalar-bmad    Instala apenas BMAD-METHOD no diretório atual e registra o projeto
   atualizar        Self-update + skills/commands + Superpowers + BMAD nos projetos registrados
   remover          Desinstala skills/commands do pacote (preserva overrides)
-  status           Mostra versão instalada, skills/commands ativos, plugins, BMAD
+  status           Versões (pacote, Superpowers, BMAD por projeto), skills/commands/personas, models.yml
 
 Flags do instalar:
   --apenas-global       Não instala BMAD no cwd (skills/commands/Superpowers somente)
   --skip-bmad           Idem
   --skip-superpowers    Não tenta instalar o plugin Superpowers
 
+Flags do instalar-bmad:
+  --update, -u          Atualiza a instalação existente (bmad-method install --action update)
+  --force, -f           Reinstala do zero: bmad-method uninstall + remove .claude/skills/bmad-* (pede confirmação)
+  -y, --sim             Confirma o --force sem perguntar
+
 Flags do atualizar:
   --skip-self-update    Não tenta atualizar o próprio pacote (git pull ou npx @latest)
-  --skip-bmad           Não pergunta sobre atualizar BMAD nos projetos
+  --skip-bmad           Não atualiza BMAD nos projetos registrados
   --auto-bmad, -y       Atualiza BMAD em todos os projetos sem perguntar
+  --projetos a,b        Atualiza BMAD só nesses projetos (caminhos separados por vírgula)
+  (sem TTY, ex. via ferramenta Bash do Claude Code: comporta como --auto-bmad)
 
 Aliases: install/update/uninstall/remove também funcionam.
 Atalho:  cbs <comando>  (se instalado globalmente)

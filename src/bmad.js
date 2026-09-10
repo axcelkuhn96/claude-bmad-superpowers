@@ -4,7 +4,9 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { ARQ_PROJETOS_BMAD, existe, garantirDir } from './caminhos.js';
 
-const CANDIDATOS_BMAD = ['_bmad', '.bmad-core', '.bmad', 'bmad-core'];
+// BMAD 6.x instala em _bmad/ (+ _bmad-output/ e .claude/skills/bmad-*)
+const CANDIDATOS_BMAD = ['_bmad'];
+export const ARQ_MANIFEST_BMAD = path.join('_bmad', '_config', 'manifest.yaml');
 
 export async function temBmadAqui(dir) {
   for (const c of CANDIDATOS_BMAD) {
@@ -12,6 +14,17 @@ export async function temBmadAqui(dir) {
     if (await existe(p)) return p;
   }
   return null;
+}
+
+// versão do BMAD instalado em `dir` (lê installation.version do manifest; sem dependência de yaml)
+export async function versaoBmadEm(dir) {
+  try {
+    const txt = await fs.readFile(path.join(dir, ARQ_MANIFEST_BMAD), 'utf8');
+    const m = txt.match(/^installation:\s*\n(?:[ \t]+.*\n)*?[ \t]+version:[ \t]*["']?([^"'\s]+)/m);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function listarProjetosBmad() {
