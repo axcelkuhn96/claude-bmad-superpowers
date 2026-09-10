@@ -26,11 +26,12 @@ cbs instalar
 2. Copia as skills de `base/skills/` pra `~/.claude/skills/` (executor-bmad-superpowers, refinador-de-prompt, investigador-de-ideia, grelhar, wayfinder, handoff).
 3. Copia os commands de `base/commands/` pra `~/.claude/commands/` (`/piloto`, `/executar`, `/refinar`, `/refinar-auto`, `/investigar`, `/revisar`, `/grelhar`, `/mapear`, `/handoff`, `/instalar-bmad`, `/atualizar`).
 4. Copia a árvore inteira de `base/personas/` pra `~/.claude/personas/`: `ponytail.md`, rulebooks de domínio em `dominios/` e lentes de review em `review/` — o executor passa o **caminho** desses arquivos aos subagents quando a task pertence ao domínio.
-5. Copia `base/config/models.yml` (modelo por papel: implementer, reviewer, final_review, e2e, investigar) pra `~/.claude/cbs-overrides/models.yml` **só se ainda não existir** — esse arquivo é seu, nem `instalar` nem `atualizar` sobrescrevem.
-6. Marca cada `.md` copiado com um rodapé `<!-- claude-bmad-superpowers:base vX.Y.Z -->` (usado pelo update pra saber o que pode sobrescrever).
-7. **Detecta** o plugin **Superpowers** (lendo `~/.claude/plugins/installed_plugins.json`); se não estiver instalado, mostra o comando exato pra rodar dentro do Claude Code (plugins não instalam via CLI fora do app).
-8. Grava a versão instalada em `~/.claude/cbs-overrides/.versao-instalada`.
-9. Sem `--apenas-global`, instala BMAD no diretório atual (ver abaixo).
+5. Copia os agentes de `base/agents/` pra `~/.claude/agents/` (`cbs-architect`, `cbs-reviewer`, `cbs-final-reviewer`, `cbs-backend`, `cbs-frontend`, `cbs-refactor`, `cbs-tester`, `cbs-explorer`, `cbs-search`) — subagentes do Claude Code com modelo, effort e tools fixados no frontmatter; os de review/exploração são read-only. Pra customizar um, copie pra `~/.claude/cbs-overrides/agents/`.
+6. Copia `base/config/models.yml` (agente/modelo por papel, com dois runtimes: `claude:` aponta pra um agente `cbs-*` ou um modelo direto; `codex:` aponta pra um agente em `~/.codex/agents/`) pra `~/.claude/cbs-overrides/models.yml` **só se ainda não existir** — esse arquivo é seu, nem `instalar` nem `atualizar` sobrescrevem. Precedência: argumento do comando > `cbs-overrides/models.yml` > default do pacote.
+7. Marca cada `.md` copiado com um rodapé `<!-- claude-bmad-superpowers:base vX.Y.Z -->` (usado pelo update pra saber o que pode sobrescrever).
+8. **Detecta** o plugin **Superpowers** (lendo `~/.claude/plugins/installed_plugins.json`); se não estiver instalado, mostra o comando exato pra rodar dentro do Claude Code (plugins não instalam via CLI fora do app).
+9. Grava a versão instalada em `~/.claude/cbs-overrides/.versao-instalada`.
+10. Sem `--apenas-global`, instala BMAD no diretório atual (ver abaixo).
 
 Flags: `--apenas-global` / `--skip-bmad` (não instala BMAD no cwd), `--skip-superpowers`.
 
@@ -43,7 +44,7 @@ npx claude-bmad-superpowers status
 Deve listar:
 - Versão instalada vs disponível
 - Skills e commands do pacote ativos em `~/.claude/`
-- Personas instaladas (base e overrides, incluindo `review/`) e se `cbs-overrides/models.yml` existe
+- Personas instaladas (base e overrides, incluindo `review/`), agentes `cbs-*` ativos em `~/.claude/agents/` e se `cbs-overrides/models.yml` existe
 - Versão do plugin Superpowers (lida de `installed_plugins.json`)
 - Skills de domínio detectadas (frontend-design, ui-ux-pro-max, taste-skill, dba)
 - BMAD no diretório atual e a versão do BMAD em cada projeto registrado (lida de `_bmad/_config/manifest.yaml`)

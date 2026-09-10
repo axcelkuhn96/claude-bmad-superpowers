@@ -2,7 +2,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
-  DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_OVERRIDES, MARCADOR,
+  DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_AGENTS, DIR_OVERRIDES, MARCADOR,
   lerVersaoPacote, lerVersaoInstalada, existe, RAIZ_CLAUDE,
 } from './caminhos.js';
 import { temBinarioClaude, plugInstalado, versoesPlugin } from './superpowers.js';
@@ -92,6 +92,17 @@ export async function status(_args = []) {
   }
   const review = personasBase.filter((p) => p.startsWith('review' + path.sep));
   if (review.length === 0) console.log('  ⚠  nenhuma persona em personas/review/ (seguranca, cobertura-de-testes)');
+  // agentes cbs-* (~/.claude/agents) + overrides (~/.claude/cbs-overrides/agents)
+  const agentsBase = (await listarComMarcador(DIR_AGENTS)).map((p) => path.relative(DIR_AGENTS, p));
+  const agentsOverride = await listarMd(path.join(DIR_OVERRIDES, 'agents'));
+  console.log(`Agentes do pacote ativos (${agentsBase.length} base, ${agentsOverride.length} override):`);
+  for (const a of agentsBase) {
+    const sobrescrito = agentsOverride.includes(a) ? '  (sobrescrito em cbs-overrides/)' : '';
+    console.log(`  ${a}${sobrescrito}`);
+  }
+  for (const a of agentsOverride) {
+    if (!agentsBase.includes(a)) console.log(`  ${a}  (só em cbs-overrides/)`);
+  }
   const modelsYml = path.join(DIR_OVERRIDES, 'models.yml');
   console.log(`Modelo por papel: ${(await existe(modelsYml)) ? '✓ ' + modelsYml : '✗ cbs-overrides/models.yml ausente (rode instalar/atualizar)'}`);
   console.log();

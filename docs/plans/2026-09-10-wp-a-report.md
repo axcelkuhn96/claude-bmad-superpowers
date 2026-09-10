@@ -18,10 +18,12 @@ Status: **concluído** (A1–A6). Nada commitado; mudanças no working tree.
 | `bin/cli.js` | ajuda (A1, A3, A4) |
 | `base/commands/atualizar.md` | A1, A2 |
 | `base/commands/instalar-bmad.md` | A2, A4 |
-| `base/config/models.yml` | **novo** (A6 / B2) |
+| `base/config/models.yml` | **novo** (A6 / B2); reescrito no adendo A7 (dois runtimes) |
+| `base/agents/cbs-*.md` (9) | **novo** (adendo A7) |
 | `test/smoke.js` | **novo** (A5) |
 | `package.json` | A5 (`"test": "node --test test/smoke.js"`) |
 | `INSTALL.md` | docs de tudo acima |
+| `src/caminhos.js` | adendo A7 (`DIR_AGENTS`) |
 
 ## Flags reais do BMAD (verificadas)
 
@@ -166,3 +168,46 @@ Projetos BMAD registrados (9):
 - Nomes em `SKILLS_DOMINIO` (`src/status.js`) devem bater com os que o roteador do executor (WP-B B4) e `frontend.md` (WP-C) usarem.
 - `base/VERSAO` e `package.json` continuam `0.11.0`; CHANGELOG `0.12.0` fica pro fechamento.
 - `docs/plans/` está untracked (contém o plano e este report).
+
+## Adendo A7 — models.yml com dois runtimes + agentes `cbs-*` instaláveis (pedido do team-lead, pós-commit `2609c49`)
+
+Sem commit; working tree.
+
+### `base/config/models.yml`
+Reescrito: 10 papéis (`orchestrator`, `architect`, `implementer_backend`, `implementer_frontend`, `refactor`, `reviewer`, `final_reviewer`, `tester`, `explorer`, `search`), cada um com `claude:` (agente em `~/.claude/agents/` **ou** modelo `sonnet|opus|fable|haiku|inherit`, com `effort:` opcional `low|medium|high|xhigh|max`) e `codex:` (agente em `~/.codex/agents/*.toml`). Defaults claude: `orchestrator = fable/max`, demais = `cbs-<papel>`. Defaults codex: `architect_sol`, `backend_terra`, `frontend_terra`, `refactor_terra`, `reviewer_sol`, `final_reviewer_sol`, `tester_luna`, `explorer_luna`, `search_spark` (nomes conferidos em `~/.codex/agents/*.toml`); `orchestrator.codex = null` (no Codex o orquestrador é a sessão). Comentários pt-BR com precedência: argumento > `cbs-overrides/models.yml` > default.
+
+Os papéis antigos (`implementer`, `final_review`, `e2e`, `investigar`) **saíram**; o WP-B (executor/piloto) precisa ler os novos nomes.
+
+### `base/agents/` (9 definições)
+Formato conferido em agentes de plugins instalados (`~/.claude/plugins/cache/claude-plugins-official/{pr-review-toolkit,feature-dev}/*/agents/*.md`): frontmatter `name`, `description`, `tools` (lista separada por vírgula), `model`, `color`; corpo em markdown. `claude agents` lista sessões (não definições), então a validação foi só pelo formato dos plugins.
+
+| Agente | model | effort | tools | Espelha (Codex) |
+|---|---|---|---|---|
+| cbs-architect | fable | xhigh | Read, Grep, Glob, WebFetch | architect_sol |
+| cbs-reviewer | opus | xhigh | Read, Grep, Glob, WebFetch | reviewer_sol |
+| cbs-final-reviewer | opus | xhigh | Read, Grep, Glob, WebFetch | final_reviewer_sol |
+| cbs-backend | opus | high | (todas) | backend_terra |
+| cbs-frontend | sonnet | high | (todas) | frontend_terra |
+| cbs-refactor | opus | high | (todas) | refactor_terra |
+| cbs-tester | sonnet | medium | (todas) | tester_luna |
+| cbs-explorer | haiku | medium | Read, Grep, Glob, WebFetch | explorer_luna |
+| cbs-search | haiku | low | Read, Grep, Glob, WebFetch | search_spark |
+
+Corpo curto em pt-BR: papel, regras (personas por caminho, ponytail, TDD por tipo, Playwright), e o contrato de retorno (status, arquivos/commit, 1 linha de teste, preocupações). Ressalva: `effort:` não aparece em nenhum agente de plugin instalado; foi incluído porque o team-lead pediu — se o Claude Code ignorar o campo, o modelo ainda vale e o effort fica só documental.
+
+### Instalador
+- `src/caminhos.js`: `DIR_AGENTS = ~/.claude/agents`.
+- `src/instalar.js`: `copiarArvore(base/agents → DIR_AGENTS)` com marcador (rodapé `<!-- ... -->` após o corpo; frontmatter intacto), cria `cbs-overrides/agents/`, README de overrides cita `agents/` e o `models.yml` novo.
+- `src/atualizar.js`: `atualizarArvore(base/agents)` (só sobrescreve com marcador).
+- `src/remover.js`: coleta/remove em `DIR_AGENTS`.
+- `src/status.js`: seção "Agentes do pacote ativos (N base, M override)" listando `cbs-*.md`, marcando sobrescritos em `cbs-overrides/agents/`.
+- `INSTALL.md`: passos 5–6 (agentes e models.yml com dois runtimes).
+
+### Smoke test
+`test/smoke.js` atualizado: valida os 10 papéis × (`claude`, `codex`) contra os defaults acima e `orchestrator.effort = max`; cada `base/agents/*.md` copiado com marcador, `name` == nome do arquivo, `description`, `model` e `effort` válidos; todo `cbs-*` referenciado em `models.yml` existe em `base/agents/`; `status` lista os agentes; `remover -y` apaga `cbs-reviewer.md`. Também cobre `base/scripts/*.sh` (WP-C): executável e marcador `#`.
+
+```
+npm test → ℹ tests 13  ℹ pass 13  ℹ fail 0  ℹ skipped 0
+```
+
+`node bin/cli.js status` no HOME real: "Agentes do pacote ativos (0 base, 0 override)" (ainda não instalado; esperado até rodar `instalar`/`atualizar`).

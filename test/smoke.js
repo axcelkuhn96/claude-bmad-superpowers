@@ -119,11 +119,61 @@ test('instalar --apenas-global copia skills, commands, personas e models.yml', a
   const modelsBase = await fs.readFile(path.join(BASE, 'config', 'models.yml'), 'utf8');
   const modelsInst = await fs.readFile(path.join(claude, 'cbs-overrides', 'models.yml'), 'utf8');
   assert.equal(modelsInst, modelsBase);
-  assert.match(modelsBase, /^implementer:\s*sonnet/m);
-  assert.match(modelsBase, /^reviewer:\s*opus/m);
-  assert.match(modelsBase, /^final_review:\s*opus/m);
-  assert.match(modelsBase, /^e2e:\s*sonnet/m);
-  assert.match(modelsBase, /^investigar:\s*inherit/m);
+  // papéis com os dois runtimes (claude: agente cbs-* ou modelo; codex: agente ~/.codex/agents)
+  const papeis = {
+    orchestrator: { claude: 'fable', codex: 'null' },
+    architect: { claude: 'cbs-architect', codex: 'architect_sol' },
+    implementer_backend: { claude: 'cbs-backend', codex: 'backend_terra' },
+    implementer_frontend: { claude: 'cbs-frontend', codex: 'frontend_terra' },
+    refactor: { claude: 'cbs-refactor', codex: 'refactor_terra' },
+    reviewer: { claude: 'cbs-reviewer', codex: 'reviewer_sol' },
+    final_reviewer: { claude: 'cbs-final-reviewer', codex: 'final_reviewer_sol' },
+    tester: { claude: 'cbs-tester', codex: 'tester_luna' },
+    explorer: { claude: 'cbs-explorer', codex: 'explorer_luna' },
+    search: { claude: 'cbs-search', codex: 'search_spark' },
+  };
+  for (const [papel, esperado] of Object.entries(papeis)) {
+    const bloco = modelsBase.match(new RegExp(`^${papel}:[^\\n]*\\n((?:[ \\t]+[^\\n]*\\n?)+)`, 'm'));
+    assert.ok(bloco, `papel ${papel} em models.yml`);
+    assert.match(bloco[1], new RegExp(`^\\s+claude:\\s*${esperado.claude}\\b`, 'm'), `${papel}.claude`);
+    assert.match(bloco[1], new RegExp(`^\\s+codex:\\s*${esperado.codex}\\b`, 'm'), `${papel}.codex`);
+  }
+  assert.match(modelsBase, /^orchestrator:[\s\S]*?^\s+effort:\s*max/m);
+
+  // agentes cbs-*: cada base/agents/*.md em ~/.claude/agents/ com marcador e frontmatter válido
+  const agentsBase = await listarMd(path.join(BASE, 'agents'));
+  assert.ok(agentsBase.length >= 9, `esperava ≥9 agentes no base, achei ${agentsBase.length}`);
+  for (const rel of agentsBase) {
+    const p = path.join(claude, 'agents', rel);
+    assert.ok(await existe(p), `agente ${rel} copiado`);
+    const txt = await fs.readFile(p, 'utf8');
+    assert.match(txt, new RegExp(MARCADOR), `marcador em ${rel}`);
+    const fm = txt.match(/^---\n([\s\S]*?)\n---\n/);
+    assert.ok(fm, `frontmatter em ${rel}`);
+    assert.match(fm[1], new RegExp(`^name:\\s*${path.basename(rel, '.md')}$`, 'm'), `name == arquivo em ${rel}`);
+    assert.match(fm[1], /^description:\s*\S/m, `description em ${rel}`);
+    assert.match(fm[1], /^model:\s*(sonnet|opus|fable|haiku|inherit)$/m, `model em ${rel}`);
+    assert.match(fm[1], /^effort:\s*(low|medium|high|xhigh|max)$/m, `effort em ${rel}`);
+  }
+  // todo agente cbs-* referenciado em models.yml existe
+  for (const m of modelsBase.matchAll(/^\s+claude:\s*(cbs-[\w-]+)/gm)) {
+    assert.ok(agentsBase.includes(`${m[1]}.md`), `agente ${m[1]} referenciado em models.yml existe em base/agents/`);
+  }
+  assert.ok(await existe(path.join(claude, 'cbs-overrides', 'agents')), 'cbs-overrides/agents/ criado');
+});
+
+test('instalar --apenas-global copia base/scripts/*.sh executáveis e com marcador', async (t) => {
+  const origem = path.join(BASE, 'scripts');
+  if (!(await existe(origem))) { t.skip('base/scripts/ ainda não existe'); return; }
+  const shs = (await fs.readdir(origem)).filter((n) => n.endsWith('.sh'));
+  assert.ok(shs.length > 0, 'esperava ao menos um .sh em base/scripts/');
+  for (const nome of shs) {
+    const p = path.join(claude, 'scripts', nome);
+    assert.ok(await existe(p), `script ${nome} copiado pra ~/.claude/scripts/`);
+    const st = await fs.stat(p);
+    assert.ok(st.mode & 0o111, `script ${nome} executável`);
+    assert.match(await fs.readFile(p, 'utf8'), new RegExp(`^#\\s*${MARCADOR}`, 'm'), `marcador # em ${nome}`);
+  }
 });
 
 test('instalar de novo não sobrescreve models.yml customizado', async () => {
@@ -174,6 +224,8 @@ test('status depois de instalar lista skills, personas e models.yml', () => {
   assert.match(out, /Skills do pacote ativos \([1-9]\d*\)/);
   assert.match(out, /Commands do pacote ativos \([1-9]\d*\)/);
   assert.match(out, /Personas instaladas \([1-9]\d* base/);
+  assert.match(out, /Agentes do pacote ativos \([1-9]\d* base, 0 override\)/);
+  assert.match(out, /^\s+cbs-reviewer\.md$/m);
   assert.match(out, /Modelo por papel: ✓/);
   assert.match(out, /Skills de domínio detectadas:/);
 });
@@ -207,6 +259,8 @@ test('remover -y apaga só arquivos com marcador e preserva cbs-overrides', asyn
   assert.equal(code, 0, out);
   assert.match(out, /arquivo\(s\) removido\(s\)/);
   assert.ok(!(await existe(path.join(claude, 'commands', 'piloto.md'))));
+  assert.ok(!(await existe(path.join(claude, 'scripts', 'gate-seguranca.sh'))), 'script com marcador removido');
+  assert.ok(!(await existe(path.join(claude, 'agents', 'cbs-reviewer.md'))), 'agente com marcador removido');
   assert.ok(await existe(path.join(claude, 'personas', 'ponytail.md')), 'arquivo sem marcador preservado');
   assert.ok(await existe(path.join(claude, 'cbs-overrides', 'models.yml')));
   assert.match(out, /superpowers@superpowers-marketplace/);

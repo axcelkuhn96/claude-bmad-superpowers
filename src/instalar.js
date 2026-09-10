@@ -2,7 +2,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
-  RAIZ_BASE, DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_OVERRIDES,
+  RAIZ_BASE, DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_SCRIPTS, DIR_AGENTS, DIR_OVERRIDES,
   ARQ_VERSAO_INSTALADA, MARCADOR, RAIZ_CLAUDE,
   garantirDir, lerVersaoPacote, existe,
 } from './caminhos.js';
@@ -11,13 +11,14 @@ import { instalarBmad } from './instalar-bmad.js';
 import { temBmadAqui } from './bmad.js';
 
 function rodapeParaArquivo(p, versao) {
-  if (!p.endsWith('.md')) return '';
-  return `\n\n<!-- ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/ pra não perder no /atualizar -->\n`;
+  if (p.endsWith('.md')) return `\n\n<!-- ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/ pra não perder no /atualizar -->\n`;
+  if (p.endsWith('.sh')) return `\n\n# ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/scripts/ pra não perder no /atualizar\n`;
+  return '';
 }
 
 function limparMarcadorAntigo(conteudo) {
-  // remove qualquer rodapé/cabeçalho antigo com o marcador
-  const regex = new RegExp(`\\n*<!--\\s*${MARCADOR}[^>]*-->\\n*`, 'g');
+  // remove qualquer rodapé/cabeçalho antigo com o marcador (forma .md `<!-- -->` ou .sh `# ...`)
+  const regex = new RegExp(`\\n*(<!--\\s*${MARCADOR}[^>]*-->|#\\s*${MARCADOR}[^\\n]*)\\n*`, 'g');
   return conteudo.replace(regex, '');
 }
 
@@ -26,6 +27,7 @@ async function copiarComMarcador(origem, destino, versao) {
   const limpo = limparMarcadorAntigo(conteudo).trimEnd();
   await garantirDir(path.dirname(destino));
   await fs.writeFile(destino, limpo + rodapeParaArquivo(destino, versao), 'utf8');
+  if (destino.endsWith('.sh')) await fs.chmod(destino, 0o755);
 }
 
 // models.yml (modelo por papel) é do usuário: copia o default SÓ se não existir
@@ -68,6 +70,8 @@ export async function instalar(args = []) {
   await garantirDir(path.join(DIR_OVERRIDES, 'skills'));
   await garantirDir(path.join(DIR_OVERRIDES, 'commands'));
   await garantirDir(path.join(DIR_OVERRIDES, 'personas'));
+  await garantirDir(path.join(DIR_OVERRIDES, 'scripts'));
+  await garantirDir(path.join(DIR_OVERRIDES, 'agents'));
 
   // copia skills
   const origemSkills = path.join(RAIZ_BASE, 'skills');
@@ -88,6 +92,20 @@ export async function instalar(args = []) {
   if (await existe(origemPersonas)) {
     console.log('→ Copiando personas de domínio...');
     await copiarArvore(origemPersonas, DIR_PERSONAS, versao);
+  }
+
+  // copia scripts (ex.: gate-seguranca.sh, rodado pelos reviewers de segurança)
+  const origemScripts = path.join(RAIZ_BASE, 'scripts');
+  if (await existe(origemScripts)) {
+    console.log('→ Copiando scripts...');
+    await copiarArvore(origemScripts, DIR_SCRIPTS, versao);
+  }
+
+  // copia agentes (subagentes cbs-* referenciados por papel em models.yml)
+  const origemAgents = path.join(RAIZ_BASE, 'agents');
+  if (await existe(origemAgents)) {
+    console.log('→ Copiando agentes cbs-*...');
+    await copiarArvore(origemAgents, DIR_AGENTS, versao);
   }
 
   // models.yml default → cbs-overrides/ (nunca sobrescreve)
@@ -112,7 +130,9 @@ Use pra customizar skills/commands do pacote sem perder no update:
 ├── skills/<nome>/SKILL.md   ← substitui ou complementa o base
 ├── commands/<nome>.md       ← substitui o base
 ├── personas/<caminho>.md    ← substitui personas/ (ponytail, dominios/, review/)
-└── models.yml               ← modelo por papel (implementer, reviewer, ...)
+├── scripts/<nome>.sh        ← substitui scripts/ (gate-seguranca.sh)
+├── agents/cbs-<papel>.md    ← substitui um agente cbs-* (modelo, effort, tools, prompt)
+└── models.yml               ← agente/modelo por papel (claude: e codex:)
 \`\`\`
 
 Convenção: se você criar um arquivo aqui com o mesmo caminho relativo de um arquivo do base, ele tem prioridade.

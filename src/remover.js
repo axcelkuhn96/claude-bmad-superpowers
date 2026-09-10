@@ -4,7 +4,7 @@ import path from 'node:path';
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import {
-  DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_OVERRIDES, ARQ_VERSAO_INSTALADA, MARCADOR, existe,
+  DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_SCRIPTS, DIR_AGENTS, DIR_OVERRIDES, ARQ_VERSAO_INSTALADA, MARCADOR, existe,
 } from './caminhos.js';
 
 async function arquivoTemMarcador(p) {
@@ -53,6 +53,8 @@ export async function remover(args = []) {
   await coletarRemoviveis(DIR_SKILLS, alvos);
   await coletarRemoviveis(DIR_COMMANDS, alvos);
   await coletarRemoviveis(DIR_PERSONAS, alvos);
+  await coletarRemoviveis(DIR_SCRIPTS, alvos);
+  await coletarRemoviveis(DIR_AGENTS, alvos);
 
   if (alvos.length === 0) {
     console.log('Nada pra remover.');
@@ -77,6 +79,8 @@ export async function remover(args = []) {
   await removerDirsVazios(DIR_SKILLS);
   await removerDirsVazios(DIR_COMMANDS);
   await removerDirsVazios(DIR_PERSONAS);
+  await removerDirsVazios(DIR_SCRIPTS);
+  await removerDirsVazios(DIR_AGENTS);
   try { await fs.rm(ARQ_VERSAO_INSTALADA, { force: true }); } catch {}
 
   console.log(`✓ ${alvos.length} arquivo(s) removido(s).`);

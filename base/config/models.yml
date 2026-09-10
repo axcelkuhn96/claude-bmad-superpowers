@@ -1,17 +1,61 @@
-# claude-bmad-superpowers — modelo por papel (lido por /executar e /piloto)
+# claude-bmad-superpowers — modelo/agente por papel (lido por /executar e /piloto)
 #
 # Copiado pelo instalador pra ~/.claude/cbs-overrides/models.yml SÓ se não existir.
 # Edite a cópia em cbs-overrides/ — o /atualizar nunca sobrescreve.
 #
-# Valores aceitos: sonnet | opus | fable | haiku | inherit
-#   inherit = usa o modelo da sessão atual do Claude Code
+# Precedência (maior vence):
+#   1. argumento do comando:  /executar models=implementer_backend:sonnet,reviewer:opus <prompt>
+#                             /piloto modelo=opus <ideia>            (todos os papéis)
+#   2. ~/.claude/cbs-overrides/models.yml (este arquivo, editado por você)
+#   3. default do pacote (base/config/models.yml)
 #
-# Override pontual por argumento do comando:
-#   /executar models=implementer:sonnet,reviewer:opus <prompt>
-#   /piloto modelo=opus <ideia>            (todos os papéis)
+# Cada papel tem dois runtimes:
+#   claude: nome de um agente em ~/.claude/agents/ (instalados pelo pacote: cbs-*)
+#           OU um modelo direto: sonnet | opus | fable | haiku | inherit
+#           effort (opcional, só faz sentido com modelo direto): low | medium | high | xhigh | max
+#           inherit = usa o modelo da sessão atual do Claude Code
+#   codex:  nome de um agente em ~/.codex/agents/ (*.toml)
+#
+# Quando `claude:` aponta pra um agente, modelo/effort/tools vêm do frontmatter do agente
+# (override do agente: copie ~/.claude/agents/cbs-*.md pra ~/.claude/cbs-overrides/agents/).
 
-implementer: sonnet      # implementa cada task (TDD)
-reviewer: opus           # task reviewer / re-reviewer por task
-final_review: opus       # review final da branch (código + segurança + cobertura)
-e2e: sonnet              # validação E2E / browser (Playwright)
-investigar: inherit      # /investigar, /grelhar, /mapear (discovery)
+orchestrator:                 # contexto principal (quem despacha e revisa o que volta)
+  claude: fable
+  effort: max
+  codex: null                 # no Codex o orquestrador é a sessão atual
+
+architect:                    # arquitetura, decisões difíceis, debugging profundo (read-only)
+  claude: cbs-architect
+  codex: architect_sol
+
+implementer_backend:          # APIs, regras de negócio, integrações, persistência
+  claude: cbs-backend
+  codex: backend_terra
+
+implementer_frontend:         # telas, componentes, estado visual, a11y
+  claude: cbs-frontend
+  codex: frontend_terra
+
+refactor:                     # refatoração estrutural preservando comportamento
+  claude: cbs-refactor
+  codex: refactor_terra
+
+reviewer:                     # task reviewer / re-reviewer por task (read-only)
+  claude: cbs-reviewer
+  codex: reviewer_sol
+
+final_reviewer:               # review final da branch: integração, testes, segurança, cobertura (read-only)
+  claude: cbs-final-reviewer
+  codex: final_reviewer_sol
+
+tester:                       # rodar/escrever testes delimitados, E2E/Playwright, reprodução curta
+  claude: cbs-tester
+  codex: tester_luna
+
+explorer:                     # mapear fluxos/arquivos/símbolos sem editar (read-only)
+  claude: cbs-explorer
+  codex: explorer_luna
+
+search:                       # busca one-shot: contagem, caminhos, linhas (read-only)
+  claude: cbs-search
+  codex: search_spark

@@ -4,7 +4,7 @@ import path from 'node:path';
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import {
-  RAIZ_BASE, DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, ARQ_VERSAO_INSTALADA,
+  RAIZ_BASE, DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_SCRIPTS, DIR_AGENTS, ARQ_VERSAO_INSTALADA,
   MARCADOR, lerVersaoPacote, lerVersaoInstalada, existe, garantirDir,
 } from './caminhos.js';
 import { tentarAtualizarSuperpowers } from './superpowers.js';
@@ -22,7 +22,7 @@ async function arquivoTemMarcador(p) {
 }
 
 function limparMarcadorAntigo(conteudo) {
-  const regex = new RegExp(`\\n*<!--\\s*${MARCADOR}[^>]*-->\\n*`, 'g');
+  const regex = new RegExp(`\\n*(<!--\\s*${MARCADOR}[^>]*-->|#\\s*${MARCADOR}[^\\n]*)\\n*`, 'g');
   return conteudo.replace(regex, '');
 }
 
@@ -34,11 +34,12 @@ async function copiarSeBase(origem, destino, versao) {
   }
   const conteudo = await fs.readFile(origem, 'utf8');
   const limpo = limparMarcadorAntigo(conteudo).trimEnd();
-  const rodape = destino.endsWith('.md')
-    ? `\n\n<!-- ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/ pra não perder no /atualizar -->\n`
-    : '';
+  let rodape = '';
+  if (destino.endsWith('.md')) rodape = `\n\n<!-- ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/ pra não perder no /atualizar -->\n`;
+  else if (destino.endsWith('.sh')) rodape = `\n\n# ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/scripts/ pra não perder no /atualizar\n`;
   await garantirDir(path.dirname(destino));
   await fs.writeFile(destino, limpo + rodape, 'utf8');
+  if (destino.endsWith('.sh')) await fs.chmod(destino, 0o755);
   return { acao: 'atualizado', destino };
 }
 
@@ -104,6 +105,12 @@ export async function atualizar(args = []) {
   }
   if (await existe(path.join(RAIZ_BASE, 'personas'))) {
     await atualizarArvore(path.join(RAIZ_BASE, 'personas'), DIR_PERSONAS, versaoNova, resultado);
+  }
+  if (await existe(path.join(RAIZ_BASE, 'scripts'))) {
+    await atualizarArvore(path.join(RAIZ_BASE, 'scripts'), DIR_SCRIPTS, versaoNova, resultado);
+  }
+  if (await existe(path.join(RAIZ_BASE, 'agents'))) {
+    await atualizarArvore(path.join(RAIZ_BASE, 'agents'), DIR_AGENTS, versaoNova, resultado);
   }
   const models = await garantirModelsOverride();
   if (models.acao === 'criado') resultado.atualizado.push(models.destino);
