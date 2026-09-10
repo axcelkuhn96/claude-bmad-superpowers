@@ -174,7 +174,7 @@ Projetos BMAD registrados (9):
 Sem commit; working tree.
 
 ### `base/config/models.yml`
-Reescrito: 10 papéis (`orchestrator`, `architect`, `implementer_backend`, `implementer_frontend`, `refactor`, `reviewer`, `final_reviewer`, `tester`, `explorer`, `search`), cada um com `claude:` (agente em `~/.claude/agents/` **ou** modelo `sonnet|opus|fable|haiku|inherit`, com `effort:` opcional `low|medium|high|xhigh|max`) e `codex:` (agente em `~/.codex/agents/*.toml`). Defaults claude: `orchestrator = fable/max`, demais = `cbs-<papel>`. Defaults codex: `architect_sol`, `backend_terra`, `frontend_terra`, `refactor_terra`, `reviewer_sol`, `final_reviewer_sol`, `tester_luna`, `explorer_luna`, `search_spark` (nomes conferidos em `~/.codex/agents/*.toml`); `orchestrator.codex = null` (no Codex o orquestrador é a sessão). Comentários pt-BR com precedência: argumento > `cbs-overrides/models.yml` > default.
+Reescrito: 10 papéis (`orchestrator`, `architect`, `implementer_backend`, `implementer_frontend`, `refactor`, `reviewer`, `final_reviewer`, `tester`, `explorer`, `search`), cada um com `claude:` (agente em `~/.claude/agents/` **ou** modelo `sonnet|opus|fable|inherit`, com `effort:` opcional `low|medium|high|xhigh|max`) e `codex:` (agente em `~/.codex/agents/*.toml`). Defaults claude: `orchestrator = fable/max`, demais = `cbs-<papel>`. Defaults codex: `architect_sol`, `backend_terra`, `frontend_terra`, `refactor_terra`, `reviewer_sol`, `final_reviewer_sol`, `tester_luna`, `explorer_luna`, `search_spark` (nomes conferidos em `~/.codex/agents/*.toml`); `orchestrator.codex = null` (no Codex o orquestrador é a sessão). Comentários pt-BR com precedência: argumento > `cbs-overrides/models.yml` > default.
 
 Os papéis antigos (`implementer`, `final_review`, `e2e`, `investigar`) **saíram**; o WP-B (executor/piloto) precisa ler os novos nomes.
 
@@ -190,8 +190,8 @@ Formato conferido em agentes de plugins instalados (`~/.claude/plugins/cache/cla
 | cbs-frontend | sonnet | high | (todas) | frontend_terra |
 | cbs-refactor | opus | high | (todas) | refactor_terra |
 | cbs-tester | sonnet | medium | (todas) | tester_luna |
-| cbs-explorer | haiku | medium | Read, Grep, Glob, WebFetch | explorer_luna |
-| cbs-search | haiku | low | Read, Grep, Glob, WebFetch | search_spark |
+| cbs-explorer | sonnet | medium | Read, Grep, Glob, WebFetch | explorer_luna |
+| cbs-search | sonnet | low | Read, Grep, Glob, WebFetch | search_spark |
 
 Corpo curto em pt-BR: papel, regras (personas por caminho, ponytail, TDD por tipo, Playwright), e o contrato de retorno (status, arquivos/commit, 1 linha de teste, preocupações). Ressalva: `effort:` não aparece em nenhum agente de plugin instalado; foi incluído porque o team-lead pediu — se o Claude Code ignorar o campo, o modelo ainda vale e o effort fica só documental.
 

@@ -152,7 +152,7 @@ test('instalar --apenas-global copia skills, commands, personas e models.yml', a
     assert.ok(fm, `frontmatter em ${rel}`);
     assert.match(fm[1], new RegExp(`^name:\\s*${path.basename(rel, '.md')}$`, 'm'), `name == arquivo em ${rel}`);
     assert.match(fm[1], /^description:\s*\S/m, `description em ${rel}`);
-    assert.match(fm[1], /^model:\s*(sonnet|opus|fable|haiku|inherit)$/m, `model em ${rel}`);
+    assert.match(fm[1], /^model:\s*(sonnet|opus|fable|inherit)$/m, `model em ${rel}`);
     assert.match(fm[1], /^effort:\s*(low|medium|high|xhigh|max)$/m, `effort em ${rel}`);
   }
   // todo agente cbs-* referenciado em models.yml existe
@@ -162,17 +162,17 @@ test('instalar --apenas-global copia skills, commands, personas e models.yml', a
   assert.ok(await existe(path.join(claude, 'cbs-overrides', 'agents')), 'cbs-overrides/agents/ criado');
 });
 
-test('instalar --apenas-global copia base/scripts/*.sh executáveis e com marcador', async (t) => {
+test('instalar --apenas-global copia base/scripts/*.js executáveis e com marcador', async (t) => {
   const origem = path.join(BASE, 'scripts');
   if (!(await existe(origem))) { t.skip('base/scripts/ ainda não existe'); return; }
-  const shs = (await fs.readdir(origem)).filter((n) => n.endsWith('.sh'));
-  assert.ok(shs.length > 0, 'esperava ao menos um .sh em base/scripts/');
+  const shs = (await fs.readdir(origem)).filter((n) => n.endsWith('.js'));
+  assert.ok(shs.length > 0, 'esperava ao menos um .js em base/scripts/');
   for (const nome of shs) {
     const p = path.join(claude, 'scripts', nome);
     assert.ok(await existe(p), `script ${nome} copiado pra ~/.claude/scripts/`);
     const st = await fs.stat(p);
     assert.ok(st.mode & 0o111, `script ${nome} executável`);
-    assert.match(await fs.readFile(p, 'utf8'), new RegExp(`^#\\s*${MARCADOR}`, 'm'), `marcador # em ${nome}`);
+    assert.match(await fs.readFile(p, 'utf8'), new RegExp(`^//\\s*${MARCADOR}`, 'm'), `marcador // em ${nome}`);
   }
 });
 
@@ -259,7 +259,7 @@ test('remover -y apaga só arquivos com marcador e preserva cbs-overrides', asyn
   assert.equal(code, 0, out);
   assert.match(out, /arquivo\(s\) removido\(s\)/);
   assert.ok(!(await existe(path.join(claude, 'commands', 'piloto.md'))));
-  assert.ok(!(await existe(path.join(claude, 'scripts', 'gate-seguranca.sh'))), 'script com marcador removido');
+  assert.ok(!(await existe(path.join(claude, 'scripts', 'gate-seguranca.js'))), 'script com marcador removido');
   assert.ok(!(await existe(path.join(claude, 'agents', 'cbs-reviewer.md'))), 'agente com marcador removido');
   assert.ok(await existe(path.join(claude, 'personas', 'ponytail.md')), 'arquivo sem marcador preservado');
   assert.ok(await existe(path.join(claude, 'cbs-overrides', 'models.yml')));

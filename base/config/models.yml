@@ -11,7 +11,7 @@
 #
 # Cada papel tem dois runtimes:
 #   claude: nome de um agente em ~/.claude/agents/ (instalados pelo pacote: cbs-*)
-#           OU um modelo direto: sonnet | opus | fable | haiku | inherit
+#           OU um modelo direto: sonnet | opus | fable | inherit
 #           effort (opcional, só faz sentido com modelo direto): low | medium | high | xhigh | max
 #           inherit = usa o modelo da sessão atual do Claude Code
 #   codex:  nome de um agente em ~/.codex/agents/ (*.toml)
