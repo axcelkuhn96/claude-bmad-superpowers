@@ -12,13 +12,13 @@ import { temBmadAqui } from './bmad.js';
 
 function rodapeParaArquivo(p, versao) {
   if (p.endsWith('.md')) return `\n\n<!-- ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/ pra não perder no /atualizar -->\n`;
-  if (p.endsWith('.sh')) return `\n\n# ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/scripts/ pra não perder no /atualizar\n`;
+  if (p.endsWith('.js')) return `\n\n// ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/scripts/ pra não perder no /atualizar\n`;
   return '';
 }
 
 function limparMarcadorAntigo(conteudo) {
-  // remove qualquer rodapé/cabeçalho antigo com o marcador (forma .md `<!-- -->` ou .sh `# ...`)
-  const regex = new RegExp(`\\n*(<!--\\s*${MARCADOR}[^>]*-->|#\\s*${MARCADOR}[^\\n]*)\\n*`, 'g');
+  // remove qualquer rodapé/cabeçalho antigo com o marcador (forma .md `<!-- -->` ou .js `// ...`)
+  const regex = new RegExp(`\\n*(<!--\\s*${MARCADOR}[^>]*-->|(?:#|//)\\s*${MARCADOR}[^\\n]*)\\n*`, 'g');
   return conteudo.replace(regex, '');
 }
 
@@ -27,7 +27,7 @@ async function copiarComMarcador(origem, destino, versao) {
   const limpo = limparMarcadorAntigo(conteudo).trimEnd();
   await garantirDir(path.dirname(destino));
   await fs.writeFile(destino, limpo + rodapeParaArquivo(destino, versao), 'utf8');
-  if (destino.endsWith('.sh')) await fs.chmod(destino, 0o755);
+  if (destino.endsWith('.js')) await fs.chmod(destino, 0o755);
 }
 
 // models.yml (modelo por papel) é do usuário: copia o default SÓ se não existir
@@ -94,7 +94,7 @@ export async function instalar(args = []) {
     await copiarArvore(origemPersonas, DIR_PERSONAS, versao);
   }
 
-  // copia scripts (ex.: gate-seguranca.sh, rodado pelos reviewers de segurança)
+  // copia scripts (ex.: gate-seguranca.js, rodado pelos reviewers de segurança)
   const origemScripts = path.join(RAIZ_BASE, 'scripts');
   if (await existe(origemScripts)) {
     console.log('→ Copiando scripts...');
@@ -130,7 +130,7 @@ Use pra customizar skills/commands do pacote sem perder no update:
 ├── skills/<nome>/SKILL.md   ← substitui ou complementa o base
 ├── commands/<nome>.md       ← substitui o base
 ├── personas/<caminho>.md    ← substitui personas/ (ponytail, dominios/, review/)
-├── scripts/<nome>.sh        ← substitui scripts/ (gate-seguranca.sh)
+├── scripts/<nome>.js        ← substitui scripts/ (gate-seguranca.js)
 ├── agents/cbs-<papel>.md    ← substitui um agente cbs-* (modelo, effort, tools, prompt)
 └── models.yml               ← agente/modelo por papel (claude: e codex:)
 \`\`\`

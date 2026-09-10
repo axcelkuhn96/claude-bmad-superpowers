@@ -22,7 +22,7 @@ async function arquivoTemMarcador(p) {
 }
 
 function limparMarcadorAntigo(conteudo) {
-  const regex = new RegExp(`\\n*(<!--\\s*${MARCADOR}[^>]*-->|#\\s*${MARCADOR}[^\\n]*)\\n*`, 'g');
+  const regex = new RegExp(`\\n*(<!--\\s*${MARCADOR}[^>]*-->|(?:#|//)\\s*${MARCADOR}[^\\n]*)\\n*`, 'g');
   return conteudo.replace(regex, '');
 }
 
@@ -36,10 +36,10 @@ async function copiarSeBase(origem, destino, versao) {
   const limpo = limparMarcadorAntigo(conteudo).trimEnd();
   let rodape = '';
   if (destino.endsWith('.md')) rodape = `\n\n<!-- ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/ pra não perder no /atualizar -->\n`;
-  else if (destino.endsWith('.sh')) rodape = `\n\n# ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/scripts/ pra não perder no /atualizar\n`;
+  else if (destino.endsWith('.js')) rodape = `\n\n// ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/scripts/ pra não perder no /atualizar\n`;
   await garantirDir(path.dirname(destino));
   await fs.writeFile(destino, limpo + rodape, 'utf8');
-  if (destino.endsWith('.sh')) await fs.chmod(destino, 0o755);
+  if (destino.endsWith('.js')) await fs.chmod(destino, 0o755);
   return { acao: 'atualizado', destino };
 }
 

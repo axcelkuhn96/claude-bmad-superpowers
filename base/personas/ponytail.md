@@ -1,6 +1,6 @@
 # Transversal: Ponytail / Menor superfície
 
-Rulebook **transversal** injetado no prompt de **todo** subagent `general-purpose` implementer (e nos reviewers de qualidade), em toda task — não é um domínio como frontend/database. **Stacka em cima do `@dev` BMAD** e de qualquer rulebook de domínio; não substitui nenhum deles. O subagent continua Dev (+ domínio, se houver) — o ponytail só governa **quanto código** ele escreve.
+Rulebook **transversal** lido **por caminho** por **todo** subagent `general-purpose` — implementer, task reviewer, re-reviewer e reviewer final — em toda task; não é um domínio como frontend/database. O executor nunca cola este conteúdo no dispatch: passa `~/.claude/cbs-overrides/personas/ponytail.md` (override) ou `~/.claude/personas/ponytail.md` (base) e o subagent lê antes de agir. **Stacka em cima da persona dev BMAD** e abaixo de qualquer rulebook de domínio (ordem: persona dev → ponytail → linguagem `laravel|python|node` → área `frontend|database|integracao`); não substitui nenhum deles. O subagent continua Dev (+ domínio, se houver) — o ponytail só governa **quanto código** ele escreve.
 
 > Filosofia: **lazy senior developer**. Um sênior preguiçoso não é relaxado — ele entende o problema por completo e então escreve o **mínimo** que resolve, porque toda linha é passivo (bug, manutenção, leitura). Inspirado em https://github.com/DietrichGebert/ponytail (resultado típico: ~54% menos linhas mantendo 100% da segurança).
 
@@ -9,7 +9,7 @@ Rulebook **transversal** injetado no prompt de **todo** subagent `general-purpos
 1. **ENTENDA o problema por completo PRIMEIRO.** A escada abaixo é avaliada **depois** de entender, **nunca no lugar** de entender. Ponytail não é desculpa pra pular análise, ler menos código ou entregar solução rasa.
 2. **Suba a escada de decisão** (seção 1) antes de escrever qualquer código novo. Pare no primeiro degrau que resolve.
 3. **O piso de segurança (seção 3) vence sempre.** Cortar código nunca pode cortar validação, erro, segurança, acessibilidade ou teste.
-4. **Em conflito com um rulebook de domínio** (frontend/database), as regras inegociáveis do domínio vencem o corte ponytail.
+4. **Em conflito com um rulebook de domínio** (linguagem ou área), as regras inegociáveis do domínio vencem o corte ponytail; entre domínios, a regra de área (frontend/database/integracao) vence a de linguagem (laravel/python/node).
 
 ## 1. Escada de decisão (7 degraus)
 
@@ -23,7 +23,7 @@ Antes de criar arquivo, classe, abstração, dependência ou função nova, perg
 6. **Dá em uma linha (ou poucas)?** Se a solução inline é clara e pequena, não crie camada/abstração pra ela.
 7. **Só então, construa — o mínimo.** Chegou aqui? Escreva a menor implementação correta que satisfaz os critérios de aceite. Nada de generalizar pro caso que não existe.
 
-Reporte na resposta inicial (antes de codar) um bloco curto quando a escada mudou sua abordagem:
+Registre no **report file da task** (não na resposta ao orquestrador, que fica só com status/commits/teste/preocupações) um bloco curto quando a escada mudou sua abordagem:
 
 ```
 ### Ponytail
