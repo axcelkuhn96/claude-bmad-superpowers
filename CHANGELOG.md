@@ -2,6 +2,42 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.12.0] - 2026-09-10
+
+Release guiada por três análises em `cbs-lab/docs/analises/` (auditoria do pacote, histórico de uso de 169 sessões, pesquisa de 45 personas/skills). Requer Superpowers ≥ 6.3.0 e BMAD ≥ 6.12.0.
+
+### Adicionado
+- **Modo autônomo**: `/piloto --auto` e `/executar --auto` (ou `auto` como primeira palavra). Um único gate obrigatório antes de `git push`/deploy/merge em main; o executor responde sozinho os menus do BMAD, do brainstorming e do writing-plans. Sem TTY/`CLAUDE_AUTONOMOUS` comporta como `--auto`.
+- **Modelo por papel** em `~/.claude/cbs-overrides/models.yml` (10 papéis: orchestrator, architect, implementer_backend, implementer_frontend, refactor, reviewer, final_reviewer, tester, explorer, search), com duas colunas por papel: `claude:` (agente nomeado ou modelo) e `codex:` (nome do agente). Override por argumento `models=papel:valor,...` ou `modelo=opus`. Precedência: argumento > override > default. Sem haiku.
+- **9 agentes Claude Code** instalados em `~/.claude/agents/` (`cbs-architect`, `cbs-reviewer`, `cbs-final-reviewer`, `cbs-backend`, `cbs-frontend`, `cbs-refactor`, `cbs-tester`, `cbs-explorer`, `cbs-search`), espelhando os agentes do Codex (`architect_sol`, `reviewer_sol`, `final_reviewer_sol`, `backend_terra`, `frontend_terra`, `refactor_terra`, `tester_luna`, `explorer_luna`, `search_spark`). Override em `cbs-overrides/agents/`.
+- **Runtime Claude/Codex**: as skills detectam o runtime e, no Codex, despacham só por nome de agente (nunca passam modelo).
+- **Personas de domínio**: `dominios/laravel.md` (Laravel Boost + ECC), `dominios/python.md`, `dominios/node.md` (Express/TypeScript, segurança em primeiro), `dominios/integracao.md` (conectores, HTTP client, webhooks). Roteamento por sinais de arquivo/story, até 2 domínios por task, ordem `@dev → ponytail → linguagem → área`.
+- **Lentes de review** em `personas/review/`: `seguranca.md` (sempre no reviewer de qualquer backend; tabelas PHP/Python/Node em `seguranca-referencia.md`) e `cobertura-de-testes.md` (reviewer final). Só reviewers recebem.
+- **Gate de segurança** `~/.claude/scripts/gate-seguranca.js` (Node, cross-platform): gitleaks + semgrep com baseline + `composer audit`/`pip-audit` + `ruff --select S`/`npm audit`. Roda antes de DONE/push em task backend; exit 1 bloqueia, ferramenta ausente só avisa.
+- `/revisar` vira skill (`revisor`) e gate final automático do `/piloto`/`/executar`.
+- `/investigar` estritamente read-only, com seção obrigatória "O que quebra se mudar".
+- TDD por tipo de tarefa: `regra-de-negocio` mantém RED-GREEN; `operacional`/`ui` aceitam validação E2E/browser.
+- `frontend.md` vira roteador de 2 KB (escolhe uma skill por situação: `frontend-design`, checklist do `ui-ux-pro-max` 2.13, Design Read do taste-skill); conteúdo integral + modos de superfície, piso de craft e checklist do reviewer de UI em `frontend-referencia.md`.
+- CLI: `atualizar --projetos a,b`; `status` mostra Superpowers, BMAD por projeto, personas, agentes, `models.yml` e skills de domínio; `test/smoke.js` (13 testes, HOME temporário) em `npm test`.
+
+### Alterado
+- Executor alinhado ao `subagent-driven-development` 6.3.0: implementer, task reviewer, re-review, final reviewer, ledger, briefs/reports em `.superpowers/sdd/`, para antes do Finish e chama `finishing-a-development-branch` uma vez; branch `feat/<slug>` quando estiver em main.
+- Personas e rulebooks passados **por caminho** (`~/.claude/personas/...`), nunca colados no dispatch. Executor de 23,7 KB para 16,4 KB; tabelas em `referencia/`.
+- BMAD 6.12: `bmad-prd`, `bmad-create-epics-and-stories`, `bmad-spec`, `bmad-architecture`; `_bmad/` em todo lugar; instalação com `--directory`, `--action update`, idioma pt-BR.
+- Saída no chat de 1 linha por fase; detalhe em `.superpowers/sdd/*-report.md`.
+- `/refinar` e `/refinar-auto` viram alias de `/piloto --so-refinar`.
+- `remover` usa `bmad-method uninstall` e `superpowers@superpowers-marketplace`.
+
+### Corrigido
+- `atualizar` travava sem TTY (readline); agora sem TTY equivale a `--auto-bmad`.
+- `instalar-bmad` sem `--directory` saía 0 sem instalar quando não havia TTY.
+- `instalar-bmad --force` apagava `_bmad/` mas deixava as skills `bmad-*`.
+- `npm test` apontava para arquivo inexistente.
+
+### Removido
+- Referências a `@qa`, `@sm`, `.bmad-core/`, `bmad-create-prd`, `bmad-create-architecture`, `install --update`, `superpowers@obra`.
+- `haiku` dos valores aceitos.
+
 ## [0.11.0] - 2026-07-16
 
 ### Mudou — grelhar agora pergunta no seletor interativo do CLI
