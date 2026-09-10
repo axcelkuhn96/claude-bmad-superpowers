@@ -1,15 +1,16 @@
 ---
-description: Transforma uma ideia crua em prompt premium contextualizado pelo projeto. Pergunta dúvidas bloqueantes antes de gerar o prompt final.
+description: Transforma uma ideia crua em prompt premium contextualizado pelo projeto, gravado em docs/prompts/. Alias de `/piloto --so-refinar` — grelha as decisões e pergunta só dúvidas bloqueantes antes do prompt final; não executa.
 ---
 
-**ORDEM OBRIGATÓRIA — sem julgamento, sem exceção:**
+Este comando é um **alias fino**: equivale a `/piloto --so-refinar <entrada>`.
 
-1. **PRIMEIRO**: invoque `Skill` com `skill: "mem-search"` passando a entrada do usuário como query. Mesmo se a ideia parecer trivial — você não decide se vale; rode sempre. Se a skill `mem-search` não existir, tente `claude-mem:mem-search`. Se nenhuma existir, registre "Memória: não disponível" e siga.
-2. **SÓ DEPOIS**: invoque `Skill` com `skill: "refinador-de-prompt"`, passando a entrada + um resumo curto do que a memória retornou (ou "nada relevante encontrado").
+Invoque `Skill` com `skill: "piloto"` passando `--so-refinar` + a entrada do usuário. Se não for possível encadear o comando, execute você mesmo as Etapas 0–2 do `/piloto`, na ordem, sem pular:
 
-Não responda nem rode Bash/Read/Grep antes desses 2 passos.
+1. `Skill` `claude-mem:mem-search` (fallback `mem-search`) com a entrada como query — sem exceção; sem skill, "Memória: não disponível".
+2. `Skill` `grelhar` (entrada + resumo da memória) — uma pergunta por vez, só decisões; espere "fechou".
+3. `Skill` `refinador-de-prompt` (entrada + memória + decisões da grelha, modo normal) — grava `docs/prompts/<data>-<slug>.md`, responde 1 linha e pergunta `ok` / ajuste. Pare após o `ok`; **não** invoque o executor.
 
-**Importante:** Se houver dúvidas bloqueantes, a skill vai PERGUNTAR antes de gerar o prompt. Mesmo se a ideia for ruim (ex.: recriar algo que existe), emita o formato completo — não termine cedo.
+Não responda nem rode Bash/Read/Grep antes do passo 1.
 
 Entrada do usuário:
 

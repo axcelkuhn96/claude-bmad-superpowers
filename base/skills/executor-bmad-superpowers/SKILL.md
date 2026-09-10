@@ -1,298 +1,152 @@
 ---
 name: executor-bmad-superpowers
-description: Use esta skill quando o usuário tiver um prompt refinado, spec ou PRD em mãos e quiser EXECUTAR — construir a feature até a entrega validada. A execução é DELEGADA ao Superpowers (brainstorming, plano, subagent-driven development com TDD e dois reviewers por task, verification). BMAD entra SEMPRE: gera as stories no planejamento e suas personas (@dev, @qa, review) são injetadas em cada subagent general-purpose.
+description: Use esta skill quando o usuário tiver um prompt refinado, spec ou PRD e quiser EXECUTAR até a entrega validada. Orquestra o Superpowers 6.3 (brainstorming → writing-plans → subagent-driven-development → finishing-a-development-branch) com a disciplina BMAD 6.12 (stories; persona dev, ponytail e rulebooks lidos POR CAMINHO). Suporta --auto, models.yml (agente por papel, runtime Claude/Codex), roteamento por domínio e TDD por tipo.
 ---
 
-# Executor (Superpowers como motor de execução)
+# Executor (Superpowers como motor, BMAD como disciplina)
 
-Você é um **orquestrador sênior**. Você **não implementa inline** — você conduz uma feature do prompt refinado até a entrega validada **delegando a execução ao Superpowers**, que garante qualidade (TDD real, subagents isolados, dois reviewers por task, verificação antes de declarar pronto).
+Você é o **orquestrador** do contexto principal. Você **não implementa inline**: conduz a feature do prompt refinado até a entrega delegando ao Superpowers, que garante TDD, subagents isolados, um task reviewer por task e um review final da branch.
 
-**Divisão de responsabilidades (SEMPRE os dois juntos, em camadas):**
-- **Superpowers = motor de execução**: brainstorming → plano → subagent-driven-development → verification. Dá a mecânica — subagents isolados por task, TDD, 2 reviewers, contexto principal limpo.
-- **BMAD = disciplina de processo**: gera as stories no planejamento (Fase 3) e suas personas (`@dev`, `@qa`, review) são **injetadas em cada subagent `general-purpose`** que o Superpowers dispara. Dá o rigor — story → dev → qa → ready for review, rodando *dentro* da mecânica do Superpowers.
+- **Superpowers 6.3 = motor**: `brainstorming` → `writing-plans` → `subagent-driven-development` (SDD) → `finishing-a-development-branch`.
+- **BMAD 6.12 = disciplina**: stories no planejamento (`bmad-create-epics-and-stories`), persona dev e rulebooks lidos **por caminho** dentro de cada subagent.
+- Não há flag pra desligar: toda execução usa os dois.
 
-Não são alternativas e não há flag pra desligar: **toda execução usa os dois**. Superpowers nunca roda "puro" (sem a disciplina BMAD nos subagents), e BMAD nunca roda "puro" (sem a mecânica de subagents do Superpowers).
+Referências: `referencia/roteamento.md` (domínios, lentes, TDD por tipo), `referencia/dispatch.md` (prompt por papel), `referencia/persona-dev.md`, `referencia/entrega.md`.
 
-## ⚠️ PRIMEIRA AÇÃO — SEMPRE consultar memória persistente
+## Modo e gates
 
-Se você ainda não chamou `mem-search` (ou `claude-mem:mem-search` / `claude-mem:smart-search`) com o tema do prompt como query — **chame agora, antes de qualquer outra ação**. Sem exceção. Decisões anteriores sobre arquitetura, padrões e bugs já resolvidos no mesmo domínio mudam a abordagem. Se nenhuma skill de memória existir, marque "Memória: não disponível" na Fase 1 e siga.
+Determine o modo na primeira ação e registre em 1 linha (`modo: auto` ou `modo: normal`).
 
-## ⚠️ FORMATO OBRIGATÓRIO — TODAS AS 7 FASES VISÍVEIS
+**Modo auto** vale quando qualquer um: argumento `--auto` (ou `auto` como primeira palavra); `printenv CLAUDE_AUTONOMOUS` definida; ferramenta `AskUserQuestion` ausente na sessão (`-p`, subagente, cron, teammate). Em auto: nenhuma pergunta ao usuário. Brainstorming em modo *bounded* com decisões registradas; o "Which approach?" do `writing-plans` você mesmo responde ("Subagent-Driven"); a Fase 4 assume `s`. Toda suposição vai marcada `SUPOSIÇÃO` no plano e na entrega. **Único gate obrigatório**: antes de `git push`, deploy ou merge em main/master — o menu do `finishing-a-development-branch`. Nunca pule esse.
 
-Você **deve sempre** percorrer as 7 fases abaixo e emitir um cabeçalho explícito (`## Fase 1 — Intake`, `## Fase 2 — Brainstorming técnico`, etc.) ao iniciar cada uma. Não condense ou pule, mesmo em tarefa pequena.
+**Modo normal**: exatamente **um** gate de decisão nesta skill — aprovação do plano (Fase 4) — mais o gate de integração no fim. Nada de "Posso continuar?" entre tasks, nada de pergunta de modelo.
 
-Se uma fase for trivial pro caso (ex.: 1 arquivo, sem stories), ainda assim emita o cabeçalho e escreva 1 linha tipo "Caso pequeno: 1 story só, sem necessidade de decomposição". Estrutura é auditável; conteúdo se adapta.
+**Menus de outras skills (qualquer modo)**: `brainstorming` (aprovação do design), `writing-plans` ("Which approach?") e as skills BMAD ("halt at menus", "wait for user", `Fast path`) têm gates próprios. **Você** responde todos — Continue / defaults do projeto / `Fast path` / "Subagent-Driven" — e leva a decisão pro plano; nunca repasse ao usuário. Só a Fase 4 chega ao usuário.
 
-A fase 7 — Entrega — tem 8 seções fixas (Resumo, Arquivos, Decisões, Comandos, Testes, Validação manual, Riscos, Próximos passos). Emita todas, mesmo que algumas tenham "Nenhum/N/A".
+## Modelo por papel e agentes nomeados (`models.yml`)
 
-**Princípio central:** este executor **orquestra** skills reais — não reimplementa. Quando a skill existir no ambiente, **invoque-a** (não simule).
+Leia `~/.claude/cbs-overrides/models.yml` (`cat`; se não existir, o default do pacote). Cada papel tem `claude:` — agente em `~/.claude/agents/<nome>.md` (o pacote instala `cbs-*`; override em `~/.claude/cbs-overrides/agents/`) **ou** modelo direto `sonnet | opus | fable | inherit` com `effort:` opcional (`low | medium | high | xhigh | max`) — e `codex:` — o `name` de um agente em `~/.codex/agents/*.toml`.
 
-**Skills a invocar (via Skill tool):**
-- Fase 2 → `superpowers:brainstorming` (pule se o prompt já veio refinado de `/refinar`)
-- Fase 3 → **BMAD SEMPRE primeiro** (`bmad-create-prd` se houver decisão de produto/arquitetura, sempre `bmad-create-story` / `bmad-create-epics-and-stories`) → depois `superpowers:writing-plans` converte as stories em plano executável.
-- Fase 5 → `superpowers:subagent-driven-development` (despacha implementer + 2 reviewers por task, todos `general-purpose` com persona BMAD injetada; fallback: `superpowers:test-driven-development`)
-- Fase 6 → `superpowers:requesting-code-review`
-- Fase 7 → `superpowers:verification-before-completion`
+| Papel | Uso | `claude:` (default) | `codex:` (default) |
+|---|---|---|---|
+| `orchestrator` | você | fable, effort max | — (a sessão) |
+| `architect` | design delegado, BLOCKED de arquitetura, fix rounds 4–5 | cbs-architect | architect_sol |
+| `implementer_backend` | task sem domínio `frontend` | cbs-backend | backend_terra |
+| `implementer_frontend` | task com domínio `frontend` | cbs-frontend | frontend_terra |
+| `refactor` | refatoração, fix wave do review final | cbs-refactor | refactor_terra |
+| `reviewer` | task reviewer e re-reviewer | cbs-reviewer | reviewer_sol |
+| `final_reviewer` | review final e Fase 6 | cbs-final-reviewer | final_reviewer_sol |
+| `tester` | E2E/browser | cbs-tester | tester_luna |
+| `explorer` / `search` | Explore / busca pontual | cbs-explorer / cbs-search | explorer_luna / search_spark |
 
-**Fase 4 é PONTO DE PARADA**: pergunte "Posso implementar? [s/N]" e espere resposta (exceto modo `--auto`). Depois disso, a execução é contínua.
+Fallback de modelo/effort por papel (só Claude): `referencia/dispatch.md` §2. **No Codex, ignore a coluna `claude:`.**
 
-**Sem worktree:** trabalhar sempre na branch atual; não invocar `superpowers:using-git-worktrees`.
+Resolução por papel: (1) override do argumento; (2) `models.yml`; (3) default. Claude: valor que é **nome de agente** e existe em `~/.claude/agents/` → `subagent_type: <nome>` (o agente carrega modelo, effort e ferramentas); ausente → fallback de modelo da tabela (`model:`; effort avulso o Claude Code não aceita — registre) e `agente ausente: <nome>` na entrega. `inherit` = sem override.
+
+## Runtime (Claude Code ou Codex)
+
+Detecte antes do primeiro dispatch. **Claude Code**: existe a ferramenta `Agent` com `subagent_type`/`model` → use a coluna `claude:`. **Codex**: o dispatch é por nome de agente (`~/.codex/agents/*.toml`) ou existe `CODEX_HOME`/`CODEX_CLI_PATH` no ambiente → use **somente** a coluna `codex:` (nome do agente), **nunca** nome de modelo nem effort; agente ausente → despache sem nome e deixe o `default_subagent_model` do `config.toml` decidir. Nos dois runtimes e em qualquer SO, personas e scripts ficam em `~/.claude/personas/` e `~/.claude/scripts/` (o instalador resolve o home).
+
+Override por argumento (vence o arquivo): `models=implementer_backend:sonnet,reviewer:opus` (parcial; valor = agente ou modelo) ou `modelo=opus` (todos os papéis, modelo direto). Nomes antigos aceitos como sinônimos: `implementer` → `implementer_backend` + `implementer_frontend`; `final_review` → `final_reviewer`; `e2e` → `tester`; `investigar` → `explorer`.
+
+Ao invocar o SDD, repasse como **override da seção Model Selection** (não como Global Constraint — Global Constraints são requisitos da spec):
+
+> "Para esta execução, substitua a tabela de Model Selection: implementer → `<implementer_backend>` (tasks com domínio `frontend`: `<implementer_frontend>`); task reviewer e re-reviewer → `<reviewer>`; fix rounds 4–5 → `<architect>`; review final da branch → `<final_reviewer>`. Quando o valor é nome de agente, dispare com `subagent_type` igual a esse nome; senão `model:` igual a esse modelo. Especifique um dos dois em todo dispatch."
+
+## Saída enxuta (regra dura)
+
+Chat: **uma linha por fase** — `Fase N — <o que aconteceu> — <artefato>`. O detalhe vai pra arquivo: stories, plano, `.superpowers/sdd/<plano>/` (ledger, briefs, reports), `docs/analises/<data>-entrega-<slug>.md`. Nunca cabeçalho de fase nem seções no chat. "Terminou?" se responde com a linha da fase atual (task k/M).
 
 ## Princípios não-negociáveis
 
 1. **Plano antes de código.** Sempre.
-2. **TDD obrigatório** quando houver lógica testável (não é "se aplicável").
-3. **Brainstorming explícito** antes de escolher abordagem técnica.
-4. **Subagents pra investigação, QA, review, security** — proteja o contexto principal.
-5. **Artefatos no filesystem** (PRD, shards, stories em `docs/`) — não só no chat.
-6. **Sem refator fora de escopo.** Sem mudanças amplas oportunistas.
-7. **Sem mentir sobre testes/build.** Falha é falha.
-8. **Menor superfície (ponytail).** Antes de construir, suba a escada: reusar > stdlib/nativo > dependência já instalada > 1 linha inline > só então build mínimo. Cortar código desnecessário — **NUNCA** validação, tratamento de erro, segurança, acessibilidade ou teste. Injetado como rulebook transversal em todo subagent (ver Fase 5).
+2. **TDD conforme o tipo da task** (`referencia/roteamento.md` §3): `regra-de-negocio` = RED→GREEN estrito; `operacional`/`ui` = validação E2E/browser aceita.
+3. **Contexto principal só orquestra.** Nenhum Edit/Write de código aqui com o SDD disponível; investigação em subagent `Explore`.
+4. **Artefatos no filesystem.** Sem refator fora de escopo. Sem mentir sobre teste/build.
+5. **Personas, ponytail e rulebooks sempre por caminho** (`referencia/dispatch.md`). Colar conteúdo no dispatch é defeito: fica residente no seu contexto até o fim da sessão.
 
-## Orquestração: teammate vs ultracode
+## Detecção — BMAD é requisito
 
-Você é o orquestrador do contexto principal. O **motor padrão** da Fase 5 continua sendo `superpowers:subagent-driven-development` — as opções abaixo são **escalonamento**, não substituição. O gate humano da Fase 4 e a injeção BMAD → ponytail → domínio valem **em qualquer caso**.
+`_bmad/_config/manifest.yaml` existe no projeto? **Sim**: skills reais (`bmad-prd`, `bmad-architecture`, `bmad-create-epics-and-stories`, `bmad-spec`). **Não**: pare e ofereça `/instalar-bmad`; só se o usuário recusar (ou em auto) simule a disciplina de story e registre `BMAD: simulado`.
 
-- **teammate** — subagent **persistente e endereçável** (dispare com `name` e continue via `SendMessage`), que mantém o contexto entre mensagens. Bom pra um reviewer/consultor de domínio que acompanha **várias tasks relacionadas** sem re-explicar o contexto, ou um "arquiteto" consultado repetidamente ao longo da execução.
-- **ultracode (Workflow)** — fan-out **multi-agente determinístico** com estágios de verificação. Bom quando há **N tasks independentes** rodando em paralelo com verificação estruturada (ex.: aplicar o mesmo padrão em muitos arquivos, revisão por dimensões). Requer **opt-in explícito** do usuário (keyword `ultracode` ou pedido direto) — não acione por conta própria.
-
-**Regra de bolso:** poucas tasks sequenciais/dependentes → `subagent-driven-development` puro. Muitas tasks independentes → considere **ultracode**. Reviewer/consultor de vida longa → **teammate**. Em todos os casos, cada subagent implementer continua `general-purpose` com `@dev` + ponytail (+ domínio) injetados.
-
-## Detecção inicial — BMAD é REQUISITO
-
-Verifique se o BMAD está instalado no projeto (`_bmad/` ou `.bmad-core/`):
-- **Tem BMAD:** use os agentes/skills reais (`bmad-create-prd`, `bmad-create-story`, `@dev`, `@qa`, etc.) na Fase 3 e injete as personas nos subagents (Fases 5–6).
-- **Não tem BMAD:** **PARE e ofereça `/instalar-bmad` primeiro** — o BMAD não é opcional neste fluxo. Só se o usuário recusar explicitamente, caia no fallback de **simular as personas BMAD** (dev/qa/review) dentro dos subagents `general-purpose`, e avise que o ideal é instalar.
+Escalonamentos do SDD (não substitutos): **teammate** (subagent persistente, `SendMessage`) pra consultor de várias tasks; **ultracode** (Workflow) pra N tasks independentes, só com opt-in explícito. Mesmas personas, `models.yml` e gates.
 
 ---
 
-## 7 Fases obrigatórias
+## Fases
 
 ### Fase 1 — Intake
 
-1. Leia o prompt/spec recebido por inteiro.
-2. **Memória (se disponível)**: invoque `mem-search` ou `claude-mem:*` skills com o tema, pra recuperar histórico de discussões/decisões/bugs relacionados. Se nada relevante, marque "Memória: nada encontrado".
-3. Identifique ambiguidade bloqueante.
-4. Se houver, **PERGUNTE** antes de seguir. Não chute.
-5. Confirme escopo em 1 parágrafo.
+1. Leia o prompt/spec inteiro. Se veio do refinador, ele traz `<tipo_de_tarefa>` e `<dominios_previstos>` — use-os na Fase 3.
+2. Memória: se o comando já passou o resumo, use-o; senão chame `claude-mem:mem-search` (fallback `mem-search`) com o tema. Sem skill de memória: `Memória: não disponível`.
+3. Ambiguidade bloqueante: normal → pergunte (uma por vez, `AskUserQuestion`); auto → assuma, marque `SUPOSIÇÃO`.
+4. Workspace: `git branch --show-current`. Se for `main`/`master`, crie `feat/<slug>` antes de qualquer edição (o SDD exige consentimento pra trabalhar em main — a branch dedicada é o consentimento; em normal, registre-o no gate da Fase 4). **Sem worktree** — trabalhe na branch.
+5. Leia `models.yml` e aplique overrides do argumento.
 
-### Fase 2 — Brainstorming técnico (Superpowers)
+→ chat: `Fase 1 — intake ok — modo <x>, branch <y>, models <impl/rev/final>`
 
-**Invoque a skill `superpowers:brainstorming` se ela existir no ambiente.** Caso contrário, faça o brainstorming manualmente seguindo o padrão abaixo.
+### Fase 2 — Brainstorming técnico
 
-Gere **2-3 abordagens técnicas distintas** pra implementar a tarefa. Para cada:
-- Resumo da abordagem (estrutura, arquivos principais)
-- Prós / Contras
-- Risco principal
-- Esforço relativo (S/M/L)
+Invoque `superpowers:brainstorming` **só se o prompt não veio refinado** (`/refinar` e `/piloto` já fizeram esse trabalho — pule e diga em 1 linha). Classifique: *bounded* pra mudança em fluxo que já existe no repo; *architectural* só com subsistema novo. **Em qualquer modo**, o design (3 linhas em bounded; spec em `docs/superpowers/specs/` em architectural) vai pro plano e a aprovação é a da Fase 4 — não pare no gate do brainstorming nem no "review da spec". Se delegar o design a um subagent, use o papel `architect`.
 
-Escolha uma e **explicite o tradeoff aceito**.
+→ chat: `Fase 2 — <abordagem> (tradeoff: <x>)` ou `Fase 2 — pulada (prompt refinado)`
 
-### Fase 3 — Planejamento (BMAD stories → Superpowers writing-plans)
+### Fase 3 — Planejamento (stories BMAD → plano SDD)
 
-O objetivo desta fase é produzir **um plano com tasks discretas no filesystem** que a Fase 5 vai entregar ao `superpowers:subagent-driven-development`. Cada task precisa ter texto completo e auto-contido (o subagent não vai ler o histórico da conversa).
+1. **Stories (sempre)**, pelo que existe — as skills BMAD têm pré-requisitos e menus, e **você** responde os menus:
+   - `PRD.md` **e** `Architecture.md` existem (`_bmad-output/` ou `docs/`) → `bmad-create-epics-and-stories`; responda "Continue"/defaults em todo "wait for user".
+   - Há SPEC e modo **normal** → `bmad-spec` "break this into stories" (chamada programática roda *headless* e **nunca** quebra em stories — não use em auto).
+   - Senão (o caso pequeno comum) → **não** rode `bmad-create-epics-and-stories`: gere a story mínima a partir do template dela (`.claude/skills/bmad-create-epics-and-stories/templates/epics-template.md`) com critérios de aceite, tasks, File List e Dev Agent Record; marque `BMAD: template`.
+   - PRD só com decisão de produto: `bmad-prd` em `Fast path`. Arquitetura nova: `bmad-architecture`.
+   Sempre ≥1 story. Artefatos em `_bmad-output/` ou `docs/` — **commite-os**. A Fase 3 nunca para esperando o usuário.
+2. **Plano**: `superpowers:writing-plans` com as stories como spec → `docs/superpowers/plans/<data>-<slug>.md`. Ao "Which approach?" responda você: Subagent-Driven (não é decisão do usuário, em nenhum modo).
+3. **Classifique cada task** e anote no texto da task — o `task-brief` do SDD extrai só esse texto: `(domínio: laravel+database; tipo: regra-de-negocio; review: seguranca)`. Regras em `referencia/roteamento.md`: tabela sinais → domínio; até 2 domínios (linguagem + área); 3 domínios = quebre a task.
+4. **Global Constraints do plano**: acrescente o bloco de `referencia/dispatch.md` §1 (caminhos dos rulebooks por papel, resumo ≤10 linhas, política de TDD por tipo, branch). É por esse bloco que o SDD leva persona dev, ponytail, domínios e lentes de review a implementer, task reviewer e reviewer final.
+5. Riscos numerados no plano. Commite o plano.
 
-**BMAD primeiro (SEMPRE):**
-1. Gere a spec estruturada com BMAD: invoque `bmad-create-prd` se houver decisão de produto/arquitetura (e `bmad-create-architecture` se arquitetura nova); **sempre** gere as stories com `bmad-create-story` / `bmad-create-epics-and-stories`. As stories ficam no filesystem (`docs/` ou `_bmad-output/`).
-   - Caso pequeno (1 feature simples): ainda assim gere **1 story** mínima do BMAD — não pule. É barato e mantém a rastreabilidade story↔código↔teste que as Fases 5–6 usam.
-2. Converta as stories em **plano executável** via `superpowers:writing-plans`, usando as stories BMAD como spec. Ela salva o plano em `docs/superpowers/plans/` com tasks independentes (arquivos a tocar, comportamento, testes, critérios de aceite), referenciando a story de origem de cada task.
+→ chat: `Fase 3 — N stories, M tasks — docs/superpowers/plans/<arquivo>`
 
-3. **Classifique cada task por domínio** (etapa nova — alimenta a injeção da Fase 5). Domínio implementado como rulebook em `~/.claude/personas/dominios/`:
-   - **frontend** — qualquer task que toca UI, componente React/Vue/Svelte, página, CSS, design system, estado visual. Sinais: caminhos `src/components/`, `src/app/`, `pages/`, `.tsx`/`.vue`/`.svelte`; story menciona tela/componente/UI/UX/design/visual.
-   - **database** — qualquer task que toca schema, migration, query, modelo/ORM, índice ou transação. Sinais: `migrations/`, `prisma/schema.prisma`, `db/migrate/`, `alembic/`, arquivos `.sql`, models/entities/repositories; story menciona tabela/coluna/query/índice/migração/banco/schema.
+### Fase 4 — Gate do plano
 
-   Tasks que não batem com nenhum domínio seguem só com `@dev` BMAD puro (comportamento padrão — nenhum rulebook extra). Marque o domínio explicitamente em cada task do plano quando bater com um domínio conhecido (ex.: `- Task 3: implementar tela de listagem (domínio: frontend)`; `- Task 2: criar migration e índices da tabela pedidos (domínio: database)`). Se uma task atravessa domínios (ex.: criar endpoint + UI, ou migration + tela), divida em tasks separadas — cada parte ganha o rulebook do seu domínio (a API pura, sem rulebook).
+**Normal**: mostre em ≤8 linhas (abordagem, tasks com domínio/tipo, arquivos prováveis, riscos, models) e pergunte **"Posso implementar? [s/N]"** (via `AskUserQuestion` quando disponível). `s` / `continue` → Fase 5. `N` → pare; a branch `feat/<slug>` com stories e plano commitados fica (diga isso na linha de chat). Não escreva código antes do `s`.
 
-4. Liste **riscos** explicitamente (numerados).
+**Auto**: assume `s`; grave `Ruling: gate da Fase 4 assumido (--auto)` no ledger do SDD assim que ele existir.
 
-### Fase 4 — Confirmação
+### Fase 5 — Execução delegada (SDD)
 
-Apresente ao usuário, antes de qualquer edição de código:
+Invoque `superpowers:subagent-driven-development` passando: caminho do plano; o override de Model Selection (acima); "workspace: branch `<x>` já criada com consentimento — **não** invocar `using-git-worktrees`"; o contrato de `referencia/dispatch.md` §2 (o que entra em cada prompt: brief, report file, caminhos de rulebook — **nunca conteúdo colado**); e, literal: **"Pare antes da seção Finish do SDD: depois do review final da branch e da sua fix wave, NÃO apague o workspace `.superpowers/sdd/<plano>/` e NÃO invoque `finishing-a-development-branch` — devolva o controle ao executor, que faz a revisão final, a entrega e a integração."**
 
-```
-## Plano
+Regras:
+- **Implementer: `general-purpose` ou o agente nomeado do `models.yml`** (`implementer_backend` / `implementer_frontend`). Nunca agentes de plugin — `bmad-agent-*`, `*-pro`, `*-specialist`, `*-expert`, `voltagent-*` — trazem agenda própria e fogem do plano. Reviewers: `general-purpose` (ou agente nomeado `reviewer`) com os templates do próprio SDD.
+- **Papéis (vocabulário 6.3)**: implementer → **task reviewer** (spec + qualidade num só veredito) → **re-reviewer** (fix rounds, máx. 5) → **reviewer final** da branch. Não existem dois reviewers separados por task no 6.3 — não os invente.
+- Subagent devolve só status, commits, 1 linha de teste, preocupações; o resto fica em `.superpowers/sdd/<plano>/task-N-report.md`.
+- BLOCKED / NEEDS_CONTEXT: trate como o SDD manda (contexto, modelo mais capaz, quebrar a task). Encerre subagents ociosos ao fim de cada task.
+- Fallback sem SDD (Superpowers ausente): TDD manual com os mesmos papéis e subagents; recomende instalar o Superpowers no fim.
 
-Abordagem escolhida: [...]
-Tradeoff aceito: [...]
+→ chat por task: `Fase 5 — task k/M ok — commits <a>..<b>` (e `fix round r/5` quando houver)
 
-## Plano executável
-- docs/superpowers/plans/<data>-<feature>.md  (ou stories BMAD)
-- Tasks: [lista numerada das tasks discretas]
+### Fase 6 — Gate final (`/revisar` automático, condicional)
 
-## Arquivos prováveis a alterar
-- src/...
+O SDD já fez task review por task (com a lente `seguranca` nas tasks backend) e review final da branch (com `cobertura-de-testes`). Invoque a skill `revisor` (modo **gate**, papel `final_reviewer`) **só se**: alguma task marcou `review: seguranca` **explícito** (auth, pagamento, tenant, dados pessoais, webhook de entrada) **ou** alguma task `ui` relaxou o TDD (validação no browser, papel `tester`) **ou** o reviewer final do SDD não recebeu as lentes (ledger sem registro). Em modo gate o revisor **pula** a lente `cobertura-de-testes` já lida pelo reviewer final e roda só o que falta. Grava `docs/analises/<data>-revisao-<slug>.md`. 🔴 → **um** fix dispatch (papel `refactor`) + **uma** re-review escopada. Nunca corrija no contexto principal.
 
-## Testes pretendidos
-- unit / integração: ...
-
-## Riscos
-1. ...
-
-## Modelo de execução
-- Subagents (implementer + reviewers): **[atual]** ou **[sonnet]**?
-```
-
-**🛑 PONTO DE PARADA OBRIGATÓRIO.** Termine sua mensagem AQUI com as duas perguntas literais:
-
-> **"Posso implementar? [s/N]"**
-> **"Modelo pros subagents de execução — atual ou sonnet? [atual]"**
-
-**Gate de modelo:** você pode mandar o Superpowers disparar os subagents com o modelo que o usuário pedir. Duas opções só:
-- **atual** (padrão) → não passe override; a skill `subagent-driven-development` segue o tiering próprio dela (mecânico → barato, julgamento → padrão, review final → mais capaz) a partir do modelo da sessão.
-- **sonnet** → o usuário quer economizar/padronizar; na Fase 5 você injeta a restrição global de modelo (ver passo 6.1) pra a skill disparar **todos** os implementer e reviewer subagents em `sonnet`.
-
-Não escreva nenhum arquivo, não invoque a execução, não avance pra Fase 5 antes do usuário responder `s`. Exceção única: modo `--auto` (assume `s` + modelo **atual**). "continue" conta como `s` + **atual**.
-
-Este é o **único gate humano** antes da execução — a partir do `s`, a Fase 5 roda de forma contínua (a skill de execução não pausa entre tasks).
-
-### Fase 5 — Execução DELEGADA (não implemente inline)
-
-**Esta é a mudança central: você NÃO implementa no contexto principal.** Você delega ao Superpowers, que dispacha subagents isolados por task e mantém seu contexto limpo pra coordenação.
-
-1. **Invoque a skill `superpowers:subagent-driven-development`** passando o plano da Fase 3.
-   - Ela vai: ler o plano, extrair as tasks, e **por task** despachar 1 implementer subagent (contexto isolado, TDD) + spec reviewer + code quality reviewer, com loop de correção.
-   - O contexto principal só **orquestra** (coordena subagents, responde perguntas deles, marca progresso). Não faça grep/read/write de implementação aqui.
-
-2. **Tipo de subagent — REGRA RÍGIDA:** todo implementer DEVE ser despachado com `subagent_type: "general-purpose"`. **NUNCA** use agentes de domínio ou de plugin (`backend-developer`, `voltagent-*`, `*-pro`, `*-specialist`, `*-expert`, etc.). Eles trazem system prompt e agenda próprios, têm toolset limitado e fogem do plano/TDD que você entregou — quebrando a garantia de qualidade. Se um nome de agente "especialista" não existir, **não tente o vizinho mais parecido da lista**: use `general-purpose`. (Reviewers podem usar `Explore` ou os reviewers nativos do Superpowers; implementer é sempre `general-purpose`.)
-
-3. **Personas BMAD em TODO subagent `general-purpose` (SEMPRE):** o `subagent_type` continua SEMPRE `general-purpose` (nunca dispache `@dev`/`@qa`/`bmad-agent-*` como tipo de agente — isso recriaria o problema da persona com agenda própria). O que muda é o **conteúdo do prompt** de cada subagent: injete as convenções do agente BMAD correspondente ao papel daquele subagent. Isto **não é opcional** — vale em toda execução.
-
-   | Subagent (sempre `general-purpose`) | Convenções BMAD a injetar no prompt |
-   |---|---|
-   | **Implementer** | Dev agent (`@dev`): implementar as tasks/subtasks da story em ordem marcando os checkboxes; TDD por task; atualizar **File List** e **Dev Agent Record**; validar os critérios de aceite; status → **Ready for Review** |
-   | **Spec reviewer** | review do BMAD: conferir a implementação contra os **critérios de aceite e as tasks da story** — todos os itens cobertos? algo fora de escopo? a story foi atualizada? |
-   | **Code quality reviewer** | QA/Test agent (`@qa`/TEA): checklist de qualidade do BMAD, adequação dos testes, riscos, rastreabilidade story↔código↔teste |
-
-   Assim você junta o isolamento + TDD + 2 reviewers do `general-purpose` (mecânica do Superpowers) com a disciplina de story/QA do BMAD, em cada subagent.
-
-4. **Rulebook TRANSVERSAL ponytail (SEMPRE, em TODO implementer):** diferente do rulebook de domínio (condicional à marcação da Fase 3), este é **incondicional** — vale em toda task. Leia o `ponytail.md` (mesma precedência de caminho dos domínios) e **injete o conteúdo completo** no prompt de todo implementer, em bloco `<ponytail-rulebook>...</ponytail-rulebook>`, empilhado **abaixo** de qualquer rulebook de domínio.
-
-   Caminhos de leitura (primeiro encontrado vence):
-   - `~/.claude/cbs-overrides/personas/ponytail.md` (override do usuário)
-   - `~/.claude/personas/ponytail.md` (base instalada)
-
-   **Ordem de empilhamento no prompt:** `@dev` (base BMAD) → **ponytail** (transversal, sempre) → domínio frontend/database (se a task foi marcada). O ponytail governa *quanto* código o subagent escreve (menor superfície); o piso de segurança dele é inegociável e **vence** o corte em conflito. Nível padrão: `full` (só mude se o usuário pedir `lite`/`ultra`/`off` explicitamente). Não resuma — passe o conteúdo completo.
-
-5. **Rulebook de DOMÍNIO empilhado em cima do `@dev` (quando aplicável):** se a task foi marcada com domínio na Fase 3, leia o rulebook correspondente e **inclua o conteúdo dele dentro do prompt do implementer** (e do code quality reviewer, no caso de QA específico de domínio).
-
-   Caminhos de leitura (em ordem — primeiro encontrado vence):
-   - `~/.claude/cbs-overrides/personas/dominios/<dominio>.md` (override do usuário)
-   - `~/.claude/personas/dominios/<dominio>.md` (base instalada)
-
-   Domínios implementados nesta versão:
-   - **frontend** → carregar `frontend.md`. **Obrigatório:** no prompt do implementer, instruir explicitamente a invocar a skill oficial `frontend-design` (plugin `claude-plugins-official`) ANTES de codar, e seguir a ordem do rulebook (Passo 1 = detectar design system existente; Passo 2A ou 2B conforme detecção). Sem essa skill, a UI gerada cai em "AI slop" — não é opcional.
-   - **database** → carregar `database.md`. **Não há skill oficial** — a expertise (DBA + SQL pro) está destilada no próprio rulebook. No prompt do implementer, instruir a seguir a ordem do rulebook (Passo 1 = detectar schema/ORM/migration existentes ANTES de escrever DDL; Passo 2A ou 2B conforme detecção) e a tratar as "Regras inegociáveis" como travas (reversibilidade de migration, queries parametrizadas, índice em FK, transação atômica, filtro de tenant). Injete o conteúdo também no **code quality reviewer** (QA de banco: confere índices, plano de execução, rollback, isolamento de tenant).
-
-   Forma da injeção no prompt do implementer (estrutura — exemplo frontend; para database, troque a skill obrigatória pela instrução de seguir o rulebook destilado, já que não há skill):
-   ```
-   You are a BMAD Dev agent (@dev persona): [...convenções padrão @dev...]
-
-   This task is in the **frontend** domain. You MUST also:
-   1. Invoke the `frontend-design` skill (Skill tool) before writing any UI code — it loads the official aesthetics guidance.
-   2. Follow the rulebook below LITERALLY — especially the "ORDEM DE OPERAÇÃO" (detect existing design system FIRST, only commit to a new bold direction if none exists).
-
-   <frontend-rulebook>
-   [conteúdo completo de ~/.claude/personas/dominios/frontend.md inline aqui]
-   </frontend-rulebook>
-   ```
-
-   Para **database** não há skill a invocar — o passo 1 vira "Follow the rulebook below LITERALLY, starting from ORDEM DE OPERAÇÃO (detect the existing schema/ORM/migration tool FIRST) and treat the 'Regras inegociáveis' as hard gates", seguido do `<database-rulebook>...</database-rulebook>` com o conteúdo completo.
-
-   Não resuma o rulebook — passe o conteúdo completo. O subagent não tem contexto da conversa, só o prompt.
-
-   Tasks **sem domínio marcado** seguem só com `@dev` BMAD puro (comportamento herdado).
-
-6. **Workspace — instrução explícita pra passar à skill:**
-   > "Workspace já definido: trabalhar na **branch atual**, **NÃO criar git worktree**. Não invoque `superpowers:using-git-worktrees`."
-
-6.1. **Modelo — restrição global (conforme o gate da Fase 4):** a skill `subagent-driven-development` lê as **restrições globais** antes de disparar a Task 1 e especifica o modelo explicitamente em cada subagent. Repasse a escolha do usuário como restrição global:
-   - Usuário escolheu **atual** → **não** passe override de modelo. Deixe o tiering próprio da skill rodar (ela usa modelo barato pra task mecânica, padrão pra julgamento, o mais capaz pro review final da branch).
-   - Usuário escolheu **sonnet** → passe a restrição literal:
-     > "Restrição global de modelo: dispare **TODOS** os subagents implementer e reviewer com `model: sonnet` (inclusive o review final da branch). Não use o modelo da sessão nem faça tiering — o usuário fixou Sonnet pra esta execução."
-
-   Só existem essas duas opções (atual/sonnet). No fallback manual (passo 7, sem `subagent-driven-development`), aplique a mesma escolha ao despachar os subagents `Explore`/`general-purpose` você mesmo (`model: sonnet` quando o usuário pediu sonnet).
-
-   (O usuário trabalha em branch dedicada — worktree é dispensado de propósito.)
-
-7. **Se `subagent-driven-development` não existir** no ambiente (Superpowers não instalado), aí sim caia no fallback: invoque `superpowers:test-driven-development` se existir, ou faça TDD manual (teste falha → código mínimo → verde), delegando investigação pesada a subagent `Explore` (`general-purpose` pra implementação). Recomende instalar Superpowers no fim.
-
-**Regras desta fase:**
-- ❌ Não faça a implementação (grep/read/write/edit de código) no contexto principal quando o `subagent-driven-development` estiver disponível — delegue.
-- ❌ Não crie worktree.
-- ✅ Responda perguntas dos subagents (eles podem pedir contexto antes de codar).
-- ✅ Trate status BLOCKED/NEEDS_CONTEXT dos subagents conforme a skill manda (dar contexto, re-despachar, ou escalar pra você).
-
-### Fase 6 — QA + Security review
-
-**Regra de subagent (igual à Fase 5):** todas as etapas abaixo rodam em subagent `subagent_type: "general-purpose"` com as convenções do agente BMAD correspondente injetadas no prompt. **NUNCA** dispache `code-reviewer`, `qa-expert`, `security-auditor`, `voltagent-*` ou `bmad-agent-*` como tipo de agente.
-
-**Code review:** invoque `superpowers:requesting-code-review` se existir. Senão, delegue a um subagent `general-purpose` carregando as convenções do **review do BMAD** (`bmad-code-review`: revisar contra a story, critérios de aceite e padrões do projeto). **Injete também o `ponytail.md`** (mesma precedência de caminho da Fase 5) no prompt do reviewer, instruindo a usar o checklist de over-engineering (seção 4 do rulebook) pra sinalizar abstração especulativa, wrapper de 1 chamada, camadas a mais e reimplementação do que a lib já faz — **sem** afrouxar o piso de segurança (validação/erro/segurança/acessibilidade/teste nunca são "código a cortar").
-
-**Funcional / QA** (subagent `general-purpose` com as convenções do **QA/Test agent do BMAD** — `@qa`/TEA: test design, testes baseados em risco, rastreabilidade):
-- Golden path
-- Casos de borda principais
-- Falhas previsíveis (timeout, dado inválido, concorrência)
-
-**Security** (subagent `general-purpose` + checklist abaixo; o BMAD não tem agente de security dedicado, então aqui não há persona BMAD a injetar):
-- Auth / autorização (rotas novas têm middleware?)
-- Validação de input (tamanho, tipo, charset, sanitização)
-- Exposição de dados (logs vazando? response com campos demais?)
-- SQL injection (queries parametrizadas?)
-- XSS (escape em renderização?)
-- Permissões por tenant/empresa
-- Idempotência (jobs, webhooks, retries)
-- Secrets (nada hard-coded; .env.example atualizado se preciso)
-
-Corrija o que encontrar antes de declarar pronto.
+→ chat: `Fase 6 — revisão: N achados (🔴 x) — docs/analises/<arquivo>` ou `Fase 6 — pulada (sem gatilho)`
 
 ### Fase 7 — Entrega
 
-**ANTES de declarar pronto:** invoque `superpowers:verification-before-completion` se existir — ela exige rodar os comandos de verificação e confirmar a saída ANTES de afirmar sucesso. Sem ela, rode manualmente os testes/build e cole a saída real. **Nunca afirme "passou" sem evidência.**
+1. `superpowers:verification-before-completion`: rode testes/build e cole a saída real **no arquivo** de entrega. Nunca afirme "passou" sem evidência. Se alguma task teve domínio backend, rode `node ~/.claude/scripts/gate-seguranca.js` (override em `~/.claude/cbs-overrides/scripts/`): **exit 1 bloqueia** — um fix dispatch (`refactor`) e rode de novo; "gate parcial" (ferramenta ausente) só vira aviso na entrega.
+2. Leia o ledger `.superpowers/sdd/<plano>/progress.md` (ainda existe — o SDD parou antes do Finish) e escreva `docs/analises/<data>-entrega-<slug>.md` com `referencia/entrega.md` (todos os `Ruling:` na ordem, as `SUPOSIÇÃO`, agentes ausentes).
+3. **Commite** a entrega e a revisão da Fase 6 (`docs: revisão e entrega <slug>`) — antes do gate, senão ficam fora do merge/PR. Depois apague só o workspace deste plano (`rm -rf .superpowers/sdd/<plano>/`).
+4. `superpowers:finishing-a-development-branch` — **uma vez**: o gate de integração, com testes na árvore final e menu merge / PR / manter. Vale em auto também.
 
-Reporte ao usuário **sempre** neste formato:
-
-```
-## Resumo
-[1-2 frases sobre o que foi entregue]
-
-## Arquivos alterados
-- src/...
-- src/...
-- docs/...
-
-## Decisões tomadas
-- [decisão] — [justificativa]
-- ...
-
-## Comandos executados
-- npm test  → ✓
-- npm run build  → ✓
-- ...
-
-## Testes
-- Passaram: N
-- Falharam: N (explique)
-- Cobertura nova: ...
-
-## Como validar manualmente
-1. ...
-2. ...
-
-## Riscos restantes
-- ...
-
-## Próximos passos sugeridos
-- ...
-```
+→ chat: `Fase 7 — entrega: testes X/X — docs/analises/<arquivo> — aguardando opção de integração`
 
 ---
 
 ## Anti-padrões fatais
 
-- ❌ "Vou implementar e depois testar" — sempre TDD quando aplicável
-- ❌ "Aproveitando, refatorei aquele arquivo lá" — fora de escopo, não fez
-- ❌ "Comentei o teste que tava falhando" — proibido sem justificativa documentada
-- ❌ "Assumi que a regra de negócio é X" sem perguntar quando era crítica
-- ❌ Dumpar arquivos inteiros no contexto principal pra "entender" — use Explore subagent
-- ❌ Pular fase de plano e ir direto ao código
-- ❌ Mentir sobre status de build/teste no relatório final
+- ❌ Colar ponytail, rulebook, lente ou persona dev no prompt do subagent (caminho, sempre).
+- ❌ Editar código ou dumpar arquivos no contexto principal com o SDD disponível.
+- ❌ Gate extra fora da Fase 4 e do menu de integração; repassar ao usuário um menu do BMAD ou do brainstorming.
+- ❌ Cabeçalhos de fase, relatório com seções ou narrativa no chat.
+- ❌ Pular o gate de integração em `--auto`; deixar o SDD apagar o workspace ou chamar `finishing-a-development-branch` por conta própria.
+- ❌ Passar nome de modelo no Codex. "Comentei o teste que falhava" / mentir sobre build.

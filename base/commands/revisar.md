@@ -1,46 +1,15 @@
 ---
-description: Revisa tudo que foi feito (mudanças da branch / working tree) — code review + QA + security com Superpowers e personas BMAD, em subagents general-purpose. Read-only por padrão: reporta achados e só corrige com seu OK.
+description: "Revisa tudo que foi feito (mudanças da branch / working tree ou escopo dado) — code review + cobertura de testes + segurança em subagents general-purpose, com ponytail, domínios e lentes personas/review/ lidos por caminho. Read-only por padrão — grava o relatório em docs/analises/ e só corrige com seu OK. É também o gate final automático de /executar e /piloto."
 ---
 
-**ORDEM OBRIGATÓRIA — sem julgamento, sem exceção:**
+**ORDEM OBRIGATÓRIA:**
 
-1. **PRIMEIRO**: invoque `Skill` com `skill: "mem-search"` passando o tema das mudanças como query. Se não existir, tente `claude-mem:mem-search`; se nenhuma existir, registre "Memória: não disponível".
+1. **PRIMEIRO**: invoque `Skill` com `skill: "claude-mem:mem-search"` (fallback `mem-search`) passando o tema das mudanças como query. Se nenhuma existir, registre "Memória: não disponível".
+2. **SÓ DEPOIS**: invoque `Skill` com `skill: "revisor"` em modo **standalone**, passando o escopo (argumentos, ou vazio = mudanças da branch atual) + resumo da memória.
 
-2. **Determine o escopo (sem editar nada):**
-   - Se o usuário passou argumentos (arquivos, PR, descrição), use-os como escopo.
-   - Senão, levante o que mudou: `git status` + `git diff` (não-commitado) e, se estiver numa branch de feature, `git diff <base>...HEAD` pros commits da branch.
-   - Liste os arquivos/áreas que vão ser revisados antes de começar.
+A skill determina o escopo sem editar nada, escreve o diff num arquivo e despacha subagents `general-purpose` read-only (code review com ponytail + domínios; cobertura com `review/cobertura-de-testes.md`; segurança com `review/seguranca.md` só quando há superfície; E2E com Playwright quando há UI sem teste) — todos recebendo **caminhos**, nunca conteúdo colado. Papéis: `final_reviewer` / `tester` / `refactor` de `~/.claude/cbs-overrides/models.yml` (agente nomeado ou modelo). O contexto principal só orquestra.
 
-3. **Revisão — delegada a subagents `subagent_type: "general-purpose"` (NUNCA `code-reviewer`/`qa-expert`/`security-auditor`/`voltagent-*`/`bmad-agent-*` como tipo de agente):**
-   - Invoque `superpowers:requesting-code-review` se existir no ambiente.
-   - Despache subagents `general-purpose` com as personas BMAD injetadas no prompt:
-     - **Code review** → convenções do review do BMAD (`bmad-code-review`): conferir contra os critérios de aceite/story, padrões do projeto, escopo (nada fora do pedido).
-     - **QA** → `@qa`/TEA: cobertura de testes, casos de borda, falhas previsíveis (timeout, dado inválido, concorrência), rastreabilidade story↔código↔teste.
-     - **Security** → checklist (auth/autorização, validação de input, exposição de dados, injection, XSS, permissões por tenant, idempotência, secrets). O BMAD não tem agente de security dedicado — aqui é só o checklist no `general-purpose`.
-   - O contexto principal **só orquestra**: o trabalho de ler diffs e código acontece nos subagents, não no chat principal.
-
-4. **Relatório final (formato fixo, sempre):**
-
-```
-## Escopo revisado
-- arquivos / commits / áreas
-
-## Achados por severidade
-- 🔴 Bloqueante: ...
-- 🟡 Atenção: ...
-- 🟢 OK: ...
-
-## Cobertura de testes
-- o que está testado / lacunas
-
-## Segurança
-- itens do checklist + achados
-
-## Veredito
-- Pronto pra merge? O que falta.
-```
-
-5. **NÃO corrija nada sem OK.** Termine perguntando: **"Quer que eu corrija os 🔴/🟡 agora? [s/N]"**. Se `s`, aí sim delegue as correções ao `superpowers:subagent-driven-development` (implementer `general-purpose` + persona `@dev`), na branch atual, sem worktree.
+Relatório em `docs/analises/<data>-revisao-<slug>.md`; chat com 1 linha. **Nada é corrigido sem OK**: a skill termina perguntando "Corrigir os 🔴/🟡 agora? [s/N]" e, com `s`, delega a um implementer `general-purpose` na branch atual, sem worktree, seguido de re-review.
 
 Escopo (opcional — vazio = revisar mudanças da branch atual):
 

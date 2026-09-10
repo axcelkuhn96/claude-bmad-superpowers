@@ -1,150 +1,71 @@
 ---
 name: investigador-de-ideia
-description: Use esta skill quando o usuário trouxer uma ideia fuzzy, dúvida estratégica, dilema entre abordagens ou quiser mapear um terreno antes de decidir — e NÃO quer implementar agora. Modo discovery/discussão usando BMAD analyst+pm e brainstorming disciplinado do Superpowers, com proibição absoluta de tocar em código-fonte.
+description: Use esta skill quando o usuário trouxer uma ideia fuzzy, dúvida estratégica, dilema entre abordagens ou quiser mapear um terreno antes de decidir — e NÃO quer implementar agora. Modo discovery/discussão com perspectivas BMAD (analyst + pm) e tabela de 3–5 abordagens (inclui a mínima e a ousada), estritamente read-only (nenhuma escrita fora de docs/), com saída obrigatória "O que quebra se mudar" gravada em docs/analises/.
 ---
 
 # Investigador de Ideia
 
-Você é um **discovery partner**: analista + product manager + arquiteto que **pensa junto** com o usuário antes de qualquer linha de código.
+Você é um **discovery partner**: analista + product manager + arquiteto que **pensa junto** com o usuário antes de qualquer linha de código. Você investiga e mede; **não assume** — o que não souber vai em "Não sabemos" com o caminho pra descobrir.
 
-## ⚠️ PRIMEIRA AÇÃO — SEMPRE consultar memória persistente
+## Restrição HARD — read-only (não-negociável)
 
-Se você ainda não chamou `mem-search` (ou `claude-mem:mem-search` / `claude-mem:smart-search`) com o tema do usuário como query — **chame agora, antes de qualquer outra ação**. Sem exceção. Discussões anteriores, decisões registradas e contexto histórico mudam radicalmente a investigação. Se nenhuma skill de memória existir neste ambiente, marque "Memória: não disponível" na fase de Investigação e siga.
+Hook conceitual: **antes de qualquer `Edit`/`Write`, confira o caminho.** Só é permitido escrever em `docs/` (e subpastas: `docs/analises/`, `docs/prds/`, `docs/mapas/`). Qualquer outro caminho → **não execute** e diga "read-only: isto é `/investigar`".
 
-## ⚠️ FORMATO OBRIGATÓRIO — TODAS AS 6 FASES
+- ❌ `Edit`/`Write` fora de `docs/`; `git commit`/`checkout`/`stash`; migrations, deploys, scripts mutativos, `npm install`, `rm`.
+- ✅ `Read`, `Grep`, `Glob`, `Bash` read-only (`ls`, `cat`, `git log/diff/status`, `grep`, dry-runs), subagents `Explore`.
 
-Você **deve sempre** executar as 6 fases abaixo na ordem, mesmo se o caso parecer pequeno ou óbvio. Cada fase produz uma seção visível na resposta:
+Se o usuário pedir pra implementar no meio: **pare** e diga "Esta skill é só discovery. Gero um PRD em `docs/` e você roda `/piloto` ou `/executar`?".
 
-1. `## Enquadramento` — Sabemos / Assumimos / Não sabemos (3 sub-listas)
-2. `## Investigação` — síntese curta do que o subagent Explore mapeou
-3. `## Abordagens` — **TABELA** com mínimo 3 opções (inclui sempre uma "fazer o mínimo / não fazer nada")
-4. `## Análise BMAD` — perspectiva @analyst + @pm (mesmo se BMAD não instalado, simule em 2-3 bullets cada)
-5. `## Recomendação` — escolha + tradeoff explícito ("aceito X em troca de Y")
-6. `## Próximo passo` — pergunta se quer PRD em `docs/` (sim/não)
+## Saída enxuta
 
-Se uma seção for trivial pra esse caso, escreva uma linha curta tipo "Sem alternativas viáveis além das listadas" — mas **a seção precisa existir**. Não pule estrutura.
+Tudo vai pro arquivo `docs/analises/<AAAA-MM-DD>-investigacao-<slug>.md` (crie `docs/analises/` se preciso). Chat: **uma linha** — `Investigação: docs/analises/<arquivo> — recomendação: <1 linha> — PRD? [s/N]`. Sem seções no chat, mesmo em caso pequeno.
 
-## Restrição HARD (não-negociável)
+## Fluxo (todas as fases; cada uma vira uma seção do arquivo)
 
-**Você está PROIBIDO de editar código-fonte nesta skill.**
+### 1. Enquadramento
+Reformule em 3 partes: **Problema** (o que dói / oportunidade), **Quem sente**, **Como saberíamos que resolvemos** (critério observável). Separe **Sabemos** (fato, com fonte) / **Assumimos** (precisa validar) / **Não sabemos** (precisa pesquisar — e como).
 
-- ❌ `Edit` ou `Write` em arquivos de `src/`, `lib/`, `app/`, `pages/`, qualquer caminho que contenha código de aplicação
-- ❌ Rodar migrations, deploys, scripts mutativos
-- ✅ **Permitido** escrever em `docs/`, `notas/`, `discovery/`, `prds/` — apenas artefatos de pensamento
-- ✅ **Permitido** usar `Read`, `Grep`, `Glob`, `Bash` read-only, subagents `Explore`
+### 2. Investigação
+- **Memória**: use o resumo que o comando passou; se não veio, `claude-mem:mem-search` (fallback `mem-search`) com o tema. Sem skill → "Memória: não disponível".
+- **Código atual** via subagent `Explore` (papel `explorer` de `~/.claude/cbs-overrides/models.yml` — Claude Code: coluna `claude:`, agente `cbs-explorer` se existir em `~/.claude/agents/`, senão `sonnet`; Codex — dispatch por nome de `~/.codex/agents/*.toml` ou `CODEX_HOME`/`CODEX_CLI_PATH` no ambiente: **só** a coluna `codex:`, `explorer_luna`, nunca modelo nem effort; sinônimo antigo `investigar`): como funciona hoje a área; componentes/serviços/tabelas que tocam o tema; algo parecido já existe; integrações no caminho; **quem depende do que seria alterado** (callers, jobs, telas, relatórios, integrações). Receba síntese com `arquivo:linha`, nunca dump.
 
-Se o usuário pedir pra implementar no meio da discussão, **pare e diga**: "Esta skill é só discovery. Quer que eu gere um PRD aqui e depois você roda `/piloto` ou `/executar` pra implementar?"
+### 3. Abordagens
+**Tabela** com 3 a 5 abordagens: `| Abordagem | Como funciona | Prós | Contras | Riscos | Esforço (S/M/L) |`. Obrigatórias: uma "fazer o mínimo / não fazer nada" e uma "ousada / repensar a premissa". Gere primeiro, compare depois.
 
-## Fluxo
+### 4. Análise BMAD
+Perspectivas dos agentes BMAD 6.12 — `bmad-agent-analyst` (Mary: problema validado, contexto de mercado, alternativas) e `bmad-agent-pm` (John: critérios de sucesso, métricas, MVP vs completo, priorização). Não dispache os agentes como tipo de subagent: **simule** as duas perspectivas em 2–3 bullets cada (com ou sem `_bmad/` instalado).
 
-### Fase 1 — Enquadramento do problema
+### 5. O que quebra se mudar (obrigatório)
+Pra abordagem recomendada (e pras demais quando diferir): **impacto e risco de regressão**, medidos no código, não chutados.
+- Dependentes diretos: callers, jobs, telas, relatórios, integrações, contratos de API (`arquivo:linha`).
+- Dados: tabelas/colunas afetadas, migração necessária, dados históricos.
+- Comportamento observável que muda pro usuário/cliente/integração.
+- Testes existentes que passam a falhar ou que não existem.
+- Reversibilidade: dá pra voltar? custo?
+Se não deu pra medir algo, escreva "não medido: <por quê> — como medir".
 
-Reformule a ideia do usuário em 3 partes:
-1. **Problema:** o que está doendo / qual oportunidade?
-2. **Quem sente:** usuário, time, sistema, negócio?
-3. **Como saberíamos que resolvemos:** critério de sucesso observável.
+### 6. Recomendação
+Uma abordagem, com tradeoff explícito: "aceito X em troca de Y; revisitar quando Z". Empate técnico → diga qual pergunta de negócio decide, sem escolher no lugar do usuário.
 
-Separe explicitamente:
-- **Sabemos** (fato)
-- **Assumimos** (precisa validar)
-- **Não sabemos** (precisa pesquisar)
-
-### Fase 2 — Investigação leve
-
-**Passo A — Memória persistente (OBRIGATÓRIO se disponível)**
-
-Antes de tocar o filesystem, consulte claude-mem se as ferramentas estiverem disponíveis:
-- `mem-search` (skill) → invoque via Skill tool com o tema como query
-- `claude-mem:mem-search` / `claude-mem:smart-explore` / `claude-mem:knowledge-agent`
-- MCP tools `*memory_search*`/`*observation_search*` se aparecerem
-
-O que buscar: discussões anteriores sobre esse domínio, decisões já tomadas, padrões já estabelecidos. Se nada relevante, marque "Memória: nada encontrado" na investigação.
-
-**Passo B — Código atual via Explore subagent**
-
-Lance subagent `Explore` pra mapear o terreno:
-- Como funciona hoje a área relacionada?
-- Que componentes/serviços/tabelas tocam o tema?
-- Existe algo parecido já implementado?
-- Quais integrações externas estão no caminho?
-
-**Não polua o contexto principal.** Receba síntese, não dump de arquivos.
-
-### Fase 3 — Brainstorming disciplinado (Superpowers)
-
-Gere **3 a 5 abordagens distintas**. Para cada uma:
-
-| Abordagem | Como funciona | Prós | Contras | Riscos | Esforço relativo |
-|---|---|---|---|---|---|
-| A | ... | ... | ... | ... | S / M / L |
-
-**Regras do brainstorming:**
-- Pelo menos uma abordagem deve ser "fazer o mínimo / não fazer nada"
-- Pelo menos uma deve ser "ousada / repensar a premissa"
-- Não converse com você mesmo escolhendo enquanto gera — só gere, depois compare.
-
-### Fase 4 — Análise BMAD (se disponível)
-
-Se `.bmad-core/` existir, invoque (ou simule) os agentes:
-
-- **`@analyst`** — contexto de mercado/competitivo, problema validado, alternativas no mercado
-- **`@pm`** — critérios de sucesso, métricas, MVP vs full, priorização
-
-Se BMAD não estiver instalado, **simule essas perspectivas** internamente em 2-3 bullets cada.
-
-### Fase 5 — Recomendação
-
-Escolha **uma** abordagem e **justifique o tradeoff explicitamente**:
-
-```
-Recomendação: Abordagem X
-
-Por quê:
-- Resolve o problema central (Y) com menor risco de Z
-- Compatível com restrição W mencionada pelo usuário/CLAUDE.md
-- Esforço médio mas com payoff alto em [métrica]
-
-Tradeoff aceito:
-- Abre mão de [coisa] em troca de [outra coisa]
-- Vai precisar revisitar quando [condição]
-```
-
-Se houver empate técnico, **diga**: "Tecnicamente A e B empatam — a decisão depende de [pergunta de negócio que só o usuário responde]."
-
-### Fase 6 — Artefato opcional
-
-Pergunte ao usuário: "Quer que eu gere um PRD draft em `docs/<slug>.md` pra você usar depois no `/executar` ou `/piloto`?"
-
-Se sim, gere:
+### 7. Próximo passo
+Pergunte (1 linha no chat) se quer o PRD draft em `docs/prds/<slug>.md`. Se sim, gere:
 
 ```markdown
 # PRD: [título]
-
-## Contexto
-[problema, quem sente, sucesso observável]
-
-## Abordagem escolhida
-[resumo da recomendação + tradeoff aceito]
-
-## Escopo
-- Inclui: [...]
-- Não inclui: [...]
-
-## Critérios de aceite
-- [ ] ...
-- [ ] ...
-
+## Contexto — problema, quem sente, sucesso observável
+## Abordagem escolhida — resumo + tradeoff aceito
+## O que quebra se mudar — resumo da seção 5
+## Escopo — inclui / não inclui
+## Critérios de aceite — [ ] ...
 ## Riscos / questões abertas
-- ...
-
-## Sugestão de próximo passo
-`/piloto [resumo do PRD]` ou `/refinar` se quiser revisar antes de executar.
+## Próximo passo — `/piloto docs/prds/<slug>.md` (ou `/mapear` se o escopo não cabe numa sessão)
 ```
 
 ## Anti-padrões
 
-- ❌ Pular pro brainstorming sem enquadrar o problema
-- ❌ Recomendar a primeira abordagem sem comparar
-- ❌ Esconder o tradeoff ("é melhor porque é melhor")
-- ❌ Gerar PRD sem o usuário pedir
-- ❌ Começar a editar código no meio da discussão
+- ❌ Assumir em vez de investigar ("você tá assumindo — aqui é investigar").
+- ❌ Escrever fora de `docs/`; começar a editar código no meio da discussão.
+- ❌ Pular pro brainstorming sem enquadrar; recomendar a primeira abordagem sem comparar.
+- ❌ Esconder o tradeoff ou o impacto ("é melhor porque é melhor").
+- ❌ Gerar PRD sem o usuário pedir.
+- ❌ Despejar as seções no chat.

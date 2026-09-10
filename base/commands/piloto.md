@@ -1,37 +1,34 @@
 ---
-description: Fluxo completo fim-a-fim — grelha a ideia (interrogatório), refina em prompt premium, pede OK, e executa com BMAD + Superpowers.
+description: "Fluxo completo fim-a-fim — grelha a ideia, refina em prompt premium (gate 1), planeja (gate 2) e executa com BMAD + Superpowers; gate de integração antes de push/merge/deploy. Flags — --auto (sem gates de decisão), --so-refinar (para no prompt), models=papel:valor / modelo=x (agente nomeado ou modelo por papel)."
 ---
 
-**FLUXO OBRIGATÓRIO — invocações sequenciais da Skill tool:**
+**Flags** — primeiras palavras de `$ARGUMENTS`; remova-as antes de passar a entrada às skills e registre o modo em 1 linha (`modo: auto|normal`):
 
-## Etapa 0 — Memória (PRIMEIRO de tudo)
+- `--auto` (ou `auto`) → **modo autônomo**: sem grelha interativa (cada decisão vira recomendação registrada como `SUPOSIÇÃO`), sem gate 1 nem gate 2. **Único gate** = integração (menu antes de `git push` / merge / deploy). O mesmo modo vale, sem flag, se `printenv CLAUDE_AUTONOMOUS` estiver definida ou se `AskUserQuestion` não existir na sessão.
+- `--so-refinar` → executa as Etapas 0–2 e para (é o que `/refinar` e `/refinar-auto` chamam).
+- `models=implementer_backend:opus,reviewer:fable` ou `modelo=opus` → override de `~/.claude/cbs-overrides/models.yml` (papéis: `orchestrator`, `architect`, `implementer_backend`, `implementer_frontend`, `refactor`, `reviewer`, `final_reviewer`, `tester`, `explorer`, `search`; valor = nome de agente em `~/.claude/agents` (ex.: `cbs-backend`) / `~/.codex/agents` ou modelo `sonnet|opus|fable|inherit`); repasse literal ao executor.
 
-Invoque `Skill` com `skill: "mem-search"` passando a entrada do usuário como query. Sem exceção, mesmo se parecer trivial. Se não existir, tente `claude-mem:mem-search`; se nenhuma existir, registre "Memória: não disponível" e siga.
+Chat enxuto: 1 linha por etapa. O detalhe vai pros arquivos (`docs/prompts/`, plano, `.superpowers/sdd/`, `docs/analises/`).
 
-## Etapa 1 — Grelhar (interrogatório antes de refinar)
+## Etapa 0 — Memória (primeiro de tudo)
 
-Invoque `Skill` com `skill: "grelhar"` passando a entrada do usuário + resumo da memória. A skill interroga o usuário — **uma pergunta por vez, com resposta recomendada**, buscando fatos sozinha e pondo só as decisões pra ele — descendo a árvore de decisão até haver **entendimento compartilhado**. É aqui que as escolhas ficam afiadas antes de gastar tokens gerando o prompt.
+Invoque `Skill` com `skill: "claude-mem:mem-search"` (fallback `mem-search`) passando a entrada do usuário como query. Sem exceção. Se nenhuma existir, registre "Memória: não disponível" e siga.
 
-Espere o usuário fechar a grelha (**"fechou"** / equivalente). Só então siga pra Etapa 2. Não pule esta etapa: ela se auto-escala (ideia trivial fecha em 1-2 perguntas; ideia grande destrincha vários galhos). Se a grelha revelar que o escopo é grande demais pra uma sessão, ofereça `/mapear` em vez de seguir direto.
+## Etapa 1 — Grelhar
 
-## Etapa 2 — Refinar
+Invoque `Skill` com `skill: "grelhar"` passando a entrada + resumo da memória + o modo. Normal: uma pergunta por vez no `AskUserQuestion`, só decisões (fatos ela busca sozinha); espere **"fechou"**. Auto: modo auto da skill (sem perguntas, recomendação registrada por decisão). Se a grelha revelar escopo grande demais pra uma sessão: normal → ofereça `/mapear` e pare; auto → registre `SUPOSIÇÃO: escopo cabe numa sessão`, siga, e anote na entrega que `/mapear` era o indicado.
 
-Invoque `Skill` com `skill: "refinador-de-prompt"` passando a entrada do usuário + resumo da memória + as **decisões fechadas na grelha**. Aguarde a skill produzir o prompt final premium no formato dela (4 seções). Como a grelha já resolveu as decisões, o "Alinhamento prévio" da refinador vira uma **confirmação rápida** — não reabra as mesmas perguntas.
+## Etapa 2 — Refinar (gate 1)
 
-Se ainda restar dúvida bloqueante, **PERGUNTE** ao usuário e pare aqui até a resposta.
+Invoque `Skill` com `skill: "refinador-de-prompt"` passando a entrada + resumo da memória + **decisões fechadas na grelha** + o modo. Ela grava `docs/prompts/<data>-<slug>.md` (com `tipo_de_tarefa` e `dominios_previstos`) e responde 1 linha. Não reabra decisões da grelha.
 
-## Etapa 3 — Aguardar OK
+- Normal: a pergunta dela (**`ok` executa / diga o que mudar**) é o **gate 1**. `ok` → Etapa 3.
+- Auto: sem pergunta → Etapa 3.
+- `--so-refinar`: pare aqui (após o `ok`, no modo normal).
 
-A própria skill `refinador-de-prompt` faz o loop de iteração ("ajustar algo? ok pra fechar..."). Quando o usuário fechar com `ok` (ou equivalente), pergunte literalmente:
+## Etapa 3 — Executar
 
-**"Posso executar agora? [s/N]"**
-
-- `s` → siga pra Etapa 4
-- `N` → pare (sem invocar executor)
-
-## Etapa 4 — Executar (invoque Skill tool de novo)
-
-Invoque a ferramenta `Skill` com `skill: "executor-bmad-superpowers"` passando o prompt final aprovado. A skill orquestra as fases — e a implementação é **delegada ao `superpowers:subagent-driven-development`** (subagents isolados por task, contexto principal limpo, branch atual sem worktree). O planejamento SEMPRE gera stories com BMAD → `superpowers:writing-plans`, e cada subagent `general-purpose` carrega a persona BMAD do seu papel (`@dev`/review/`@qa`). Haverá outro ponto de parada ("Posso implementar? [s/N]") antes de tocar código.
+Invoque `Skill` com `skill: "executor-bmad-superpowers"` passando o caminho do prompt + modo + models. O executor tem o **gate 2** (aprovação do plano, só no modo normal) e o **gate de integração** (`finishing-a-development-branch`, em qualquer modo). Não há outro ponto de parada: implementação delegada ao `superpowers:subagent-driven-development` na branch atual (`feat/<slug>` se estava em main), personas por caminho, revisão final automática (`revisor`) quando houver gatilho.
 
 Entrada do usuário:
 

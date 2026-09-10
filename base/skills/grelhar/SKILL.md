@@ -9,9 +9,15 @@ Você é um **interrogador implacável**. Sua missão: submeter o plano/decisão
 
 Adaptado do padrão `grilling` de [mattpocock/skills](https://github.com/mattpocock/skills), no tom e no fluxo do CBS.
 
+Chega-se aqui por `/grelhar` direto, pela Etapa 1 do `/piloto` (que `/refinar` e `/refinar-auto` também percorrem) ou pelo `/mapear` (pra nomear o destino e mapear a fronteira). Subagents `Explore` da Fase 2 usam o papel `explorer` de `~/.claude/cbs-overrides/models.yml` — Claude Code: coluna `claude:` (agente `cbs-explorer` se existir em `~/.claude/agents/`, senão `sonnet`); Codex (`~/.codex/agents/*.toml`, `CODEX_HOME`/`CODEX_CLI_PATH`): **só** a coluna `codex:` (`explorer_luna`), nunca modelo nem effort.
+
 ## ⚠️ PRIMEIRA AÇÃO — consultar memória (se disponível)
 
-Se ainda não chamou `mem-search` (ou `claude-mem:mem-search` / `claude-mem:smart-search`) com o tema como query, **chame agora**. Decisões anteriores e padrões já estabelecidos mudam quais perguntas ainda fazem sentido. Se nenhuma skill de memória existir, registre "Memória: não disponível" e siga.
+Use o resumo que o comando passou. Se não veio, chame `claude-mem:mem-search` (fallback `mem-search`) com o tema como query. Decisões anteriores e padrões já estabelecidos mudam quais perguntas ainda fazem sentido. Se nenhuma skill de memória existir, registre "Memória: não disponível" e siga.
+
+## Modo auto (sem interlocutor)
+
+Vale quando o chamador passou `--auto`, `CLAUDE_AUTONOMOUS` está definida ou `AskUserQuestion` não existe na sessão (`-p`, subagente, cron, teammate). Aí **não há interrogatório**: você ainda **busca os fatos sozinho** (Fase 2), mas cada decisão em aberto recebe a sua recomendação como resposta, marcada `SUPOSIÇÃO`, sem perguntar. Emita só o bloco de Fechamento (Fase 4) com as decisões assumidas e siga — sem "fechou?". Quem chamou (`/piloto --auto`) leva essas suposições pro prompt e pra entrega.
 
 ## Regras não-negociáveis
 
@@ -87,12 +93,14 @@ Quando os galhos estiverem resolvidos, emita:
 - [se houver]
 
 Fechou? Se sim, próximo passo sugerido:
-- `/refinar` — pra virar prompt premium executável
+- `/piloto` — refina em prompt premium e executa (`/refinar` se quiser só o prompt)
 - `/executar` — se já for direto pro código
 - `/mapear` — se o escopo for grande demais pra uma sessão só
 ```
 
-**Só depois do "fechou"** você para. Se o usuário pedir pra implementar no meio, lembre: "Grelhar é só pra alinhar. Quer que eu leve isso pro `/refinar` ou `/executar`?".
+Mantenha o fechamento em ≤10 linhas. Dentro do `/piloto`, as decisões fechadas vão pro prompt em `docs/prompts/` e o chat fica com 1 linha (`Grelha fechada: N decisões`).
+
+**Só depois do "fechou"** você para (em modo auto, não há espera). Se o usuário pedir pra implementar no meio, lembre: "Grelhar é só pra alinhar. Quer que eu leve isso pro `/piloto` ou `/executar`?".
 
 ## Anti-padrões
 
