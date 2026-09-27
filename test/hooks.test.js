@@ -139,6 +139,26 @@ describe('cbs-no-verify', () => {
     'git rebase --no-verify main',
     'git cherry-pick --no-verify abc123',
     'git am --no-verify 0001.patch',
+    // Achados do review (desvios do ECC): comentário, subshell/substituição, aspas no gap, shell -c/eval.
+    'git commit -m "fix #12" && git push --no-verify',
+    "echo '#'; git push --no-verify",
+    '(cd r && git commit -m x --no-verify)',
+    '$(git push --no-verify)',
+    '`git push --no-verify`',
+    'echo "$(git push --no-verify)"',
+    'git commit -m "$(git push --no-verify)"',
+    'git commit -m "$(echo x)" --no-verify',
+    'git -C "dir x" commit --no-verify',
+    'git -c user.name="A B" commit -n',
+    '"git" push --no-verify',
+    'bash -c "git commit --no-verify -m x"',
+    "sh -lc 'git push --no-verify'",
+    'eval "git push --no-verify"',
+    'git push 2>&1 --no-verify',
+    'git push &>/dev/null --no-verify',
+    'git "commit" --no-verify',
+    'x=$(git push --no-verify)',
+    'bash -o pipefail -c "git push --no-verify"',
   ];
   const LIBERA = [
     'git commit -m "hello"',
@@ -157,9 +177,26 @@ describe('cbs-no-verify', () => {
     'git commit --no-verbose -m "msg"',
     'npm test -- --no-verify',
     'ls -la',
+    'echo "git commit --no-verify"',
+    'grep -rn "git commit -n" .',
+    'git tag -m "bloqueia git commit --no-verify"',
+    'gh pr create --body "x git push --no-verify"',
+    'git commit -m "a) b; c | d" -m "e `f` g"',
+    'git commit -m "$(echo x)"',
+    'echo a#b; git commit -m x',
+    'bash -c "echo ok" && git push',
+    'git commit -m x # --no-verify',
+    "bash -c \"echo 'git push --no-verify'\"",
   ];
   for (const c of BLOQUEIA) test(`bloqueia: ${c}`, () => assert.equal(noVerify.checarComando(c).bloquear, true));
   for (const c of LIBERA) test(`libera: ${c}`, () => assert.equal(noVerify.checarComando(c).bloquear, false));
+  test('comando patológico (muitos git sem separador) decide em tempo linear', () => {
+    for (const c of ['git a '.repeat(20000), 'git push '.repeat(20000), 'git ' + '-c a=b '.repeat(40000) + 'push --no-verify']) {
+      const t0 = performance.now();
+      noVerify.checarComando(c);
+      assert.ok(performance.now() - t0 < 2000, `${c.slice(0, 20)}…: ${Math.round(performance.now() - t0)} ms`);
+    }
+  });
   test('motivo cita o subcomando git', () => assert.match(noVerify.checarComando('git commit -m x && git push --no-verify').motivo, /git push/));
   test('E2E: bloqueio sai 2 com motivo no stderr e stdout vazio', () => {
     const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } });
@@ -175,6 +212,20 @@ describe('cbs-no-verify', () => {
   });
   test('E2E: CBS_HOOKS_DESLIGADOS=no-verify libera', () => {
     const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } }, { CBS_HOOKS_DESLIGADOS: 'no-verify' });
-    assert.equal(r.code, 0);
+    assert.equal(r.code, 0); assert.equal(r.out, ''); assert.equal(r.err, '');
+  });
+  test('E2E: argv do Codex (array) também é checado', () => {
+    for (const command of [['git', 'commit', '--no-verify', '-m', 'x'], ['bash', '-lc', 'git push --no-verify']]) {
+      const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command } });
+      assert.equal(r.code, 2, JSON.stringify(command)); assert.equal(r.out, ''); assert.match(r.err, /no-verify/);
+    }
+    const ok = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: ['git', 'status'] } });
+    assert.equal(ok.code, 0); assert.equal(ok.out + ok.err, '');
+  });
+  test('E2E: erro interno sai 0 com aviso [cbs] no stderr', (t) => {
+    // Preload que quebra RegExp#test (usado já no caminho rápido de checarComando) simula falha interna.
+    const boom = escrever(tmpDoTeste(t), 'boom.cjs', "RegExp.prototype.test = function () { throw new Error('boom'); };\n");
+    const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } }, { NODE_OPTIONS: `--require=${boom}` });
+    assert.equal(r.code, 0); assert.equal(r.out, ''); assert.match(r.err, /^\[cbs\] no-verify: erro interno ignorado \(boom\)/);
   });
 });
