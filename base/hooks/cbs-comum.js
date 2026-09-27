@@ -17,8 +17,9 @@ export function hookDesligado(nome, env = process.env) {
     .includes(nome);
 }
 
+// Erro de leitura (stdin fechado, diretório, etc.) → aviso curto no stderr e payload vazio (hook sai 0).
 export function lerStdin() {
-  try { return fs.readFileSync(0, 'utf8'); } catch { return ''; }
+  try { return fs.readFileSync(0, 'utf8'); } catch (e) { avisar(`stdin ilegível ignorado (${e.code || e.message})`); return ''; }
 }
 
 // Conteúdo do arquivo, ou '' quando não existe / não dá pra ler.
@@ -81,16 +82,19 @@ export function executavel(p) {
 }
 
 // Binário do próprio projeto (vendor/bin, node_modules/.bin, .venv/bin). Nunca npx.
+// No Windows retorna null (SP-8: shims .cmd/.bat exigem shell → hook sai 0 em silêncio).
 export function binLocal(raiz, rel) {
+  if (WIN) return null;
   const p = path.join(raiz, rel);
   return executavel(p) ? p : null;
 }
 
 // Resolve no PATH sem shell. No Windows retorna null (SP-8: shims .cmd exigem shell).
+// Só diretórios absolutos: entrada relativa ('.', 'bin') resolveria contra o cwd do projeto.
 export function noPath(nome, env = process.env) {
   if (WIN) return null;
   for (const dir of String(env.PATH || '').split(path.delimiter)) {
-    if (!dir) continue;
+    if (!path.isAbsolute(dir)) continue;
     const p = path.join(dir, nome);
     if (executavel(p)) return p;
   }
@@ -105,4 +109,23 @@ export function ehEntrada(metaUrl) {
 
 export function avisar(msg) {
   try { process.stderr.write(`[cbs] ${msg}\n`); } catch {}
+}
+
+// Acumulador por sessão (PostToolUse registra, Stop consome). Só extensões com typecheck.
+export const EXT_TIPADAS = new Set(['.ts', '.tsx', '.mts', '.cts', '.php', '.py', '.pyi']);
+export function arquivoAcumulador(sessionId, dirTmp = os.tmpdir()) {
+  const id = String(sessionId || 'sem-sessao').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128);
+  return path.join(dirTmp, `cbs-editados-${id}.txt`);
+}
+// O_NOFOLLOW: o tmp é compartilhado; symlink plantado no caminho do acumulador não é seguido (lança).
+const FLAG_ACUMULADOR = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW || 0);
+export function registrarEdicao(sessionId, arquivos, dirTmp = os.tmpdir()) {
+  const tipados = arquivos.filter((a) => EXT_TIPADAS.has(path.extname(a).toLowerCase()));
+  if (tipados.length) fs.appendFileSync(arquivoAcumulador(sessionId, dirTmp), tipados.map((a) => a + '\n').join(''), { mode: 0o600, flag: FLAG_ACUMULADOR });
+  return tipados.length;
+}
+export function lerAcumulador(sessionId, dirTmp = os.tmpdir()) {
+  try {
+    return [...new Set(fs.readFileSync(arquivoAcumulador(sessionId, dirTmp), 'utf8').split('\n').filter(Boolean))];
+  } catch { return []; }
 }
