@@ -17,7 +17,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/smoke.js test/gate-gitleaks.test.js test/gate-achados-revisados.test.js test/gate-agentshield.test.js test/settings-merge.test.js"
+    "test": "node --test test/smoke.js test/gate-gitleaks.test.js test/gate-achados-revisados.test.js test/gate-agentshield.test.js test/settings-merge.test.js test/hooks.test.js"
   },
   "keywords": [
     "claude-code",
