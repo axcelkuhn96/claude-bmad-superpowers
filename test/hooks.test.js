@@ -174,6 +174,24 @@ describe('cbs-no-verify', () => {
     "tcsh -c 'git push --no-verify'",
     "ash -c 'git push --no-verify'",
     "echo \"$(bash -c 'git push --no-verify')\"",
+    // Re-review do fix round 2 (N4, N5) e inversão fail-closed: flag fora de dado provado = bloqueia.
+    'git commit -m">" --no-verify',
+    'git commit -m"<wip> x" -n',
+    "git commit -am'<x>' -n",
+    "echo $$'\\'; git push --no-verify #'",
+    "git push $'--no-verify'",
+    'git push $"--no-verify"',
+    'git push "--no-verify"',
+    'git push $(echo) echo --no-verify',
+    "X='; git push'; eval echo $X --no-verify",
+    "X='; git push'; bash -c \"echo $X --no-verify\"",
+    "bash -c 'git commit \"$@\"' _ -n",
+    "bash -c 'git push \"$@\"' _ --no-verify",
+    '{ git push --no-verify; }',
+    'if git push --no-verify; then :; fi',
+    'sudo git push --no-verify',
+    'git push {--no-verify,}',
+    'git am -n 0001.patch',
   ];
   const LIBERA = [
     'git commit -m "hello"',
@@ -205,6 +223,13 @@ describe('cbs-no-verify', () => {
     "git commit -F- <<'EOF'\nfix: mensagem normal, don't panic\nEOF",
     "echo $'a\\'b' && git push origin main",
     'git commit -m "x" 2>&1 | tail -3',
+    'head -n 3 f && git commit -m x',
+    'if true; then echo --no-verify; fi; git status',
+    'A=1 echo --no-verify && git status',
+    'git log -n 3 | head -n 1 && git commit -m "x"',
+    "bash -c 'echo $X --no-verify' && git status",
+    'git push -n origin main && git commit -m "x"',
+    'printf "%s\\n" "--no-verify" && git commit -m x',
   ];
   for (const c of BLOQUEIA) test(`bloqueia: ${c}`, () => assert.equal(noVerify.checarComando(c).bloquear, true));
   for (const c of LIBERA) test(`libera: ${c}`, () => assert.equal(noVerify.checarComando(c).bloquear, false));

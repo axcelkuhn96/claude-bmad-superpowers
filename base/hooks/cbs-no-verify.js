@@ -1,19 +1,18 @@
 #!/usr/bin/env node
-// cbs-no-verify.js — PreToolUse (Bash): bloqueia bypass de hooks git (--no-verify, commit -n, -c core.hooksPath=…)
-// em commit/push/merge/cherry-pick/rebase/am — inclusive dentro de ( ), $( ), crase, sh -c e eval — sem falso
-// positivo quando o texto está em string (echo, grep, mensagem de commit/tag/PR) ou em comentário.
-// Fail-closed: se a análise fica incerta (aspa/heredoc aberto, comando > 64 KB ou orçamento de custo estourado,
-// shell -c/eval não modelado), o texto cru é checado e basta `git` + flag de bypass para bloquear. Trade-off
-// aceito: heredoc cujo texto contém "--no-verify" pode bloquear — escape: CBS_HOOKS_DESLIGADOS=no-verify.
+// cbs-no-verify.js — PreToolUse (Bash): bloqueia bypass de hooks git (--no-verify, commit/am -n, -c core.hooksPath=…).
+// Fail-closed por construção: o gatilho é o TEXTO CRU — palavra `git` + flag de bypass (--no-verify ou prefixo,
+// core.hooksPath=, ou -n agrupado quando há commit/am) → BLOQUEIA. O parser só REBAIXA para liberar quando a análise
+// é certa E cada flag está provadamente em dado: argumento de echo/printf/grep/rg/gh, valor de -m/-F em commit/tag/merge,
+// comentário, -n de comando onde ele não é --no-verify (head, git log…), ou script de sh -c/eval que, analisado
+// sozinho, libera. Bug de parser vira falso positivo, nunca falso negativo.
+// Incerto (heredoc, $'…', aspa sem fechar, comando > 64 KB, sh -c aninhado demais) → vale o texto cru. Trade-off
+// aceito: heredoc cujo texto contém "--no-verify" bloqueia — escape: CBS_HOOKS_DESLIGADOS=no-verify.
 // Adaptado de affaan-m/ECC @ e482e57, scripts/hooks/block-no-verify.js — MIT License,
 // Copyright (c) 2026 Affaan Mustafa. Licença: https://github.com/affaan-m/ECC/blob/e482e57/LICENSE
 import { hookDesligado, lerStdin, lerPayload, comandoBash, ehEntrada, avisar } from './cbs-comum.js';
 
-// --- Adaptado do ECC (block-no-verify.js:21-511); nomes internos em inglês como na fonte. ---
-// Desvios do ECC (review da Task 4): scanShell (aspas, comentário só em início de palavra, ( ) $( ) e crase);
-// findCommandSegmentEnd/findGit/detectGitCommand/checkCommand reescritos sobre ele (isInComment virou o COMMENT dele);
-// subcomando achado por tokenizeShellWords (aspas no gap); scripts de sh -c / eval checados por recursão;
-// \git, $'…' e redirecionamento colado (push>/dev/null) modelados; incerteza → rawBypass no texto cru.
+// --- Do ECC (block-no-verify.js:21-31, 38-84, 210-275, 396-404), sem mudança: subcomandos, flags de bypass e
+// opções de valor do git commit. O resto do ECC (scanner por string) foi substituído pela lógica fail-closed abaixo. ---
 
 /**
  * Git commands that support the --no-verify flag.
@@ -26,11 +25,6 @@ const GIT_COMMANDS_WITH_NO_VERIFY = [
   'rebase',
   'am',
 ];
-
-/**
- * Characters that can appear immediately before 'git' in a command string.
- */
-const VALID_BEFORE_GIT = ' \t\n\r;&|$`(<{!"\']/.~\\';
 
 // Git config section and variable names are case-insensitive
 // (subsection names are case-sensitive but core.hooksPath has none),
@@ -79,222 +73,6 @@ const COMMIT_SHORT_OPTIONS_WITH_VALUE = new Set(['m', 'F', 'C', 'c', 't']);
 // (`-uno`, `-S<keyid>`). The rest of the cluster is that value, so an `n`
 // after them is not the -n flag: `git commit -uno` means --untracked-files=no.
 const COMMIT_SHORT_OPTIONS_WITH_OPTIONAL_VALUE = new Set(['u', 'S']);
-
-function tokenizeShellWords(input, start = 0, end = input.length) {
-  spend(end - start);
-  const tokens = [];
-  let value = '';
-  let tokenStart = null;
-  let quote = null;
-  let escaped = false;
-
-  function beginToken(index) {
-    if (tokenStart === null) {
-      tokenStart = index;
-    }
-  }
-
-  function pushToken(index) {
-    if (tokenStart === null) {
-      return;
-    }
-
-    tokens.push({
-      value,
-      start: tokenStart,
-      end: index,
-    });
-    value = '';
-    tokenStart = null;
-  }
-
-  for (let i = start; i < end; i++) {
-    const char = input.charAt(i);
-
-    if (escaped) {
-      beginToken(i - 1);
-      value += char;
-      escaped = false;
-      continue;
-    }
-
-    if (quote) {
-      if (char === quote) {
-        quote = null;
-        continue;
-      }
-
-      if (quote === '"' && char === '\\') {
-        beginToken(i);
-        escaped = true;
-        continue;
-      }
-
-      beginToken(i);
-      value += char;
-      continue;
-    }
-
-    if (char === '"' || char === "'") {
-      beginToken(i);
-      quote = char;
-      continue;
-    }
-
-    if (char === '\\') {
-      beginToken(i);
-      escaped = true;
-      continue;
-    }
-
-    if (/\s/.test(char)) {
-      pushToken(i);
-      continue;
-    }
-
-    beginToken(i);
-    value += char;
-  }
-
-  if (escaped) {
-    value += '\\';
-  }
-  pushToken(end);
-
-  return tokens;
-}
-
-const LITERAL = 0;
-const CODE = 1;
-const COMMENT = 2;
-let lastScan = null;
-
-// Teto de custo: acima disso a análise é incerta e cai no texto cru (fail-closed).
-const MAX_COMMAND = 64 * 1024;
-const MAX_WORK = 4 * 1024 * 1024;
-let work = 0;
-let uncertainty = null;
-class ParseBudgetExceeded extends Error {}
-function spend(n) {
-  work += n;
-  if (work > MAX_WORK) throw new ParseBudgetExceeded('orçamento de análise estourado');
-}
-function markUncertain(why) {
-  if (!uncertainty) uncertainty = why;
-}
-
-/**
- * Classifica cada posição do comando: CODE (sintaxe do shell), LITERAL (dentro de aspas ou escapado)
- * ou COMMENT; `depth` conta ( ), $( ) e crases abertos; `end` marca separadores (; | & \n), o fechamento
- * de ( ) / $( ) / crase e o início de comentário (`#` só conta fora de aspas e em início de palavra).
- * `quotedSubs` guarda o corpo de $( ) / crase abertos dentro de aspas duplas (rodam como comando);
- * `uncertain` diz por que o estado pode divergir do shell (heredoc, aspa ou parêntese sem fechar).
- */
-function scanShell(input) {
-  if (lastScan && lastScan.input === input) return lastScan;
-  spend(input.length);
-  const n = input.length;
-  const kind = new Uint8Array(n);
-  const depth = new Uint32Array(n);
-  const end = new Uint8Array(n);
-  const stack = [];
-  const quotedSubs = [];
-  let codeDepth = 0;
-  let heredoc = false;
-  const literalNext = (i) => { if (i < n) { kind[i] = LITERAL; depth[i] = codeDepth; } };
-  // `i` é o índice do caractere que abre ( `(` de $( ) ou a crase ); o corpo começa em i + 1.
-  const openCode = (type, i, inQuotes) => { stack.push({ type, inQuotes, start: i + 1 }); codeDepth++; };
-  const closeCode = (i) => {
-    const frame = stack.pop();
-    codeDepth--;
-    if (frame.inQuotes) quotedSubs.push(input.slice(frame.start, i));
-  };
-
-  for (let i = 0; i < n; i++) {
-    const char = input.charAt(i);
-    const top = stack.length ? stack[stack.length - 1].type : null;
-    depth[i] = codeDepth;
-
-    if (top === "'") {
-      if (char === "'") { stack.pop(); kind[i] = CODE; } else { kind[i] = LITERAL; }
-      continue;
-    }
-
-    // ANSI-C $'…': \ escapa (inclusive \'), ' fecha.
-    if (top === "$'") {
-      kind[i] = LITERAL;
-      if (char === '\\') { literalNext(i + 1); i++; continue; }
-      if (char === "'") { stack.pop(); kind[i] = CODE; }
-      continue;
-    }
-
-    if (top === '"') {
-      kind[i] = LITERAL;
-      if (char === '\\') { literalNext(i + 1); i++; continue; }
-      if (char === '"') { stack.pop(); kind[i] = CODE; continue; }
-      if (char === '$' && input.charAt(i + 1) === '(') {
-        kind[i] = CODE; kind[i + 1] = CODE; depth[i + 1] = codeDepth; i++;
-        openCode('$(', i, true);
-        continue;
-      }
-      if (char === '`') { kind[i] = CODE; openCode('`', i, true); }
-      continue;
-    }
-
-    kind[i] = CODE;
-    if (char === '\\') { literalNext(i + 1); i++; continue; }
-    if (char === '$' && input.charAt(i + 1) === "'") {
-      kind[i + 1] = CODE; depth[i + 1] = codeDepth; i++;
-      stack.push({ type: "$'" });
-      continue;
-    }
-    if (char === "'" || char === '"') { stack.push({ type: char }); continue; }
-    if (char === '#' && (i === 0 || (kind[i - 1] === CODE && /[\s;&|()]/.test(input.charAt(i - 1))))) {
-      end[i] = 1;
-      for (; i < n && input.charAt(i) !== '\n'; i++) { kind[i] = COMMENT; depth[i] = codeDepth; }
-      i--;
-      continue;
-    }
-    if (char === '$' && input.charAt(i + 1) === '(') {
-      kind[i + 1] = CODE; depth[i + 1] = codeDepth; i++;
-      openCode('$(', i, false);
-      continue;
-    }
-    if (char === '(') { openCode('(', i, false); continue; }
-    if (char === ')') {
-      end[i] = 1;
-      if (top === '$(' || top === '(') closeCode(i);
-      continue;
-    }
-    if (char === '`') {
-      if (top === '`') { end[i] = 1; closeCode(i); } else { openCode('`', i, false); }
-      continue;
-    }
-    // Heredoc (<< e <<-, não <<<): o corpo não segue as regras de aspas — análise incerta.
-    if (char === '<' && input.charAt(i + 1) === '<' && input.charAt(i + 2) !== '<' && input.charAt(i - 1) !== '<') heredoc = true;
-    // `2>&1`, `&>arq` e `>|arq` são redirecionamento, não separador.
-    if (char === '&' && (/[<>]/.test(input.charAt(i - 1)) || input.charAt(i + 1) === '>')) continue;
-    if (char === '|' && input.charAt(i - 1) === '>') continue;
-    if (char === ';' || char === '|' || char === '&' || char === '\n') end[i] = 1;
-  }
-
-  // segEnd[i]: próximo fim de segmento no mesmo nível de i (todo nível fecha com um `end` nele), em O(n).
-  const segEnd = new Uint32Array(n);
-  const nextEndAt = [];
-  for (let i = n - 1; i >= 0; i--) {
-    if (end[i]) nextEndAt[depth[i]] = i;
-    segEnd[i] = nextEndAt[depth[i]] ?? n;
-  }
-
-  const uncertain = heredoc ? 'heredoc' : stack.length ? 'aspa ou parêntese sem fechar' : null;
-  lastScan = { input, kind, depth, end, segEnd, quotedSubs, uncertain };
-  return lastScan;
-}
-
-function findCommandSegmentEnd(input, start) {
-  if (start >= input.length) return input.length;
-  return scanShell(input).segEnd[start];
-}
 
 function commitOptionConsumesNextValue(value) {
   if (isCommitNoVerifyShortFlag(value)) {
@@ -364,100 +142,6 @@ function isCommitNoVerifyShortFlag(value) {
 }
 
 /**
- * Find the next 'git' token in the input starting from a position.
- * Só conta `git` em contexto de código (fora de aspas e de comentário) ou a palavra inteira entre
- * aspas (`"git" push`); `len` inclui a aspa de fechamento nesse caso.
- */
-function findGit(input, start) {
-  const { kind } = scanShell(input);
-  let pos = start;
-  while (pos < input.length) {
-    const idx = input.indexOf('git', pos);
-    if (idx === -1) return null;
-    pos = idx + 1;
-
-    const isExe = input.slice(idx + 3, idx + 7).toLowerCase() === '.exe';
-    const len = isExe ? 7 : 3;
-    const after = input[idx + len] || ' ';
-    if (!/[\s"']/.test(after)) continue;
-
-    const before = idx > 0 ? input[idx - 1] : ' ';
-    if (!VALID_BEFORE_GIT.includes(before)) continue;
-
-    if (kind[idx] === CODE) return { idx, len };
-    if (before === '\\' && kind[idx - 1] === CODE) return { idx, len };  // \git: escape só desliga alias
-    const wholeQuoted = kind[idx] === LITERAL && (before === '"' || before === "'") &&
-      kind[idx - 1] === CODE && after === before && kind[idx + len] === CODE;
-    if (wholeQuoted) return { idx, len: len + 1 };
-  }
-  return null;
-}
-
-// Opções globais do git que consomem o próximo token (git -C dir, git -c chave=valor…).
-// Redirecionamento: token que começa com ele (`>x`, `2>&1`, `&>x`) ou só o operador (`>`, `2>>`).
-const REDIRECT_START = /^(\d*|&)[<>]/;
-const REDIRECT_ONLY = /^(\d*|&)[<>]{1,2}[|&]?$/;
-// Redirecionamento colado na palavra (`push>/dev/null`, `--no-verify&>x`): a palavra termina antes dele.
-function cutRedirect(value) {
-  return value.replace(/&?[<>][\s\S]*$/, '');
-}
-const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set(['-c', '-C', '--work-tree', '--git-dir', '--namespace', '--super-prefix']);
-
-/**
- * Primeira palavra depois de git que não é opção global (nem valor dela). Tokeniza numa janela que dobra
- * até achar a palavra inteira, pra não retokenizar o segmento todo a cada `git` (custo linear).
- */
-function findGitSubcommand(input, start, segmentEnd) {
-  for (let size = 256; ; size *= 2) {
-    const windowEnd = Math.min(segmentEnd, start + size);
-    let expectFlagArg = false;
-    for (const t of tokenizeShellWords(input, start, windowEnd)) {
-      if (t.end >= windowEnd && windowEnd < segmentEnd) break;  // token pode ter sido cortado pela janela
-      if (expectFlagArg) { expectFlagArg = false; continue; }
-      if (REDIRECT_START.test(t.value)) {
-        if (REDIRECT_ONLY.test(t.value)) expectFlagArg = true;  // `>` solto: o próximo token é o alvo
-        continue;
-      }
-      if (t.value.startsWith('-')) {
-        if (GIT_GLOBAL_OPTIONS_WITH_VALUE.has(t.value)) expectFlagArg = true;
-        continue;
-      }
-      return { ...t, value: cutRedirect(t.value) };
-    }
-    if (windowEnd >= segmentEnd) return null;
-  }
-}
-
-/**
- * Detect which git subcommand (commit, push, etc.) is being invoked.
- * Returns { command, offset } where offset is the position right after the
- * subcommand keyword, so callers can scope flag checks to only that portion.
- * O subcomando é a primeira palavra (com aspas resolvidas) depois de git e das opções globais.
- */
-function detectGitCommand(input, start = 0) {
-  while (start < input.length) {
-    const git = findGit(input, start);
-    if (!git) return null;
-
-    const gitEnd = git.idx + git.len;
-    const sub = findGitSubcommand(input, gitEnd, findCommandSegmentEnd(input, gitEnd));
-
-    if (sub && GIT_COMMANDS_WITH_NO_VERIFY.includes(sub.value)) {
-      return {
-        command: sub.value,
-        offset: sub.end,
-        gitStart: git.idx,
-        gitEnd,
-        commandStart: sub.start,
-      };
-    }
-
-    start = gitEnd;
-  }
-  return null;
-}
-
-/**
  * git's option parser accepts any unambiguous prefix of a long option, so
  * `--no-veri` and `--no-verif` run as --no-verify. Shorter prefixes such as
  * `--no-ver` are ambiguous with --no-verbose and git rejects them itself, so
@@ -467,217 +151,268 @@ function isNoVerifyLongFlag(value) {
   return value.length >= '--no-v'.length && '--no-verify'.startsWith(value);
 }
 
-/**
- * Check if the input contains a --no-verify flag for a specific git command.
- * Only inspects the portion of the input starting at `offset` (the position
- * right after the detected subcommand keyword) so that flags belonging to
- * earlier commands in a chain are not falsely matched.
- */
-function hasNoVerifyFlag(input, command, offset) {
-  const segmentEnd = findCommandSegmentEnd(input, offset);
-  const tokens = tokenizeShellWords(input, offset, segmentEnd);
-  let skipNext = false;
+// --- CBS: fail-closed por construção ---
 
-  for (const token of tokens) {
-    const value = cutRedirect(token.value);
-
-    if (skipNext) {
-      skipNext = false;
-      continue;
-    }
-
-    if (value === '--') {
-      break;
-    }
-
-    if (command === 'commit') {
-      if (commitOptionConsumesNextValue(value)) {
-        skipNext = true;
-        continue;
-      }
-
-      if (commitOptionContainsInlineValue(value)) {
-        continue;
-      }
-    }
-
-    if (isNoVerifyLongFlag(value)) return true;
-
-    // For commit, -n is shorthand for --no-verify.
-    if (command === 'commit' && isCommitNoVerifyShortFlag(value)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-/**
- * Check if the input contains a -c core.hooksPath= override.
- */
-function hasHooksPathOverride(input, detected) {
-  const tokens = tokenizeShellWords(input, detected.gitEnd, detected.commandStart);
-
-  for (let i = 0; i < tokens.length; i++) {
-    const value = tokens[i].value;
-    // Git config section + variable names are case-insensitive, so a
-    // bypass attempt like `core.HOOKSPATH=...` or `core.hookspath=...`
-    // must compare against the lowercased token.
-    const lowered = value.toLowerCase();
-
-    if (value === '-c') {
-      const next = tokens[i + 1] && tokens[i + 1].value;
-      if (typeof next === 'string' && next.toLowerCase().startsWith(GIT_CONFIG_KEY_PREFIX)) {
-        return true;
-      }
-      i++;
-      continue;
-    }
-
-    if (lowered.startsWith(`-c${GIT_CONFIG_KEY_PREFIX}`)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish']);
-// Shells e wrappers cujo -c não é modelado: a análise vira incerta (fail-closed).
-const UNMODELLED_SHELLS = new Set(['su', 'ash', 'mksh', 'tcsh', 'csh', 'yash', 'posh', 'busybox', 'ksh93', 'pwsh', 'powershell']);
-// Opções de sh/bash que consomem o próximo token antes do -c.
-const SHELL_OPTIONS_WITH_VALUE = new Set(['-o', '+o', '-O', '+O', '--rcfile', '--init-file']);
+const MAX_COMMAND = 64 * 1024;
 const MAX_NESTING = 3;
+const LITERAL = 0;
+const CODE = 1;
+const COMMENT = 2;
+const EXPANSION = 3;  // `$` dentro de aspas duplas: expande antes do comando ver o texto
 
-/**
- * Scripts passados a `sh|bash|… -c`, a `eval` e corpos de $( ) / crase dentro de aspas duplas: rodam como
- * comando, então são checados por recursão. Shell não modelado marca a análise como incerta.
- */
-function nestedShellScripts(input) {
-  const { kind, quotedSubs } = scanShell(input);
-  const tokens = tokenizeShellWords(input).filter(t => kind[t.start] === CODE);
-  const scripts = [...quotedSubs];
-  for (let i = 0; i < tokens.length; i++) {
-    const name = tokens[i].value.split(/[/;&|(`]/).pop();
-    if (UNMODELLED_SHELLS.has(name)) markUncertain(`${name} não modelado`);
-    if (name === 'eval') {
-      const words = tokenizeShellWords(input, tokens[i].end, findCommandSegmentEnd(input, tokens[i].end));
-      scripts.push(words.map(t => t.value).join(' '));
-      continue;
-    }
-    if (!SHELLS.has(name)) continue;
-    let hasC = false;
-    for (let j = i + 1; j < tokens.length; j++) {
-      const value = tokens[j].value;
-      if (SHELL_OPTIONS_WITH_VALUE.has(value)) { j++; continue; }
-      if (value.startsWith('-')) { if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(value)) hasC = true; continue; }
-      if (hasC) scripts.push(value);
-      break;
-    }
-  }
-  return scripts;
+// Subcomandos em que -n é --no-verify.
+const SHORT_N_SUBCOMMANDS = new Set(['commit', 'am']);
+// Subcomandos git em que -n é outra coisa (dry-run, no-stat, no-commit, contagem…).
+const GIT_SUBCOMMANDS_N_IS_OTHER = new Set(['log', 'show', 'shortlog', 'reflog', 'rev-list', 'whatchanged', 'format-patch',
+  'grep', 'push', 'pull', 'fetch', 'merge', 'rebase', 'cherry-pick', 'revert', 'clean', 'add', 'rm', 'mv', 'tag', 'diff',
+  'status', 'blame']);
+// Comandos cujos argumentos são só dado (não executam nada).
+const DATA_COMMANDS = new Set(['echo', 'printf', 'grep', 'egrep', 'fgrep', 'rg', 'gh']);
+// Comandos em que -n é opção própria (e que não executam outro comando).
+const N_IS_OTHER_COMMANDS = new Set([...DATA_COMMANDS, 'head', 'tail', 'ls', 'sort', 'uniq', 'cut', 'wc', 'nl', 'cat',
+  'diff', 'sed', 'jq']);
+// Palavras reservadas antes do comando de verdade.
+const KEYWORDS = new Set(['!', 'if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', 'time']);
+const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set(['-c', '-C', '--work-tree', '--git-dir', '--namespace', '--super-prefix']);
+const MESSAGE_OPTIONS = new Set(['-m', '--message', '-F', '--file']);
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish']);
+const SHELL_OPTIONS_WITH_VALUE = new Set(['-o', '+o', '-O', '+O', '--rcfile', '--init-file']);
+
+const isGitWord = (w) => /(^|\/)git(\.exe)?$/i.test(w);
+
+// Palavras do texto cru: corta em qualquer metacaractere (mesmo entre aspas) e tira aspas, \, $ e variáveis —
+// superconjunto de toda palavra que o shell poderia montar.
+function rawWords(text) {
+  return text.split(/[\s;&|()`<>{},]+/)
+    .map(w => w.replace(/\$\{[^}]*\}|\$[A-Za-z_]\w*|\$[0-9#?!@*$-]/g, '').replace(/[\\"'$]/g, ''))
+    .filter(Boolean);
+}
+
+function nearestSubcommand(words, i, forwardFirst) {
+  const find = (from, step) => {
+    for (let j = from; j >= 0 && j < words.length; j += step) if (GIT_COMMANDS_WITH_NO_VERIFY.includes(words[j])) return words[j];
+    return null;
+  };
+  return forwardFirst ? find(i + 1, 1) ?? find(i - 1, -1) : find(i - 1, -1) ?? find(i + 1, 1);
 }
 
 /**
- * Check a command string for git hook bypass attempts.
+ * Gatilho cru: `git` (em `context`) + flag de bypass (em `text`). -n só conta se `context` tem commit/am.
  */
-function checkCommand(input, nesting = 0) {
-  const scan = scanShell(input);
-  if (scan.uncertain) markUncertain(scan.uncertain);
-  let start = 0;
-  // Segmentos já checados: um git no mesmo nível dentro deles é argumento (git push origin git), não comando.
-  let checked = [];
+function findBypass(text, context = text) {
+  const contextWords = rawWords(context);
+  if (!contextWords.some(isGitWord)) return null;
+  const nCounts = contextWords.some(w => SHORT_N_SUBCOMMANDS.has(w));
+  const words = text === context ? contextWords : rawWords(text);
+  for (let i = 0; i < words.length; i++) {
+    const hooksPath = words[i].toLowerCase().includes(GIT_CONFIG_KEY_PREFIX);
+    if (hooksPath || isNoVerifyLongFlag(words[i]) || (nCounts && isCommitNoVerifyShortFlag(words[i]))) {
+      return { hooksPath, command: nearestSubcommand(words, i, hooksPath) };
+    }
+  }
+  return null;
+}
 
-  while (start < input.length) {
-    const detected = detectGitCommand(input, start);
-    if (!detected) break;
-
-    const { command: gitCommand, offset } = detected;
-    const level = scanShell(input).depth[detected.gitStart];
-    checked = checked.filter(seg => seg.until > detected.gitStart);
-    if (checked.some(seg => seg.level === level)) {
-      start = offset;
+/**
+ * Classifica cada posição: CODE (sintaxe do shell), LITERAL (entre aspas ou escapado), COMMENT, EXPANSION.
+ * Devolve null quando a análise é incerta: heredoc, $'…' ou aspa / substituição sem fechar.
+ */
+function scanShell(input) {
+  const n = input.length;
+  const kind = new Uint8Array(n);
+  const stack = [];
+  for (let i = 0; i < n; i++) {
+    const c = input[i];
+    const top = stack[stack.length - 1];
+    if (top === "'") {
+      if (c === "'") { stack.pop(); kind[i] = CODE; }
       continue;
     }
-
-    if (hasHooksPathOverride(input, detected)) {
-      return {
-        blocked: true,
-        command: gitCommand,
-        hooksPath: true,
-        reason: `BLOCKED: Overriding core.hooksPath is not allowed with git ${gitCommand}. Git hooks must not be bypassed.`,
-      };
+    if (top === '"') {
+      if (c === '\\') { if ('"\\$`\n'.includes(input[i + 1] ?? '')) kind[i] = CODE; i++; continue; }
+      if (c === '"') { stack.pop(); kind[i] = CODE; continue; }
+      if (c === '$' && input[i + 1] === '(') { kind[i] = kind[i + 1] = CODE; i++; stack.push('$('); continue; }
+      if (c === '$') { kind[i] = EXPANSION; continue; }
+      if (c === '`') { kind[i] = CODE; stack.push('`'); }
+      continue;
     }
-
-    if (hasNoVerifyFlag(input, gitCommand, offset)) {
-      return {
-        blocked: true,
-        command: gitCommand,
-        reason: `BLOCKED: --no-verify flag is not allowed with git ${gitCommand}. Git hooks must not be bypassed.`,
-      };
+    kind[i] = CODE;
+    if (c === '\\') { i++; continue; }
+    if (c === '$' && input[i + 1] === "'") return null;
+    if (c === '<' && input[i + 1] === '<' && input[i + 2] !== '<' && input[i - 1] !== '<') return null;
+    if (c === "'" || c === '"') { stack.push(c); continue; }
+    if (c === '#' && (i === 0 || (kind[i - 1] === CODE && /[\s;&|()`]/.test(input[i - 1])))) {
+      for (; i < n && input[i] !== '\n'; i++) kind[i] = COMMENT;
+      i--;
+      continue;
     }
-
-    // Continua logo após o subcomando: um git dentro de $( ) no próprio argumento também roda.
-    checked.push({ level, until: findCommandSegmentEnd(input, offset) });
-    start = offset;
+    if (c === '$' && input[i + 1] === '(') { kind[i + 1] = CODE; i++; stack.push('$('); continue; }
+    if (c === '(') { stack.push('('); continue; }
+    if (c === ')') { if (top === '$(' || top === '(') stack.pop(); continue; }
+    if (c === '`') { if (top === '`') stack.pop(); else stack.push('`'); }
   }
+  return stack.length ? null : kind;
+}
 
-  const scripts = nestedShellScripts(input);
-  if (nesting >= MAX_NESTING) {
-    if (scripts.length) markUncertain('aninhamento de sh -c / eval profundo demais');
-  } else {
-    for (const script of scripts) {
-      const r = checkCommand(script, nesting + 1);
-      if (r.blocked) return r;
+/**
+ * Comandos simples do input: listas de palavras { start, end, value (sem aspas), target (alvo de
+ * redirecionamento), subst (contém $( ) / crase), expands (contém $var) }. $( ), ( ) e crase abrem um contexto
+ * próprio; a palavra de fora que contém a substituição continua depois dela.
+ */
+function simpleCommands(input, kind) {
+  const commands = [];
+  const stack = [];
+  const context = (opener) => ({ opener, words: [], word: null, redirectNext: false });
+  let ctx = context(null);
+  const startWord = (i) => {
+    if (!ctx.word) {
+      ctx.word = { start: i, end: i, value: '', target: ctx.redirectNext, subst: false, expands: false };
+      ctx.redirectNext = false;
+    }
+    ctx.word.end = i + 1;
+    return ctx.word;
+  };
+  const endWord = () => { if (ctx.word) { ctx.words.push(ctx.word); ctx.word = null; } };
+  const endCommand = () => { endWord(); if (ctx.words.length) commands.push(ctx.words); ctx.words = []; };
+  const open = (opener) => { stack.push(ctx); ctx = context(opener); };
+  const close = (i) => {
+    endCommand();
+    ctx = stack.pop();
+    if (ctx.word) ctx.word.end = i + 1;
+  };
+
+  for (let i = 0; i < input.length; i++) {
+    const c = input[i];
+    if (kind[i] === COMMENT) { endCommand(); continue; }
+    if (kind[i] === LITERAL || kind[i] === EXPANSION) {
+      const w = startWord(i);
+      w.value += c;
+      if (kind[i] === EXPANSION) w.expands = true;
+      continue;
+    }
+    if (c === '$' && input[i + 1] === '(') { startWord(i).subst = true; i++; open('$('); continue; }
+    if (c === '`') {
+      if (ctx.opener === '`') close(i); else { startWord(i).subst = true; open('`'); }
+      continue;
+    }
+    if (c === '(') { endCommand(); open('('); continue; }
+    if (c === ')') {
+      if (ctx.opener === '$(' || ctx.opener === '(') close(i); else endCommand();
+      continue;
+    }
+    if (/\s/.test(c)) { if (c === '\n') endCommand(); else endWord(); continue; }
+    const redirect = c === '<' || c === '>' ||
+      (c === '&' && (input[i - 1] === '>' || input[i - 1] === '<' || input[i + 1] === '>')) ||
+      (c === '|' && input[i - 1] === '>');
+    if (redirect) {
+      // `2>x`: o número colado no operador é o descritor, não argumento.
+      if (ctx.word && ctx.word.end === i && /^\d+$/.test(ctx.word.value)) ctx.word.target = true;
+      endWord();
+      ctx.redirectNext = true;
+      continue;
+    }
+    if (c === ';' || c === '|' || c === '&') { endCommand(); continue; }
+    const w = startWord(i);
+    if (c === '"' || c === "'" || c === '\\') continue;  // sintaxe de aspas: não entra no valor
+    w.value += c;
+    if (c === '$') w.expands = true;
+  }
+  endCommand();
+  return commands;
+}
+
+// Opções de mensagem do git commit/tag/merge: o valor delas é dado.
+function clearGitData(args, clear) {
+  let i = 0;
+  while (i < args.length && args[i].value.startsWith('-')) i += GIT_GLOBAL_OPTIONS_WITH_VALUE.has(args[i].value) ? 2 : 1;
+  const sub = args[i]?.value;
+  const rest = args.slice(i + 1);
+  if (GIT_SUBCOMMANDS_N_IS_OTHER.has(sub)) rest.filter(w => isCommitNoVerifyShortFlag(w.value)).forEach(clear);
+  let skipNext = false;
+  for (const w of rest) {
+    if (skipNext) { skipNext = false; clear(w); continue; }
+    if (w.value === '--') break;
+    if (sub === 'commit') {
+      if (commitOptionConsumesNextValue(w.value)) skipNext = true;
+      else if (commitOptionContainsInlineValue(w.value)) clear(w);
+    } else if (sub === 'tag' || sub === 'merge') {
+      if (MESSAGE_OPTIONS.has(w.value)) skipNext = true;
+      else if (/^--(message|file)=|^-[a-zA-Z]*[mF][\s\S]/.test(w.value)) clear(w);
     }
   }
+}
 
-  return { blocked: false };
+// Script de sh -c / eval só vira dado se não expande nada fora e, analisado sozinho, libera.
+function scriptIsClean(words, depth, info) {
+  if (!words.length || words.some(w => w.subst || w.expands)) return false;
+  if (depth >= MAX_NESTING) { info.uncertain ??= 'sh -c / eval aninhado demais'; return false; }
+  const r = analyze(words.map(w => w.value).join(' '), depth + 1);
+  if (r?.uncertain) info.uncertain ??= r.uncertain;
+  return !r;
+}
+
+function shellScriptWord(args) {
+  let hasC = false;
+  for (let j = 0; j < args.length; j++) {
+    const value = args[j].value;
+    if (SHELL_OPTIONS_WITH_VALUE.has(value)) { j++; continue; }
+    if (/^[-+]/.test(value)) { if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(value)) hasC = true; continue; }
+    return hasC ? args[j] : null;
+  }
+  return null;
+}
+
+/**
+ * Máscara do que é dado provado (vira espaço antes da segunda passada do gatilho cru).
+ */
+function dataMask(input, kind, depth, info) {
+  const cleared = new Uint8Array(input.length);
+  for (let i = 0; i < input.length; i++) if (kind[i] === COMMENT) cleared[i] = 1;
+  const clear = (w) => { if (!w.subst) cleared.fill(1, w.start, w.end); };
+  for (const words of simpleCommands(input, kind)) {
+    const args = words.filter(w => !w.target);
+    let k = 0;
+    while (k < args.length && (KEYWORDS.has(args[k].value) || /^[A-Za-z_]\w*=/.test(args[k].value))) k++;
+    if (k >= args.length) continue;
+    const name = args[k].value.split('/').pop();
+    const rest = args.slice(k + 1);
+    if (DATA_COMMANDS.has(name)) rest.forEach(clear);
+    else if (N_IS_OTHER_COMMANDS.has(name)) rest.filter(w => isCommitNoVerifyShortFlag(w.value)).forEach(clear);
+    else if (isGitWord(args[k].value)) clearGitData(rest, clear);
+    else if (SHELLS.has(name)) {
+      const script = shellScriptWord(rest);
+      if (script && scriptIsClean([script], depth, info)) clear(script);
+    } else if (name === 'eval' && scriptIsClean(rest, depth, info)) rest.forEach(clear);
+  }
+  return cleared;
+}
+
+/**
+ * null = libera; senão { hooksPath, command, uncertain? } = bloqueia.
+ */
+function analyze(input, depth = 0) {
+  const hit = findBypass(input);
+  if (!hit) return null;
+  if (input.length > MAX_COMMAND) return { ...hit, uncertain: 'comando acima de 64 KB' };
+  const kind = scanShell(input);
+  if (!kind) return { ...hit, uncertain: "heredoc, $'…' ou aspa sem fechar" };
+  const info = {};
+  const cleared = dataMask(input, kind, depth, info);
+  const leftover = input.replace(/[\s\S]/g, (c, i) => (cleared[i] ? ' ' : c));
+  const r = findBypass(leftover, input);
+  return r ? { ...r, uncertain: info.uncertain } : null;
 }
 
 // --- CBS ---
 
-/**
- * Fallback fail-closed no texto cru: `git` + (--no-verify ou prefixo | core.hooksPath= | -n agrupado com commit).
- */
-function rawBypass(input) {
-  if (!/\bgit\b/.test(input)) return null;
-  // Palavras sem aspas nem barras (o texto pode estar em qualquer nível de aspas aninhadas).
-  const words = input.split(/[\s;&|()`<>]+/).map(w => w.replace(/[\\"']/g, '').replace(/^\$/, ''));
-  const command = words.find(w => GIT_COMMANDS_WITH_NO_VERIFY.includes(w)) || null;
-  if (words.some(w => w.toLowerCase().includes(GIT_CONFIG_KEY_PREFIX))) return { blocked: true, command, hooksPath: true };
-  if (words.some(isNoVerifyLongFlag)) return { blocked: true, command };
-  if (words.includes('commit') && words.some(isCommitNoVerifyShortFlag)) return { blocked: true, command: 'commit' };
-  return null;
-}
-
 export function checarComando(comando) {
-  if (typeof comando !== 'string' || !/\bgit\b/.test(comando)) return { bloquear: false };  // caminho rápido
-  let r = null;
-  let incerto = null;
-  if (comando.length > MAX_COMMAND) {
-    incerto = 'comando acima de 64 KB';
-  } else {
-    work = 0;
-    uncertainty = null;
-    try {
-      r = checkCommand(comando);
-      incerto = uncertainty;
-    } catch (e) {
-      if (!(e instanceof ParseBudgetExceeded)) throw e;
-      incerto = e.message;
-    }
-  }
-  if (!(r && r.blocked) && incerto) {
-    r = rawBypass(comando);
-    if (!r) return { bloquear: false };
-    r.incerto = incerto;
-  }
-  if (!r || !r.blocked) return { bloquear: false };
+  if (typeof comando !== 'string') return { bloquear: false };
+  const r = analyze(comando);
+  if (!r) return { bloquear: false };
   const sub = r.command ? `git ${r.command}` : 'git';
   const tipo = r.hooksPath ? 'sobrescrever core.hooksPath' : 'usar --no-verify / -n';
-  const extra = r.incerto
-    ? ` Análise incerta (${r.incerto}): na dúvida o CBS bloqueia; se for falso positivo, rode com CBS_HOOKS_DESLIGADOS=no-verify.`
+  const extra = r.uncertain
+    ? ` Análise incerta (${r.uncertain}): na dúvida o CBS bloqueia; se for falso positivo, rode com CBS_HOOKS_DESLIGADOS=no-verify.`
     : '';
   return { bloquear: true, motivo: `CBS: bloqueado — não é permitido ${tipo} em ${sub}. Os hooks git do projeto não podem ser pulados; corrija o que o hook reprovou.${extra}` };
 }
