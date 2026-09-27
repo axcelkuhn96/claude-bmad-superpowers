@@ -21,9 +21,11 @@ function exigirCaminhoSeguro(p) {
   return p;
 }
 // Hook roda via launcher POSIX (base/hooks/cbs-node.sh), que acha um node válido mesmo após troca de versão (H3).
+// Launcher ausente (desinstalação parcial) → exit 0: `sh arquivo-inexistente` sai 2 e bloquearia toda tool call.
 export function comandoHook(dirHooks, script) {
   exigirCaminhoSeguro(dirHooks);
-  const comando = `sh "${path.join(dirHooks, 'cbs-node.sh')}" "${path.join(dirHooks, script)}"`;
+  const launcher = path.join(dirHooks, 'cbs-node.sh');
+  const comando = `[ ! -f "${launcher}" ] || sh "${launcher}" "${path.join(dirHooks, script)}"`;
   if (scriptCbs(comando) !== script) throw new Error(`comando do hook não reconhecido como ${script}: ${comando}`);
   return comando;
 }

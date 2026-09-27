@@ -38,9 +38,10 @@ test('HOOKS_CBS: 4 hooks, matchers estreitos, nunca .*', () => {
   assert.ok(Object.isFrozen(HOOKS_CBS));
 });
 
-test('comando é sh + launcher cbs-node.sh + caminho absoluto do hook, entre aspas, sem npx', () => {
+test('comando é launcher-se-existir + sh cbs-node.sh + caminho absoluto do hook, entre aspas, sem npx', () => {
   const c = comandoHook(DIR, 'cbs-format.js');
-  assert.equal(c, `sh "${path.join(DIR, 'cbs-node.sh')}" "${path.join(DIR, 'cbs-format.js')}"`);
+  const l = path.join(DIR, 'cbs-node.sh');
+  assert.equal(c, `[ ! -f "${l}" ] || sh "${l}" "${path.join(DIR, 'cbs-format.js')}"`);
   assert.doesNotMatch(c, /npx/);
   assert.equal(scriptCbs(c), 'cbs-format.js');
 });
@@ -262,7 +263,7 @@ test('retirarHooks: ausente ou sem CBS não grava; inválido aborta só mandando
 
 // ---- launcher base/hooks/cbs-node.sh (POSIX) ----
 // Ambiente montado à mão: HOME temporário, PATH só com as ferramentas que o launcher usa (sem node).
-const FERRAMENTAS = ['dirname', 'sed', 'sort', 'tail', 'cut'];
+const FERRAMENTAS = ['sh', 'dirname', 'sed', 'sort', 'tail', 'cut'];
 async function cenario(t) {
   const d = await tmpDir(t);
   const home = path.join(d, 'home'); const hooks = path.join(home, '.claude', 'hooks'); const bin = path.join(d, 'bin');
@@ -328,9 +329,29 @@ test('launcher: nenhum node em lugar nenhum → exit 0 sem saída', { skip: proc
   assert.deepEqual([r.status, r.stdout, r.stderr], [0, '', '']);
 });
 
-test('launcher é POSIX: passa em sh -n e não usa bashismos óbvios', async () => {
+test('launcher é POSIX: passa em sh -n e não usa bashismos óbvios', { skip: process.platform === 'win32' && 'POSIX' }, async () => {
   const texto = await fs.readFile(LAUNCHER, 'utf8');
   assert.equal(spawnSync('/bin/sh', ['-n', LAUNCHER]).status, 0);
   assert.match(texto, /^#!\/bin\/sh\n/);
   assert.doesNotMatch(texto, /\[\[|^\s*(function|local|declare|shopt|source)\s|\$\(\(|<<<|\$\{[^}]*\/\/|&>/m);
+});
+
+// ---- comando exato gravado no settings.json, rodado como o Claude Code roda (sh -c) ----
+test('comando: launcher apagado (desinstalação parcial) → exit 0 sem saída, não bloqueia a sessão', { skip: process.platform === 'win32' && 'POSIX' }, async (t) => {
+  const c = await cenario(t);
+  await gravarCaminhoNode(c.hooks, process.execPath);
+  await fs.rm(path.join(c.hooks, 'cbs-node.sh'));
+  const r = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-x.js')], { encoding: 'utf8', input: 'payload', env: { HOME: c.home, PATH: c.bin } });
+  assert.deepEqual([r.status, r.stdout, r.stderr], [0, '', '']);
+});
+
+test('comando: hook que sai com 2 devolve 2 (bloqueio intencional preservado); 0 devolve 0', { skip: process.platform === 'win32' && 'POSIX' }, async (t) => {
+  const c = await cenario(t);
+  await gravarCaminhoNode(c.hooks, process.execPath);
+  await fs.writeFile(path.join(c.hooks, 'cbs-bloqueia.js'), "process.stderr.write('bloqueado');process.exit(2);");
+  const env = { HOME: c.home, PATH: c.bin };
+  const r2 = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-bloqueia.js')], { encoding: 'utf8', env });
+  assert.deepEqual([r2.status, r2.stderr], [2, 'bloqueado']);
+  const r0 = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-x.js')], { encoding: 'utf8', input: 'oi', env });
+  assert.deepEqual([r0.status, r0.stdout], [0, 'real:oi']);
 });
