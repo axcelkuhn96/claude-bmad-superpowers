@@ -316,3 +316,248 @@ describe('cbs-format — E2E', { skip: !POSIX && 'POSIX' }, () => {
     assert.equal(fs.existsSync(path.join(p, 'alvo')), false);
   });
 });
+
+// ── Task 7: cbs-typecheck (Stop) — typecheck em lote das stacks tocadas na sessão ──
+const tc = await import(pathToFileURL(path.join(HOOKS, 'cbs-typecheck.js')).href);
+// H2: nunca lê *.tsbuildinfo velho nem grava buildinfo no repo; --composite false evita o TS6379 do composite.
+const ARGS_TSC = ['--noEmit', '--pretty', 'false', '--composite', 'false', '--incremental', 'false'];
+const EXE0 = '#!/bin/sh\nexit 0\n';
+describe('cbs-typecheck — decisão', () => {
+  const falha = [{ stack: 'ts', raiz: '/p', linhas: ['src/a.ts(1,7): error TS2322: x'] }];
+  test('sem falhas: silêncio e limpa o acumulador', () => {
+    assert.deepEqual(tc.decidirSaida({ falhas: [], stopHookActive: false, estourou: false }), { stdout: '', stderr: '', limpar: true });
+  });
+  test('falha sem stop_hook_active: decision block, mantém o acumulador', () => {
+    const s = tc.decidirSaida({ falhas: falha, stopHookActive: false, estourou: false });
+    const j = JSON.parse(s.stdout);
+    assert.equal(j.decision, 'block'); assert.match(j.reason, /TS2322/); assert.equal(s.stderr, ''); assert.equal(s.limpar, false);
+  });
+  test('falha com stop_hook_active: só avisa e limpa (sem loop)', () => {
+    const s = tc.decidirSaida({ falhas: falha, stopHookActive: true, estourou: false });
+    assert.equal(s.stdout, ''); assert.match(s.stderr, /só aviso/); assert.equal(s.limpar, true);
+  });
+  test('estourou o teto: só avisa', () => {
+    const s = tc.decidirSaida({ falhas: [], stopHookActive: false, estourou: true });
+    assert.equal(s.stdout, ''); assert.match(s.stderr, /teto/); assert.equal(s.limpar, true);
+  });
+  test('motivo é resumido', () => {
+    const muitas = [{ stack: 'ts', raiz: '/p', linhas: Array.from({ length: 500 }, (_, i) => `src/a.ts(${i},1): error TS1: ${'x'.repeat(50)}`) }];
+    assert.ok(JSON.parse(tc.decidirSaida({ falhas: muitas, stopHookActive: false, estourou: false }).stdout).reason.length <= 1600);
+  });
+});
+describe('cbs-typecheck — plano por stack', { skip: !POSIX && 'POSIX' }, () => {
+  const SEM_PATH = { PATH: '' };
+  test('ts com tsconfig e tsc local → roda o projeto sem ler nem gravar buildinfo (H2)', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'tsconfig.json', '{}'); escrever(p, 'node_modules/.bin/tsc', EXE0, 0o755);
+    const [pl] = tc.planejarChecagens([escrever(p, 'src/a.ts', '')], SEM_PATH);
+    assert.equal(pl.stack, 'ts'); assert.equal(pl.raiz, p);
+    assert.deepEqual(pl.args, [...ARGS_TSC, '-p', path.join(p, 'tsconfig.json')]);
+  });
+  test('ts sem tsc local → nada', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'tsconfig.json', '{}');
+    assert.deepEqual(tc.planejarChecagens([escrever(p, 'a.ts', '')], SEM_PATH), []);
+  });
+  test('tsconfig solution-style (files: [] + references, JSONC) → checa cada projeto referenciado (H4)', (t) => {
+    const p = tmpDoTeste(t);
+    escrever(p, 'tsconfig.json', '{\n  // raiz do template Vite react-ts\n  "files": [],\n  "references": [\n    { "path": "./tsconfig.app.json" },\n    { "path": "./tsconfig.node.json" }, /* vírgula final */\n  ],\n}\n');
+    escrever(p, 'tsconfig.app.json', '{}'); escrever(p, 'tsconfig.node.json', '{}');
+    escrever(p, 'node_modules/.bin/tsc', EXE0, 0o755);
+    const planos = tc.planejarChecagens([escrever(p, 'src/a.ts', '')], SEM_PATH);
+    assert.deepEqual(planos.map((x) => x.args), [
+      [...ARGS_TSC, '-p', path.join(p, 'tsconfig.app.json')],
+      [...ARGS_TSC, '-p', path.join(p, 'tsconfig.node.json')],
+    ]);
+    assert.ok(planos.every((x) => x.stack === 'ts' && x.raiz === p));
+  });
+  test('solution-style: referência a diretório, solution aninhada e ciclo', (t) => {
+    const p = tmpDoTeste(t);
+    escrever(p, 'tsconfig.json', '{ "files": [], "references": [{ "path": "./pkg" }, { "path": "./nao-existe.json" }] }');
+    escrever(p, 'pkg/tsconfig.json', '{ "files": [], "references": [{ "path": "./tsconfig.lib.json" }, { "path": ".." }] }');
+    escrever(p, 'pkg/tsconfig.lib.json', '{}');
+    escrever(p, 'node_modules/.bin/tsc', EXE0, 0o755);
+    const planos = tc.planejarChecagens([escrever(p, 'src/a.ts', '')], SEM_PATH);
+    assert.deepEqual(planos.map((x) => x.args), [[...ARGS_TSC, '-p', path.join(p, 'pkg', 'tsconfig.lib.json')]]);
+  });
+  test('tsconfig com references e include próprio não é solution-style → roda a raiz', (t) => {
+    const p = tmpDoTeste(t);
+    escrever(p, 'tsconfig.json', '{ "include": ["src"], "files": [], "references": [{ "path": "./tsconfig.app.json" }] }');
+    escrever(p, 'tsconfig.app.json', '{}'); escrever(p, 'node_modules/.bin/tsc', EXE0, 0o755);
+    const [pl] = tc.planejarChecagens([escrever(p, 'src/a.ts', '')], SEM_PATH);
+    assert.deepEqual(pl.args, [...ARGS_TSC, '-p', path.join(p, 'tsconfig.json')]);
+  });
+  test('php com phpstan + phpstan.neon.dist → phpstan nos arquivos tocados', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'composer.json', '{}'); escrever(p, 'phpstan.neon.dist', ''); escrever(p, 'vendor/bin/phpstan', EXE0, 0o755);
+    const a = escrever(p, 'app/A.php', '<?php');
+    const [pl] = tc.planejarChecagens([a], SEM_PATH);
+    assert.equal(pl.stack, 'php'); assert.deepEqual(pl.args, ['analyse', '--no-progress', '--error-format=raw', a]);
+  });
+  test('php com phpstan sem neon → nada', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'composer.json', '{}'); escrever(p, 'vendor/bin/phpstan', EXE0, 0o755);
+    assert.deepEqual(tc.planejarChecagens([escrever(p, 'A.php', '')], SEM_PATH), []);
+  });
+  test('py com [tool.mypy] e mypy no PATH → mypy nos arquivos', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'pyproject.toml', '[tool.mypy]\nstrict = true\n');
+    const bin = tmpDoTeste(t, 'cbs-bin-'); escrever(bin, 'mypy', EXE0, 0o755);
+    const a = escrever(p, 'm.py', '');
+    const [pl] = tc.planejarChecagens([a], { PATH: bin });
+    assert.equal(pl.stack, 'py'); assert.equal(pl.bin, path.join(bin, 'mypy')); assert.deepEqual(pl.args, [a]);
+  });
+  test('py com pyrightconfig.json e pyright local → pyright nos arquivos', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'pyrightconfig.json', '{}'); const bin = escrever(p, 'node_modules/.bin/pyright', EXE0, 0o755);
+    const a = escrever(p, 'm.py', '');
+    const [pl] = tc.planejarChecagens([a], SEM_PATH);
+    assert.equal(pl.bin, bin); assert.deepEqual(pl.args, [a]);
+  });
+  test('py sem config de mypy/pyright → nada, mesmo com mypy no PATH', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'pyproject.toml', '[project]\nname = "x"\n');
+    const bin = tmpDoTeste(t, 'cbs-bin-'); escrever(bin, 'mypy', EXE0, 0o755);
+    assert.deepEqual(tc.planejarChecagens([escrever(p, 'm.py', '')], { PATH: bin }), []);
+  });
+  test('dois .ts do mesmo projeto → uma checagem só', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'tsconfig.json', '{}'); escrever(p, 'node_modules/.bin/tsc', EXE0, 0o755);
+    assert.equal(tc.planejarChecagens([escrever(p, 'a.ts', ''), escrever(p, 'b.ts', '')], SEM_PATH).length, 1);
+  });
+  test('.md → nada', () => assert.deepEqual(tc.planejarChecagens(['/p/README.md'], SEM_PATH), []));
+  test('filtrarSaida de ts mantém só erros dos arquivos editados (SP-5)', () => {
+    const plano = { stack: 'ts', raiz: '/p', arquivos: ['/p/src/a.ts'] };
+    assert.deepEqual(tc.filtrarSaida(plano, 'src/a.ts(1,1): error TS1: x\nsrc/outro.ts(2,2): error TS2: y\n'), ['src/a.ts(1,1): error TS1: x']);
+  });
+  test('filtrarSaida de ts não atribui erro de a.tsx nem de outro src/a.ts ao arquivo editado', () => {
+    const plano = { stack: 'ts', raiz: '/p', arquivos: ['/p/src/a.ts'] };
+    const saida = 'src/a.tsx(1,1): error TS1: x\nlib/src/a.ts(1,1): error TS1: y\n/p/src/a.ts(3,3): error TS3: z\n';
+    assert.deepEqual(tc.filtrarSaida(plano, saida), ['/p/src/a.ts(3,3): error TS3: z']);
+  });
+  test('filtrarSaida de php/py mantém toda a saída (só os arquivos tocados foram checados)', () => {
+    assert.deepEqual(tc.filtrarSaida({ stack: 'php', raiz: '/p', arquivos: ['/p/A.php'] }, '/p/A.php:3:Erro\n\n'), ['/p/A.php:3:Erro']);
+  });
+});
+describe('cbs-typecheck — arquivos do acumulador', { skip: !POSIX && 'POSIX' }, () => {
+  test('aceita só arquivo regular existente dentro do projeto da sessão', (t) => {
+    const p = tmpDoTeste(t, 'cbs-proj-'); const fora = tmpDoTeste(t, 'cbs-fora-');
+    const dentro = escrever(p, 'src/a.ts', '');
+    const alheio = escrever(fora, 'x.ts', '');
+    fs.symlinkSync(alheio, path.join(p, 'src', 'link.ts'));
+    fs.symlinkSync(fora, path.join(p, 'dirlink'));
+    fs.mkdirSync(path.join(p, 'pasta.ts'));
+    const lista = [dentro, path.join(p, 'apagado.ts'), alheio, path.join(p, 'src', 'link.ts'), path.join(p, 'dirlink', 'x.ts'),
+      path.join(p, 'pasta.ts'), 'src/a.ts', path.join(p, '..', path.basename(fora), 'x.ts')];
+    assert.deepEqual(tc.arquivosDoProjeto(lista, p), [dentro]);
+  });
+  test('cwd ausente, relativo ou inexistente → nenhum arquivo', (t) => {
+    const p = tmpDoTeste(t); const a = escrever(p, 'a.ts', '');
+    for (const cwd of [undefined, '', 'rel', path.join(p, 'nao-existe')]) assert.deepEqual(tc.arquivosDoProjeto([a], cwd), []);
+  });
+});
+describe('cbs-typecheck — E2E Stop', { skip: !POSIX && 'POSIX' }, () => {
+  function projetoTs(t, scriptTsc, tsconfig = '{}') {
+    const p = tmpDoTeste(t, 'cbs-tc-');
+    escrever(p, 'tsconfig.json', tsconfig);
+    escrever(p, 'node_modules/.bin/tsc', scriptTsc, 0o755);
+    return { p, a: escrever(p, 'src/a.ts', 'let x: number = "s";') };
+  }
+  test('bloqueia uma vez e, com stop_hook_active, só avisa e limpa', (t) => {
+    const { p, a } = projetoTs(t, '#!/bin/sh\necho "src/a.ts(1,5): error TS2322: Type string is not assignable to type number."\nexit 2\n');
+    comum.registrarEdicao('e2e-tc', [a], p);
+    const r1 = rodarHook('cbs-typecheck.js', { session_id: 'e2e-tc', cwd: p, stop_hook_active: false }, { TMPDIR: p });
+    assert.equal(r1.code, 0); assert.equal(r1.err, '');
+    const j = JSON.parse(r1.out);
+    assert.equal(j.decision, 'block'); assert.match(j.reason, /src\/a\.ts\(1,5\): error TS2322/);
+    assert.equal(r1.out.trim().split('\n').length, 1, 'um único JSON no stdout');
+    assert.deepEqual(comum.lerAcumulador('e2e-tc', p), [a], 'acumulador mantido após o bloqueio');
+    const r2 = rodarHook('cbs-typecheck.js', { session_id: 'e2e-tc', cwd: p, stop_hook_active: true }, { TMPDIR: p });
+    assert.equal(r2.code, 0); assert.equal(r2.out, ''); assert.match(r2.err, /só aviso/);
+    assert.deepEqual(comum.lerAcumulador('e2e-tc', p), [], 'acumulador limpo');
+  });
+  test('passa em silêncio e limpa quando o tsc sai 0', (t) => {
+    const { p, a } = projetoTs(t, EXE0);
+    comum.registrarEdicao('e2e-ok', [a], p);
+    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-ok', cwd: p }, { TMPDIR: p });
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, ''); assert.deepEqual(comum.lerAcumulador('e2e-ok', p), []);
+  });
+  test('erro só em arquivo não editado não bloqueia (SP-5)', (t) => {
+    const { p, a } = projetoTs(t, '#!/bin/sh\necho "src/outro.ts(1,1): error TS2322: x"\nexit 2\n');
+    comum.registrarEdicao('e2e-outro', [a], p);
+    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-outro', cwd: p }, { TMPDIR: p });
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, ''); assert.deepEqual(comum.lerAcumulador('e2e-outro', p), []);
+  });
+  test('estouro do teto só avisa', (t) => {
+    const { p, a } = projetoTs(t, '#!/bin/sh\nsleep 5\n');
+    comum.registrarEdicao('e2e-teto', [a], p);
+    const inicio = Date.now();
+    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-teto', cwd: p }, { TMPDIR: p, CBS_TYPECHECK_TETO_MS: '300' });
+    assert.equal(r.code, 0); assert.equal(r.out, ''); assert.match(r.err, /teto/);
+    assert.ok(Date.now() - inicio < 4000, 'não espera o processo morto terminar');
+    assert.deepEqual(comum.lerAcumulador('e2e-teto', p), []);
+  });
+  test('sem acumulador: silêncio total', (t) => {
+    const p = tmpDoTeste(t);
+    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-vazio', cwd: p }, { TMPDIR: p });
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
+  });
+  test('stdin vazio ou inválido → exit 0 sem saída', () => {
+    for (const payload of ['', '{', '[1]']) {
+      const r = rodarHook('cbs-typecheck.js', payload);
+      assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
+    }
+  });
+  test('typecheck desligado: não roda nem consome o acumulador', (t) => {
+    const { p, a } = projetoTs(t, '#!/bin/sh\necho "src/a.ts(1,5): error TS2322: x"\nexit 2\n');
+    comum.registrarEdicao('e2e-desl', [a], p);
+    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-desl', cwd: p }, { TMPDIR: p, CBS_HOOKS_DESLIGADOS: 'typecheck' });
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, ''); assert.deepEqual(comum.lerAcumulador('e2e-desl', p), [a]);
+  });
+  test('solution-style do Vite com erro de tipo → bloqueia (H4)', (t) => {
+    // tsc falso com o comportamento medido no TS 5.9/6.0/7.0: -p na raiz solution-style passa sem checar nada.
+    const tsc = '#!/bin/sh\nfor a in "$@"; do cfg="$a"; done\ncase "$cfg" in\n  */tsconfig.app.json) echo "src/a.ts(1,5): error TS2322: Type string is not assignable to type number."; exit 2;;\nesac\nexit 0\n';
+    const { p, a } = projetoTs(t, tsc, '{ "files": [], "references": [{ "path": "./tsconfig.app.json" }, { "path": "./tsconfig.node.json" }] }');
+    escrever(p, 'tsconfig.app.json', '{ "include": ["src"] }'); escrever(p, 'tsconfig.node.json', '{ "include": ["vite.config.ts"] }');
+    comum.registrarEdicao('e2e-sol', [a], p);
+    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-sol', cwd: p }, { TMPDIR: p });
+    assert.equal(r.code, 0); assert.match(JSON.parse(r.out).reason, /TS2322/);
+  });
+  test('incremental com *.tsbuildinfo velho: não lê nem regrava o buildinfo e bloqueia (H2)', (t) => {
+    // tsc falso: em modo incremental confia no buildinfo velho (esconde o erro) e o regrava no repo.
+    const tsc = '#!/bin/sh\ncase " $* " in\n  *" --incremental false "*) echo "src/a.ts(1,17): error TS1479: The current file is a CommonJS module."; exit 2;;\nesac\necho novo > .cache/app.tsbuildinfo\nexit 0\n';
+    const { p, a } = projetoTs(t, tsc, '{ "compilerOptions": { "incremental": true, "tsBuildInfoFile": "./.cache/app.tsbuildinfo" } }');
+    const buildinfo = escrever(p, '.cache/app.tsbuildinfo', 'velho');
+    const tmpSessao = tmpDoTeste(t, 'cbs-tmp-');
+    comum.registrarEdicao('e2e-inc', [a], tmpSessao);
+    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-inc', cwd: p }, { TMPDIR: tmpSessao });
+    assert.equal(r.code, 0); assert.match(JSON.parse(r.out).reason, /TS1479/);
+    assert.equal(fs.readFileSync(buildinfo, 'utf8'), 'velho');
+  });
+  test('composite: não cai no TS6379 nem grava tsbuildinfo em outDir (H2)', (t) => {
+    // tsc falso com o comportamento medido: composite + só --incremental false → TS6379 (erro de config, não cita o arquivo);
+    // sem as flags grava dist/tsconfig.tsbuildinfo.
+    const tsc = '#!/bin/sh\ncase " $* " in\n  *" --composite false "*) ;;\n  *" --incremental false "*) echo "tsconfig.json(1,3): error TS6379: Composite projects may not disable incremental compilation."; exit 2;;\n  *) mkdir -p dist; echo x > dist/tsconfig.tsbuildinfo;;\nesac\necho "src/a.ts(1,5): error TS2322: x"\nexit 2\n';
+    const { p, a } = projetoTs(t, tsc, '{ "compilerOptions": { "composite": true, "outDir": "dist" } }');
+    const tmpSessao = tmpDoTeste(t, 'cbs-tmp-');
+    comum.registrarEdicao('e2e-comp', [a], tmpSessao);
+    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-comp', cwd: p }, { TMPDIR: tmpSessao });
+    assert.equal(r.code, 0); assert.match(JSON.parse(r.out).reason, /TS2322/);
+    assert.equal(fs.existsSync(path.join(p, 'dist')), false);
+  });
+  test('phpstan recebe só os arquivos tocados e a falha bloqueia', (t) => {
+    const p = tmpDoTeste(t, 'cbs-tc-'); const log = path.join(p, 'args.log');
+    escrever(p, 'composer.json', '{}'); escrever(p, 'phpstan.neon', '');
+    escrever(p, 'vendor/bin/phpstan', `#!/bin/sh\necho "$@" > "${log}"\necho "${p}/app/A.php:3:Undefined variable: \\$x"\nexit 1\n`, 0o755);
+    const a = escrever(p, 'app/A.php', '<?php'); escrever(p, 'app/B.php', '<?php');
+    const tmpSessao = tmpDoTeste(t, 'cbs-tmp-');
+    comum.registrarEdicao('e2e-php', [a], tmpSessao);
+    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-php', cwd: p }, { TMPDIR: tmpSessao });
+    assert.equal(r.code, 0); assert.match(JSON.parse(r.out).reason, /A\.php:3:Undefined variable/);
+    assert.equal(fs.readFileSync(log, 'utf8').trim(), `analyse --no-progress --error-format=raw ${a}`);
+  });
+  test('acumulador com arquivo fora do projeto da sessão: não roda o binário de lá', (t) => {
+    const fora = projetoTs(t, '');
+    const marca = path.join(fora.p, 'rodou');
+    escrever(fora.p, 'node_modules/.bin/tsc', `#!/bin/sh\ntouch "${marca}"\necho "src/a.ts(1,1): error TS1: x"\nexit 2\n`, 0o755);
+    const p = tmpDoTeste(t, 'cbs-proj-');
+    const tmpSessao = tmpDoTeste(t, 'cbs-tmp-');
+    comum.registrarEdicao('e2e-fora', [fora.a], tmpSessao);
+    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-fora', cwd: p }, { TMPDIR: tmpSessao });
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
+    assert.equal(fs.existsSync(marca), false);
+    assert.deepEqual(comum.lerAcumulador('e2e-fora', tmpSessao), []);
+  });
+});
