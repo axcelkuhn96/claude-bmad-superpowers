@@ -62,12 +62,38 @@ export function caminhosEditados(payload) {
   return [...new Set(brutos.map((p) => path.resolve(cwd, p)))];
 }
 
-// Sobe a partir de `inicio` até achar um dos marcadores; para na raiz do disco ou no HOME.
-export function acharRaiz(inicio, marcadores) {
+// Confiança (POSIX): só roda binário/config que outro usuário local não consegue plantar nem trocar.
+// Dono = usuário ou root. "Gravável por outros" = bit de outros, ou de grupo que não seja o grupo privado
+// do usuário (UPG: gid == uid, comum com umask 002 — node_modules 775 continua aceito).
+const UID = WIN ? -1 : process.getuid();
+const GID = WIN ? -1 : process.getgid();
+const donoOk = (st, uid) => st.uid === uid || st.uid === 0;
+const gravavelPorOutros = (st) => (st.mode & 0o002) !== 0 || ((st.mode & 0o020) !== 0 && !(st.gid === GID && GID === UID));
+// Diretório que pode ser raiz de projeto: nunca gravável por outros, nem com sticky (/tmp não é projeto).
+function dirConfiavel(dir, uid) {
+  try { const st = fs.statSync(dir); return donoOk(st, uid) && !gravavelPorOutros(st); } catch { return false; }
+}
+// `p` e cada ancestral até a raiz do disco (lstat): dono ok; entrada não gravável por outros; ancestral
+// gravável por outros só com sticky (ninguém renomeia a entrada do usuário). Symlink: vale o dono do link
+// (os bits dele não significam nada) e depois o alvo real passa pela mesma checagem.
+function cadeiaConfiavel(p, uid) {
+  for (let atual = p; ; atual = path.dirname(atual)) {
+    const st = fs.lstatSync(atual);
+    if (!donoOk(st, uid)) return false;
+    const sticky = atual !== p && st.isDirectory() && (st.mode & 0o1000) !== 0;
+    if (!st.isSymbolicLink() && gravavelPorOutros(st) && !sticky) return false;
+    if (atual === path.dirname(atual)) return true;
+  }
+}
+
+// Sobe a partir de `inicio` até achar um dos marcadores; para na raiz do disco, no HOME ou no primeiro
+// diretório não confiável (gravável por outros, ex.: /tmp; ou de outro dono) — sem aceitá-lo nem subir além.
+export function acharRaiz(inicio, marcadores, uid = UID) {
   let dir = path.resolve(inicio);
   const raizDisco = path.parse(dir).root;
   const home = os.homedir();
   for (;;) {
+    if (!WIN && !dirConfiavel(dir, uid)) return null;
     if (marcadores.some((m) => fs.existsSync(path.join(dir, m)))) return dir;
     if (dir === raizDisco || dir === home) return null;
     dir = path.dirname(dir);
@@ -82,11 +108,13 @@ export function executavel(p) {
 }
 
 // Binário do próprio projeto (vendor/bin, node_modules/.bin, .venv/bin). Nunca npx.
+// Só com raiz, binário e toda a cadeia de diretórios confiáveis (link e alvo real): nada plantado por outro usuário.
 // No Windows retorna null (SP-8: shims .cmd/.bat exigem shell → hook sai 0 em silêncio).
-export function binLocal(raiz, rel) {
+export function binLocal(raiz, rel, uid = UID) {
   if (WIN) return null;
   const p = path.join(raiz, rel);
-  return executavel(p) ? p : null;
+  if (!executavel(p) || !dirConfiavel(raiz, uid)) return null;
+  try { return cadeiaConfiavel(p, uid) && cadeiaConfiavel(fs.realpathSync(p), uid) ? p : null; } catch { return null; }
 }
 
 // Resolve no PATH sem shell. No Windows retorna null (SP-8: shims .cmd exigem shell).
