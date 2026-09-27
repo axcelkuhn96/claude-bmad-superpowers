@@ -4,13 +4,14 @@ import path from 'node:path';
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import {
-  RAIZ_BASE, DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_SCRIPTS, DIR_AGENTS, ARQ_VERSAO_INSTALADA,
-  MARCADOR, lerVersaoPacote, lerVersaoInstalada, existe, garantirDir,
+  RAIZ_BASE, DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_SCRIPTS, DIR_AGENTS, DIR_HOOKS, ARQ_VERSAO_INSTALADA,
+  ARQ_SETTINGS, MARCADOR, lerVersaoPacote, lerVersaoInstalada, existe, garantirDir,
 } from './caminhos.js';
 import { tentarAtualizarSuperpowers } from './superpowers.js';
 import { listarProjetosBmad, atualizarBmadEmProjeto, limparProjetosInvalidos } from './bmad.js';
 import { tentarSelfUpdate } from './auto-update.js';
-import { garantirModelsOverride } from './instalar.js';
+import { garantirModelsOverride, instalarHooks } from './instalar.js';
+import { prevalidarHooks } from './hooks-settings.js';
 
 async function arquivoTemMarcador(p) {
   try {
@@ -36,10 +37,11 @@ async function copiarSeBase(origem, destino, versao) {
   const limpo = limparMarcadorAntigo(conteudo).trimEnd();
   let rodape = '';
   if (destino.endsWith('.md')) rodape = `\n\n<!-- ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/ pra não perder no /atualizar -->\n`;
-  else if (destino.endsWith('.js')) rodape = `\n\n// ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/scripts/ pra não perder no /atualizar\n`;
+  else if (/\.m?js$/.test(destino)) rodape = `\n\n// ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/scripts/ pra não perder no /atualizar\n`;
+  else if (destino.endsWith('.sh')) rodape = `\n\n# ${MARCADOR} v${versao} — arquivo do pacote; o /atualizar sobrescreve\n`;
   await garantirDir(path.dirname(destino));
   await fs.writeFile(destino, limpo + rodape, 'utf8');
-  if (destino.endsWith('.js')) await fs.chmod(destino, 0o755);
+  if (/\.m?js$/.test(destino)) await fs.chmod(destino, 0o755);
   return { acao: 'atualizado', destino };
 }
 
@@ -83,6 +85,10 @@ export async function atualizar(args = []) {
   console.log(`Versão instalada em ~/.claude: ${versaoInstalada || '(não detectada)'}`);
   console.log(`Versão do clone/pacote atual: ${versaoAtual}\n`);
 
+  const semHooks = args.includes('--sem-hooks');
+  // settings.json inválido ou caminho inseguro aborta ANTES de copiar qualquer coisa (SP-6)
+  if (!semHooks) await prevalidarHooks(ARQ_SETTINGS, DIR_HOOKS);
+
   // ETAPA 0 — Self-update (a menos que --skip-self-update)
   if (!args.includes('--skip-self-update')) {
     console.log('━━━ Etapa 1/4: self-update do pacote ━━━');
@@ -111,6 +117,13 @@ export async function atualizar(args = []) {
   }
   if (await existe(path.join(RAIZ_BASE, 'agents'))) {
     await atualizarArvore(path.join(RAIZ_BASE, 'agents'), DIR_AGENTS, versaoNova, resultado);
+  }
+  if (await existe(path.join(RAIZ_BASE, 'hooks'))) {
+    const r = await instalarHooks(versaoNova, semHooks, async (origem, destino, versao) => {
+      const c = await copiarSeBase(origem, destino, versao);
+      resultado[c.acao].push(c.destino);
+    });
+    if (r.mudou) resultado.atualizado.push(ARQ_SETTINGS);
   }
   const models = await garantirModelsOverride();
   if (models.acao === 'criado') resultado.atualizado.push(models.destino);

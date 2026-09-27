@@ -35,6 +35,7 @@ Flags do instalar:
   --apenas-global       Não instala BMAD no cwd (skills/commands/Superpowers somente)
   --skip-bmad           Idem
   --skip-superpowers    Não tenta instalar o plugin Superpowers
+  --sem-hooks           Não registra os hooks CBS no ~/.claude/settings.json (os arquivos são copiados)
 
 Flags do instalar-bmad:
   --update, -u          Atualiza a instalação existente (bmad-method install --action update)
@@ -47,6 +48,12 @@ Flags do atualizar:
   --auto-bmad, -y       Atualiza BMAD em todos os projetos sem perguntar
   --projetos a,b        Atualiza BMAD só nesses projetos (caminhos separados por vírgula)
   (sem TTY, ex. via ferramenta Bash do Claude Code: comporta como --auto-bmad)
+  --sem-hooks           Não registra os hooks CBS no ~/.claude/settings.json (os arquivos são copiados)
+
+Hooks CBS (env):
+  CBS_HOOKS=off                                        desliga todos
+  CBS_HOOKS_DESLIGADOS=format,typecheck,no-verify,config   desliga os escolhidos
+  CBS_PERMITIR_CONFIG=1                                libera edição de config de lint/format
 
 Aliases: install/update/uninstall/remove também funcionam.
 Atalho:  cbs <comando>  (se instalado globalmente)

@@ -2,7 +2,8 @@
 
 Rulebook lido por caminho pelo subagent `general-purpose` quando a task toca código Node (API Express/Fastify, worker, CLI, script TS/JS de servidor). **Stacka em cima do `@dev` BMAD e do ponytail**, não substitui — o subagent é Dev + Node. Empilha `database.md` se toca banco, `integracao.md` se chama API externa, `frontend.md` se é React/Vue no mesmo repo (ordem: @dev → ponytail → node → área). Regra inegociável de área vence a daqui.
 
-> Adaptado de: Express "Production Best Practices" (CC-BY-4.0), goldbergyoni/nodebestpractices (CC-BY-SA-4.0), OWASP Node.js Security Cheat Sheet (CC-BY-SA-4.0), `typescript-reviewer` do ECC (MIT). Reescrito em pt-BR com atribuição; por derivar de fontes CC-BY-SA, **este arquivo é CC-BY-SA-4.0**.
+> Adaptado de: Express "Production Best Practices" (CC-BY-4.0), goldbergyoni/nodebestpractices (CC-BY-SA-4.0), OWASP Node.js Security Cheat Sheet (CC-BY-SA-4.0), `typescript-reviewer` do ECC (MIT). Reescrito em pt-BR com atribuição; por derivar de fontes CC-BY-SA, **este arquivo é CC-BY-SA-4.0** + affaan-m/ECC @ e482e57 (MIT, Copyright (c) 2026 Affaan Mustafa).
+> Regras adicionais destiladas de affaan-m/ECC @ e482e57 (agents/{typescript-reviewer,build-error-resolver}.md, rules/typescript/{coding-style,testing}.md, scripts/hooks/config-protection.js) — MIT License, Copyright (c) 2026 Affaan Mustafa (https://github.com/affaan-m/ECC/blob/e482e57/LICENSE).
 
 ## Gatilhos (Fase 3 do executor)
 - Arquivos: `package.json` com `express` | `fastify` | `@nestjs/core` | `koa` | `hono`; `tsconfig.json`; `src/**/*.{ts,js,mjs,cjs}`; `server.{ts,js}`, `app.{ts,js}`, `routes/`, `controllers/`, `middlewares/`, `jobs/`, `workers/`; `vitest.config.*`/`jest.config.*`; `.env.example`.
@@ -39,18 +40,32 @@ Modo: seguir padrão | estabelecer padrão
 - Rate limit em login/reset/OTP (por conta **e** por IP) e em rotas caras; brute-force = bloqueio progressivo (`express-rate-limit`/`rate-limiter-flexible` ou o proxy).
 - `helmet()` (ou equivalente do framework) e `app.disable('x-powered-by')`. Limite de payload (`express.json({ limit })`, menor por rota quando cabe). `hpp` se query arrays não são esperadas. CORS com allowlist explícita — nunca `*` com credenciais.
 - Resposta: só os campos necessários (allowlist/DTO), nunca `res.json(user)` com hash/segredo. Merge de objeto de input (`Object.assign`/spread/`merge`) só após schema (prototype pollution).
+- Estado mutável de módulo (`let`/`Map` global) com dado de request/usuário vaza entre requests e tenants → escopo do handler ou store externo. (ECC typescript-reviewer)
 - Segredo só via `process.env` validado **no boot** em um módulo de config (falha rápido se faltar); nunca literal, nunca `|| 'default'`, nunca em log. `npm audit --audit-level=high` (ou pnpm/yarn) no loop.
 
 **Erros e async (bloqueante)**
 - Toda promise é aguardada **ou** tem `.catch` com ação. Handler `async` em Express 4 passa erro pro `next` (wrapper) — nunca fica "flutuando". `array.forEach(async …)` = bug; use `for…of` ou `Promise.all`/`allSettled`.
 - `await` sequencial em trabalho independente → `Promise.all`. `return await` dentro de `try` (pra capturar e manter stack).
 - Erros são `Error` (ou subclasse com `cause`, `isOperational`, `status`); nunca `throw "string"`. `JSON.parse` de input sempre em try.
+- `catch (e)`: `e` é `unknown` (`strict`) → `instanceof Error` antes de `.message`. Erro novo que embrulha `e` leva `{ cause: e }` (lib ≥ es2022); re-lançar o mesmo é `throw e`. (ECC rules/typescript/coding-style; medido TS 5.9)
+- Em código `async`, I/O de callback → `node:fs/promises`, `node:stream/promises` ou `util.promisify`; não misture os estilos. (ECC typescript-reviewer)
 - **Um** handler central de erro (último middleware, 4 args no Express) que loga com contexto e responde por tipo: operacional → status + mensagem segura; desconhecido → 500 genérico + log completo. Sem stack pro cliente.
 - `process.on('unhandledRejection')`/`process.on('uncaughtException')`: **só** logar e `process.exit(1)` quando não-operacional. Nunca "engolir e seguir" — quem reinicia é o supervisor. Sem `domain`.
 - `catch (e) {}` vazio ou `catch` que devolve `null`/`[]` sem log e sem a spec pedir = bug (piso do ponytail).
 - EventEmitter/stream: assinar `'error'`; try/catch não pega. Nada de `*Sync` (fs, crypto, child_process) em caminho de request. CPU pesada → worker thread/fila.
 
 **Config, log, processo · TypeScript · Testes** → `dominios/node-referencia.md` (lido por caminho; resumo: `NODE_ENV`, lockfile + `npm ci`, log estruturado sem PII, graceful shutdown em `SIGTERM`, processo stateless; TS `strict` nunca afrouxado, `any` só justificado; testes de API com supertest cobrindo os 5 outcomes, tempo/rede controlados).
+
+## Testes
+- Asserção async com `await`/`return` (`await expect(p).rejects…`): flutuante passa em falso. (ECC typescript-reviewer)
+- Fluxo crítico com UI no mesmo repo: E2E no runner que o projeto já tem; sem runner, validação Playwright do tipo `ui` (sem dep nova). (ECC rules/typescript/testing)
+
+## Build quebrado
+- Reproduza como o Stop: `node_modules/.bin/tsc --noEmit --pretty false -p <tsconfig.json mais próximo>` (project references: script `typecheck`, não `tsc -b`). Pós-edição: `biome format --write <arq>` (com `biome.json(c)`) ou `prettier --write <arq>` (com config), de `node_modules/.bin`. (hooks cbs-typecheck, cbs-format; ECC typescript-reviewer)
+- `incremental`/`composite`: até o `--noEmit` grava `*.tsbuildinfo` (`outDir` ou ao lado do tsconfig), que esconde erro após mudar `type`/tsconfig → `--incremental false` ou apague-o. Bundler: `rm -rf node_modules/.cache .next`; deps: `rm -rf node_modules && npm ci` ou o do gerenciador (lockfile fica). (ECC build-error-resolver; medido TS 5.9)
+- Erro de módulo (ESM/CJS, `paths`, `.ts` direto) e `TS7016` → `dominios/node-referencia.md`.
+- Tipo incompatível/`possibly 'undefined'` → corrija, guard ou schema; sem calar com `any`/`as`/`@ts-ignore` (inevitável: `@ts-expect-error` + motivo). (ECC build-error-resolver, ECC typescript-reviewer; medido TS 5.9)
+- Não afrouxe `tsconfig` (`strict`…), eslint, prettier ou biome pra passar. (ECC typescript-reviewer, ECC config-protection; hook cbs-config-protect, exceto `tsconfig.json`)
 
 ## Loop obrigatório de validação (antes de Ready for Review)
 ```

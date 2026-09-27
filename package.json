@@ -1,6 +1,6 @@
 {
   "name": "claude-bmad-superpowers",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Workflow PT-BR para Claude Code: refina ideias com memória e executa sempre com Superpowers (motor) + BMAD (disciplina) integrados — TDD, subagents isolados e dois reviewers por task.",
   "type": "module",
   "bin": {
@@ -17,7 +17,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/smoke.js"
+    "test": "node --test test/smoke.js test/gate-gitleaks.test.js test/gate-achados-revisados.test.js test/gate-agentshield.test.js test/settings-merge.test.js test/hooks.test.js"
   },
   "keywords": [
     "claude-code",

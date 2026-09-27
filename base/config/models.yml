@@ -40,6 +40,10 @@ refactor:                     # refatoração estrutural preservando comportamen
   claude: cbs-refactor
   codex: refactor_terra
 
+build_fixer:                  # destrava build/compile/typecheck quebrado com a menor mudança (task BLOCKED por build, Stop que persiste)
+  claude: cbs-build-fixer
+  codex: backend_terra        # não há agente Codex de build-fixer; o CBS não gerencia ~/.codex/agents
+
 reviewer:                     # task reviewer / re-reviewer por task (read-only)
   claude: cbs-reviewer
   codex: reviewer_sol

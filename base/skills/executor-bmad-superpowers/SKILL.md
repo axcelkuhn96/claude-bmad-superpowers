@@ -34,6 +34,7 @@ Leia `~/.claude/cbs-overrides/models.yml` (`cat`; se não existir, o default do 
 | `implementer_backend` | task sem domínio `frontend` | cbs-backend | backend_terra |
 | `implementer_frontend` | task com domínio `frontend` | cbs-frontend | frontend_terra |
 | `refactor` | refatoração, fix wave do review final | cbs-refactor | refactor_terra |
+| `build_fixer` | task BLOCKED por build/compile/typecheck ou Stop que persiste | cbs-build-fixer | backend_terra |
 | `reviewer` | task reviewer e re-reviewer | cbs-reviewer | reviewer_sol |
 | `final_reviewer` | review final e Fase 6 | cbs-final-reviewer | final_reviewer_sol |
 | `tester` | E2E/browser | cbs-tester | tester_luna |
@@ -120,7 +121,7 @@ Regras:
 - **Implementer: `general-purpose` ou o agente nomeado do `models.yml`** (`implementer_backend` / `implementer_frontend`). Nunca agentes de plugin — `bmad-agent-*`, `*-pro`, `*-specialist`, `*-expert`, `voltagent-*` — trazem agenda própria e fogem do plano. Reviewers: `general-purpose` (ou agente nomeado `reviewer`) com os templates do próprio SDD.
 - **Papéis (vocabulário 6.3)**: implementer → **task reviewer** (spec + qualidade num só veredito) → **re-reviewer** (fix rounds, máx. 5) → **reviewer final** da branch. Não existem dois reviewers separados por task no 6.3 — não os invente.
 - Subagent devolve só status, commits, 1 linha de teste, preocupações; o resto fica em `.superpowers/sdd/<plano>/task-N-report.md`.
-- BLOCKED / NEEDS_CONTEXT: trate como o SDD manda (contexto, modelo mais capaz, quebrar a task). Encerre subagents ociosos ao fim de cada task.
+- BLOCKED / NEEDS_CONTEXT: trate como o SDD manda (contexto, modelo mais capaz, quebrar a task); BLOCKED por build/typecheck → papel `build_fixer` (`referencia/dispatch.md` §2). Encerre subagents ociosos ao fim de cada task.
 - Fallback sem SDD (Superpowers ausente): TDD manual com os mesmos papéis e subagents; recomende instalar o Superpowers no fim.
 
 → chat por task: `Fase 5 — task k/M ok — commits <a>..<b>` (e `fix round r/5` quando houver)

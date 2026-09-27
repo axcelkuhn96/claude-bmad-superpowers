@@ -45,6 +45,7 @@ Defaults do `models.yml` (agente `claude` instalado pelo pacote em `~/.claude/ag
 | `implementer_backend` | cbs-backend | opus/high | backend_terra |
 | `implementer_frontend` | cbs-frontend | sonnet/high | frontend_terra |
 | `refactor` | cbs-refactor | opus/high | refactor_terra |
+| `build_fixer` | cbs-build-fixer | sonnet/high | backend_terra |
 | `reviewer` | cbs-reviewer | opus/xhigh | reviewer_sol |
 | `final_reviewer` | cbs-final-reviewer | opus/xhigh | final_reviewer_sol |
 | `tester` | cbs-tester | sonnet/medium | tester_luna |
@@ -58,6 +59,7 @@ Defaults do `models.yml` (agente `claude` instalado pelo pacote em `~/.claude/ag
 | re-reviewer | `reviewer` (read-only) | findings abertos, brief, report, diff do fix |
 | reviewer final | `final_reviewer` (read-only) | review-package da branch; linhas `minor (deferred)` e `parked` do ledger; Global Constraints (§1) com a lente `cobertura-de-testes` (+ `seguranca` se alguma task foi backend) — **passadas por você** |
 | fix wave do review final | `refactor` | lista completa de findings, review-package, report path |
+| build fixer (task BLOCKED por build/compile/typecheck, ou hook de Stop que continua falhando depois de 1 fix round) | `build_fixer` | saída real do comando que falha; caminho do brief e do report; persona da linguagem **por caminho** (seção "Build quebrado"); "menor mudança, sem refatorar" |
 | tester (Fase 6 / revisor, tasks `ui` / `operacional`) | `tester` | roteiro de validação; Playwright no venv do projeto/usuário; salvar screenshots em `.superpowers/sdd/<plano>/task-N-visual/`; devolver só o caminho e o veredito |
 | explorer / search (intake) | `explorer` / `search` | pergunta fechada; devolver síntese com `arquivo:linha`, nunca dump |
 

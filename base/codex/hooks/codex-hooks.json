@@ -1,0 +1,49 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ ! -f \"$HOME/.claude/hooks/cbs-node.sh\" ] || [ ! -f \"$HOME/.claude/hooks/cbs-no-verify.mjs\" ] || sh \"$HOME/.claude/hooks/cbs-node.sh\" \"$HOME/.claude/hooks/cbs-no-verify.mjs\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "^(Bash|apply_patch)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ ! -f \"$HOME/.claude/hooks/cbs-node.sh\" ] || [ ! -f \"$HOME/.claude/hooks/cbs-config-protect.mjs\" ] || sh \"$HOME/.claude/hooks/cbs-node.sh\" \"$HOME/.claude/hooks/cbs-config-protect.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^apply_patch$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ ! -f \"$HOME/.claude/hooks/cbs-node.sh\" ] || [ ! -f \"$HOME/.claude/hooks/cbs-format.mjs\" ] || sh \"$HOME/.claude/hooks/cbs-node.sh\" \"$HOME/.claude/hooks/cbs-format.mjs\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ ! -f \"$HOME/.claude/hooks/cbs-node.sh\" ] || [ ! -f \"$HOME/.claude/hooks/cbs-typecheck.mjs\" ] || sh \"$HOME/.claude/hooks/cbs-node.sh\" \"$HOME/.claude/hooks/cbs-typecheck.mjs\"",
+            "timeout": 90
+          }
+        ]
+      }
+    ]
+  }
+}
