@@ -2,7 +2,7 @@
 
 > Workflow PT-BR para [Claude Code](https://claude.com/claude-code): **refina sua ideia com a memória do projeto e entrega pra uma execução de qualidade** — TDD real, subagents isolados, um task reviewer por task e review final da branch.
 
-Um pacote de **7 skills** e **11 comandos** em português que amarram cinco camadas, cada uma no seu nível:
+Um pacote de **7 skills** e **12 comandos** em português que amarram cinco camadas, cada uma no seu nível:
 
 | Camada | Quem faz | Papel |
 |---|---|---|
@@ -30,6 +30,7 @@ Em vez de competir, cada peça fica no que faz bem: **você refina em português
 - [BMAD + Superpowers: sempre juntos](#bmad--superpowers-sempre-juntos)
 - [Personas: domínios e lentes de review](#personas-domínios-e-lentes-de-review)
 - [Ponytail](#ponytail-menos-código-mesma-segurança)
+- [Hooks globais](#hooks-globais)
 - [CLI de referência](#cli-de-referência)
 - [Customização que sobrevive a updates](#customização-que-sobrevive-a-updates)
 - [Desinstalar](#desinstalar)
@@ -71,6 +72,7 @@ Isso faz, em ordem:
 |---|---|
 | `--apenas-global` / `--skip-bmad` | Não instala BMAD no diretório atual (só skills/comandos/Superpowers) |
 | `--skip-superpowers` | Não tenta instalar o plugin Superpowers |
+| `--sem-hooks` | Não instala os hooks CBS (`~/.claude/hooks/cbs-*.js`) no `settings.json` |
 
 Verifique a qualquer momento:
 
@@ -93,6 +95,7 @@ cbs status
 | Atalho fim-a-fim | `/piloto [--auto] <ideia>` | grelhar + refinar (gate 1) + executar (gate 2 + integração) numa conversa só |
 | Quer revisar o que foi feito | `/revisar [escopo]` | Code review + cobertura + segurança (lentes `personas/review/`), relatório em `docs/analises/`; só corrige com seu OK. É também o gate final automático do `/executar` e `/piloto`. |
 | Vai trocar de sessão/agente | `/handoff [foco]` | Compacta a conversa num documento de continuação (referencia artefatos, redige segredos, sugere próximas skills). |
+| Quer auditar a config de agentes | `/blindar` | AgentShield estático em ~/.claude, ~/.codex e no projeto; relatório em `docs/analises/` (read-only) |
 
 Comandos de manutenção:
 
@@ -128,7 +131,7 @@ Stories em auto: sem `PRD.md` + `Architecture.md` o executor não roda `bmad-cre
 
 ## Modelo por papel e agentes nomeados (`models.yml`)
 
-O instalador copia `base/config/models.yml` pra `~/.claude/cbs-overrides/models.yml` (só se não existir; o `/atualizar` nunca sobrescreve) e os 9 agentes `cbs-*` pra `~/.claude/agents/` (override em `~/.claude/cbs-overrides/agents/`). `/executar`, `/piloto`, `/revisar`, `/refinar`, `/investigar`, `/grelhar` e `/mapear` leem o arquivo. Cada papel tem `claude:` (nome de um agente em `~/.claude/agents/` **ou** modelo direto `sonnet | opus | fable | inherit`, com `effort:` opcional `low | medium | high | xhigh | max`) e `codex:` (o `name` de um agente em `~/.codex/agents/*.toml`). O runtime escolhe a coluna.
+O instalador copia `base/config/models.yml` pra `~/.claude/cbs-overrides/models.yml` (só se não existir; o `/atualizar` nunca sobrescreve) e os 10 agentes `cbs-*` pra `~/.claude/agents/` (override em `~/.claude/cbs-overrides/agents/`). `/executar`, `/piloto`, `/revisar`, `/refinar`, `/investigar`, `/grelhar` e `/mapear` leem o arquivo. Cada papel tem `claude:` (nome de um agente em `~/.claude/agents/` **ou** modelo direto `sonnet | opus | fable | inherit`, com `effort:` opcional `low | medium | high | xhigh | max`) e `codex:` (o `name` de um agente em `~/.codex/agents/*.toml`). O runtime escolhe a coluna.
 
 | Papel | Usado em | Default `claude` (modelo/effort do agente) | Default `codex` |
 |---|---|---|---|
@@ -137,6 +140,7 @@ O instalador copia `base/config/models.yml` pra `~/.claude/cbs-overrides/models.
 | `implementer_backend` | implementer de task sem domínio `frontend` | `cbs-backend` (opus/high) | `backend_terra` |
 | `implementer_frontend` | implementer de task `frontend` | `cbs-frontend` (sonnet/high) | `frontend_terra` |
 | `refactor` | refatoração, fix wave do review final, correções do `/revisar` | `cbs-refactor` (opus/high) | `refactor_terra` |
+| `build_fixer` | task BLOCKED por build/typecheck, ou Stop (`cbs-typecheck`) continuando a falhar | `cbs-build-fixer` (sonnet/high) | `backend_terra` |
 | `reviewer` | task reviewer / re-reviewer (read-only) | `cbs-reviewer` (opus/xhigh) | `reviewer_sol` |
 | `final_reviewer` | review final da branch e `revisor` (read-only) | `cbs-final-reviewer` (opus/xhigh) | `final_reviewer_sol` |
 | `tester` | validação E2E / browser | `cbs-tester` (sonnet/medium) | `tester_luna` |
@@ -303,7 +307,7 @@ cbs instalar-bmad        # PT-BR, registra o projeto pro /atualizar
 ~/.claude/personas/
 ├── ponytail.md                       transversal — todo subagent
 ├── dominios/
-│   ├── frontend.md  (+ frontend-referencia.md)   área
+│   ├── frontend.md  (+ frontend-referencia.md, React e React Native)   área
 │   ├── database.md                                área
 │   ├── integracao.md                              área
 │   ├── laravel.md                                 linguagem
@@ -320,7 +324,7 @@ Cada task do plano recebe a marcação `(domínio: <linguagem>+<área>; tipo: <t
 
 | Domínio | Sinais (resumo) |
 |---|---|
-| `frontend` | `*.blade.php`, `src/components/`, `*.tsx/.vue/.svelte`, `*.css`, `app/Livewire/**`; tela, componente, layout, dashboard |
+| `frontend` | `*.blade.php`, `src/components/`, `*.tsx/.vue/.svelte`, `*.css`, `app/Livewire/**`, `react-native`/`expo` no `package.json`; tela, componente, layout, dashboard |
 | `database` | `migrations/`, `prisma/`, `alembic/`, `*.sql`, models; tabela, índice, migration, query |
 | `laravel` | `composer.json` com `laravel/framework` + `app/**`, `routes/**`; controller, job, policy, Eloquent |
 | `python` | `pyproject.toml` / `requirements*.txt` + `*.py`; script, ETL, FastAPI/Django, pytest |
@@ -329,7 +333,9 @@ Cada task do plano recebe a marcação `(domínio: <linguagem>+<área>; tipo: <t
 
 Regras: **até 2 domínios por task** (uma linguagem + uma área; 3 = quebrar a task). **Ordem de leitura**: persona dev → ponytail → linguagem → área. **Precedência**: regra inegociável de área vence a de linguagem; ambas vencem o corte do ponytail. Sem sinal → só persona dev + ponytail. Lentes de review nunca entram no implementer. As tabelas completas ficam ao lado (`node-referencia.md`, `frontend-referencia.md`, `review/seguranca-referencia.md`) e são consultadas por caminho quando o rulebook manda.
 
-**Gate de segurança**: a lente `seguranca` manda rodar `node ~/.claude/scripts/gate-seguranca.js` (gitleaks + semgrep com baseline + audit da stack; override em `~/.claude/cbs-overrides/scripts/`) antes de DONE em task backend; o executor roda de novo na Fase 7 antes do push e o `/revisar` em diff backend. Exit 1 bloqueia; ferramenta ausente vira "gate parcial" no report, nunca aprovação silenciosa.
+`laravel.md`, `python.md`, `node.md` (com seção "Testes") e as seções React/React Native de `frontend-referencia.md` trazem regras duras adaptadas do ECC (MIT), cada uma com uma seção **"Build quebrado"** — lida pelo `cbs-build-fixer` quando uma task fica BLOCKED por build/typecheck.
+
+**Gate de segurança**: a lente `seguranca` manda rodar `node ~/.claude/scripts/gate-seguranca.js` (gitleaks + semgrep com baseline + audit da stack + AgentShield; override em `~/.claude/cbs-overrides/scripts/`) antes de DONE em task backend; o executor roda de novo na Fase 7 antes do push e o `/revisar` em diff backend. Exit 1 bloqueia. **gitleaks ausente ou com erro reprova o gate** (mudança de comportamento — instale o binário); `.gitleaks.toml` ausente no HEAD não reprova, o gate usa as regras default do gitleaks. Achados históricos do gitleaks já revisados ficam fora do gate: lista opcional por projeto em `~/.claude/cbs-overrides/gate-achados-revisados.json`. Quando o diff toca config de agente (`.claude/`, `.codex/`, `CLAUDE.md`, `AGENTS.md`, `.mcp.json`, `hooks.json`/`hooks/`), o gate roda o **AgentShield** em modo estático (nunca `--opus`); achado alto ou crítico reprova, sem supressão. Demais ferramentas ausentes viram "gate parcial" no report, nunca aprovação silenciosa.
 
 ### TDD por tipo de tarefa
 
@@ -381,6 +387,23 @@ O motor da execução é sempre o `superpowers:subagent-driven-development`. Esc
 
 ---
 
+## Hooks globais
+
+4 hooks em `~/.claude/hooks/cbs-*.js` (ESM, sem dependências, sem `npx`), Claude Code **e** Codex, ligados por padrão via merge idempotente no `settings.json` (backup automático; hooks e chaves de outras ferramentas nunca são tocados):
+
+| Hook | Evento / matcher | O que faz |
+|---|---|---|
+| `cbs-format.js` | PostToolUse `Edit\|Write\|MultiEdit` | Formata só o arquivo editado com pint, `ruff format`, biome ou prettier **do projeto** (binário + config locais); em silêncio quando não há ferramenta |
+| `cbs-no-verify.js` | PreToolUse `Bash` | Bloqueia `--no-verify`, `-n`/`--no-verify` em commit/am, `-c core.hooksPath=…` em commit/push/merge/rebase/am/cherry-pick; fail-closed (texto ambíguo bloqueia); não marca falso positivo em string, echo, `grep`/`gh` ou mensagem de commit |
+| `cbs-config-protect.js` | PreToolUse `Edit\|Write\|MultiEdit` | Bloqueia editar config existente de lint/format/typecheck (ESLint, Prettier, Biome, Pint, PHPStan, Ruff, mypy, Stylelint, `[tool.ruff]`/`[tool.mypy]` do `pyproject.toml`); criar config nova é permitido |
+| `cbs-typecheck.js` | Stop | Roda tsc/phpstan/mypy\|pyright só nas stacks tocadas na sessão; bloqueia o fim do turno **uma vez** com o resumo dos erros; teto de 60 s; nunca escreve buildinfo/cache no repo do usuário |
+
+Env: `CBS_HOOKS=off` desliga todos; `CBS_HOOKS_DESLIGADOS=format,typecheck,no-verify,config` desliga os escolhidos; `CBS_PERMITIR_CONFIG=1` é o escape pontual do `cbs-config-protect`. Rodam via um launcher POSIX (`~/.claude/hooks/cbs-node.sh`) que acha um `node` válido mesmo depois de troca de versão no nvm/fnm/volta; launcher ou script ausente nunca bloqueia a sessão (o hook vira no-op). `cbs instalar --sem-hooks` / `cbs atualizar --sem-hooks` pula a instalação; `cbs status` lista os hooks CBS ativos; `cbs remover` tira só as entradas CBS do `settings.json`.
+
+**Codex:** os mesmos 4 hooks chegam pelo plugin (`codex-hooks.json`) e exigem o CBS instalado em `~/.claude`; precisam estar marcados como confiáveis no Codex pra rodar. `apply_patch` roteado pelo shell só é coberto pelo `cbs-config-protect`, não por format/typecheck.
+
+**Windows:** exige Git Bash (`sh`) — os hooks não têm caminho nativo `.cmd`/PowerShell. Latência medida < 100 ms no caminho vazio (sem match).
+
 ## CLI de referência
 
 ```bash
@@ -398,6 +421,7 @@ cbs status           # versões (pacote, Superpowers, BMAD por projeto), skills/
 | `--skip-self-update` | Não tenta atualizar o próprio pacote (git pull / npx @latest) |
 | `--skip-bmad` | Não mexe no BMAD dos projetos registrados |
 | `--auto-bmad` / `-y` | Atualiza BMAD em todos os projetos sem perguntar (padrão quando não há TTY) |
+| `--sem-hooks` | Não atualiza/reinstala os hooks CBS no `settings.json` |
 
 O `atualizar` detecta como o pacote foi instalado (clone git ou npm) e se atualiza sozinho; depois reescreve só a camada base, **preservando suas customizações** (veja abaixo).
 
