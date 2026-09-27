@@ -17,10 +17,11 @@ function tmpDoTeste(t, prefixo) {
   t.after(() => fs.rmSync(d, { recursive: true, force: true }));
   return d;
 }
-// Env do processo sem as chaves CBS_* (o usuário pode tê-las exportado).
+// Env do processo sem as chaves CBS_* (o usuário pode tê-las exportado) nem CLAUDE_PROJECT_DIR (npm test rodado
+// dentro de uma sessão do Claude Code herda o projeto da sessão, que o cbs-typecheck usa como âncora).
 function envLimpo() {
   const env = { ...process.env };
-  for (const k of Object.keys(env)) if (k.startsWith('CBS_')) delete env[k];
+  for (const k of Object.keys(env)) if (k.startsWith('CBS_') || k === 'CLAUDE_PROJECT_DIR') delete env[k];
   return env;
 }
 // Roda o hook como o Claude Code/Codex: node absoluto, payload no stdin, HOME temporário.
@@ -459,8 +460,9 @@ describe('cbs-format — fix round 1', { skip: !POSIX && 'POSIX' }, () => {
 
 // ── Task 7: cbs-typecheck (Stop) — typecheck em lote das stacks tocadas na sessão ──
 const tc = await import(pathToFileURL(path.join(HOOKS, 'cbs-typecheck.js')).href);
-// H2: nunca lê *.tsbuildinfo velho nem grava buildinfo no repo; --composite false evita o TS6379 do composite.
-const ARGS_TSC = ['--noEmit', '--pretty', 'false', '--composite', 'false', '--incremental', 'false'];
+// H2: nunca lê *.tsbuildinfo velho nem grava buildinfo no repo; --composite false evita o TS6379 do composite;
+// --emitDeclarationOnly false e --tsBuildInfoFile null evitam o TS5053/TS5069 que as próprias flags provocam no TS 4.9.
+const ARGS_TSC = ['--noEmit', '--pretty', 'false', '--composite', 'false', '--incremental', 'false', '--tsBuildInfoFile', 'null', '--emitDeclarationOnly', 'false'];
 const EXE0 = '#!/bin/sh\nexit 0\n';
 describe('cbs-typecheck — decisão', () => {
   const falha = [{ stack: 'ts', raiz: '/p', linhas: ['src/a.ts(1,7): error TS2322: x'] }];
@@ -699,5 +701,140 @@ describe('cbs-typecheck — E2E Stop', { skip: !POSIX && 'POSIX' }, () => {
     assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
     assert.equal(fs.existsSync(marca), false);
     assert.deepEqual(comum.lerAcumulador('e2e-fora', tmpSessao), []);
+  });
+});
+
+// ── Task 7, fix round 1: erro de config do tsc avisa, solution-style com include: [] / BOM, âncora do projeto,
+// teto com falhas já achadas, SIGKILL, .mypy.ini, cache do mypy fora do repo, ciclo de references por realpath ──
+describe('cbs-typecheck — fix round 1 (unidade)', { skip: !POSIX && 'POSIX' }, () => {
+  const SEM_PATH = { PATH: '' };
+  const falha = [{ stack: 'ts', raiz: '/p', linhas: ['src/a.ts(1,7): error TS2322: x'] }];
+  test('teto estourado depois de achar falha: só avisa, mas o aviso traz a falha achada', () => {
+    const s = tc.decidirSaida({ falhas: falha, stopHookActive: false, estourou: true });
+    assert.equal(s.stdout, ''); assert.match(s.stderr, /teto/); assert.match(s.stderr, /TS2322/); assert.equal(s.limpar, true);
+  });
+  test('stop_hook_active sem falhas: silêncio e limpa', () => {
+    assert.deepEqual(tc.decidirSaida({ falhas: [], stopHookActive: true, estourou: false }), { stdout: '', stderr: '', limpar: true });
+  });
+  function solution(t, tsconfig) {
+    const p = tmpDoTeste(t);
+    escrever(p, 'tsconfig.json', tsconfig);
+    escrever(p, 'tsconfig.app.json', '{}'); escrever(p, 'node_modules/.bin/tsc', EXE0, 0o755);
+    return tc.planejarChecagens([escrever(p, 'src/a.ts', '')], SEM_PATH).map((x) => path.relative(p, x.args.at(-1)));
+  }
+  test('solution-style com include: [] (sem files) → checa as referências (H4)', (t) => {
+    assert.deepEqual(solution(t, '{ "include": [], "references": [{ "path": "./tsconfig.app.json" }] }'), ['tsconfig.app.json']);
+  });
+  test('solution-style com files: [] e include: [] → checa as referências (H4)', (t) => {
+    assert.deepEqual(solution(t, '{ "files": [], "include": [], "references": [{ "path": "./tsconfig.app.json" }] }'), ['tsconfig.app.json']);
+  });
+  test('tsconfig com BOM UTF-8 é lido (H4)', (t) => {
+    assert.deepEqual(solution(t, '﻿{ "files": [], "references": [{ "path": "./tsconfig.app.json" }] }'), ['tsconfig.app.json']);
+  });
+  test('sem files nem include não é solution-style (include padrão) → roda a raiz', (t) => {
+    assert.deepEqual(solution(t, '{ "references": [{ "path": "./tsconfig.app.json" }] }'), ['tsconfig.json']);
+  });
+  test('py só com .mypy.ini e mypy no PATH → mypy nos arquivos', (t) => {
+    const p = tmpDoTeste(t); escrever(p, '.mypy.ini', '[mypy]\nstrict = True\n');
+    const bin = tmpDoTeste(t, 'cbs-bin-'); escrever(bin, 'mypy', EXE0, 0o755);
+    const a = escrever(p, 'm.py', '');
+    const [pl] = tc.planejarChecagens([a], { PATH: bin });
+    assert.equal(pl?.stack, 'py'); assert.equal(pl.bin, path.join(bin, 'mypy')); assert.deepEqual(pl.args, [a]);
+  });
+  test('references em ciclo via symlink para o próprio diretório terminam (vistos por realpath)', (t) => {
+    const p = tmpDoTeste(t);
+    escrever(p, 'tsconfig.json', '{ "files": [], "references": [{ "path": "./laco1" }, { "path": "./laco2" }, { "path": "./tsconfig.app.json" }] }');
+    fs.symlinkSync(p, path.join(p, 'laco1')); fs.symlinkSync(p, path.join(p, 'laco2'));
+    escrever(p, 'tsconfig.app.json', '{}'); escrever(p, 'node_modules/.bin/tsc', EXE0, 0o755);
+    const a = escrever(p, 'src/a.ts', '');
+    // Em subprocesso: sem a chave por realpath a recursão é exponencial e travaria o próprio npm test.
+    const codigo = `const tc = await import(${JSON.stringify(pathToFileURL(path.join(HOOKS, 'cbs-typecheck.js')).href)});
+      process.stdout.write(JSON.stringify(tc.planejarChecagens([${JSON.stringify(a)}], { PATH: '' }).map((x) => x.args.at(-1))));`;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', codigo], { encoding: 'utf8', timeout: 5000, env: envLimpo() });
+    assert.equal(r.error, undefined, 'terminou antes de 5 s');
+    assert.deepEqual(JSON.parse(r.stdout), [path.join(p, 'tsconfig.app.json')]);
+  });
+});
+describe('cbs-typecheck — fix round 1 (E2E)', { skip: !POSIX && 'POSIX' }, () => {
+  function projetoTs(t, scriptTsc, tsconfig = '{}') {
+    const p = tmpDoTeste(t, 'cbs-tc-');
+    escrever(p, 'tsconfig.json', tsconfig);
+    escrever(p, 'node_modules/.bin/tsc', scriptTsc, 0o755);
+    return { p, a: escrever(p, 'src/a.ts', 'let x: number = "s";') };
+  }
+  function stop(t, sessao, arquivos, payload, env = {}) {
+    const tmpSessao = tmpDoTeste(t, 'cbs-tmp-');
+    comum.registrarEdicao(sessao, arquivos, tmpSessao);
+    const r = rodarHook('cbs-typecheck.js', { session_id: sessao, ...payload }, { TMPDIR: tmpSessao, ...env });
+    return { ...r, acumulador: comum.lerAcumulador(sessao, tmpSessao) };
+  }
+  const ERRO_A = 'echo "src/a.ts(1,5): error TS2322: Type string is not assignable to type number."';
+  test('stop_hook_active com o typecheck passando: silêncio e limpa', (t) => {
+    const { p, a } = projetoTs(t, EXE0);
+    const r = stop(t, 'fr-ativo-ok', [a], { cwd: p, stop_hook_active: true });
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, ''); assert.deepEqual(r.acumulador, []);
+  });
+  test('erro de opção do tsconfig (TS5101) suprime o check: avisa "não verificado", não bloqueia e limpa', (t) => {
+    const { p, a } = projetoTs(t, '#!/bin/sh\necho "tsconfig.json(1,40): error TS5101: Option \'baseUrl\' is deprecated and will stop functioning in TypeScript 7.0."\nexit 2\n');
+    const r = stop(t, 'fr-ts5101', [a], { cwd: p });
+    assert.equal(r.code, 0); assert.equal(r.out, '');
+    assert.match(r.err, /^\[cbs\] typecheck não verificado: tsconfig\.json\(1,40\): error TS5101: /);
+    assert.deepEqual(r.acumulador, []);
+  });
+  test('erro global do tsc sem arquivo (TS5023) também avisa "não verificado"', (t) => {
+    const { p, a } = projetoTs(t, '#!/bin/sh\necho "error TS5023: Unknown compiler option \'--x\'."\nexit 1\n');
+    const r = stop(t, 'fr-ts5023', [a], { cwd: p });
+    assert.equal(r.out, ''); assert.match(r.err, /typecheck não verificado: error TS5023/);
+  });
+  test('emitDeclarationOnly: --noEmit não provoca TS5053 e o erro do arquivo bloqueia', (t) => {
+    // tsc falso com o comportamento medido no TS 4.9: --noEmit + emitDeclarationOnly → TS5053 e nenhum check semântico.
+    const tsc = `#!/bin/sh\ncase " $* " in\n  *" --emitDeclarationOnly false "*) ${ERRO_A}; exit 2;;\nesac\necho "error TS5053: Option 'emitDeclarationOnly' cannot be specified with option 'noEmit'."\nexit 1\n`;
+    const { p, a } = projetoTs(t, tsc, '{ "compilerOptions": { "declaration": true, "emitDeclarationOnly": true } }');
+    const r = stop(t, 'fr-ts5053', [a], { cwd: p });
+    assert.equal(r.code, 0); assert.match(JSON.parse(r.out).reason, /TS2322/);
+  });
+  test('incremental + tsBuildInfoFile: --incremental false não provoca TS5069 e o erro do arquivo bloqueia', (t) => {
+    // tsc falso com o comportamento medido no TS 4.9: --incremental false com tsBuildInfoFile no tsconfig → TS5069.
+    const tsc = `#!/bin/sh\ncase " $* " in\n  *" --tsBuildInfoFile null "*) ${ERRO_A}; exit 2;;\nesac\necho "tsconfig.json(1,24): error TS5069: Option 'tsBuildInfoFile' cannot be specified without specifying option 'incremental' or option 'composite'."\nexit 2\n`;
+    const { p, a } = projetoTs(t, tsc, '{ "compilerOptions": { "incremental": true, "tsBuildInfoFile": "./.cache/app.tsbuildinfo" } }');
+    const r = stop(t, 'fr-ts5069', [a], { cwd: p });
+    assert.equal(r.code, 0); assert.match(JSON.parse(r.out).reason, /TS2322/);
+  });
+  test('âncora é CLAUDE_PROJECT_DIR (cwd corrente num subdir não descarta a edição)', (t) => {
+    const { p, a } = projetoTs(t, `#!/bin/sh\n${ERRO_A}\nexit 2\n`);
+    const sub = path.join(p, 'docs'); fs.mkdirSync(sub);
+    const r = stop(t, 'fr-ancora', [a], { cwd: sub }, { CLAUDE_PROJECT_DIR: p });
+    assert.match(JSON.parse(r.out).reason, /TS2322/);
+    const r2 = stop(t, 'fr-ancora2', [a], { cwd: p }, { CLAUDE_PROJECT_DIR: tmpDoTeste(t, 'cbs-outro-') });
+    assert.equal(r2.out + r2.err, ''); assert.deepEqual(r2.acumulador, []);
+  });
+  test('teto estourado depois de uma falha: só avisa, com a falha achada, e limpa', (t) => {
+    const tsc = `#!/bin/sh\nfor a in "$@"; do cfg="$a"; done\ncase "$cfg" in\n  */tsconfig.app.json) ${ERRO_A}; exit 2;;\nesac\nsleep 5\n`;
+    const { p, a } = projetoTs(t, tsc, '{ "files": [], "references": [{ "path": "./tsconfig.app.json" }, { "path": "./tsconfig.node.json" }] }');
+    escrever(p, 'tsconfig.app.json', '{}'); escrever(p, 'tsconfig.node.json', '{}');
+    const r = stop(t, 'fr-teto', [a], { cwd: p }, { CBS_TYPECHECK_TETO_MS: '1500' });
+    assert.equal(r.code, 0); assert.equal(r.out, '');
+    assert.match(r.err, /teto/); assert.match(r.err, /src\/a\.ts\(1,5\): error TS2322/);
+    assert.deepEqual(r.acumulador, []);
+  });
+  test('timeout mata com SIGKILL: tsc que ignora SIGTERM não prende o hook', (t) => {
+    const { p, a } = projetoTs(t, '#!/bin/sh\ntrap "" TERM\nsleep 5\n');
+    const inicio = Date.now();
+    const r = stop(t, 'fr-kill', [a], { cwd: p }, { CBS_TYPECHECK_TETO_MS: '300' });
+    assert.ok(Date.now() - inicio < 4000, `demorou ${Date.now() - inicio} ms`);
+    assert.equal(r.out, ''); assert.match(r.err, /teto/);
+  });
+  test('mypy roda com cache num dir temporário apagado depois — nada de .mypy_cache no repo', (t) => {
+    const p = tmpDoTeste(t, 'cbs-py-'); const log = path.join(p, 'cache.log');
+    escrever(p, 'pyproject.toml', '[tool.mypy]\nstrict = true\n');
+    // mypy falso: grava o cache onde --cache-dir mandar (sem a flag, em ./.mypy_cache, como o de verdade).
+    escrever(p, '.venv/bin/mypy', `#!/bin/sh\ncache=.mypy_cache\nif [ "$1" = "--cache-dir" ]; then cache="$2"; fi\nmkdir -p "$cache" && echo x > "$cache/CACHEDIR.TAG"\necho "$cache" > "${log}"\necho "m.py:1: error: Incompatible types in assignment  [assignment]"\nexit 1\n`, 0o755);
+    const a = escrever(p, 'm.py', 'x: int = "s"\n');
+    const r = stop(t, 'fr-mypy', [a], { cwd: p });
+    assert.match(JSON.parse(r.out).reason, /m\.py:1: error: Incompatible types/);
+    assert.equal(fs.existsSync(path.join(p, '.mypy_cache')), false);
+    const cache = fs.readFileSync(log, 'utf8').trim();
+    assert.ok(path.isAbsolute(cache) && !cache.startsWith(p + path.sep), cache);
+    assert.equal(fs.existsSync(cache), false, 'cache temporário apagado');
   });
 });
