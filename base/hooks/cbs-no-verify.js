@@ -2,6 +2,9 @@
 // cbs-no-verify.js — PreToolUse (Bash): bloqueia bypass de hooks git (--no-verify, commit -n, -c core.hooksPath=…)
 // em commit/push/merge/cherry-pick/rebase/am — inclusive dentro de ( ), $( ), crase, sh -c e eval — sem falso
 // positivo quando o texto está em string (echo, grep, mensagem de commit/tag/PR) ou em comentário.
+// Fail-closed: se a análise fica incerta (aspa/heredoc aberto, comando > 64 KB ou orçamento de custo estourado,
+// shell -c/eval não modelado), o texto cru é checado e basta `git` + flag de bypass para bloquear. Trade-off
+// aceito: heredoc cujo texto contém "--no-verify" pode bloquear — escape: CBS_HOOKS_DESLIGADOS=no-verify.
 // Adaptado de affaan-m/ECC @ e482e57, scripts/hooks/block-no-verify.js — MIT License,
 // Copyright (c) 2026 Affaan Mustafa. Licença: https://github.com/affaan-m/ECC/blob/e482e57/LICENSE
 import { hookDesligado, lerStdin, lerPayload, comandoBash, ehEntrada, avisar } from './cbs-comum.js';
@@ -9,7 +12,8 @@ import { hookDesligado, lerStdin, lerPayload, comandoBash, ehEntrada, avisar } f
 // --- Adaptado do ECC (block-no-verify.js:21-511); nomes internos em inglês como na fonte. ---
 // Desvios do ECC (review da Task 4): scanShell (aspas, comentário só em início de palavra, ( ) $( ) e crase);
 // findCommandSegmentEnd/findGit/detectGitCommand/checkCommand reescritos sobre ele (isInComment virou o COMMENT dele);
-// subcomando achado por tokenizeShellWords (aspas no gap); scripts de sh -c / eval checados por recursão.
+// subcomando achado por tokenizeShellWords (aspas no gap); scripts de sh -c / eval checados por recursão;
+// \git, $'…' e redirecionamento colado (push>/dev/null) modelados; incerteza → rawBypass no texto cru.
 
 /**
  * Git commands that support the --no-verify flag.
@@ -77,6 +81,7 @@ const COMMIT_SHORT_OPTIONS_WITH_VALUE = new Set(['m', 'F', 'C', 'c', 't']);
 const COMMIT_SHORT_OPTIONS_WITH_OPTIONAL_VALUE = new Set(['u', 'S']);
 
 function tokenizeShellWords(input, start = 0, end = input.length) {
+  spend(end - start);
   const tokens = [];
   let value = '';
   let tokenStart = null;
@@ -164,28 +169,62 @@ const CODE = 1;
 const COMMENT = 2;
 let lastScan = null;
 
+// Teto de custo: acima disso a análise é incerta e cai no texto cru (fail-closed).
+const MAX_COMMAND = 64 * 1024;
+const MAX_WORK = 4 * 1024 * 1024;
+let work = 0;
+let uncertainty = null;
+class ParseBudgetExceeded extends Error {}
+function spend(n) {
+  work += n;
+  if (work > MAX_WORK) throw new ParseBudgetExceeded('orçamento de análise estourado');
+}
+function markUncertain(why) {
+  if (!uncertainty) uncertainty = why;
+}
+
 /**
  * Classifica cada posição do comando: CODE (sintaxe do shell), LITERAL (dentro de aspas ou escapado)
  * ou COMMENT; `depth` conta ( ), $( ) e crases abertos; `end` marca separadores (; | & \n), o fechamento
  * de ( ) / $( ) / crase e o início de comentário (`#` só conta fora de aspas e em início de palavra).
+ * `quotedSubs` guarda o corpo de $( ) / crase abertos dentro de aspas duplas (rodam como comando);
+ * `uncertain` diz por que o estado pode divergir do shell (heredoc, aspa ou parêntese sem fechar).
  */
 function scanShell(input) {
   if (lastScan && lastScan.input === input) return lastScan;
+  spend(input.length);
   const n = input.length;
   const kind = new Uint8Array(n);
   const depth = new Uint32Array(n);
   const end = new Uint8Array(n);
   const stack = [];
+  const quotedSubs = [];
   let codeDepth = 0;
+  let heredoc = false;
   const literalNext = (i) => { if (i < n) { kind[i] = LITERAL; depth[i] = codeDepth; } };
+  // `i` é o índice do caractere que abre ( `(` de $( ) ou a crase ); o corpo começa em i + 1.
+  const openCode = (type, i, inQuotes) => { stack.push({ type, inQuotes, start: i + 1 }); codeDepth++; };
+  const closeCode = (i) => {
+    const frame = stack.pop();
+    codeDepth--;
+    if (frame.inQuotes) quotedSubs.push(input.slice(frame.start, i));
+  };
 
   for (let i = 0; i < n; i++) {
     const char = input.charAt(i);
-    const top = stack[stack.length - 1];
+    const top = stack.length ? stack[stack.length - 1].type : null;
     depth[i] = codeDepth;
 
     if (top === "'") {
       if (char === "'") { stack.pop(); kind[i] = CODE; } else { kind[i] = LITERAL; }
+      continue;
+    }
+
+    // ANSI-C $'…': \ escapa (inclusive \'), ' fecha.
+    if (top === "$'") {
+      kind[i] = LITERAL;
+      if (char === '\\') { literalNext(i + 1); i++; continue; }
+      if (char === "'") { stack.pop(); kind[i] = CODE; }
       continue;
     }
 
@@ -195,16 +234,21 @@ function scanShell(input) {
       if (char === '"') { stack.pop(); kind[i] = CODE; continue; }
       if (char === '$' && input.charAt(i + 1) === '(') {
         kind[i] = CODE; kind[i + 1] = CODE; depth[i + 1] = codeDepth; i++;
-        stack.push('$('); codeDepth++;
+        openCode('$(', i, true);
         continue;
       }
-      if (char === '`') { kind[i] = CODE; stack.push('`'); codeDepth++; }
+      if (char === '`') { kind[i] = CODE; openCode('`', i, true); }
       continue;
     }
 
     kind[i] = CODE;
     if (char === '\\') { literalNext(i + 1); i++; continue; }
-    if (char === "'" || char === '"') { stack.push(char); continue; }
+    if (char === '$' && input.charAt(i + 1) === "'") {
+      kind[i + 1] = CODE; depth[i + 1] = codeDepth; i++;
+      stack.push({ type: "$'" });
+      continue;
+    }
+    if (char === "'" || char === '"') { stack.push({ type: char }); continue; }
     if (char === '#' && (i === 0 || (kind[i - 1] === CODE && /[\s;&|()]/.test(input.charAt(i - 1))))) {
       end[i] = 1;
       for (; i < n && input.charAt(i) !== '\n'; i++) { kind[i] = COMMENT; depth[i] = codeDepth; }
@@ -213,19 +257,21 @@ function scanShell(input) {
     }
     if (char === '$' && input.charAt(i + 1) === '(') {
       kind[i + 1] = CODE; depth[i + 1] = codeDepth; i++;
-      stack.push('$('); codeDepth++;
+      openCode('$(', i, false);
       continue;
     }
-    if (char === '(') { stack.push('('); codeDepth++; continue; }
+    if (char === '(') { openCode('(', i, false); continue; }
     if (char === ')') {
       end[i] = 1;
-      if (top === '$(' || top === '(') { stack.pop(); codeDepth--; }
+      if (top === '$(' || top === '(') closeCode(i);
       continue;
     }
     if (char === '`') {
-      if (top === '`') { end[i] = 1; stack.pop(); codeDepth--; } else { stack.push('`'); codeDepth++; }
+      if (top === '`') { end[i] = 1; closeCode(i); } else { openCode('`', i, false); }
       continue;
     }
+    // Heredoc (<< e <<-, não <<<): o corpo não segue as regras de aspas — análise incerta.
+    if (char === '<' && input.charAt(i + 1) === '<' && input.charAt(i + 2) !== '<' && input.charAt(i - 1) !== '<') heredoc = true;
     // `2>&1`, `&>arq` e `>|arq` são redirecionamento, não separador.
     if (char === '&' && (/[<>]/.test(input.charAt(i - 1)) || input.charAt(i + 1) === '>')) continue;
     if (char === '|' && input.charAt(i - 1) === '>') continue;
@@ -240,7 +286,8 @@ function scanShell(input) {
     segEnd[i] = nextEndAt[depth[i]] ?? n;
   }
 
-  lastScan = { input, kind, depth, end, segEnd };
+  const uncertain = heredoc ? 'heredoc' : stack.length ? 'aspa ou parêntese sem fechar' : null;
+  lastScan = { input, kind, depth, end, segEnd, quotedSubs, uncertain };
   return lastScan;
 }
 
@@ -338,6 +385,7 @@ function findGit(input, start) {
     if (!VALID_BEFORE_GIT.includes(before)) continue;
 
     if (kind[idx] === CODE) return { idx, len };
+    if (before === '\\' && kind[idx - 1] === CODE) return { idx, len };  // \git: escape só desliga alias
     const wholeQuoted = kind[idx] === LITERAL && (before === '"' || before === "'") &&
       kind[idx - 1] === CODE && after === before && kind[idx + len] === CODE;
     if (wholeQuoted) return { idx, len: len + 1 };
@@ -346,6 +394,13 @@ function findGit(input, start) {
 }
 
 // Opções globais do git que consomem o próximo token (git -C dir, git -c chave=valor…).
+// Redirecionamento: token que começa com ele (`>x`, `2>&1`, `&>x`) ou só o operador (`>`, `2>>`).
+const REDIRECT_START = /^(\d*|&)[<>]/;
+const REDIRECT_ONLY = /^(\d*|&)[<>]{1,2}[|&]?$/;
+// Redirecionamento colado na palavra (`push>/dev/null`, `--no-verify&>x`): a palavra termina antes dele.
+function cutRedirect(value) {
+  return value.replace(/&?[<>][\s\S]*$/, '');
+}
 const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set(['-c', '-C', '--work-tree', '--git-dir', '--namespace', '--super-prefix']);
 
 /**
@@ -359,11 +414,15 @@ function findGitSubcommand(input, start, segmentEnd) {
     for (const t of tokenizeShellWords(input, start, windowEnd)) {
       if (t.end >= windowEnd && windowEnd < segmentEnd) break;  // token pode ter sido cortado pela janela
       if (expectFlagArg) { expectFlagArg = false; continue; }
+      if (REDIRECT_START.test(t.value)) {
+        if (REDIRECT_ONLY.test(t.value)) expectFlagArg = true;  // `>` solto: o próximo token é o alvo
+        continue;
+      }
       if (t.value.startsWith('-')) {
         if (GIT_GLOBAL_OPTIONS_WITH_VALUE.has(t.value)) expectFlagArg = true;
         continue;
       }
-      return t;
+      return { ...t, value: cutRedirect(t.value) };
     }
     if (windowEnd >= segmentEnd) return null;
   }
@@ -420,7 +479,7 @@ function hasNoVerifyFlag(input, command, offset) {
   let skipNext = false;
 
   for (const token of tokens) {
-    const value = token.value;
+    const value = cutRedirect(token.value);
 
     if (skipNext) {
       skipNext = false;
@@ -484,17 +543,23 @@ function hasHooksPathOverride(input, detected) {
 }
 
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish']);
+// Shells e wrappers cujo -c não é modelado: a análise vira incerta (fail-closed).
+const UNMODELLED_SHELLS = new Set(['su', 'ash', 'mksh', 'tcsh', 'csh', 'yash', 'posh', 'busybox', 'ksh93', 'pwsh', 'powershell']);
+// Opções de sh/bash que consomem o próximo token antes do -c.
+const SHELL_OPTIONS_WITH_VALUE = new Set(['-o', '+o', '-O', '+O', '--rcfile', '--init-file']);
 const MAX_NESTING = 3;
 
 /**
- * Scripts passados a `sh|bash|… -c` e a `eval`: rodam como comando, então são checados por recursão.
+ * Scripts passados a `sh|bash|… -c`, a `eval` e corpos de $( ) / crase dentro de aspas duplas: rodam como
+ * comando, então são checados por recursão. Shell não modelado marca a análise como incerta.
  */
 function nestedShellScripts(input) {
-  const { kind } = scanShell(input);
+  const { kind, quotedSubs } = scanShell(input);
   const tokens = tokenizeShellWords(input).filter(t => kind[t.start] === CODE);
-  const scripts = [];
+  const scripts = [...quotedSubs];
   for (let i = 0; i < tokens.length; i++) {
     const name = tokens[i].value.split(/[/;&|(`]/).pop();
+    if (UNMODELLED_SHELLS.has(name)) markUncertain(`${name} não modelado`);
     if (name === 'eval') {
       const words = tokenizeShellWords(input, tokens[i].end, findCommandSegmentEnd(input, tokens[i].end));
       scripts.push(words.map(t => t.value).join(' '));
@@ -504,7 +569,7 @@ function nestedShellScripts(input) {
     let hasC = false;
     for (let j = i + 1; j < tokens.length; j++) {
       const value = tokens[j].value;
-      if (value === '-o' || value === '+o') { j++; continue; }
+      if (SHELL_OPTIONS_WITH_VALUE.has(value)) { j++; continue; }
       if (value.startsWith('-')) { if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(value)) hasC = true; continue; }
       if (hasC) scripts.push(value);
       break;
@@ -517,6 +582,8 @@ function nestedShellScripts(input) {
  * Check a command string for git hook bypass attempts.
  */
 function checkCommand(input, nesting = 0) {
+  const scan = scanShell(input);
+  if (scan.uncertain) markUncertain(scan.uncertain);
   let start = 0;
   // Segmentos já checados: um git no mesmo nível dentro deles é argumento (git push origin git), não comando.
   let checked = [];
@@ -536,6 +603,8 @@ function checkCommand(input, nesting = 0) {
     if (hasHooksPathOverride(input, detected)) {
       return {
         blocked: true,
+        command: gitCommand,
+        hooksPath: true,
         reason: `BLOCKED: Overriding core.hooksPath is not allowed with git ${gitCommand}. Git hooks must not be bypassed.`,
       };
     }
@@ -543,6 +612,7 @@ function checkCommand(input, nesting = 0) {
     if (hasNoVerifyFlag(input, gitCommand, offset)) {
       return {
         blocked: true,
+        command: gitCommand,
         reason: `BLOCKED: --no-verify flag is not allowed with git ${gitCommand}. Git hooks must not be bypassed.`,
       };
     }
@@ -552,8 +622,11 @@ function checkCommand(input, nesting = 0) {
     start = offset;
   }
 
-  if (nesting < MAX_NESTING) {
-    for (const script of nestedShellScripts(input)) {
+  const scripts = nestedShellScripts(input);
+  if (nesting >= MAX_NESTING) {
+    if (scripts.length) markUncertain('aninhamento de sh -c / eval profundo demais');
+  } else {
+    for (const script of scripts) {
       const r = checkCommand(script, nesting + 1);
       if (r.blocked) return r;
     }
@@ -564,13 +637,49 @@ function checkCommand(input, nesting = 0) {
 
 // --- CBS ---
 
+/**
+ * Fallback fail-closed no texto cru: `git` + (--no-verify ou prefixo | core.hooksPath= | -n agrupado com commit).
+ */
+function rawBypass(input) {
+  if (!/\bgit\b/.test(input)) return null;
+  // Palavras sem aspas nem barras (o texto pode estar em qualquer nível de aspas aninhadas).
+  const words = input.split(/[\s;&|()`<>]+/).map(w => w.replace(/[\\"']/g, '').replace(/^\$/, ''));
+  const command = words.find(w => GIT_COMMANDS_WITH_NO_VERIFY.includes(w)) || null;
+  if (words.some(w => w.toLowerCase().includes(GIT_CONFIG_KEY_PREFIX))) return { blocked: true, command, hooksPath: true };
+  if (words.some(isNoVerifyLongFlag)) return { blocked: true, command };
+  if (words.includes('commit') && words.some(isCommitNoVerifyShortFlag)) return { blocked: true, command: 'commit' };
+  return null;
+}
+
 export function checarComando(comando) {
   if (typeof comando !== 'string' || !/\bgit\b/.test(comando)) return { bloquear: false };  // caminho rápido
-  const r = checkCommand(comando);
-  if (!r.blocked) return { bloquear: false };
-  const sub = (r.reason.match(/git ([a-z-]+)/) || [])[1] || 'git';
-  const tipo = /hooksPath/i.test(r.reason) ? 'sobrescrever core.hooksPath' : 'usar --no-verify / -n';
-  return { bloquear: true, motivo: `CBS: bloqueado — não é permitido ${tipo} em git ${sub}. Os hooks git do projeto não podem ser pulados; corrija o que o hook reprovou.` };
+  let r = null;
+  let incerto = null;
+  if (comando.length > MAX_COMMAND) {
+    incerto = 'comando acima de 64 KB';
+  } else {
+    work = 0;
+    uncertainty = null;
+    try {
+      r = checkCommand(comando);
+      incerto = uncertainty;
+    } catch (e) {
+      if (!(e instanceof ParseBudgetExceeded)) throw e;
+      incerto = e.message;
+    }
+  }
+  if (!(r && r.blocked) && incerto) {
+    r = rawBypass(comando);
+    if (!r) return { bloquear: false };
+    r.incerto = incerto;
+  }
+  if (!r || !r.blocked) return { bloquear: false };
+  const sub = r.command ? `git ${r.command}` : 'git';
+  const tipo = r.hooksPath ? 'sobrescrever core.hooksPath' : 'usar --no-verify / -n';
+  const extra = r.incerto
+    ? ` Análise incerta (${r.incerto}): na dúvida o CBS bloqueia; se for falso positivo, rode com CBS_HOOKS_DESLIGADOS=no-verify.`
+    : '';
+  return { bloquear: true, motivo: `CBS: bloqueado — não é permitido ${tipo} em ${sub}. Os hooks git do projeto não podem ser pulados; corrija o que o hook reprovou.${extra}` };
 }
 
 function main() {

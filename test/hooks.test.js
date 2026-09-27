@@ -159,6 +159,21 @@ describe('cbs-no-verify', () => {
     'git "commit" --no-verify',
     'x=$(git push --no-verify)',
     'bash -o pipefail -c "git push --no-verify"',
+    // Re-review do fix round 1: \git, redirecionamento colado, heredoc/ANSI-C e incerteza de parse (fail-closed).
+    '\\git push --no-verify',
+    'git push>/dev/null --no-verify',
+    'git commit>log -n -m x',
+    'git push&>/dev/null --no-verify',
+    'git push --no-verify>/dev/null',
+    "cat >f <<'EOF'\ndon't\nEOF\ngit commit -n -m x",
+    "echo $'\\''; git push --no-verify",
+    'echo "x; git push --no-verify',
+    'bash -O extglob -c "git push --no-verify"',
+    "su -c 'git push --no-verify' deploy",
+    "mksh -c 'git push --no-verify'",
+    "tcsh -c 'git push --no-verify'",
+    "ash -c 'git push --no-verify'",
+    "echo \"$(bash -c 'git push --no-verify')\"",
   ];
   const LIBERA = [
     'git commit -m "hello"',
@@ -187,6 +202,9 @@ describe('cbs-no-verify', () => {
     'bash -c "echo ok" && git push',
     'git commit -m x # --no-verify',
     "bash -c \"echo 'git push --no-verify'\"",
+    "git commit -F- <<'EOF'\nfix: mensagem normal, don't panic\nEOF",
+    "echo $'a\\'b' && git push origin main",
+    'git commit -m "x" 2>&1 | tail -3',
   ];
   for (const c of BLOQUEIA) test(`bloqueia: ${c}`, () => assert.equal(noVerify.checarComando(c).bloquear, true));
   for (const c of LIBERA) test(`libera: ${c}`, () => assert.equal(noVerify.checarComando(c).bloquear, false));
@@ -196,6 +214,35 @@ describe('cbs-no-verify', () => {
       noVerify.checarComando(c);
       assert.ok(performance.now() - t0 < 2000, `${c.slice(0, 20)}…: ${Math.round(performance.now() - t0)} ms`);
     }
+  });
+  test('teto de custo (> 64 KB ou orçamento de tokens) cai no texto cru e bloqueia rápido', () => {
+    const casos = [
+      ['git -c '.repeat(2e4) + '; git push --no-verify', true],        // > 64 KB
+      ['git -c '.repeat(8000) + '; git push --no-verify', true],       // < 64 KB, estoura o orçamento
+      ['eval '.repeat(8000) + 'git push --no-verify', true],           // eval aninhado
+      ['git commit -m "' + 'x'.repeat(70000) + '"', false],            // > 64 KB sem flag de bypass
+    ];
+    for (const [c, bloquear] of casos) {
+      const t0 = performance.now();
+      const r = noVerify.checarComando(c);
+      const ms = Math.round(performance.now() - t0);
+      assert.equal(r.bloquear, bloquear, `${c.slice(0, 24)}…`);
+      assert.ok(ms < 2000, `${c.slice(0, 24)}…: ${ms} ms`);
+    }
+  });
+  test('sh -c aninhado além do limite cai no texto cru e bloqueia', () => {
+    const aspas = (x) => "'" + x.replace(/'/g, "'\\''") + "'";
+    let c = 'git push --no-verify';
+    for (let i = 0; i < 5; i++) c = 'bash -c ' + aspas(c);
+    const r = noVerify.checarComando(c);
+    assert.equal(r.bloquear, true);
+    assert.match(r.motivo, /Análise incerta/);
+  });
+  test('bloqueio por análise incerta explica o escape CBS_HOOKS_DESLIGADOS=no-verify', () => {
+    const r = noVerify.checarComando("cat >f <<'EOF'\ndon't\nEOF\ngit commit -n -m x");
+    assert.equal(r.bloquear, true);
+    assert.match(r.motivo, /CBS_HOOKS_DESLIGADOS=no-verify/);
+    assert.doesNotMatch(noVerify.checarComando('git push --no-verify').motivo, /CBS_HOOKS_DESLIGADOS/);
   });
   test('motivo cita o subcomando git', () => assert.match(noVerify.checarComando('git commit -m x && git push --no-verify').motivo, /git push/));
   test('E2E: bloqueio sai 2 com motivo no stderr e stdout vazio', () => {
