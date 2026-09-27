@@ -132,6 +132,7 @@ assert.ok(cmdsBase.includes('blindar.md'), 'command /blindar no base');
     tester: { claude: 'cbs-tester', codex: 'tester_luna' },
     explorer: { claude: 'cbs-explorer', codex: 'explorer_luna' },
     search: { claude: 'cbs-search', codex: 'search_spark' },
+    build_fixer: { claude: 'cbs-build-fixer', codex: 'backend_terra' },
   };
   for (const [papel, esperado] of Object.entries(papeis)) {
     const bloco = modelsBase.match(new RegExp(`^${papel}:[^\\n]*\\n((?:[ \\t]+[^\\n]*\\n?)+)`, 'm'));
@@ -143,7 +144,7 @@ assert.ok(cmdsBase.includes('blindar.md'), 'command /blindar no base');
 
   // agentes cbs-*: cada base/agents/*.md em ~/.claude/agents/ com marcador e frontmatter válido
   const agentsBase = await listarMd(path.join(BASE, 'agents'));
-  assert.ok(agentsBase.length >= 9, `esperava ≥9 agentes no base, achei ${agentsBase.length}`);
+  assert.ok(agentsBase.length >= 10, `esperava ≥10 agentes no base, achei ${agentsBase.length}`);
   for (const rel of agentsBase) {
     const p = path.join(claude, 'agents', rel);
     assert.ok(await existe(p), `agente ${rel} copiado`);
@@ -227,6 +228,7 @@ test('status depois de instalar lista skills, personas e models.yml', () => {
   assert.match(out, /Personas instaladas \([1-9]\d* base/);
   assert.match(out, /Agentes do pacote ativos \([1-9]\d* base, 0 override\)/);
   assert.match(out, /^\s+cbs-reviewer\.md$/m);
+  assert.match(out, /^\s+cbs-build-fixer\.md$/m);
   assert.match(out, /Modelo por papel: ✓/);
   assert.match(out, /Skills de domínio detectadas:/);
 });
