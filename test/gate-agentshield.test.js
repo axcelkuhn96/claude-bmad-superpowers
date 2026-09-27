@@ -25,7 +25,7 @@ function saidaFalsa(severidades) {
   for (const s of ['critical', 'high', 'medium', 'low', 'info']) summary[s] = severidades.filter((x) => x === s).length;
   return JSON.stringify({ timestamp: '2026-01-01T00:00:00.000Z', targetPath: '/x', findings, score: {}, summary, defenses: [] });
 }
-function cenario(t, arquivoTocado, severidades, { saida = saidaFalsa(severidades), exit = 0 } = {}) {
+function cenario(t, arquivoTocado, severidades, { saida = saidaFalsa(severidades), exit = 0, commitar = true } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-ags-'));
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-ags-home-'));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-ags-bin-'));
@@ -39,7 +39,7 @@ function cenario(t, arquivoTocado, severidades, { saida = saidaFalsa(severidades
   const alvo = path.join(root, arquivoTocado);
   fs.mkdirSync(path.dirname(alvo), { recursive: true });
   fs.writeFileSync(alvo, '{}\n');
-  git(root, 'add', '-A'); git(root, 'commit', '-m', 'muda');
+  if (commitar) { git(root, 'add', '-A'); git(root, 'commit', '-m', 'muda'); }
   const log = path.join(bin, 'chamadas.log');
   const json = path.join(bin, 'saida.json');
   fs.writeFileSync(json, saida);
@@ -94,6 +94,46 @@ test('saída ilegível ou sem findings → erro, gate parcial', opts, (t) => {
     assert.match(r.stdout, /⚠ agentshield: erro \(exit \d+, saída ilegível\)/);
     assert.ok(fs.existsSync(path.join(c.root, 'reports', 'agentshield.err')));
   }
+});
+test('.claude/ aninhado e hooks.json em qualquer nível disparam a etapa', opts, (t) => {
+  for (const arquivo of ['packages/a/.claude/settings.json', 'packages/b/.codex/config.toml', 'plugins/x/hooks.json']) {
+    const c = cenario(t, arquivo, ['high']);
+    const r = rodar(c, `${c.bin}${path.delimiter}${semAgentshield()}`);
+    assert.match(r.stdout, /✗ agentshield: 1 achado\(s\) alto\/crítico/, arquivo);
+  }
+});
+test('hooks/ fora da raiz (ex.: React src/hooks) não dispara a etapa', opts, (t) => {
+  const c = cenario(t, 'src/hooks/useX.ts', ['critical']);
+  const r = rodar(c, `${c.bin}${path.delimiter}${semAgentshield()}`);
+  assert.match(r.stdout, /^GATE: /m);
+  assert.doesNotMatch(r.stdout, /agentshield/);
+  assert.equal(fs.existsSync(c.log), false);
+});
+test('arquivo não rastreado em .claude/ dispara a etapa', opts, (t) => {
+  const c = cenario(t, '.claude/settings.json', ['critical'], { commitar: false });
+  const r = rodar(c, `${c.bin}${path.delimiter}${semAgentshield()}`);
+  assert.match(r.stdout, /✗ agentshield: 1 achado\(s\) alto\/crítico/);
+});
+test('exit 1 com JSON válido → erro, gate parcial', opts, (t) => {
+  const c = cenario(t, '.claude/settings.json', ['high'], { exit: 1 });
+  const r = rodar(c, `${c.bin}${path.delimiter}${semAgentshield()}`);
+  assert.match(r.stdout, /⚠ agentshield: erro \(exit 1, saída ilegível\)/);
+  assert.doesNotMatch(r.stdout, /✗ agentshield/);
+});
+test('severity não-string (objeto hostil) não conta e não derruba o gate', opts, (t) => {
+  const saida = JSON.stringify({ findings: [{ severity: { toString: 1 } }, { severity: 'HIGH' }], summary: {} });
+  const c = cenario(t, '.claude/settings.json', [], { saida });
+  const r = rodar(c, `${c.bin}${path.delimiter}${semAgentshield()}`);
+  assert.match(r.stdout, /✗ agentshield: 1 achado\(s\) alto\/crítico/, r.stderr);
+});
+test('git falha ao listar os arquivos tocados → parcial, nunca pula em silêncio', opts, (t) => {
+  const c = cenario(t, '.claude/settings.json', ['high']);
+  const gitReal = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+  // git falso só pra `diff --name-only`; o resto (inclusive o gitleaks) usa o git real.
+  fs.writeFileSync(path.join(c.bin, 'git'), `#!/bin/sh\nif [ "$1" = "diff" ] && [ "$2" = "--name-only" ]; then exit 128; fi\nexec "${gitReal}" "$@"\n`, { mode: 0o755 });
+  const r = rodar(c, `${c.bin}${path.delimiter}${semAgentshield()}`);
+  assert.match(r.stdout, /⚠ agentshield: não foi possível listar os arquivos tocados \(git\) — gate parcial/);
+  assert.match(r.stdout, /APROVADO COM RESSALVAS — .*agentshield/);
 });
 test('nunca chama o modo --opus', opts, (t) => {
   const c = cenario(t, '.codex/config.toml', []);
