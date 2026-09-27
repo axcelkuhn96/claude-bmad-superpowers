@@ -45,6 +45,19 @@ async function listarMd(dir) {
   return out.sort();
 }
 
+const RTK_GRUPO = { matcher: 'Bash', hooks: [{ type: 'command', command: '/x/.claude/hooks/rtk-rewrite.sh' }] };
+const SETTINGS_INICIAL = { model: 'opus', hooks: { PreToolUse: [RTK_GRUPO] } };
+async function lerJson(p) { return JSON.parse(await fs.readFile(p, 'utf8')); }
+function hooksCbs(settings) {
+  const out = [];
+  for (const [ev, gs] of Object.entries(settings.hooks || {})) for (const g of gs) for (const h of g.hooks) {
+    const m = String(h.command).match(/[\\/]\.claude[\\/]hooks[\\/](cbs-[a-z-]+\.js)/);
+    if (m) out.push(`${ev}:${m[1]}`);
+  }
+  return out.sort();
+}
+const HOOKS_ESPERADOS = ['PostToolUse:cbs-format.js', 'PreToolUse:cbs-config-protect.js', 'PreToolUse:cbs-no-verify.js', 'Stop:cbs-typecheck.js'];
+
 before(async () => {
   homeTmp = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-smoke-'));
   claude = path.join(homeTmp, '.claude');
@@ -61,6 +74,7 @@ test('cli --help sai com 0 e lista os comandos', () => {
     assert.match(out, new RegExp(`^\\s+${c}\\s`, 'm'), `comando ${c} na ajuda`);
   }
   assert.match(out, /--projetos/);
+  assert.match(out, /--sem-hooks/);
 });
 
 test('comando desconhecido sai com 1', () => {
@@ -76,6 +90,19 @@ test('status num HOME vazio não quebra e reporta não instalado', () => {
   assert.match(out, /Skills do pacote ativos \(0\)/);
   assert.match(out, /Projetos BMAD registrados \(0\)/);
   assert.match(out, /models\.yml ausente/);
+});
+
+test('instalar com settings.json inválido aborta sem gravar nada', async () => {
+  await fs.mkdir(claude, { recursive: true });
+  await fs.writeFile(path.join(claude, 'settings.json'), '{ "hooks": ', 'utf8');
+  const { code, out } = cli(['instalar', '--apenas-global', '--skip-superpowers']);
+  assert.equal(code, 1, out);
+  assert.match(out, /settings\.json inválido/);
+  assert.match(out, /--sem-hooks/, 'instalar sugere --sem-hooks');
+  assert.equal(await fs.readFile(path.join(claude, 'settings.json'), 'utf8'), '{ "hooks": ');
+  assert.ok(!(await existe(path.join(claude, 'skills'))), 'nada copiado');
+  assert.ok(!(await existe(path.join(claude, 'hooks'))), 'nenhum hook copiado');
+  await fs.writeFile(path.join(claude, 'settings.json'), JSON.stringify(SETTINGS_INICIAL, null, 2), 'utf8');
 });
 
 test('instalar --apenas-global copia skills, commands, personas e models.yml', async () => {
@@ -162,6 +189,23 @@ assert.ok(cmdsBase.includes('blindar.md'), 'command /blindar no base');
     assert.ok(agentsBase.includes(`${m[1]}.md`), `agente ${m[1]} referenciado em models.yml existe em base/agents/`);
   }
   assert.ok(await existe(path.join(claude, 'cbs-overrides', 'agents')), 'cbs-overrides/agents/ criado');
+
+  // hooks: todo arquivo de base/hooks (menos package.json) com marcador + package.json ESM + 4 entradas no settings.json, rtk intacto, backup
+  const hooksBase = (await fs.readdir(path.join(BASE, 'hooks'))).filter((n) => n !== 'package.json');
+  for (const h of ['cbs-comum.js', 'cbs-no-verify.js', 'cbs-node.sh']) assert.ok(hooksBase.includes(h), `${h} no base`);
+  for (const h of hooksBase) {
+    const p = path.join(claude, 'hooks', h);
+    assert.ok(await existe(p), `hook ${h} copiado`);
+    assert.match(await fs.readFile(p, 'utf8'), new RegExp(MARCADOR), `marcador em ${h}`);
+  }
+  assert.equal(spawnSync('/bin/sh', ['-n', path.join(claude, 'hooks', 'cbs-node.sh')]).status, 0, 'launcher com marcador continua sh válido');
+  assert.equal(await fs.readFile(path.join(claude, 'hooks', '.cbs-node-path'), 'utf8'), `${process.execPath}\n`, 'node do instalador gravado pro launcher');
+  assert.match(await fs.readFile(path.join(claude, 'hooks', 'package.json'), 'utf8'), /"type":\s*"module"/);
+  const settings = await lerJson(path.join(claude, 'settings.json'));
+  assert.deepEqual(hooksCbs(settings), HOOKS_ESPERADOS);
+  assert.deepEqual(settings.hooks.PreToolUse[0], RTK_GRUPO);
+  assert.equal(settings.model, 'opus');
+  assert.ok(await existe(path.join(claude, 'settings.json.cbs-backup')));
 });
 
 test('instalar --apenas-global copia base/scripts/*.js executáveis e com marcador', async (t) => {
@@ -182,11 +226,13 @@ test('instalar de novo não sobrescreve models.yml customizado', async () => {
   const modelsInst = path.join(claude, 'cbs-overrides', 'models.yml');
   const custom = 'implementer: opus\nreviewer: opus\n';
   await fs.writeFile(modelsInst, custom, 'utf8');
+  const settingsAntes = await fs.readFile(path.join(claude, 'settings.json'), 'utf8');
 
   const { code, out } = cli(['instalar', '--apenas-global', '--skip-superpowers']);
   assert.equal(code, 0, out);
   assert.match(out, /models\.yml já existe — preservado/);
   assert.equal(await fs.readFile(modelsInst, 'utf8'), custom);
+  assert.equal(await fs.readFile(path.join(claude, 'settings.json'), 'utf8'), settingsAntes, 'segunda instalação não regrava o settings.json');
 });
 
 test('atualizar --skip-self-update --skip-bmad preserva models.yml e override sem marcador', async () => {
@@ -195,6 +241,11 @@ test('atualizar --skip-self-update --skip-bmad preserva models.yml e override se
   // persona editada pelo usuário (sem marcador) não pode ser sobrescrita
   const ponytail = path.join(claude, 'personas', 'ponytail.md');
   await fs.writeFile(ponytail, '# meu ponytail\n', 'utf8');
+  // node gravado velho (ex.: versão do nvm trocada) → atualizar regrava
+  const nodePath = path.join(claude, 'hooks', '.cbs-node-path');
+  await fs.writeFile(nodePath, '/node/velho/bin/node\n', 'utf8');
+  // hook do pacote apagado → atualizar recopia
+  await fs.rm(path.join(claude, 'hooks', 'cbs-no-verify.js'));
 
   const { code, out } = cli(['atualizar', '--skip-self-update', '--skip-bmad']);
   assert.equal(code, 0, out);
@@ -202,6 +253,59 @@ test('atualizar --skip-self-update --skip-bmad preserva models.yml e override se
   assert.equal(await fs.readFile(modelsInst, 'utf8'), custom);
   assert.equal(await fs.readFile(ponytail, 'utf8'), '# meu ponytail\n');
   assert.match(out, /customização\(ões\) preservada\(s\)/);
+  assert.deepEqual(hooksCbs(await lerJson(path.join(claude, 'settings.json'))), HOOKS_ESPERADOS);
+  assert.equal(await fs.readFile(nodePath, 'utf8'), `${process.execPath}\n`);
+  assert.match(await fs.readFile(path.join(claude, 'hooks', 'cbs-no-verify.js'), 'utf8'), new RegExp(MARCADOR));
+  assert.doesNotMatch(out, /hooks[\\/]package\.json/, 'package.json ESM do pacote não aparece como customização');
+});
+
+test('instalar --sem-hooks copia os hooks mas não toca no settings.json; package.json alheio sem ESM → aviso, preservado', async () => {
+  const outroHome = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-smoke-semhooks-'));
+  const rodar = (args) => spawnSync(process.execPath, [CLI, ...args], {
+    encoding: 'utf8', env: { ...process.env, HOME: outroHome, USERPROFILE: outroHome }, cwd: outroHome, input: '',
+  });
+  try {
+    const pkg = path.join(outroHome, '.claude', 'hooks', 'package.json');
+    await fs.mkdir(path.dirname(pkg), { recursive: true });
+    await fs.writeFile(pkg, '{ "name": "meus-hooks" }\n', 'utf8');
+    const r = rodar(['instalar', '--apenas-global', '--skip-superpowers', '--sem-hooks']);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.ok(await existe(path.join(outroHome, '.claude', 'hooks', 'cbs-no-verify.js')));
+    assert.ok(await existe(path.join(outroHome, '.claude', 'hooks', 'cbs-node.sh')));
+    assert.ok(!(await existe(path.join(outroHome, '.claude', 'settings.json'))));
+    assert.match(r.stdout, /package\.json existe sem "type": "module"/);
+    assert.equal(await fs.readFile(pkg, 'utf8'), '{ "name": "meus-hooks" }\n');
+
+    const a = rodar(['atualizar', '--skip-self-update', '--skip-bmad', '--sem-hooks']);
+    assert.equal(a.status, 0, a.stdout + a.stderr);
+    assert.match(a.stdout, /package\.json existe sem "type": "module"/, 'atualizar avisa igual ao instalar');
+    assert.ok(!(await existe(path.join(outroHome, '.claude', 'settings.json'))));
+    assert.equal(await fs.readFile(pkg, 'utf8'), '{ "name": "meus-hooks" }\n');
+  } finally {
+    await fs.rm(outroHome, { recursive: true, force: true });
+  }
+});
+
+test('atualizar com settings.json inválido aborta antes de copiar; com --sem-hooks segue sem tocar nele', async () => {
+  const arq = path.join(claude, 'settings.json');
+  const valido = await fs.readFile(arq, 'utf8');
+  const piloto = path.join(claude, 'commands', 'piloto.md');
+  await fs.rm(piloto);
+  await fs.writeFile(arq, '[1, 2]', 'utf8');
+  try {
+    const r = cli(['atualizar', '--skip-self-update', '--skip-bmad']);
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /settings\.json inválido/);
+    assert.match(r.out, /--sem-hooks/);
+    assert.ok(!(await existe(piloto)), 'nada copiado antes do abort');
+
+    const s = cli(['atualizar', '--skip-self-update', '--skip-bmad', '--sem-hooks']);
+    assert.equal(s.code, 0, s.out);
+    assert.ok(await existe(piloto));
+    assert.equal(await fs.readFile(arq, 'utf8'), '[1, 2]');
+  } finally {
+    await fs.writeFile(arq, valido, 'utf8');
+  }
 });
 
 test('atualizar sem TTY e sem projetos registrados não bloqueia em prompt', () => {
@@ -231,6 +335,28 @@ test('status depois de instalar lista skills, personas e models.yml', () => {
   assert.match(out, /^\s+cbs-build-fixer\.md$/m);
   assert.match(out, /Modelo por papel: ✓/);
   assert.match(out, /Skills de domínio detectadas:/);
+  assert.match(out, /Hooks CBS ativos \(4\)/);
+  assert.match(out, /Stop → cbs-typecheck\.js/);
+  assert.match(out, /PreToolUse \[Bash\] → cbs-no-verify\.js$/m);
+  assert.doesNotMatch(out, /launcher .* ausente|node gravado .* não existe/);
+});
+
+test('status avisa quando o node gravado sumiu e quando o launcher sumiu', async () => {
+  const nodePath = path.join(claude, 'hooks', '.cbs-node-path');
+  const launcher = path.join(claude, 'hooks', 'cbs-node.sh');
+  const salvoNode = await fs.readFile(nodePath, 'utf8');
+  const salvoLauncher = await fs.readFile(launcher, 'utf8');
+  try {
+    await fs.writeFile(nodePath, '/node/sumiu/bin/node\n', 'utf8');
+    await fs.rm(launcher);
+    const { code, out } = cli(['status']);
+    assert.equal(code, 0, out);
+    assert.match(out, /node gravado .*\/node\/sumiu\/bin\/node.* não existe mais/);
+    assert.match(out, /launcher .*cbs-node\.sh ausente/);
+  } finally {
+    await fs.writeFile(nodePath, salvoNode, 'utf8');
+    await fs.writeFile(launcher, salvoLauncher, 'utf8');
+  }
 });
 
 test('instalar-bmad --force sem TTY e sem -y aborta sem apagar nada', async () => {
@@ -257,6 +383,23 @@ test('status lê a versão do BMAD do manifest de um projeto registrado', async 
   assert.match(out, new RegExp(`✓ ${proj.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+BMAD 6\\.12\\.0`));
 });
 
+test('remover com settings.json inválido aborta sem apagar nada e só manda corrigir o JSON', async () => {
+  const arq = path.join(claude, 'settings.json');
+  const valido = await fs.readFile(arq, 'utf8');
+  await fs.writeFile(arq, '{ "hooks": ', 'utf8');
+  try {
+    const { code, out } = cli(['remover', '-y']);
+    assert.equal(code, 1, out);
+    assert.match(out, /settings\.json inválido.*corrija o JSON/);
+    assert.doesNotMatch(out, /--sem-hooks/);
+    assert.ok(await existe(path.join(claude, 'commands', 'piloto.md')));
+    assert.ok(await existe(path.join(claude, 'hooks', 'cbs-node.sh')));
+    assert.equal(await fs.readFile(arq, 'utf8'), '{ "hooks": ');
+  } finally {
+    await fs.writeFile(arq, valido, 'utf8');
+  }
+});
+
 test('remover -y apaga só arquivos com marcador e preserva cbs-overrides', async () => {
   const { code, out } = cli(['remover', '-y']);
   assert.equal(code, 0, out);
@@ -268,4 +411,10 @@ test('remover -y apaga só arquivos com marcador e preserva cbs-overrides', asyn
   assert.ok(await existe(path.join(claude, 'cbs-overrides', 'models.yml')));
   assert.match(out, /superpowers@superpowers-marketplace/);
   assert.match(out, /bmad-method uninstall/);
+  assert.deepEqual(await lerJson(path.join(claude, 'settings.json')), SETTINGS_INICIAL, 'settings.json volta ao estado anterior');
+  assert.ok(!(await existe(path.join(claude, 'hooks', 'cbs-no-verify.js'))), 'hook com marcador removido');
+  assert.ok(!(await existe(path.join(claude, 'hooks', 'cbs-node.sh'))), 'launcher removido');
+  assert.ok(!(await existe(path.join(claude, 'hooks', '.cbs-node-path'))), 'node gravado removido');
+  assert.ok(await existe(path.join(claude, 'hooks', 'package.json')), 'package.json sem marcador preservado (SP-2)');
+  assert.match(out, /4 entrada\(s\) CBS removida\(s\) do settings\.json/);
 });

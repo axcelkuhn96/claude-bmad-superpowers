@@ -4,8 +4,10 @@ import path from 'node:path';
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import {
-  DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_SCRIPTS, DIR_AGENTS, DIR_OVERRIDES, ARQ_VERSAO_INSTALADA, MARCADOR, existe,
+  DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_SCRIPTS, DIR_AGENTS, DIR_HOOKS, DIR_OVERRIDES, ARQ_VERSAO_INSTALADA,
+  ARQ_SETTINGS, MARCADOR, existe,
 } from './caminhos.js';
+import { lerSettings, retirarHooks, listarHooksCbs } from './hooks-settings.js';
 
 async function arquivoTemMarcador(p) {
   try {
@@ -49,20 +51,28 @@ export async function remover(args = []) {
   console.log('Vai remover apenas arquivos com marcador do pacote.');
   console.log(`Customizações em ${DIR_OVERRIDES} serão preservadas.\n`);
 
+  const { dados: settings } = await lerSettings(ARQ_SETTINGS); // inválido → aborta sem tocar em nada (SP-6)
+  const entradasCbs = listarHooksCbs(settings).length;
+
   const alvos = [];
   await coletarRemoviveis(DIR_SKILLS, alvos);
   await coletarRemoviveis(DIR_COMMANDS, alvos);
   await coletarRemoviveis(DIR_PERSONAS, alvos);
   await coletarRemoviveis(DIR_SCRIPTS, alvos);
   await coletarRemoviveis(DIR_AGENTS, alvos);
+  await coletarRemoviveis(DIR_HOOKS, alvos);
+  // node gravado pro launcher (sem marcador: é só um caminho)
+  const nodeGravado = path.join(DIR_HOOKS, '.cbs-node-path');
+  if (await existe(nodeGravado)) alvos.push(nodeGravado);
 
-  if (alvos.length === 0) {
+  if (alvos.length === 0 && entradasCbs === 0) {
     console.log('Nada pra remover.');
     return;
   }
 
   console.log(`Arquivos a remover (${alvos.length}):`);
   for (const a of alvos) console.log(`  - ${a}`);
+  if (entradasCbs) console.log(`  - ${entradasCbs} entrada(s) CBS em ${ARQ_SETTINGS}`);
   console.log();
 
   if (!args.includes('--sim') && !args.includes('-y')) {
@@ -75,12 +85,16 @@ export async function remover(args = []) {
     }
   }
 
+  // entradas do settings.json saem ANTES do launcher/.cbs-node-path (H3): nunca há hook registrado apontando pro vazio
+  const rs = await retirarHooks(ARQ_SETTINGS);
+  if (rs.removidos) console.log(`✓ ${rs.removidos} entrada(s) CBS removida(s) do settings.json (backup em ${rs.backup}).`);
   for (const a of alvos) await fs.rm(a, { force: true });
   await removerDirsVazios(DIR_SKILLS);
   await removerDirsVazios(DIR_COMMANDS);
   await removerDirsVazios(DIR_PERSONAS);
   await removerDirsVazios(DIR_SCRIPTS);
   await removerDirsVazios(DIR_AGENTS);
+  await removerDirsVazios(DIR_HOOKS);
   try { await fs.rm(ARQ_VERSAO_INSTALADA, { force: true }); } catch {}
 
   console.log(`✓ ${alvos.length} arquivo(s) removido(s).`);

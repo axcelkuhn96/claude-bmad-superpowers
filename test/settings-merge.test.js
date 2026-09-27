@@ -38,10 +38,11 @@ test('HOOKS_CBS: 4 hooks, matchers estreitos, nunca .*', () => {
   assert.ok(Object.isFrozen(HOOKS_CBS));
 });
 
-test('comando é launcher-se-existir + sh cbs-node.sh + caminho absoluto do hook, entre aspas, sem npx', () => {
+test('comando é launcher-e-script-se-existirem + sh cbs-node.sh + caminho absoluto do hook, entre aspas, sem npx', () => {
   const c = comandoHook(DIR, 'cbs-format.js');
   const l = path.join(DIR, 'cbs-node.sh');
-  assert.equal(c, `[ ! -f "${l}" ] || sh "${l}" "${path.join(DIR, 'cbs-format.js')}"`);
+  const js = path.join(DIR, 'cbs-format.js');
+  assert.equal(c, `[ ! -f "${l}" ] || [ ! -f "${js}" ] || sh "${l}" "${js}"`);
   assert.doesNotMatch(c, /npx/);
   assert.equal(scriptCbs(c), 'cbs-format.js');
 });
@@ -342,6 +343,13 @@ test('comando: launcher apagado (desinstalação parcial) → exit 0 sem saída,
   await gravarCaminhoNode(c.hooks, process.execPath);
   await fs.rm(path.join(c.hooks, 'cbs-node.sh'));
   const r = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-x.js')], { encoding: 'utf8', input: 'payload', env: { HOME: c.home, PATH: c.bin } });
+  assert.deepEqual([r.status, r.stdout, r.stderr], [0, '', '']);
+});
+
+test('comando: script do hook ausente (ainda não instalado ou apagado) → exit 0 sem saída', { skip: process.platform === 'win32' && 'POSIX' }, async (t) => {
+  const c = await cenario(t);
+  await gravarCaminhoNode(c.hooks, process.execPath);
+  const r = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-nao-instalado.js')], { encoding: 'utf8', input: 'payload', env: { HOME: c.home, PATH: c.bin } });
   assert.deepEqual([r.status, r.stdout, r.stderr], [0, '', '']);
 });
 

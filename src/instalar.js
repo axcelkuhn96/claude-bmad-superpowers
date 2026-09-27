@@ -2,10 +2,11 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
-  RAIZ_BASE, DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_SCRIPTS, DIR_AGENTS, DIR_OVERRIDES,
-  ARQ_VERSAO_INSTALADA, MARCADOR, RAIZ_CLAUDE,
+  RAIZ_BASE, DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_SCRIPTS, DIR_AGENTS, DIR_HOOKS, DIR_OVERRIDES,
+  ARQ_VERSAO_INSTALADA, ARQ_SETTINGS, MARCADOR, RAIZ_CLAUDE,
   garantirDir, lerVersaoPacote, existe,
 } from './caminhos.js';
+import { lerSettings, aplicarHooks, gravarCaminhoNode } from './hooks-settings.js';
 import { tentarInstalarSuperpowers } from './superpowers.js';
 import { instalarBmad } from './instalar-bmad.js';
 import { temBmadAqui } from './bmad.js';
@@ -13,6 +14,7 @@ import { temBmadAqui } from './bmad.js';
 function rodapeParaArquivo(p, versao) {
   if (p.endsWith('.md')) return `\n\n<!-- ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/ pra não perder no /atualizar -->\n`;
   if (p.endsWith('.js')) return `\n\n// ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/scripts/ pra não perder no /atualizar\n`;
+  if (p.endsWith('.sh')) return `\n\n# ${MARCADOR} v${versao} — arquivo do pacote; o /atualizar sobrescreve\n`;
   return '';
 }
 
@@ -41,6 +43,24 @@ export async function garantirModelsOverride() {
   return { acao: 'criado', destino };
 }
 
+// hooks: arquivos com marcador (cbs-*.js, launcher cbs-node.sh); package.json ({"type":"module"}) SÓ se não existir (SP-2).
+// `copiar` troca a política de cópia (o atualizar preserva arquivo sem marcador).
+export async function copiarHooks(origem, destino, versao, copiar = copiarComMarcador) {
+  const pkgDestino = path.join(destino, 'package.json');
+  const pkgExistia = await existe(pkgDestino);
+  for (const ent of await fs.readdir(origem, { withFileTypes: true })) {
+    if (!ent.isFile()) continue;
+    if (ent.name === 'package.json') {
+      if (!pkgExistia) { await garantirDir(destino); await fs.copyFile(path.join(origem, ent.name), pkgDestino); }
+      else if (!/"type"\s*:\s*"module"/.test(await fs.readFile(pkgDestino, 'utf8'))) {
+        console.log(`⚠  ${pkgDestino} existe sem "type": "module" — os hooks CBS (ESM) não vão carregar; ajuste manualmente.`);
+      }
+      continue;
+    }
+    await copiar(path.join(origem, ent.name), path.join(destino, ent.name), versao);
+  }
+}
+
 async function copiarArvore(origemBase, destinoBase, versao) {
   const entradas = await fs.readdir(origemBase, { withFileTypes: true });
   for (const ent of entradas) {
@@ -61,6 +81,9 @@ export async function instalar(args = []) {
   console.log(`Versão do pacote: ${versao}`);
   const pularBmad = args.includes('--apenas-global') || args.includes('--skip-bmad');
   const pularSuperpowers = args.includes('--skip-superpowers');
+  const semHooks = args.includes('--sem-hooks');
+  // settings.json inválido aborta ANTES de copiar qualquer coisa (SP-6)
+  if (!semHooks) await lerSettings(ARQ_SETTINGS, 'corrija o JSON ou rode com --sem-hooks');
 
   await garantirDir(RAIZ_CLAUDE);
   await garantirDir(DIR_SKILLS);
@@ -106,6 +129,22 @@ export async function instalar(args = []) {
   if (await existe(origemAgents)) {
     console.log('→ Copiando agentes cbs-*...');
     await copiarArvore(origemAgents, DIR_AGENTS, versao);
+  }
+
+  // hooks globais (cbs-*.js + launcher) + node do instalador pro launcher + merge idempotente no settings.json
+  const origemHooks = path.join(RAIZ_BASE, 'hooks');
+  if (await existe(origemHooks)) {
+    console.log('→ Copiando hooks cbs-*...');
+    await copiarHooks(origemHooks, DIR_HOOKS, versao);
+    await gravarCaminhoNode(DIR_HOOKS);
+    if (semHooks) {
+      console.log('(registro no settings.json pulado por --sem-hooks)');
+    } else {
+      const r = await aplicarHooks(ARQ_SETTINGS, DIR_HOOKS);
+      console.log(r.mudou
+        ? `→ settings.json: hooks CBS registrados${r.backup ? ` (backup em ${r.backup})` : ''}`
+        : '✓ settings.json: hooks CBS já registrados.');
+    }
   }
 
   // models.yml default → cbs-overrides/ (nunca sobrescreve)

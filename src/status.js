@@ -2,9 +2,10 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
-  DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_AGENTS, DIR_OVERRIDES, MARCADOR,
+  DIR_SKILLS, DIR_COMMANDS, DIR_PERSONAS, DIR_AGENTS, DIR_HOOKS, DIR_OVERRIDES, ARQ_SETTINGS, MARCADOR,
   lerVersaoPacote, lerVersaoInstalada, existe, RAIZ_CLAUDE,
 } from './caminhos.js';
+import { lerSettings, listarHooksCbs } from './hooks-settings.js';
 import { temBinarioClaude, plugInstalado, versoesPlugin } from './superpowers.js';
 import { temBmadAqui, versaoBmadEm, listarProjetosBmad } from './bmad.js';
 
@@ -102,6 +103,25 @@ export async function status(_args = []) {
   }
   for (const a of agentsOverride) {
     if (!agentsBase.includes(a)) console.log(`  ${a}  (só em cbs-overrides/)`);
+  }
+  // hooks CBS registrados no settings.json (+ launcher e node gravado de que eles dependem)
+  try {
+    const { dados } = await lerSettings(ARQ_SETTINGS);
+    const hooks = listarHooksCbs(dados);
+    console.log(`Hooks CBS ativos (${hooks.length}):`);
+    for (const h of hooks) {
+      const falta = (await existe(path.join(DIR_HOOKS, h.script))) ? '' : '  ✗ arquivo ausente';
+      console.log(`  ${h.evento}${h.matcher ? ` [${h.matcher}]` : ''} → ${h.script}${falta}`);
+    }
+    const launcher = path.join(DIR_HOOKS, 'cbs-node.sh');
+    if (hooks.length && !(await existe(launcher))) console.log(`  ✗ launcher ${launcher} ausente — os hooks não rodam (rode atualizar)`);
+    const node = (await fs.readFile(path.join(DIR_HOOKS, '.cbs-node-path'), 'utf8').catch(() => '')).split('\n')[0];
+    if (node && !(await existe(node))) {
+      console.log(`  ⚠  node gravado (${node}) não existe mais — o launcher procura outro (PATH, nvm, fnm, volta); rode atualizar pra regravar`);
+    }
+    if (String(process.env.CBS_HOOKS || '').trim().toLowerCase() === 'off') console.log('  (CBS_HOOKS=off neste ambiente: todos desligados)');
+  } catch (e) {
+    console.log(`Hooks CBS: ✗ ${e.message}`);
   }
   const modelsYml = path.join(DIR_OVERRIDES, 'models.yml');
   console.log(`Modelo por papel: ${(await existe(modelsYml)) ? '✓ ' + modelsYml : '✗ cbs-overrides/models.yml ausente (rode instalar/atualizar)'}`);
