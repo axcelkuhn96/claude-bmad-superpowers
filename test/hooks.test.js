@@ -406,4 +406,48 @@ describe('cbs-config-protect', () => {
     const r = cp.avaliarEdicao(upd(p, '@@\n-name = "x"\n+name = "y"'), { env: {}, prazoMs: 0 });
     assert.equal(r.bloquear, true); assert.match(r.motivo, /CBS_PERMITIR_CONFIG=1/);
   });
+  // Fix round 4: spread em splice/push estourava a pilha (RangeError → "erro interno" → exit 0 = fail open) e o
+  // orçamento não era checado ao aplicar os hunks (pyproject de MiB + 200k hunks morria no timeout do hook = fail open).
+  const patchBruto = (p, corpo) => ({ cwd: p, tool_name: 'apply_patch', tool_input: { input: `*** Begin Patch\n${corpo}*** End Patch` } });
+  const opsGrandes = (n) => { let s = ''; for (let i = 0; i < n; i++) s += `*** Add File: g/f${i}\n+x\n`; return s; };
+  const hunkRuff = '*** Update File: pyproject.toml\n@@\n-line-length = 100\n+line-length = 200\n';
+  test('apply_patch com 200k linhas novas num hunk: sem estouro de pilha, [tool.ruff] bloqueia (unitário e E2E)', (t) => {
+    const p = projeto(t);
+    const payload = patchBruto(p, `*** Update File: pyproject.toml\n@@\n-name = "x"\n+name = "x"\n${'+#\n'.repeat(200_000)}@@\n-line-length = 100\n+line-length = 200\n`);
+    const r = av(payload);
+    assert.equal(r.bloquear, true); assert.match(r.motivo, /pyproject\.toml \[tool\.ruff\]/);
+    const e2e = rodarHook('cbs-config-protect.js', payload);
+    assert.equal(e2e.code, 2, e2e.err); assert.equal(e2e.out, ''); assert.match(e2e.err, /CBS_PERMITIR_CONFIG=1/);
+  });
+  test('apply_patch com 200k operações: sem estouro de pilha, hunk em [tool.ruff] bloqueia pela análise', (t) => {
+    const p = projeto(t);
+    const r = av(patchBruto(p, hunkRuff + opsGrandes(200_000)));
+    assert.equal(r.bloquear, true); assert.match(r.motivo, /pyproject\.toml \[tool\.ruff\]/);
+  });
+  test('erro interno na análise com config protegida no payload bloqueia; sem config citada segue como erro interno', (t) => {
+    const p = projeto(t);
+    const quebrado = (rel) => {
+      const payload = ed(p, rel);
+      Object.defineProperty(payload, 'cwd', { get() { throw new Error('boom'); }, enumerable: false }); // JSON.stringify ignora
+      return payload;
+    };
+    const r = av(quebrado('.eslintrc.json'));
+    assert.equal(r.bloquear, true); assert.match(r.motivo, /erro interno.*boom/); assert.match(r.motivo, /CBS_PERMITIR_CONFIG=1/);
+    assert.throws(() => av(quebrado('src/app.ts')), /boom/);
+  });
+  // Orçamento de 1 s: decide (pela análise ou pelo estouro) perto do orçamento — nunca segue além dele sem checar.
+  test('pyproject de 4 MiB + 60k hunks decide dentro do orçamento (fail closed), não no timeout do hook', (t) => {
+    const pad = (i) => String(i).padStart(7, '0');
+    const toml = ['[project]\nname = "x"\n'];
+    for (let i = 0; i < 400_000; i++) toml.push(`# a${pad(i)}\n`);
+    const d = py(t, toml.join('') + '\n[tool.ruff]\nline-length = 100\n');
+    const corpo = ['*** Update File: pyproject.toml\n'];
+    for (let i = 0; i < 60_000; i++) corpo.push(`@@\n-# a${pad(i)}\n+# b\n+# c\n`);
+    corpo.push('@@\n-line-length = 100\n+line-length = 200\n');
+    const ini = Date.now();
+    const r = cp.avaliarEdicao(patchBruto(d, corpo.join('')), { env: {}, prazoMs: 1000 });
+    const ms = Date.now() - ini;
+    assert.equal(r.bloquear, true); assert.match(r.motivo, /CBS_PERMITIR_CONFIG=1/);
+    assert.ok(ms < 2500, `${ms} ms`);
+  });
 });

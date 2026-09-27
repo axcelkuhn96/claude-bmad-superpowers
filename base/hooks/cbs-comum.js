@@ -56,7 +56,7 @@ export function caminhosEditados(payload) {
   const brutos = [];
   if (typeof ti.file_path === 'string' && ti.file_path) brutos.push(ti.file_path);
   for (const v of [ti.input, ti.patch, comandoBash(payload)]) {
-    if (typeof v === 'string' && v.includes('*** Begin Patch')) brutos.push(...caminhosDoPatch(v));
+    if (typeof v === 'string' && v.includes('*** Begin Patch')) for (const p of caminhosDoPatch(v)) brutos.push(p); // sem spread: patch com 200k cabeçalhos estoura a pilha
   }
   return [...new Set(brutos.map((p) => path.resolve(cwd, p)))];
 }

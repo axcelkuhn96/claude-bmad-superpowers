@@ -37,10 +37,12 @@ export function ehProtegido(arquivo) {
 function realOuNull(p) {
   try { return fs.realpathSync(p); } catch { return null; }
 }
-const chave = (p) => realOuNull(p) ?? p;
+// Chave canônica de um caminho (realpath quando existe). Sem exceção no caminho inexistente: 200k operações
+// de patch custavam segundos só em ENOENT lançado.
+const chave = (p) => (existeNoDisco(p) && realOuNull(p)) || p;
 // lstat: symlink quebrado conta como existente; erro que não é ENOENT também (fail closed, como o ECC)
 function existeNoDisco(p) {
-  try { fs.lstatSync(p); return true; } catch (e) { return !(e && e.code === 'ENOENT'); }
+  try { return fs.lstatSync(p, { throwIfNoEntry: false }) !== undefined; } catch { return true; }
 }
 
 
@@ -202,6 +204,7 @@ function operacoes(texto, cwd) {
   let dentro = false;
   let achou = false;
   for (let i = 0; i < linhas.length;) {
+    prazo();
     const cab = aparar(linhas[i++], true, true);
     if (!dentro) {
       if (cab.endsWith('*** Begin Patch')) dentro = achou = true;
@@ -268,9 +271,21 @@ function aplicarHunks(texto, hunks, antigo) {
     trocas.push([i, velho.length, novo]);
     pos = i + velho.length;
   }
-  trocas.sort((a, b) => a[0] - b[0]).reverse().forEach(([i, n, novo]) => linhas.splice(i, n, ...novo));
-  if (linhas[linhas.length - 1] !== '') linhas.push('');
-  return linhas.join('\n');
+  // Reconstrói numa passada, em ordem crescente (o splice por hunk era O(linhas × hunks) e o spread de `novo`
+  // estourava a pilha). Trocas sobrepostas (*** End of File fora de ordem) fogem do que o Codex garante → não aplica.
+  trocas.sort((a, b) => a[0] - b[0]);
+  const out = [];
+  let de = 0;
+  for (const [i, n, novo] of trocas) {
+    prazo();
+    if (i < de) return null;
+    for (; de < i; de++) out.push(linhas[de]);
+    for (const l of novo) out.push(l);
+    de = i + n;
+  }
+  for (; de < linhas.length; de++) out.push(linhas[de]);
+  if (out[out.length - 1] !== '') out.push('');
+  return out.join('\n');
 }
 // Textos do payload que trazem patch (input, patch, command).
 function textosDePatch(payload) {
@@ -284,7 +299,7 @@ function opsDoPayload(textos, cwd) {
   for (const t of textos) {
     const o = operacoes(t, cwd);
     if (!o) return null;
-    ops.push(...o);
+    for (const op of o) ops.push(op); // sem spread: 200k operações estouram a pilha
   }
   return ops;
 }
@@ -294,6 +309,7 @@ function caminhosCitados(textos, cwd) {
   const out = [];
   for (const t of textos) {
     for (const l of t.split('\n')) {
+      prazo();
       const m = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$/.exec(aparar(l, true, true));
       if (m) out.push(path.resolve(cwd, m[1]));
     }
@@ -326,6 +342,7 @@ function avaliar(payload) {
   for (const op of ops || []) for (const p of [op.arquivo, op.destino]) if (p) caminhos.add(p);
   let vfss;
   for (const arquivo of caminhos) {
+    prazo();
     if (!existeNoDisco(arquivo)) continue; // SP-3: criação inicial não enfraquece nada (inclui destino de Move)
     // symlink: nome comum apontando para uma config conta como a config
     const alvos = [arquivo, realOuNull(arquivo)].filter(Boolean);
@@ -335,8 +352,12 @@ function avaliar(payload) {
     const antes = lerTexto(arquivo);
     let depois;
     if (ops !== undefined) {
-      // as duas leituras de "@@ " (Codex atual e antigo): bloqueia se qualquer uma que aplica mexe nas seções
-      vfss ??= ops ? [simular(ops, false), simular(ops, true)].filter(Boolean) : [];
+      // as duas leituras de "@@ " (Codex atual e antigo): bloqueia se qualquer uma que aplica mexe nas seções;
+      // sem "@@ " no patch as duas são iguais — simula uma vez
+      if (vfss === undefined) {
+        const leituras = ops?.some((op) => op.hunks?.some((h) => h.ctxVazio)) ? [false, true] : [false];
+        vfss = ops ? leituras.map((antigo) => simular(ops, antigo)).filter(Boolean) : [];
+      }
       depois = vfss.filter((v) => v.has(chave(arquivo))).map((v) => v.get(chave(arquivo)) ?? '');
     } else if (typeof ti.content === 'string') depois = [ti.content];
     else depois = aplicarEdits(antes, Array.isArray(ti.edits) ? ti.edits : [ti]);
@@ -351,15 +372,21 @@ function avaliar(payload) {
   return { bloquear: false };
 }
 
-// `prazoMs`: orçamento da análise (padrão 3 s); estourou → bloqueia.
+// Payload (serializado) que cita config protegida; falha na serialização conta como citando (fail closed).
+function citaProtegido(payload) {
+  try { return RE_CITA_PROTEGIDO.test(JSON.stringify(payload)); } catch { return true; }
+}
+// `prazoMs`: orçamento da análise (padrão 3 s); estourou → bloqueia. Erro interno com config protegida citada no
+// payload também bloqueia (o "erro interno → exit 0" dos hooks deixaria a edição passar); sem citar, sobe como antes.
 export function avaliarEdicao(payload, { env = process.env, prazoMs = PRAZO_MS } = {}) {
   if (String(env.CBS_PERMITIR_CONFIG || '') === '1') return { bloquear: false };
   limite = Date.now() + prazoMs;
   try {
     return avaliar(payload || {});
   } catch (e) {
-    if (!(e instanceof Prazo)) throw e;
-    return { bloquear: true, motivo: msg(`pyproject.toml (edição grande demais para conferir [tool.ruff]/[tool.mypy] em ${prazoMs / 1000} s)`) };
+    if (e instanceof Prazo) return { bloquear: true, motivo: msg(`pyproject.toml (edição grande demais para conferir [tool.ruff]/[tool.mypy] em ${prazoMs / 1000} s)`) };
+    if (!citaProtegido(payload)) throw e;
+    return { bloquear: true, motivo: msg(`config protegida (erro interno na análise: ${e?.message ?? e})`) };
   } finally {
     limite = Infinity;
   }
