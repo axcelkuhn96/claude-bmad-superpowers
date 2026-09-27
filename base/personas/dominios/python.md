@@ -34,11 +34,10 @@ Modo: seguir padrão | estabelecer padrão
 - Shell: `subprocess.run([...])` com lista; nunca `shell=True` com input; nunca `os.system`.
 - Path de usuário: resolver e checar que fica dentro do diretório base (`Path.resolve()` + `is_relative_to`).
 - `eval`/`exec`/`pickle.loads`/`yaml.load` sem `SafeLoader` em dado não confiável = bug.
-- Segredo só via env/config; nunca literal. Obrigatório: `os.environ["X"]` (falha no boot), sem default no `getenv`. (ECC rules/python/security) `hashlib.md5/sha1` só pra checksum, nunca senha (use `argon2`/`bcrypt` ou o do framework).
+- Segredo só via env/config; nunca literal. Obrigatório falha no boot (`os.environ["X"]` ou campo sem default no settings), nunca `getenv("X", default)`. (ECC rules/python/security) `hashlib.md5/sha1` só pra checksum, nunca senha (use `argon2`/`bcrypt` ou o do framework).
 - Django: `select_related`/`prefetch_related` contra N+1, `transaction.atomic()` em multi-passo, migrations geradas pelo `makemigrations`. Flask: CSRF e error handlers.
-- FastAPI: nada bloqueante em `async def` (`requests`, `Session` síncrona do SQLAlchemy) — client/driver async, ou endpoint `def` (threadpool) se a lib é síncrona. Sessão de banco/auth via `Depends`, não `SessionLocal()`/client criado no handler. `response_model`/tipo de retorno sem senha, hash nem token. `allow_origins=["*"]` com `allow_credentials=True` = bug (Starlette ecoa a origem). (ECC rules/python/fastapi)
-- JWT: `jwt.decode(..., algorithms=[...])`, `exp` exigido (`options={"require": ["exp"]}`), `audience`/`issuer` conferidos se emitidos; nunca `verify_signature: False`. (ECC rules/python/fastapi)
-- Rate limit em login, reset de senha e OTP. Log sem senha, token, cookie nem header `Authorization`. (ECC rules/python/fastapi)
+- FastAPI: body/query por modelo Pydantic, não `dict`/`request.json()` cru. Nada bloqueante em `async def` (`requests`, `Session` sync do SQLAlchemy) — driver async ou endpoint `def` (threadpool). Sessão/auth via `Depends`; nunca `SessionLocal()`/client de vida longa no handler. Resposta sem senha/hash/token (exceto a que emite credencial). `allow_origins=["*"]` + `allow_credentials=True` = bug. (ECC rules/python/fastapi, ECC python-reviewer)
+- JWT: `jwt.decode(..., algorithms=[...])`, `exp` exigido (PyJWT: `options={"require": ["exp"]}`), `aud`/`iss` conferidos se emitidos; nunca `verify_signature: False`. Rate limit em login, reset e OTP. Log sem senha, token, cookie nem `Authorization`. (ECC rules/python/fastapi)
 - `pip-audit` e `ruff check --select S` (ou `bandit`) no loop de validação.
 
 **Erro (piso do ponytail)**
@@ -47,8 +46,8 @@ Modo: seguir padrão | estabelecer padrão
 - Recurso (arquivo, conexão, lock) sempre com `with`.
 
 **Qualidade**
-- Tipos em toda função pública; `Any` só com justificativa. Nulo explícito: `X | None` (`Optional[X]` < 3.10); `def f(x: int = None)` é erro no mypy. (ECC python-reviewer)
-- Mutable default (`def f(x=[])`) = bug. `is None`, não `== None`. `isinstance`, não `type() ==`. Sem `import *` nem sombrear builtin (`list`, `dict`, `str`). (ECC python-reviewer)
+- Tipos em toda função pública; `Any` só com justificativa. Nulo: `X | None` (`Optional[X]` < 3.10); `def f(x: int = None)` é erro no mypy. (ECC python-reviewer)
+- Mutable default (`def f(x=[])`) = bug. `is None`, não `== None`. `isinstance`, não `type() ==`. Sem `import *` nem sombrear builtin (`list`, `dict`). (ECC python-reviewer)
 - `logging` (não `print`) fora de CLI de saída; nível certo.
 - Função > ~50 linhas ou > 5 parâmetros → dataclass/objeto de parâmetros, se o projeto tiver esse padrão.
 - Concorrência: estado compartilhado com lock; não misture sync e async sem `to_thread`/executor.
@@ -58,7 +57,7 @@ Modo: seguir padrão | estabelecer padrão
 - Fixture com escopo mínimo; compartilhado em `conftest.py`. `parametrize` pra matriz de casos (com `ids`). `monkeypatch`/`mock.patch` no ponto de uso, não na definição.
 - Sem rede/relógio/aleatoriedade real: `freezegun`/`time_machine` se o projeto tiver, senão injete o relógio; `responses`/`respx`/`httpx.MockTransport` pra HTTP.
 - Teste de erro: `pytest.raises(TipoEspecífico, match=...)`.
-- FastAPI: sobrescreva a função exata do `Depends` e limpe `app.dependency_overrides` no teardown. (ECC rules/python/fastapi)
+- FastAPI: override da função exata do `Depends`; limpe `app.dependency_overrides` no teardown. (ECC rules/python/fastapi)
 
 ## Loop obrigatório de validação (antes de Ready for Review)
 ```
@@ -71,11 +70,11 @@ ruff check --select S .                  # ou: bandit -r <pacote> -ll -ii -q
 Cole a saída resumida no Dev Agent Record; declare o que não pôde rodar.
 
 ## Build quebrado
-- Na raiz: `mypy <arquivos tocados>` (`.venv/bin/` ou PATH) se há `[tool.mypy]`/`mypy.ini`/`[mypy]` do `setup.cfg`; senão `pyright <arquivos>` se há `[tool.pyright]`/`pyrightconfig.json`. Após editar: `ruff format <arquivo>` se há `[tool.ruff]`/`ruff.toml`. Caches `.mypy_cache/`/`.ruff_cache/` têm `.gitignore` próprio; erro fantasma: `rm -rf .mypy_cache && ruff clean`. (hooks cbs-typecheck, cbs-format)
-- `python --version` do venv × `requires-python`; `python -m pip check`. `ModuleNotFoundError`: pacote fora do venv ativo. (ECC django-build-resolver)
-- `ImportError: cannot import name`: versão incompatível ou import circular (`python -c "import <módulo>"`; import dentro da função). (ECC django-build-resolver)
-- mypy: `Library stubs not installed` → `types-<pacote>` no venv; `Item "None" of "X | None"` → `if x is None`; tipo incompatível → corrija, sem `Any`/`cast`/`# type: ignore`. (ECC build-error-resolver, ECC python-reviewer)
-- Não afrouxe `[tool.ruff]`/`[tool.mypy]`/`ruff.toml`/`mypy.ini` pra passar — corrija o código. (ECC config-protection; hook cbs-config-protect)
+- Na raiz: `mypy <arquivos tocados>` (`.venv/bin/` ou PATH) com `[tool.mypy]`/`mypy.ini`/`[mypy]` do `setup.cfg`; senão `pyright <arquivos>` com `[tool.pyright]`/`pyrightconfig.json`. Após editar: `ruff format <arquivo>` com `[tool.ruff]`/`ruff.toml`/`.ruff.toml`. (hooks cbs-typecheck, cbs-format)
+- Cache velho: `rm -rf .mypy_cache && ruff clean`. (ECC build-error-resolver Quick Recovery)
+- `python --version` do venv × `requires-python`; `python -m pip check`. `ModuleNotFoundError`: pacote fora do venv ativo. `ImportError: cannot import name`: versão incompatível ou import circular (`python -c "import <módulo>"`; import dentro da função). (ECC django-build-resolver)
+- mypy: `Library stubs not installed` → `types-<pacote>` no venv (sem stubs: `# type: ignore[import-untyped]` no import); `Item "None" of "X | None"` → `if x is None`; tipo incompatível → corrija, sem calar com `Any`/`cast`/`# type: ignore` nu (inevitável: `[<código>]` + motivo). (ECC build-error-resolver, ECC python-reviewer)
+- Não afrouxe config de ruff/mypy pra passar. (ECC config-protection; hook cbs-config-protect)
 
 ## Saída esperada (além do @dev)
 - Bloco "Convenções Python detectadas". Dependências novas (idealmente zero) com justificativa pela escada do ponytail.
