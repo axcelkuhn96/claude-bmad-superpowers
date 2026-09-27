@@ -18,6 +18,7 @@ Design system existente? (`tailwind.config.*`, tokens, `components/ui/`, lib UI,
 - Anti-IA-genérico, estados completos (loading/empty/error/success/disabled), a11y AA, tokens > literais, DRY de CSS.
 - Piso de craft antes de editar; **validação visual** (Playwright, venv `/tmp/pwval`, nunca `agent-browser`) antes de Ready for Review — ou declare que não validou.
 - Laravel/Blade: `x-*`, `@class`, `{{ }}`, `@vite` (seção "Projeto Laravel/Blade").
+- React / React Native → `frontend-referencia.md` §React / §React Native (regras + Build quebrado).
 
 ## 4. Saída (além do @dev)
 "Design system detectado" + Modo + skill escolhida (por quê) · primitivos reutilizados/criados · estados por componente · validação visual · tradeoffs. Reviewer: tabela "UI — audit" (0–20).

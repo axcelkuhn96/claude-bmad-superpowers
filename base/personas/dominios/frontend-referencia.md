@@ -2,6 +2,8 @@
 
 Conteúdo integral do rulebook de frontend, lido **por caminho** pelo subagent depois do roteador `dominios/frontend.md` (que escolhe **uma** skill por situação: `frontend-design` em greenfield, checklist do reviewer em projeto existente, Design Read do taste-skill quando há referência visual). As menções a `frontend-design` abaixo valem quando o roteador a escolheu; o resto (detecção, modos, anti-IA-genérico, piso de craft, validação visual, checklist) vale sempre.
 
+> §React e §React Native: regras adicionais destiladas de affaan-m/ECC @ e482e57 (agents/react-{reviewer,build-resolver}.md, rules/react{,-native}/*.md) — MIT License, Copyright (c) 2026 Affaan Mustafa (https://github.com/affaan-m/ECC/blob/e482e57/LICENSE).
+
 ---
 
 Rulebook injetado no prompt do subagent `general-purpose` quando a story for de UI/frontend. **Stacka em cima do `@dev` BMAD**, não substitui — o subagent é Dev + UI, não só UI.
@@ -205,6 +207,42 @@ Se o projeto é Laravel e o plugin `ui-ux-pro-max` está instalado, uma consulta
 `python "${CLAUDE_PLUGIN_ROOT}/.claude/skills/ui-ux-pro-max/scripts/search.py" "<tema: form validation | blade component | livewire loading>" --stack laravel`
 Regras que valem sempre em Blade: componente `x-*` com `@props` pra markup repetido; `@class` pra classe condicional; `{{ }}` (nunca `{!! !!}` com dado de usuário); `@vite` pra assets; diretivas Blade, não `<?php ?>`; layout único com `@extends`/`@section` ou componente de layout.
 
+## React
+Vale também no RN, menos DOM/SSR.
+- Hook só no topo de componente/hook `use*` — nunca em `if`, loop, callback ou após `return` cedo (salvo `use()`). `react-hooks/*` só silenciado com motivo. (ECC rules/react/hooks)
+- `useEffect` só sincroniza com sistema externo: derivado se calcula no render, reset por prop é `key` no pai, aviso ao pai no handler. (ECC rules/react/hooks)
+- Effect com assinatura, timer, listener ou fetch devolve cleanup (`AbortController`/flag de resposta velha). (ECC react-reviewer)
+- Estado não se muta (`arr.push`, `obj.x =`); valor do anterior em async/intervalo → `setX(x => …)`. `ref.current` só em effect/handler (salvo init lazy). (ECC react-reviewer, rules/react/hooks)
+- `key` estável (id), nunca índice em lista que reordena, insere ou remove. (ECC rules/react/patterns)
+- Com TanStack Query, SWR ou RSC, dado de servidor vem dele — sem `fetch` em `useEffect` nem cópia em store. (ECC rules/react/patterns)
+- `<Suspense>` sobre dado que pode falhar tem Error Boundary acima (Next: `error.tsx`). (ECC rules/react/patterns)
+- Ação só por clique em `<div>`/`<span>` → `<button>`/`<a>` nativo. (ECC react-reviewer)
+- `dangerouslySetInnerHTML` só com fonte sob controle ou sanitizada por allowlist (DOMPurify ou o do projeto) na chamada; senão, texto. (ECC rules/react/security)
+- URL de usuário em `href`/`src`: allowlist de esquema (`http:`/`https:`/`mailto:`) — o React 19 bloqueia `javascript:`, não `data:`. (ECC rules/react/security; medido React 19.3)
+- `NEXT_PUBLIC_*`/`VITE_*`/`REACT_APP_*`/`EXPO_PUBLIC_*` vão pro bundle: nunca segredo. Token de sessão novo fora de `localStorage`/`sessionStorage` (cookie `httpOnly` se o backend é seu; SDK de auth adotado usa o dele). Esconder no JSX não autoriza: a API checa. (ECC rules/react/security)
+- Com RSC/Next: `"use server"` é endpoint público — valida input e checa sessão/permissão; módulo com segredo ou cliente de banco leva `import "server-only"` (Next resolve sem instalar); registro inteiro (hash, token) não vira prop de Client Component; `"use client"` na folha interativa, não no layout. (ECC react-reviewer, rules/react/patterns; medido Next 16.3)
+- Teste (se já há Testing Library): query por role/label/texto (`data-testid` por último); async com `findBy*`/`waitFor`, nunca `setTimeout`; `await` em `user.*`. (ECC rules/react/testing)
+
+### Build quebrado
+- Stop, caches e config intocável: `dominios/node.md` § Build quebrado (Vite: `node_modules/.vite`). Vite com `tsconfig.json` só de `references` (`files: []`): esse `tsc -p` passa com erro → use o `typecheck`/`build` do projeto (`tsc -b` só porque os filhos têm `noEmit`). Next: `next build` tipa; `tsc` avulso pede `next typegen`. (ECC react-build-resolver; hook cbs-typecheck; medido Vite 8/TS 6, Next 16.3)
+- `Invalid hook call` → hook fora de componente, versões distintas de `react`/`react-dom` ou React duplicado (`npm ls react`). `@types/react` no major do `react`. `'React' is not defined` → `"jsx": "react-jsx"`. `Element type is invalid … undefined` → import default × nomeado. (ECC react-build-resolver; medido React 19.3)
+- Hydration mismatch: `Date.now()`, `Math.random()`, `window`/`localStorage` no render ou HTML inválido (`<div>` em `<p>`) → valor de cliente em `useEffect`/`useSyncExternalStore`. Next: `Can't resolve 'fs'` no cliente → lógica pro servidor. (ECC react-build-resolver)
+
+## React Native
+CLI `expo`/`react-native` de `node_modules/.bin` (`npx` só fora de hook). Validação visual: simulador/emulador ou web (`expo start --web`, sem safe area/teclado nativo); declare o alvo ou "não validado". (ECC rules/react-native/production-readiness)
+- Lista grande ou sem limite: `FlatList`/`SectionList` (ou `FlashList` instalado) com `keyExtractor` estável — nunca `.map()` em `ScrollView`. (ECC rules/react-native/performance)
+- Tocável custom tem `accessibilityRole`/`role`; só ícone, `accessibilityLabel`/`aria-label`; estado em `accessibilityState`/`aria-*`; alvo ≥ 44pt/48dp (`hitSlop`); sem altura fixa que corte fonte ampliada. (ECC rules/react-native/accessibility)
+- Safe area por `react-native-safe-area-context` (`SafeAreaView` do core: deprecated), sem offset fixo de notch. (ECC rules/react-native/coding-style; medido RN 0.87)
+- `app.json`/`app.config` vão ao bundle: sem segredo. Token em Keychain/Keystore (`expo-secure-store` ou o do projeto), nunca `AsyncStorage`/MMKV sem cifra. (ECC rules/react-native/security)
+- Param de rota/deep link, payload de push e resposta de API: valide com o schema do projeto (`safeParse`; `parse` lança no render). (ECC rules/react-native/patterns)
+- Dep nativa nova: compatível com New Architecture (única desde RN 0.82) e, no Expo, por `expo install <pkg>` (versão do SDK). Mudança nativa exige build, não EAS Update. (ECC rules/react-native/production-readiness; medido RN 0.87)
+- Teste: como §React (`testID` por último); E2E só no runner que já existe (Maestro/Detox). (ECC rules/react-native/testing)
+
+### Build quebrado
+- Typecheck como o Stop (`dominios/node.md`); lint: `expo lint` ou o do projeto. Versão nativa fora do SDK: `expo install --check` (`--fix`). (ECC rules/react-native/hooks; hook cbs-typecheck)
+- Metro velho ou `Unable to resolve module`: `expo start --clear` ou `react-native start --reset-cache`. (fato de plataforma; medido Expo CLI 57, RN 0.87)
+- `TurboModuleRegistry.getEnforcing … could not be found` após dep nativa: rebuild do binário (`expo run:ios|android`/dev build; RN puro: `pod install`), Metro não basta; Expo Go não carrega nativo fora do SDK. (ECC rules/react-native/production-readiness; medido RN 0.87)
+
 ## Loop obrigatório de validação visual
 
 Antes de marcar a story como **Ready for Review**:
@@ -258,4 +296,4 @@ Ordem de prioridade; pare no primeiro 🔴:
 **Formato de saída do reviewer de UI** (entra no relatório junto do QA):
 
 ## Fontes
-Rulebook original do pacote · adendo adaptado de pbakaus/impeccable (Apache-2.0: modos, piso de craft, score de audit, triagem), Leonxlnx/taste-skill (MIT: Design Read, dials, regras de CTA), nextlevelbuilder/ui-ux-pro-max 2.13 (MIT: checklist por prioridade, `--stack laravel`), ckm:design-system (MIT: 3 camadas de token, prioridade de estados), skill oficial `frontend-design` (Apache-2.0). Reescrita em pt-BR.
+Rulebook original do pacote · adendo adaptado de pbakaus/impeccable (Apache-2.0: modos, piso de craft, score de audit, triagem), Leonxlnx/taste-skill (MIT: Design Read, dials, regras de CTA), nextlevelbuilder/ui-ux-pro-max 2.13 (MIT: checklist por prioridade, `--stack laravel`), ckm:design-system (MIT: 3 camadas de token, prioridade de estados), skill oficial `frontend-design` (Apache-2.0), affaan-m/ECC (MIT: §React/§React Native). Reescrita em pt-BR.
