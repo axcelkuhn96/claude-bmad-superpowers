@@ -10,7 +10,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { hookDesligado, lerStdin, lerPayload, lerTexto, caminhosEditados, acharRaiz, binLocal, noPath, ehEntrada, avisar, registrarEdicao } from './cbs-comum.js';
 
-const EXT_WEB = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.css', '.json', '.md']);
+const EXT_WEB = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.css', '.json', '.md']);
 const BIOME_CFG = ['biome.json', 'biome.jsonc'];
 const PRETTIER_CFG = ['.prettierrc', '.prettierrc.json', '.prettierrc.yml', '.prettierrc.yaml', '.prettierrc.json5',
   '.prettierrc.js', '.prettierrc.cjs', '.prettierrc.mjs', '.prettierrc.toml', 'prettier.config.js', 'prettier.config.cjs', 'prettier.config.mjs'];
@@ -37,7 +37,7 @@ export function escolherFormatador(arquivo, env = process.env) {
   if (ext === '.py' || ext === '.pyi') {
     const raiz = acharRaiz(dir, ['pyproject.toml', 'ruff.toml', '.ruff.toml']);
     if (!raiz) return null;
-    const configurado = tem(raiz, ['ruff.toml', '.ruff.toml']) || /^\[tool\.ruff/m.test(lerTexto(path.join(raiz, 'pyproject.toml')));
+    const configurado = tem(raiz, ['ruff.toml', '.ruff.toml']) || /^\[tool\.ruff[\].]/m.test(lerTexto(path.join(raiz, 'pyproject.toml')));
     if (!configurado) return null;
     const bin = binLocal(raiz, path.join('.venv', 'bin', 'ruff')) || noPath('ruff', env);
     if (!bin) return null;
@@ -47,11 +47,19 @@ export function escolherFormatador(arquivo, env = process.env) {
     const raiz = acharRaiz(dir, ['package.json']);
     if (!raiz) return null;
     const biome = binLocal(raiz, path.join('node_modules', '.bin', 'biome'));
-    if (biome && tem(raiz, BIOME_CFG)) return { ferramenta: 'biome', bin: biome, args: ['format', '--write', arquivo], raiz };
+    // biome não formata markdown (.md cai no prettier); --no-errors-on-unmatched: arquivo que o biome.json ignora sai 0.
+    if (biome && ext !== '.md' && tem(raiz, BIOME_CFG)) return { ferramenta: 'biome', bin: biome, args: ['format', '--write', '--no-errors-on-unmatched', arquivo], raiz };
     const prettier = binLocal(raiz, path.join('node_modules', '.bin', 'prettier'));
     if (prettier && (tem(raiz, PRETTIER_CFG) || chavePrettierNoPackage(raiz))) return { ferramenta: 'prettier', bin: prettier, args: ['--write', arquivo], raiz };
   }
   return null;
+}
+
+// Roda o formatador sem shell; devolve null quando deu certo, senão o motivo (erro, sinal ou código de saída).
+// SIGKILL no timeout: formatador que ignora SIGTERM não prende o hook.
+export function rodarFormatador(f, timeoutMs = TIMEOUT_MS) {
+  const r = spawnSync(f.bin, f.args, { cwd: f.raiz, stdio: 'ignore', timeout: timeoutMs, killSignal: 'SIGKILL', shell: false });
+  return r.error || r.status !== 0 ? String(r.error?.code ?? r.signal ?? r.status) : null;
 }
 
 function main() {
@@ -70,8 +78,8 @@ function main() {
   for (const arquivo of arquivos) {
     const f = escolherFormatador(arquivo);
     if (!f) continue;
-    const r = spawnSync(f.bin, f.args, { cwd: f.raiz, stdio: 'ignore', timeout: TIMEOUT_MS, shell: false });
-    if (r.error || r.status !== 0) avisar(`format: ${f.ferramenta} falhou em ${path.basename(arquivo)} (exit ${r.status ?? r.error?.code}) — arquivo mantido`);
+    const falha = rodarFormatador(f);
+    if (falha !== null) avisar(`format: ${f.ferramenta} falhou em ${path.basename(arquivo)} (exit ${falha}) — arquivo mantido`);
   }
   return 0;
 }

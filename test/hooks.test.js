@@ -159,7 +159,7 @@ describe('cbs-format — escolha do formatador', { skip: !POSIX && 'binários fa
     const p = tmpDoTeste(t); escrever(p, 'package.json', '{}'); escrever(p, 'biome.json', '{}'); escrever(p, 'node_modules/.bin/biome', EXE, 0o755);
     const a = escrever(p, 'src/a.ts', '');
     const f = fmt.escolherFormatador(a);
-    assert.equal(f?.ferramenta, 'biome'); assert.deepEqual(f.args, ['format', '--write', a]); assert.equal(f.raiz, p);
+    assert.equal(f?.ferramenta, 'biome'); assert.deepEqual(f.args, ['format', '--write', '--no-errors-on-unmatched', a]); assert.equal(f.raiz, p);
   });
   test('tsx com prettier local + .prettierrc → prettier', (t) => {
     const p = tmpDoTeste(t); escrever(p, 'package.json', '{}'); escrever(p, '.prettierrc', '{}'); escrever(p, 'node_modules/.bin/prettier', EXE, 0o755);
@@ -314,6 +314,146 @@ describe('cbs-format — E2E', { skip: !POSIX && 'POSIX' }, () => {
     assert.equal(r.code, 0); assert.equal(r.out, '');
     assert.equal(fs.existsSync(log), true);
     assert.equal(fs.existsSync(path.join(p, 'alvo')), false);
+  });
+});
+
+// ── Task 6, fix round 1: raiz/binário confiáveis, biome sem aviso falso, sinal, .mts/.cts, [tool.ruff] exato ──
+const OUTRO_UID = 2 ** 31 - 7; // uid que não é o do processo nem root: simula dono estrangeiro sem chown
+const GRUPO_PRIVADO = POSIX && process.getgid() === process.getuid();
+const grupoAlheio = POSIX ? process.getgroups().find((g) => g !== process.getgid() && g !== 0) : undefined;
+describe('cbs-comum — raiz e binário confiáveis', { skip: !POSIX && 'POSIX' }, () => {
+  test('acharRaiz não aceita raiz gravável por todos (1777, como /tmp)', (t) => {
+    const r = tmpDoTeste(t); const shared = path.join(r, 'shared');
+    escrever(shared, 'package.json', '{}'); const a = escrever(shared, 'user-owned/sess/scratch.ts', '');
+    fs.chmodSync(shared, 0o1777);
+    assert.equal(comum.acharRaiz(path.dirname(a), ['package.json']), null);
+  });
+  test('acharRaiz para no diretório gravável por outros (não sobe além dele)', (t) => {
+    const r = tmpDoTeste(t); escrever(r, 'package.json', '{}');
+    const a = escrever(r, 'pub/x/a.ts', ''); fs.chmodSync(path.join(r, 'pub'), 0o777);
+    assert.equal(comum.acharRaiz(path.dirname(a), ['package.json']), null);
+    fs.chmodSync(path.join(r, 'pub'), 0o755);
+    assert.equal(comum.acharRaiz(path.dirname(a), ['package.json']), r);
+  });
+  test('acharRaiz recusa raiz de outro dono', (t) => {
+    const r = tmpDoTeste(t); escrever(r, 'package.json', '{}');
+    assert.equal(comum.acharRaiz(r, ['package.json']), r);
+    assert.equal(comum.acharRaiz(r, ['package.json'], OUTRO_UID), null);
+  });
+  test('acharRaiz para no HOME', (t) => {
+    const r = tmpDoTeste(t); escrever(r, 'package.json', '{}');
+    const home = path.join(r, 'h'); const src = path.join(home, 'proj', 'src'); fs.mkdirSync(src, { recursive: true });
+    const antes = process.env.HOME;
+    process.env.HOME = home;
+    try { assert.equal(comum.acharRaiz(src, ['package.json']), null); } finally { process.env.HOME = antes; }
+  });
+  test('binLocal recusa raiz gravável por outros mesmo com sticky (1777)', (t) => {
+    const r = tmpDoTeste(t); escrever(r, 'node_modules/.bin/biome', EXE, 0o755);
+    fs.chmodSync(r, 0o1777);
+    assert.equal(comum.binLocal(r, 'node_modules/.bin/biome'), null);
+  });
+  test('binLocal recusa binário gravável por todos', (t) => {
+    const r = tmpDoTeste(t); escrever(r, 'vendor/bin/pint', EXE, 0o757);
+    assert.equal(comum.binLocal(r, 'vendor/bin/pint'), null);
+  });
+  test('binLocal recusa binário em diretório gravável por todos sem sticky', (t) => {
+    const r = tmpDoTeste(t); escrever(r, 'node_modules/.bin/biome', EXE, 0o755);
+    fs.chmodSync(path.join(r, 'node_modules/.bin'), 0o777);
+    assert.equal(comum.binLocal(r, 'node_modules/.bin/biome'), null);
+    fs.chmodSync(path.join(r, 'node_modules/.bin'), 0o1777); // sticky: ninguém troca a entrada do usuário
+    assert.equal(comum.binLocal(r, 'node_modules/.bin/biome'), path.join(r, 'node_modules/.bin/biome'));
+  });
+  test('binLocal aceita diretório gravável pelo grupo privado do usuário (umask 002)', { skip: !GRUPO_PRIVADO && 'sem grupo privado' }, (t) => {
+    const r = tmpDoTeste(t); escrever(r, 'node_modules/.bin/biome', EXE, 0o775);
+    fs.chmodSync(path.join(r, 'node_modules/.bin'), 0o775); fs.chmodSync(path.join(r, 'node_modules'), 0o775);
+    assert.equal(comum.binLocal(r, 'node_modules/.bin/biome'), path.join(r, 'node_modules/.bin/biome'));
+  });
+  test('binLocal recusa diretório gravável por um grupo compartilhado', { skip: grupoAlheio === undefined && 'sem grupo suplementar' }, (t) => {
+    const r = tmpDoTeste(t); escrever(r, 'node_modules/.bin/biome', EXE, 0o755);
+    const bin = path.join(r, 'node_modules/.bin');
+    fs.chownSync(bin, process.getuid(), grupoAlheio); fs.chmodSync(bin, 0o775);
+    assert.equal(comum.binLocal(r, 'node_modules/.bin/biome'), null);
+  });
+  test('binLocal segue symlink do npm até alvo confiável e recusa alvo gravável por outros', (t) => {
+    const r = tmpDoTeste(t);
+    escrever(r, 'node_modules/@biomejs/biome/bin/biome', EXE, 0o755);
+    fs.mkdirSync(path.join(r, 'node_modules/.bin'));
+    fs.symlinkSync('../@biomejs/biome/bin/biome', path.join(r, 'node_modules/.bin/biome'));
+    assert.equal(comum.binLocal(r, 'node_modules/.bin/biome'), path.join(r, 'node_modules/.bin/biome'));
+    const mau = escrever(r, 'mau/biome', EXE, 0o755); fs.chmodSync(path.join(r, 'mau'), 0o777);
+    fs.symlinkSync(mau, path.join(r, 'node_modules/.bin/prettier'));
+    assert.equal(comum.binLocal(r, 'node_modules/.bin/prettier'), null);
+  });
+  test('binLocal recusa binário de outro dono e aceita o de root', (t) => {
+    const r = tmpDoTeste(t); escrever(r, 'vendor/bin/pint', EXE, 0o755);
+    assert.equal(comum.binLocal(r, 'vendor/bin/pint', OUTRO_UID), null);
+    const env = fs.existsSync('/usr/bin/env') && fs.lstatSync('/usr/bin/env');
+    if (env && env.isFile() && env.uid === 0) assert.equal(comum.binLocal('/usr', 'bin/env', OUTRO_UID), '/usr/bin/env');
+  });
+  test('escolherFormatador ignora projeto plantado em diretório 1777', (t) => {
+    const r = tmpDoTeste(t); const shared = path.join(r, 'shared');
+    escrever(shared, 'package.json', '{}'); escrever(shared, 'biome.json', '{}'); escrever(shared, 'node_modules/.bin/biome', EXE, 0o755);
+    const a = escrever(shared, 'user-owned/sess/scratch.ts', '');
+    fs.chmodSync(shared, 0o1777);
+    assert.equal(fmt.escolherFormatador(a), null);
+  });
+});
+describe('cbs-format — fix round 1', { skip: !POSIX && 'POSIX' }, () => {
+  test('E2E: binário plantado numa raiz 1777 não roda', (t) => {
+    const r = tmpDoTeste(t); const shared = path.join(r, 'shared');
+    const log = projetoBiome(shared);
+    escrever(shared, 'user-owned/sess/scratch.ts', 'const x=1');
+    fs.chmodSync(shared, 0o1777);
+    const res = rodarHook('cbs-format.js', { session_id: 'e2e-1777', cwd: shared, tool_name: 'Write', tool_input: { file_path: 'user-owned/sess/scratch.ts' } }, { TMPDIR: r });
+    assert.equal(res.code, 0); assert.equal(res.out + res.err, '');
+    assert.equal(fs.existsSync(log), false);
+  });
+  test('.md vai para o prettier mesmo com biome configurado (biome não formata markdown)', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'package.json', '{}'); escrever(p, 'biome.json', '{}'); escrever(p, '.prettierrc', '{}');
+    escrever(p, 'node_modules/.bin/biome', EXE, 0o755); escrever(p, 'node_modules/.bin/prettier', EXE, 0o755);
+    const a = escrever(p, 'README.md', '');
+    const f = fmt.escolherFormatador(a);
+    assert.equal(f?.ferramenta, 'prettier'); assert.deepEqual(f.args, ['--write', a]);
+  });
+  test('.md em projeto só com biome → nada', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'package.json', '{}'); escrever(p, 'biome.json', '{}'); escrever(p, 'node_modules/.bin/biome', EXE, 0o755);
+    assert.equal(fmt.escolherFormatador(escrever(p, 'README.md', '')), null);
+  });
+  test('E2E: arquivo que o biome.json ignora não gera aviso falso', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'package.json', '{}'); escrever(p, 'biome.json', '{}');
+    // Como o biome real: sem --no-errors-on-unmatched, arquivo ignorado sai com 1.
+    escrever(p, 'node_modules/.bin/biome', '#!/bin/sh\nfor a in "$@"; do [ "$a" = --no-errors-on-unmatched ] && exit 0; done\nexit 1\n', 0o755);
+    escrever(p, 'ignorado.ts', '');
+    const r = rodarHook('cbs-format.js', { session_id: 'e2e-ign', cwd: p, tool_input: { file_path: 'ignorado.ts' } }, { TMPDIR: p });
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
+  });
+  test('.mts e .cts são formatados como .ts', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'package.json', '{}'); escrever(p, 'biome.json', '{}'); escrever(p, 'node_modules/.bin/biome', EXE, 0o755);
+    for (const ext of ['.mts', '.cts']) assert.equal(fmt.escolherFormatador(escrever(p, 'a' + ext, ''))?.ferramenta, 'biome');
+  });
+  test('[tool.ruff] exato ou [tool.ruff.x] conta; [tool.ruffus] não', (t) => {
+    const bin = tmpDoTeste(t, 'cbs-bin-'); escrever(bin, 'ruff', EXE, 0o755);
+    const casos = { '[tool.ruffus]\n': null, '[tool.ruff.lint]\nselect = ["E"]\n': 'ruff', '[tool.ruff]\n': 'ruff' };
+    for (const [toml, esperado] of Object.entries(casos)) {
+      const p = tmpDoTeste(t); escrever(p, 'pyproject.toml', toml);
+      assert.equal(fmt.escolherFormatador(escrever(p, 'm.py', ''), { PATH: bin })?.ferramenta ?? null, esperado, toml);
+    }
+  });
+  test('E2E: formatador morto por sinal → aviso mostra o sinal', (t) => {
+    const p = tmpDoTeste(t); escrever(p, 'package.json', '{}'); escrever(p, 'biome.json', '{}');
+    escrever(p, 'node_modules/.bin/biome', '#!/bin/sh\nkill -9 $$\n', 0o755);
+    escrever(p, 'a.ts', '');
+    const r = rodarHook('cbs-format.js', { session_id: 'e2e-sinal', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p });
+    assert.equal(r.code, 0);
+    assert.match(r.err, /^\[cbs\] format: biome falhou em a\.ts \(exit SIGKILL\)/);
+  });
+  test('timeout mata com SIGKILL: formatador que ignora SIGTERM não prende o hook', (t) => {
+    const p = tmpDoTeste(t);
+    const bin = escrever(p, 'teimoso', '#!/bin/sh\ntrap "" TERM\nsleep 5\n', 0o755);
+    const t0 = Date.now();
+    const falha = fmt.rodarFormatador({ bin, args: [], raiz: p }, 300);
+    assert.ok(Date.now() - t0 < 3000, `demorou ${Date.now() - t0} ms`);
+    assert.equal(falha, 'ETIMEDOUT');
   });
 });
 
