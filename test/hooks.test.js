@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { HOOKS_CBS, comandoHook } from '../src/hooks-settings.js';
 
 const RAIZ = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const HOOKS = path.join(RAIZ, 'base', 'hooks');
@@ -1035,12 +1036,12 @@ describe('cbs-no-verify', () => {
 
 // Formato verificado com o Codex 0.156.1 (Task 10): shell = tool_name "Bash" e apply_patch = "apply_patch"; o comando
 // do hook roda via `$SHELL -c` (expande $HOME); exit 2 + stderr bloqueia; timeout em segundos.
-const { HOOKS_CBS } = await import(pathToFileURL(path.join(RAIZ, 'src', 'hooks-settings.js')).href);
 describe('codex-hooks.json', () => {
   const cfg = JSON.parse(fs.readFileSync(path.join(RAIZ, 'base', 'codex', 'hooks', 'codex-hooks.json'), 'utf8'));
   const entradas = Object.entries(cfg.hooks).flatMap(([ev, gs]) => gs.flatMap((g) => g.hooks.map((h) => ({ ev, matcher: g.matcher, ...h }))));
   const script = (e) => e.command.match(/cbs-[a-z-]+\.js/)[0];
-  const comandoCodex = (s) => `[ ! -f "$HOME/.claude/hooks/cbs-node.sh" ] || sh "$HOME/.claude/hooks/cbs-node.sh" "$HOME/.claude/hooks/${s}"`;
+  // Mesma guarda do settings.json do Claude Code (comandoHook): launcher OU script ausente → no-op; aqui com $HOME literal.
+  const comandoCodex = (s) => comandoHook('/CBS-HOME/.claude/hooks', s).replaceAll('/CBS-HOME', '$HOME');
   test('só eventos que o Codex aceita', () => {
     for (const ev of Object.keys(cfg.hooks)) assert.ok(['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop'].includes(ev), ev);
   });
@@ -1052,10 +1053,15 @@ describe('codex-hooks.json', () => {
     }
   });
   test('matchers com os nomes reais de ferramenta do Codex (Bash, apply_patch); Stop sem matcher', () => {
-    const esperado = { 'cbs-no-verify.js': '^Bash$', 'cbs-config-protect.js': '^apply_patch$', 'cbs-format.js': '^apply_patch$', 'cbs-typecheck.js': undefined };
+    // config-protect também em Bash: `apply_patch` rodado pelo shell chega como tool_name "Bash" (medido na review da T10).
+    const esperado = { 'cbs-no-verify.js': '^Bash$', 'cbs-config-protect.js': '^(Bash|apply_patch)$', 'cbs-format.js': '^apply_patch$', 'cbs-typecheck.js': undefined };
     for (const e of entradas) assert.equal(e.matcher, esperado[script(e)], script(e));
   });
-  test('comando = launcher POSIX (H3); nenhum matcher .*, nenhum npx, todos com timeout', () => {
+  for (const s of ['cbs-config-protect.js', 'cbs-format.js', 'cbs-no-verify.js', 'cbs-typecheck.js']) {
+    const skip = s === 'cbs-config-protect.js' && 'TODO(T5): cbs-config-protect.js chega com o merge da T5';
+    test(`${s} existe em base/hooks`, { skip }, () => assert.ok(fs.existsSync(path.join(HOOKS, s)), s));
+  }
+  test('comando = launcher POSIX (H3) com a guarda do comandoHook; nenhum matcher .*, nenhum npx, todos com timeout', { skip: !POSIX && 'POSIX' }, () => {
     for (const e of entradas) {
       assert.equal(e.command, comandoCodex(script(e)));
       assert.ok(!e.matcher || !e.matcher.includes('.*'), e.matcher);
@@ -1069,6 +1075,17 @@ describe('codex-hooks.json', () => {
     for (const s of entradas.map(script)) {
       const r = spawnSync('sh', ['-c', comandoCodex(s)], { input: '{}', encoding: 'utf8', timeout: 10_000, env: { ...envLimpo(), HOME: home } });
       assert.equal(r.status, 0, s); assert.equal(r.stdout + r.stderr, '');
+    }
+  });
+  test('E2E: launcher instalado e script ausente → sai 0 em silêncio', { skip: !POSIX && 'POSIX' }, (t) => {
+    const home = tmpDoTeste(t, 'cbs-home-');
+    const dir = path.join(home, '.claude', 'hooks');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.copyFileSync(path.join(HOOKS, 'cbs-node.sh'), path.join(dir, 'cbs-node.sh'));
+    fs.writeFileSync(path.join(dir, '.cbs-node-path'), `${process.execPath}\n`);
+    for (const e of entradas) {
+      const r = spawnSync('sh', ['-c', e.command], { input: '{}', encoding: 'utf8', timeout: 10_000, env: { ...envLimpo(), HOME: home } });
+      assert.equal(r.status, 0, script(e)); assert.equal(r.stdout + r.stderr, '', script(e));
     }
   });
   test('E2E: comando do Codex com payload real (Bash) bloqueia --no-verify via launcher', { skip: !POSIX && 'POSIX' }, (t) => {
