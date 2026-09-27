@@ -100,6 +100,7 @@ test('instalar --apenas-global copia skills, commands, personas e models.yml', a
   // commands
   const cmdsBase = await listarMd(path.join(BASE, 'commands'));
   assert.ok(cmdsBase.includes('atualizar.md') && cmdsBase.includes('instalar-bmad.md'));
+assert.ok(cmdsBase.includes('blindar.md'), 'command /blindar no base');
   for (const rel of cmdsBase) {
     assert.ok(await existe(path.join(claude, 'commands', rel)), `command ${rel} copiado`);
   }
