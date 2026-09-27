@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cbs-config-protect.mjs — PreToolUse (Edit|Write|MultiEdit; Codex: apply_patch): bloqueia enfraquecer config de lint/format.
+// cbs-config-protect.mjs — PreToolUse (Edit|Write|MultiEdit; Codex: apply_patch e Bash): bloqueia enfraquecer config de lint/format.
 // Escape: CBS_PERMITIR_CONFIG=1. package.json, tsconfig.json e composer.json nunca são bloqueados.
 // Derivado de affaan-m/ECC @ e482e57, scripts/hooks/config-protection.js — MIT License,
 // Copyright (c) 2026 Affaan Mustafa. Licença: https://github.com/affaan-m/ECC/blob/e482e57/LICENSE
@@ -303,18 +303,30 @@ function opsDoPayload(textos, cwd) {
   }
   return ops;
 }
-// Toda linha com cara de cabeçalho de patch (aparada como o Rust + U+FEFF) conta como tocando o arquivo, mesmo onde
-// o parser não chega (fail closed).
-function caminhosCitados(textos, cwd) {
+// Caminhos de toda linha com cara de cabeçalho de patch (aparada como o Rust + U+FEFF), crus: mesmo onde o parser não
+// chega (fail closed).
+function caminhosBrutos(textos) {
   const out = [];
   for (const t of textos) {
     for (const l of t.split('\n')) {
       prazo();
       const m = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$/.exec(aparar(l, true, true));
-      if (m) out.push(path.resolve(cwd, m[1]));
+      if (m) out.push(m[1]);
     }
   }
   return out;
+}
+const caminhosCitados = (textos, cwd) => caminhosBrutos(textos).map((p) => path.resolve(cwd, p));
+// Codex: apply_patch rodado pelo shell chega como tool_name "Bash", sem o workdir e com cwd = raiz da sessão (medido na
+// T10) — caminho relativo pode morar em outro diretório e parecer criação. Nome de config protegida (ou pyproject.toml)
+// em caminho relativo → trata como tocando a config (fail closed). Caixa ignorada: o disco certo é desconhecido.
+function relativoProtegido(textos) {
+  for (const p of caminhosBrutos(textos)) {
+    if (path.isAbsolute(p)) continue;
+    const b = path.basename(p).toLowerCase();
+    if (b === 'pyproject.toml' || PROTEGIDOS.some((re) => re.test(b))) return path.basename(p);
+  }
+  return null;
 }
 // Aplica as operações em memória, na ordem do Codex: Map chave → conteúdo (null = apagado). null = não aplica.
 function simular(ops, antigo) {
@@ -336,6 +348,10 @@ function avaliar(payload) {
   const ti = payload.tool_input || {};
   const cwd = typeof payload.cwd === 'string' && payload.cwd ? payload.cwd : process.cwd();
   const textos = textosDePatch(payload);
+  if (payload.tool_name === 'Bash') {
+    const nome = relativoProtegido(textos);
+    if (nome) return { bloquear: true, motivo: msg(`${nome} (apply_patch pelo shell com caminho relativo: o Codex não informa o diretório)`) };
+  }
   const ops = opsDoPayload(textos, cwd);
   // união: caminhos do cbs-comum, do parser do Codex e de toda linha com cara de cabeçalho
   const caminhos = new Set([...caminhosEditados(payload), ...caminhosCitados(textos, cwd)]);

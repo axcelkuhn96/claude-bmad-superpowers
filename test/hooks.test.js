@@ -1446,3 +1446,51 @@ describe('cbs-config-protect', () => {
     assert.ok(ms < 2500, `${ms} ms`);
   });
 });
+
+// Codex: apply_patch rodado pelo shell chega como tool_name "Bash", sem workdir e com cwd = raiz da sessão (medido ao
+// vivo na review da T10) — caminho relativo pode ser de outro diretório. Config protegida em caminho relativo → bloqueia.
+describe('cbs-config-protect — apply_patch pelo shell no Codex (tool_name Bash)', () => {
+  // Payload real capturado (Codex 0.156.1, exec_command com workdir "sub"); ids anonimizados, cwd = raiz do repo temporário.
+  const capturado = (cwd, command = "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: .eslintrc.json\n@@\n-{}\n+{\"root\": true}\n*** End Patch\nEOF") => ({
+    session_id: 's', turn_id: 't', transcript_path: null, cwd, hook_event_name: 'PreToolUse', model: 'm',
+    permission_mode: 'bypassPermissions', tool_name: 'Bash', tool_input: { command }, tool_use_id: 'exec-1',
+  });
+  const heredoc = (corpo) => `apply_patch <<'EOF'\n*** Begin Patch\n${corpo}\n*** End Patch\nEOF`;
+  const repo = (t) => { const r = tmpDoTeste(t, 'cbs-codex-sh-'); escrever(r, 'sub/.eslintrc.json', '{}'); escrever(r, 'src/app.ts', 'x\n'); return r; };
+  const av = (payload, env = {}) => cp.avaliarEdicao(payload, { env });
+
+  test('payload capturado: .eslintrc.json relativo (arquivo só em sub/) bloqueia com o escape na mensagem', (t) => {
+    const r = av(capturado(repo(t)));
+    assert.equal(r.bloquear, true); assert.match(r.motivo, /\.eslintrc\.json/); assert.match(r.motivo, /CBS_PERMITIR_CONFIG=1/);
+  });
+  test('E2E: payload capturado sai 2 no stderr; CBS_PERMITIR_CONFIG=1 libera', (t) => {
+    const p = repo(t);
+    const r = rodarHook('cbs-config-protect.mjs', capturado(p));
+    assert.equal(r.code, 2); assert.equal(r.out, ''); assert.match(r.err, /^CBS: edição de \.eslintrc\.json \(apply_patch pelo shell.*\) bloqueada .*CBS_PERMITIR_CONFIG=1/);
+    assert.equal(rodarHook('cbs-config-protect.mjs', capturado(p), { CBS_PERMITIR_CONFIG: '1' }).code, 0);
+  });
+  test('pyproject.toml, config em subdiretório, Add e Move to relativos também bloqueiam', (t) => {
+    const p = repo(t);
+    for (const corpo of ['*** Update File: pyproject.toml\n@@\n-a\n+b', '*** Add File: web/.prettierrc\n+{}', '*** Update File: sub/biome.json\n@@\n-a\n+b',
+      '*** Update File: src/app.ts\n*** Move to: .ESLINTRC.JSON\n@@\n-x\n+y']) {
+      assert.equal(av(capturado(p, heredoc(corpo))).bloquear, true, corpo);
+    }
+  });
+  test('patch pelo shell só com arquivos relativos não protegidos passa (unidade e E2E)', (t) => {
+    const p = repo(t);
+    const cmd = heredoc('*** Update File: src/app.ts\n@@\n-x\n+y\n*** Add File: nota.txt\n+oi\n*** Add File: sub/package.json\n+{}');
+    assert.equal(av(capturado(p, cmd)).bloquear, false);
+    const r = rodarHook('cbs-config-protect.mjs', capturado(p, cmd));
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
+  });
+  test('caminho absoluto segue a análise normal: criação libera (SP-3), edição de existente bloqueia', (t) => {
+    const p = repo(t);
+    assert.equal(av(capturado(p, heredoc(`*** Add File: ${path.join(p, '.eslintrc.json')}\n+{}`))).bloquear, false);
+    assert.equal(av(capturado(p, heredoc(`*** Update File: ${path.join(p, 'sub', '.eslintrc.json')}\n@@\n-{}\n+{"root": true}`))).bloquear, true);
+  });
+  test('ferramenta apply_patch (cwd confiável) mantém a criação relativa liberada', (t) => {
+    const p = repo(t);
+    const payload = { cwd: p, tool_name: 'apply_patch', tool_input: { command: '*** Begin Patch\n*** Add File: .eslintrc.json\n+{}\n*** End Patch' } };
+    assert.equal(av(payload).bloquear, false);
+  });
+});
