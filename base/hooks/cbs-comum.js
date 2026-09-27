@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const LIMITE_STDIN = 1024 * 1024;
+// 16 MiB (como ECC post-edit-format.js): payload grande de Write/Edit não pode pular a checagem em silêncio.
+export const LIMITE_STDIN = 16 * 1024 * 1024;
 export const WIN = process.platform === 'win32';
 
 // CBS_HOOKS=off desliga todos; CBS_HOOKS_DESLIGADOS=format,typecheck,no-verify,config desliga os escolhidos.
@@ -54,7 +55,7 @@ export function caminhosEditados(payload) {
   const cwd = typeof payload?.cwd === 'string' && payload.cwd ? payload.cwd : process.cwd();
   const brutos = [];
   if (typeof ti.file_path === 'string' && ti.file_path) brutos.push(ti.file_path);
-  for (const v of [ti.input, ti.patch, ti.command]) {
+  for (const v of [ti.input, ti.patch, comandoBash(payload)]) {
     if (typeof v === 'string' && v.includes('*** Begin Patch')) brutos.push(...caminhosDoPatch(v));
   }
   return [...new Set(brutos.map((p) => path.resolve(cwd, p)))];

@@ -29,8 +29,10 @@ function rodarHook(nome, payload, env = {}) {
   try {
     const r = spawnSync(process.execPath, [path.join(HOOKS, nome)], {
       input: typeof payload === 'string' ? payload : JSON.stringify(payload),
-      encoding: 'utf8', env: { ...envLimpo(), HOME: home, USERPROFILE: home, ...env },
+      encoding: 'utf8', timeout: 10_000, env: { ...envLimpo(), HOME: home, USERPROFILE: home, ...env },
     });
+    // Hook travado (timeout) ou que nem subiu: falha visível em vez de congelar o npm test.
+    if (r.error) throw new Error(`hook ${nome} não terminou: ${r.error.message}`);
     return { code: r.status, out: r.stdout, err: r.stderr };
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
@@ -57,9 +59,15 @@ describe('cbs-comum', () => {
     assert.equal(comum.hookDesligado('typecheck', env), false);
   });
   test('sem env nada é desligado', () => assert.equal(comum.hookDesligado('format', {}), false));
-  test('lerPayload rejeita vazio, inválido, não-objeto e acima do limite', () => {
-    for (const t of ['', '   ', '{', '[1]', '"x"', 'x'.repeat(comum.LIMITE_STDIN + 1)]) assert.equal(comum.lerPayload(t), null);
+  test('lerPayload rejeita vazio, inválido e não-objeto', () => {
+    for (const t of ['', '   ', '{', '[1]', '"x"']) assert.equal(comum.lerPayload(t), null);
     assert.deepEqual(comum.lerPayload('{"a":1}'), { a: 1 });
+  });
+  test('limite do stdin é 16 MiB: JSON válido acima dá null, abaixo é lido', () => {
+    assert.equal(comum.LIMITE_STDIN, 16 * 1024 * 1024);
+    assert.equal(comum.lerPayload('{"a":"' + 'x'.repeat(comum.LIMITE_STDIN) + '"}'), null);
+    const grande = 'x'.repeat(comum.LIMITE_STDIN - 16);
+    assert.deepEqual(comum.lerPayload('{"a":"' + grande + '"}'), { a: grande });
   });
   test('caminhosEditados resolve file_path relativo contra cwd', () => {
     assert.deepEqual(comum.caminhosEditados({ cwd: '/p', tool_input: { file_path: 'src/a.ts' } }), [path.resolve('/p', 'src/a.ts')]);
@@ -68,6 +76,10 @@ describe('cbs-comum', () => {
     const patch = '*** Begin Patch\n*** Update File: src/a.py\n@@\n-x\n+y\n*** Add File: b.ts\n+z\n*** Update File: c.js\n*** Move to: d.js\n*** End Patch';
     const esperado = ['src/a.py', 'b.ts', 'c.js', 'd.js'].map((p) => path.resolve('/p', p)).sort();
     assert.deepEqual(comum.caminhosEditados({ cwd: '/p', tool_input: { input: patch } }).sort(), esperado);
+  });
+  test('caminhosEditados lê apply_patch do Codex com command em array (argv)', () => {
+    const patch = '*** Begin Patch\n*** Update File: src/a.py\n@@\n-x\n+y\n*** End Patch';
+    assert.deepEqual(comum.caminhosEditados({ cwd: '/p', tool_input: { command: ['apply_patch', patch] } }), [path.resolve('/p', 'src/a.py')]);
   });
   test('comandoBash aceita string e array (Codex)', () => {
     assert.equal(comum.comandoBash({ tool_input: { command: 'git status' } }), 'git status');
