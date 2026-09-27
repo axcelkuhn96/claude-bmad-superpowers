@@ -57,8 +57,8 @@ function hooksCbs(settings) {
   return out.sort();
 }
 const HOOKS_ESPERADOS = ['PostToolUse:cbs-format.mjs', 'PreToolUse:cbs-config-protect.mjs', 'PreToolUse:cbs-no-verify.mjs', 'Stop:cbs-typecheck.mjs'];
-// arquivos instalados em ~/.claude/hooks (com marcador). TODO(T5): + 'cbs-config-protect.mjs' quando a T5 for mesclada.
-const HOOKS_ARQUIVOS = ['cbs-comum.mjs', 'cbs-format.mjs', 'cbs-no-verify.mjs', 'cbs-typecheck.mjs', 'cbs-node.sh'];
+// arquivos instalados em ~/.claude/hooks (com marcador).
+const HOOKS_ARQUIVOS = ['cbs-comum.mjs', 'cbs-config-protect.mjs', 'cbs-format.mjs', 'cbs-no-verify.mjs', 'cbs-typecheck.mjs', 'cbs-node.sh'];
 const WIN = process.platform === 'win32';
 
 before(async () => {
