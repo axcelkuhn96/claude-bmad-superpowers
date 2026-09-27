@@ -62,10 +62,6 @@ function ambienteGitleaksImutavel() {
   };
 }
 
-// Achados históricos revisados: hashes SHA-256 de commit\0arquivo\0linha\0regra\0sha256(linha-do-blob),
-// mantidos FORA do pacote (lidos por projeto de ~/.claude/cbs-overrides/gate-achados-revisados.json).
-// Vazio = nenhuma supressão: qualquer achado histórico reprova.
-const achadosHistoricosRevisados = new Set();
 function hashAchadoHistorico(x) {
   if (!/^[0-9a-f]{40}$/i.test(x.Commit || '') || !Number.isInteger(x.StartLine) || x.StartLine < 1
     || !x.File || path.isAbsolute(x.File) || x.File.split(/[\\/]/).includes('..')) return null;
@@ -112,6 +108,32 @@ const lerTxt = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { retur
 const lerJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
 const listar = (d) => { try { return fs.readdirSync(d); } catch { return []; } };
 const contem = (arquivos, re) => arquivos.some((f) => re.test(lerTxt(f)));
+
+// Achados históricos revisados (fora do pacote): ~/.claude/cbs-overrides/gate-achados-revisados.json
+// { "<caminho absoluto do projeto>": ["<sha256>", ...] }. Só vale para o projeto cujo caminho real é a chave.
+// Ausente, inválido ou sem a chave → nenhuma supressão (fail closed).
+function carregarAchadosRevisados(raizProjeto) {
+  const arquivo = path.join(os.homedir(), '.claude', 'cbs-overrides', 'gate-achados-revisados.json');
+  const vazio = (aviso = '') => ({ hashes: new Set(), aviso });
+  if (!fs.existsSync(arquivo)) return vazio();
+  let dados;
+  try { dados = JSON.parse(fs.readFileSync(arquivo, 'utf8')); } catch { return vazio(`achados revisados: ${arquivo} inválido — ignorado (nenhuma supressão)`); }
+  if (!dados || typeof dados !== 'object' || Array.isArray(dados)) return vazio(`achados revisados: ${arquivo} inválido — ignorado (nenhuma supressão)`);
+  let alvo;
+  try { alvo = fs.realpathSync(raizProjeto); } catch { return vazio(); }
+  const hashes = new Set();
+  for (const [chave, lista] of Object.entries(dados)) {
+    if (!path.isAbsolute(chave)) continue; // chave relativa resolveria contra o cwd e casaria qualquer projeto
+    let real;
+    try { real = fs.realpathSync(chave); } catch { continue; }
+    if (real !== alvo || !Array.isArray(lista)) continue;
+    for (const h of lista) if (typeof h === 'string' && /^[0-9a-f]{64}$/.test(h)) hashes.add(h);
+  }
+  return { hashes, aviso: '' };
+}
+const revisados = carregarAchadosRevisados(process.cwd());
+const achadosHistoricosRevisados = revisados.hashes;
+if (revisados.aviso) linha(`⚠ ${revisados.aviso}`);
 
 // resolve um executável no PATH sem shell (respeita PATHEXT no Windows)
 function resolverBin(nome) {
