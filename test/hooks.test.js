@@ -88,6 +88,14 @@ describe('cbs-comum', () => {
     assert.equal(comum.comandoBash({ tool_input: { command: ['git', 'status'] } }), 'git status');
     assert.equal(comum.comandoBash({ tool_input: {} }), null);
   });
+  test('caminhosEditados lê o payload real do apply_patch do Codex 0.156.1 (patch em tool_input.command, string)', () => {
+    const payload = {
+      session_id: 's', turn_id: 't', transcript_path: null, cwd: '/p', hook_event_name: 'PreToolUse', model: 'm',
+      permission_mode: 'bypassPermissions', tool_name: 'apply_patch', tool_use_id: 'exec-1',
+      tool_input: { command: '*** Begin Patch\n*** Update File: nota.txt\n@@\n-oi\n+ola\n*** End Patch' },
+    };
+    assert.deepEqual(comum.caminhosEditados(payload), [path.resolve('/p', 'nota.txt')]);
+  });
   test('acharRaiz sobe até o marcador e para sem marcador', (t) => {
     const r = tmpDoTeste(t, 'cbs-raiz-');
     escrever(r, 'composer.json', '{}');
@@ -299,5 +307,62 @@ describe('cbs-no-verify', () => {
     const boom = escrever(tmpDoTeste(t), 'boom.cjs', "RegExp.prototype.test = function () { throw new Error('boom'); };\n");
     const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } }, { NODE_OPTIONS: `--require=${boom}` });
     assert.equal(r.code, 0); assert.equal(r.out, ''); assert.match(r.err, /^\[cbs\] no-verify: erro interno ignorado \(boom\)/);
+  });
+});
+
+// Formato verificado com o Codex 0.156.1 (Task 10): shell = tool_name "Bash" e apply_patch = "apply_patch"; o comando
+// do hook roda via `$SHELL -c` (expande $HOME); exit 2 + stderr bloqueia; timeout em segundos.
+const { HOOKS_CBS } = await import(pathToFileURL(path.join(RAIZ, 'src', 'hooks-settings.js')).href);
+describe('codex-hooks.json', () => {
+  const cfg = JSON.parse(fs.readFileSync(path.join(RAIZ, 'base', 'codex', 'hooks', 'codex-hooks.json'), 'utf8'));
+  const entradas = Object.entries(cfg.hooks).flatMap(([ev, gs]) => gs.flatMap((g) => g.hooks.map((h) => ({ ev, matcher: g.matcher, ...h }))));
+  const script = (e) => e.command.match(/cbs-[a-z-]+\.js/)[0];
+  const comandoCodex = (s) => `[ ! -f "$HOME/.claude/hooks/cbs-node.sh" ] || sh "$HOME/.claude/hooks/cbs-node.sh" "$HOME/.claude/hooks/${s}"`;
+  test('só eventos que o Codex aceita', () => {
+    for (const ev of Object.keys(cfg.hooks)) assert.ok(['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop'].includes(ev), ev);
+  });
+  test('os 4 scripts CBS, cada um uma vez, com o evento e o timeout do settings.json do Claude Code', () => {
+    assert.deepEqual(entradas.map(script).sort(), ['cbs-config-protect.js', 'cbs-format.js', 'cbs-no-verify.js', 'cbs-typecheck.js']);
+    for (const e of entradas) {
+      const h = HOOKS_CBS.find((d) => d.script === script(e));
+      assert.equal(e.ev, h.evento, h.script); assert.equal(e.timeout, h.timeout, h.script);
+    }
+  });
+  test('matchers com os nomes reais de ferramenta do Codex (Bash, apply_patch); Stop sem matcher', () => {
+    const esperado = { 'cbs-no-verify.js': '^Bash$', 'cbs-config-protect.js': '^apply_patch$', 'cbs-format.js': '^apply_patch$', 'cbs-typecheck.js': undefined };
+    for (const e of entradas) assert.equal(e.matcher, esperado[script(e)], script(e));
+  });
+  test('comando = launcher POSIX (H3); nenhum matcher .*, nenhum npx, todos com timeout', () => {
+    for (const e of entradas) {
+      assert.equal(e.command, comandoCodex(script(e)));
+      assert.ok(!e.matcher || !e.matcher.includes('.*'), e.matcher);
+      assert.doesNotMatch(e.command, /npx/);
+      assert.ok(Number.isInteger(e.timeout) && e.timeout > 0);
+      assert.equal(e.type, 'command');
+    }
+  });
+  test('E2E: sem o launcher instalado o comando sai 0 (nunca bloqueia a sessão)', { skip: !POSIX && 'POSIX' }, (t) => {
+    const home = tmpDoTeste(t, 'cbs-home-');
+    for (const s of entradas.map(script)) {
+      const r = spawnSync('sh', ['-c', comandoCodex(s)], { input: '{}', encoding: 'utf8', timeout: 10_000, env: { ...envLimpo(), HOME: home } });
+      assert.equal(r.status, 0, s); assert.equal(r.stdout + r.stderr, '');
+    }
+  });
+  test('E2E: comando do Codex com payload real (Bash) bloqueia --no-verify via launcher', { skip: !POSIX && 'POSIX' }, (t) => {
+    const home = tmpDoTeste(t, 'cbs-home-');
+    const dir = path.join(home, '.claude', 'hooks');
+    fs.mkdirSync(dir, { recursive: true });
+    for (const f of ['cbs-node.sh', 'cbs-no-verify.js', 'cbs-comum.js', 'package.json']) fs.copyFileSync(path.join(HOOKS, f), path.join(dir, f));
+    fs.writeFileSync(path.join(dir, '.cbs-node-path'), `${process.execPath}\n`);
+    const cmd = cfg.hooks.PreToolUse.find((g) => g.matcher === '^Bash$').hooks[0].command;
+    const payload = (command) => JSON.stringify({
+      session_id: 's', turn_id: 't', transcript_path: null, cwd: home, hook_event_name: 'PreToolUse', model: 'm',
+      permission_mode: 'bypassPermissions', tool_name: 'Bash', tool_input: { command }, tool_use_id: 'exec-1',
+    });
+    const rodar = (command) => spawnSync('sh', ['-c', cmd], { input: payload(command), encoding: 'utf8', timeout: 10_000, env: { ...envLimpo(), HOME: home } });
+    const r = rodar('git commit --no-verify --allow-empty -m teste');
+    assert.equal(r.status, 2); assert.equal(r.stdout, ''); assert.match(r.stderr, /CBS: bloqueado/);
+    const ok = rodar('echo passo1');
+    assert.equal(ok.status, 0); assert.equal(ok.stdout + ok.stderr, '');
   });
 });
