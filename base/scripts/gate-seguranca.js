@@ -3,7 +3,7 @@
 // Node >= 18 (ESM; o package.json ao lado declara "type": "module"), sem dependências, sem shell (spawnSync com shell:false). Windows / Linux / macOS.
 //
 // Roda antes de marcar uma task como DONE e antes de push:
-//   gitleaks (segredos)  +  semgrep (SAST, só o que é novo vs base)  +  audit da stack
+//   gitleaks (segredos)  +  semgrep (SAST, só o que é novo vs base)  +  audit da stack  +  agentshield (se o diff toca config de agente)
 //   PHP: composer audit (+ psalm se psalm.xml)   Python: pip-audit + ruff --select S (ou bandit)
 //   Node: npm|pnpm|yarn|bun audit (high+)
 //
@@ -237,7 +237,7 @@ const artefatosGerados = new Set([
   'gitleaks-commits.json', 'gitleaks-commits-reviewed.json', 'gitleaks-commits.err', 'gitleaks-staged.json', 'gitleaks-indice.err',
   'gitleaks-snapshot.json', 'gitleaks-working-tree.err', 'gitleaks-dir.json', 'gitleaks-dir.err',
   'semgrep.json', 'semgrep.err', 'composer-audit.txt', 'pip-audit.txt', 'ruff-S.txt', 'bandit.txt',
-  'npm-audit.txt', 'psalm.txt',
+  'npm-audit.txt', 'psalm.txt', 'agentshield.json', 'agentshield.err',
 ]);
 
 function sobSaida(relativo, raiz, rastreados) {
@@ -690,6 +690,42 @@ if (NODE) {
       for (const l of det) linha(`    ${l.trim()}`);
     }
   } else parcial(pm, `${pm}: não instalado — gate parcial (audit de Node não rodou)`);
+}
+
+// ── 4. agentshield (config de agente) ─────────────────────────────────────
+// Só quando o diff desde a base (ou o working tree) toca config de agente. Modo estático; NUNCA --opus
+// (sem --opus/--injection/--deep/--supply-chain-online o scan não abre socket — verificado no 1.6.0).
+// ecc-agentshield (MIT) é opcional: não é dependência do pacote.
+// Contrato do `scan --format json` (1.6.0): stdout = { findings: [{ severity: critical|high|medium|low|info, file, ... }], summary, ... };
+// exit 0 = sem crítico · 2 = há crítico · 1 = erro (sem JSON). O diretório alvo vai logo após os argumentos (`--path <dir>`).
+const RE_CONFIG_AGENTE = /^(?:\.claude|\.codex)\/|(?:^|\/)(?:CLAUDE\.md|AGENTS\.md|\.mcp\.json)$|(?:^|\/)hooks(?:\/|$)/;
+const ARGS_AGENTSHIELD = ['scan', '--format', 'json', '--path'];
+function contarAltosAgentshield(json) {
+  return json.findings.filter((x) => x && ['critical', 'high'].includes(String(x.severity).toLowerCase())).length;
+}
+// -z: nomes crus (sem as aspas/escapes do core.quotePath), pra regex casar qualquer caminho.
+const nomesGit = (...args) => { const r = gitBytes(args); return r.status === 0 ? r.stdout.toString('utf8').split('\0') : []; };
+const tocados = GIT ? [
+  ...(base ? nomesGit('diff', '--name-only', '-z', `${base}..HEAD`) : []),
+  ...nomesGit('diff', '--name-only', '-z', '--cached'),
+  ...nomesGit('diff', '--name-only', '-z'),
+  ...nomesGit('ls-files', '--others', '--exclude-standard', '-z'),
+].filter(Boolean) : [];
+if (tocados.some((f) => RE_CONFIG_AGENTE.test(f))) {
+  if (tem('agentshield')) {
+    const r = rodar('agentshield', [...ARGS_AGENTSHIELD, '.']);
+    fs.writeFileSync(arq('agentshield.json'), r.stdout || '', 'utf8');
+    let dados = null;
+    try { dados = JSON.parse(r.stdout || ''); } catch { dados = null; }
+    if (!dados || !Array.isArray(dados.findings) || (r.status !== 0 && r.status !== 2)) {
+      gravar('agentshield.err', r);
+      parcial('agentshield', `agentshield: erro (exit ${r.status}, saída ilegível) — ver ${arq('agentshield.err')} — gate parcial`);
+    } else {
+      const n = contarAltosAgentshield(dados);
+      if (n > 0) { achados += n; linha(`✗ agentshield: ${n} achado(s) alto/crítico — ${arq('agentshield.json')}`); }
+      else linha('✓ agentshield: sem achado alto/crítico');
+    }
+  } else parcial('agentshield', 'agentshield: não instalado — gate parcial (npm i -g ecc-agentshield)');
 }
 
 // ── resumo (≤ 20 linhas) ───────────────────────────────────────────────────
