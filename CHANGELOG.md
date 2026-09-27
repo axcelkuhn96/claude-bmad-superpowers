@@ -2,6 +2,32 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.13.0] - 2026-09-27
+
+Traz do ECC (affaan-m/ECC, MIT, commit e482e57) só o que serve às stacks Laravel, Node/TypeScript, React/React Native e Python. Nada novo é carregado por sessão.
+
+### Adicionado
+- **Hooks globais** em `~/.claude/hooks/cbs-*.js` (ESM, sem dependências, sem `npx`), registrados por merge idempotente no `~/.claude/settings.json` (backup em `settings.json.cbs-backup`; hooks e chaves alheias intactos):
+  - `cbs-format.js` (PostToolUse `Edit|Write|MultiEdit`): formata só o arquivo editado com pint, `ruff format`, biome ou prettier **do projeto**, quando há ferramenta e config; em silêncio quando não há.
+  - `cbs-no-verify.js` (PreToolUse `Bash`): bloqueia `--no-verify`, `git commit -n`/`git am -n` e `-c core.hooksPath=…` em commit/push/merge/rebase/am/cherry-pick, fail-closed (texto cru ambíguo bloqueia), sem falso positivo em string, echo, `grep`/`gh`, mensagem de commit ou comentário.
+  - `cbs-config-protect.js` (PreToolUse `Edit|Write|MultiEdit`): bloqueia editar config existente de ESLint, Prettier, Biome, Pint, PHPStan, PHP-CS-Fixer, Ruff, mypy, Stylelint e as seções `[tool.ruff]`/`[tool.mypy]` do `pyproject.toml`; criar config nova é permitido. Escape: `CBS_PERMITIR_CONFIG=1`.
+  - `cbs-typecheck.js` (Stop): tsc, phpstan e mypy/pyright só nas stacks tocadas; bloqueia o fim do turno uma vez com o resumo dos erros; teto de 60 s; nunca grava `*.tsbuildinfo`/cache de build no repo do usuário.
+  - Controle por env: `CBS_HOOKS=off` e `CBS_HOOKS_DESLIGADOS=format,typecheck,no-verify,config`.
+  - Launcher POSIX `~/.claude/hooks/cbs-node.sh` resolve o `node` mesmo depois de troca de versão no nvm/fnm/volta; launcher ou script ausente → hook não faz nada (nunca quebra a sessão).
+  - CLI: `--sem-hooks` em `instalar`/`atualizar` pula a instalação dos hooks; `status` lista os hooks CBS ativos; `remover` tira só as entradas CBS do `settings.json`.
+  - Codex: `base/codex/hooks/codex-hooks.json` com os eventos equivalentes, declarado no plugin (exige o CBS instalado em `~/.claude`; hooks do Codex precisam estar marcados como confiáveis nele).
+- **AgentShield no gate**: quando o diff (ou o working tree) toca `.claude/`/`.codex/` em qualquer profundidade, `CLAUDE.md`, `AGENTS.md`, `.mcp.json`, `hooks.json` ou `hooks/` na raiz, o gate roda `agentshield` em modo estático (nunca `--opus`); achado alto ou crítico reprova, sem supressão — corrija a config ou aceite conscientemente. O pacote não depende dele (`npm i -g ecc-agentshield`); ausente ou com erro vira gate parcial.
+- `/blindar`: auditoria read-only de `~/.claude`, `~/.codex` e do projeto com o AgentShield; relatório em `docs/analises/<data>-blindar.md`. Não commite o relatório em repositório público.
+- Agente `cbs-build-fixer` e papel `build_fixer` (`codex: backend_terra`): destrava build/typecheck com a menor mudança; o executor o despacha em task BLOCKED por build ou quando o Stop continua falhando.
+- Personas: regras duras do ECC em `laravel.md`, `python.md` e `node.md` (com seção "Testes"), todos com "Build quebrado"; seções React e React Native (com "Build quebrado") em `frontend-referencia.md`; sinais de roteamento de React Native.
+
+### Alterado
+- **Mudança de comportamento do gate:** gitleaks ausente ou com erro agora **reprova** o gate (antes era "gate parcial"). As demais ferramentas continuam como parcial.
+- **`.gitleaks.toml` ausente no HEAD não reprova**: o gate cai pras regras default do gitleaks (sem allowlist; nunca lê a política do working tree) e avisa `✓ gitleaks: sem .gitleaks.toml no HEAD — regras default`. Política presente no HEAD continua sendo a única fonte confiável (o endurecimento abaixo vale sempre).
+- Gate endurecido: ambiente git imutável (`GIT_NO_REPLACE_OBJECTS`, `GIT_NO_LAZY_FETCH`) com shim pro gitleaks, fotografia do índice e do working tree, `.gitleaks.toml` lido do HEAD, detecção de `git replace`, kill-switch `.semgrep-desligado` ao lado do script (desliga o semgrep sozinho; não é fail-open do gate).
+- Achados históricos revisados do gitleaks saem do código: lista opcional por projeto em `~/.claude/cbs-overrides/gate-achados-revisados.json` (`{ "<caminho absoluto do projeto>": ["<sha256 do achado>"] }`).
+- `npm test` roda a suíte inteira (smoke, hooks, merge do settings.json, gate gitleaks, achados revisados, AgentShield).
+
 ## [0.12.0] - 2026-09-10
 
 Release guiada por três análises em `cbs-lab/docs/analises/` (auditoria do pacote, histórico de uso de 169 sessões, pesquisa de 45 personas/skills). Requer Superpowers ≥ 6.3.0 e BMAD ≥ 6.12.0.
