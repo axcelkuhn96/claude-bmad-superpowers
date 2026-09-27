@@ -47,7 +47,7 @@ Modo: seguir padrão | estabelecer padrão
 - Toda promise é aguardada **ou** tem `.catch` com ação. Handler `async` em Express 4 passa erro pro `next` (wrapper) — nunca fica "flutuando". `array.forEach(async …)` = bug; use `for…of` ou `Promise.all`/`allSettled`.
 - `await` sequencial em trabalho independente → `Promise.all`. `return await` dentro de `try` (pra capturar e manter stack).
 - Erros são `Error` (ou subclasse com `cause`, `isOperational`, `status`); nunca `throw "string"`. `JSON.parse` de input sempre em try.
-- `catch (e)`: `e` é `unknown` (`strict`) → `instanceof Error` antes de `.message`; re-lance com `{ cause: e }`. (ECC rules/typescript/coding-style)
+- `catch (e)`: `e` é `unknown` (`strict`) → `instanceof Error` antes de `.message`. Erro novo que embrulha `e` leva `{ cause: e }` (lib ≥ es2022); re-lançar o mesmo é `throw e`. (ECC rules/typescript/coding-style; medido TS 5.9)
 - Em código `async`, I/O de callback → `node:fs/promises`, `node:stream/promises` ou `util.promisify`; não misture os estilos. (ECC typescript-reviewer)
 - **Um** handler central de erro (último middleware, 4 args no Express) que loga com contexto e responde por tipo: operacional → status + mensagem segura; desconhecido → 500 genérico + log completo. Sem stack pro cliente.
 - `process.on('unhandledRejection')`/`process.on('uncaughtException')`: **só** logar e `process.exit(1)` quando não-operacional. Nunca "engolir e seguir" — quem reinicia é o supervisor. Sem `domain`.
@@ -57,15 +57,14 @@ Modo: seguir padrão | estabelecer padrão
 **Config, log, processo · TypeScript · Testes** → `dominios/node-referencia.md` (lido por caminho; resumo: `NODE_ENV`, lockfile + `npm ci`, log estruturado sem PII, graceful shutdown em `SIGTERM`, processo stateless; TS `strict` nunca afrouxado, `any` só justificado; testes de API com supertest cobrindo os 5 outcomes, tempo/rede controlados).
 
 ## Testes
-- Sem watch no loop/CI: `vitest run`, `jest --ci`. (ECC typescript-reviewer)
 - Asserção async com `await`/`return` (`await expect(p).rejects…`): flutuante passa em falso. (ECC typescript-reviewer)
-- Fluxo crítico com UI no mesmo repo: E2E em Playwright (ou o runner E2E que o projeto já usa). (ECC rules/typescript/testing)
+- Fluxo crítico com UI no mesmo repo: E2E no runner que o projeto já tem; sem runner, validação Playwright do tipo `ui` (sem dep nova). (ECC rules/typescript/testing)
 
 ## Build quebrado
 - Reproduza como o Stop: `node_modules/.bin/tsc --noEmit --pretty false -p <tsconfig.json mais próximo>` (project references: script `typecheck`, não `tsc -b`). Pós-edição: `biome format --write <arq>` (com `biome.json(c)`) ou `prettier --write <arq>` (com config), de `node_modules/.bin`. (hooks cbs-typecheck, cbs-format; ECC typescript-reviewer)
-- `incremental`/`composite`: até o `--noEmit` grava `*.tsbuildinfo` (`outDir` ou ao lado do tsconfig), que esconde erro após mudar `type`/tsconfig → `--incremental false` ou apague-o (e ao terminar, se não existia). Bundler: `rm -rf node_modules/.cache .next`; deps: `rm -rf node_modules && npm ci` (lockfile fica). (ECC build-error-resolver)
-- Erro de módulo (ESM/CJS, `paths`): `node-referencia.md` § Build quebrado.
-- `TS7016` (sem declaração) → `@types/<pacote>` em devDependencies (sem tipos publicados: `.d.ts` com `declare module`). Tipo incompatível/`possibly 'undefined'` → corrija, guard ou schema; sem calar com `any`/`as`/`@ts-ignore` (inevitável: `@ts-expect-error` + motivo). (ECC build-error-resolver, ECC typescript-reviewer)
+- `incremental`/`composite`: até o `--noEmit` grava `*.tsbuildinfo` (`outDir` ou ao lado do tsconfig), que esconde erro após mudar `type`/tsconfig → `--incremental false` ou apague-o. Bundler: `rm -rf node_modules/.cache .next`; deps: `rm -rf node_modules && npm ci` ou o do gerenciador (lockfile fica). (ECC build-error-resolver; medido TS 5.9)
+- Erro de módulo (ESM/CJS, `paths`, `.ts` direto) e `TS7016` → `dominios/node-referencia.md`.
+- Tipo incompatível/`possibly 'undefined'` → corrija, guard ou schema; sem calar com `any`/`as`/`@ts-ignore` (inevitável: `@ts-expect-error` + motivo). (ECC build-error-resolver, ECC typescript-reviewer; medido TS 5.9)
 - Não afrouxe `tsconfig` (`strict`…), eslint, prettier ou biome pra passar. (ECC typescript-reviewer, ECC config-protection; hook cbs-config-protect, exceto `tsconfig.json`)
 
 ## Loop obrigatório de validação (antes de Ready for Review)

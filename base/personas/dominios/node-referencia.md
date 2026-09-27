@@ -20,6 +20,8 @@ Complemento de `node.md` (mesma licença: CC-BY-SA-4.0). Lido por caminho quando
 - Nome com 3 partes: unidade → cenário → resultado esperado. AAA. Cada teste cria seu próprio dado; sem fixture global mutável. Tempo/aleatoriedade controlados (`vi.useFakeTimers`/`jest.useFakeTimers`).
 - Middleware pesado testado isolado com `{req,res,next}` stub.
 
-## Build quebrado (erro de módulo)
-- `TS2835` (relativo sem extensão em `node16`/`nodenext`) → `./x.js`. `TS1479`/`ERR_REQUIRE_ESM` (CJS importando só-ESM) → `import()` ou `module: nodenext` (TS ≥5.8, Node ≥20.19/22.12); sem trocar o `type`. (ECC build-error-resolver)
-- `paths` só vale no `tsc`: `ERR_MODULE_NOT_FOUND` em `@/…` no `node` → o resolvedor do projeto (`imports` `#…`, bundler, `tsx`). `Cannot find module` → caminho, `paths` ou pacote ausente. (ECC build-error-resolver)
+## Build quebrado (erro de módulo, `.ts` direto, tipos ausentes)
+- `TS2835` (relativo sem extensão em `node16`/`nodenext`) → a extensão que os imports do projeto já usam: `./x.js` quando compila pra `.js`; `./x.ts` quando roda `.ts` direto (type stripping, Node ≥22.18; tsconfig com `allowImportingTsExtensions` ou `rewriteRelativeImportExtensions`). Sem extensão, o `node` dá `ERR_MODULE_NOT_FOUND`. (ECC build-error-resolver; medido TS 5.9/Node 24)
+- `TS1479`/`ERR_REQUIRE_ESM` (CJS importando só-ESM) → `import()` ou `module: nodenext` (TS ≥5.8, Node ≥20.19/22.12); sem trocar o `type`. (ECC build-error-resolver; medido TS 5.9/Node 24)
+- `paths` só vale no `tsc`: `ERR_MODULE_NOT_FOUND` em `@/…` no `node` → o resolvedor do projeto (`imports` `#…`, bundler, `tsx`). `Cannot find module` → caminho, `paths` ou pacote ausente. (ECC build-error-resolver; medido TS 5.9/Node 24)
+- `TS7016` (sem declaração) → `@types/<pacote>` em devDependencies (sem tipos publicados: `.d.ts` com `declare module`). (ECC build-error-resolver; medido TS 5.9)
