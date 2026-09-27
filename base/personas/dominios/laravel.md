@@ -97,7 +97,7 @@ Cole a saída resumida no Dev Agent Record. Ambiente sem PHP/banco → declare e
 - `composer validate`, `composer dump-autoload -o`; `php artisan optimize:clear` → `config:cache`/`route:cache`/`view:cache`, e `optimize:clear` ao terminar. (ECC laravel-verification)
 - `Class "X" not found`: `use`/namespace errado, pacote não instalado ou autoload velho. (ECC build-error-resolver, ECC rules/php/coding-style)
 - Tipo incompatível ou "on null" no phpstan: corrija o tipo ou faça null check; não alargue pra `mixed`. (ECC build-error-resolver, ECC php-reviewer)
-- Não afrouxe `phpstan.neon`/baseline/`pint.json` pra passar — corrija o código. (ECC config-protection; hook cbs-config-protection)
+- Não afrouxe `phpstan.neon`/baseline/`pint.json` pra passar — corrija o código. (ECC config-protection; hook cbs-config-protect)
 
 ## Saída esperada (além do @dev)
 - Bloco "Convenções Laravel detectadas".
