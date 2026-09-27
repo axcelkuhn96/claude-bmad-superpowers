@@ -1,4 +1,6 @@
 // test/hooks.test.js — hooks CBS (base/hooks): decisões em unidade + E2E com payload JSON real.
+// Casos do cbs-no-verify portados de affaan-m/ECC @ e482e57, tests/hooks/block-no-verify.test.js — MIT License,
+// Copyright (c) 2026 Affaan Mustafa. Licença: https://github.com/affaan-m/ECC/blob/e482e57/LICENSE
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -113,5 +115,66 @@ describe('cbs-comum', () => {
   });
   test('ehEntrada é falso quando o módulo é importado', () => {
     assert.equal(comum.ehEntrada(pathToFileURL(path.join(HOOKS, 'cbs-comum.js')).href), false);
+  });
+});
+
+const noVerify = await import(pathToFileURL(path.join(HOOKS, 'cbs-no-verify.js')).href);
+describe('cbs-no-verify', () => {
+  const BLOQUEIA = [
+    'git commit --no-verify -m "msg"',
+    'git commit -n -m "msg"',
+    'git -c core.hooksPath=/dev/null commit -m "msg"',
+    'git -c "core.hooksPath=/dev/null" commit -m "msg"',
+    'git -c core.HOOKSPATH=/dev/null commit -m "msg"',
+    'git log -n 5 && git commit --no-verify -m "msg"',
+    'git commit "--no-verify" -m "msg"',
+    'git commit -m "msg" && git push --no-verify',
+    'git push --no-verify',
+    'git commit -an -m "msg"',
+    'git commit -sn -m "msg"',
+    'git commit -nu -m "msg"',
+    'git commit --no-veri -m "msg"',
+    'git push --no-verif origin main',
+    'git merge --no-verify feature',
+    'git rebase --no-verify main',
+    'git cherry-pick --no-verify abc123',
+    'git am --no-verify 0001.patch',
+  ];
+  const LIBERA = [
+    'git commit -m "hello"',
+    'git log -n 10 && git commit -m "msg"',
+    'echo --no-verify && git commit -m "msg"',
+    'git commit -m "fix: --no-verify edge case"',
+    "git commit -m 'fix: --no-verify edge case'",
+    'git commit -m "Fixed -n bug in module"',
+    'git commit -am "--no-verify"',
+    'git commit -mn',
+    'git commit -m "doc: explain git push --no-verify risk"',
+    'git push origin commit',
+    'git commit -tn -m "msg"',
+    'git commit -uno -m "msg"',
+    'git commit -Sn -m "msg"',
+    'git commit --no-verbose -m "msg"',
+    'npm test -- --no-verify',
+    'ls -la',
+  ];
+  for (const c of BLOQUEIA) test(`bloqueia: ${c}`, () => assert.equal(noVerify.checarComando(c).bloquear, true));
+  for (const c of LIBERA) test(`libera: ${c}`, () => assert.equal(noVerify.checarComando(c).bloquear, false));
+  test('motivo cita o subcomando git', () => assert.match(noVerify.checarComando('git commit -m x && git push --no-verify').motivo, /git push/));
+  test('E2E: bloqueio sai 2 com motivo no stderr e stdout vazio', () => {
+    const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } });
+    assert.equal(r.code, 2); assert.equal(r.out, ''); assert.match(r.err, /no-verify/);
+  });
+  test('E2E: comando sem git sai 0 em silêncio', () => {
+    const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: 'ls' } });
+    assert.equal(r.code, 0); assert.equal(r.out, ''); assert.equal(r.err, '');
+  });
+  test('E2E: payload inválido sai 0 em silêncio', () => {
+    const r = rodarHook('cbs-no-verify.js', '{');
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
+  });
+  test('E2E: CBS_HOOKS_DESLIGADOS=no-verify libera', () => {
+    const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } }, { CBS_HOOKS_DESLIGADOS: 'no-verify' });
+    assert.equal(r.code, 0);
   });
 });
