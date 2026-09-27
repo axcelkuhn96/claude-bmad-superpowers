@@ -363,4 +363,47 @@ describe('cbs-config-protect', () => {
     const r = rodarHook('cbs-config-protect.js', wr(p, 'pyproject.toml', 'x'.repeat(comum.LIMITE_STDIN)));
     assert.equal(r.code, 2); assert.match(r.err, /CBS_PERMITIR_CONFIG=1/);
   });
+  // Fix round 3: cada ponto em que a simulação pode divergir da ferramenta real fecha (re-review 2 da Task 5).
+  test('pyproject: [[tool]]/[tool] (prefixo de tool.ruff/tool.mypy) inserido ou mudado bloqueia', (t) => {
+    const d = py(t, '[project]\nname = "x"\n# nota\n\n[tool.ruff]\nline-length = 100\n\n[tool.mypy]\nstrict = true\n');
+    assert.equal(av(ed(d, 'pyproject.toml', '# nota', '# nota\n[[tool]]')).bloquear, true);
+    assert.equal(av(ed(d, 'pyproject.toml', '# nota', '# nota\n[tool]')).bloquear, true);
+    assert.equal(av(ed(d, 'pyproject.toml', '[tool.ruff]', '[[tool.ruff]]')).bloquear, true);
+    assert.equal(av(ed(d, 'pyproject.toml', '# nota', '# outra nota')).bloquear, false);
+  });
+  test('Edit com new_string vazio: confere também a leitura que apaga o \\n seguinte (Claude Code)', (t) => {
+    const d = py(t, '[project]\nname = "x"\n# see\n[tool.mypy]\nstrict = true\n');
+    assert.equal(av(ed(d, 'pyproject.toml', 'see', '')).bloquear, true);
+    const e = py(t, '[project]\nname = "x"\nversion = "0"\n\n[tool.mypy]\nstrict = true\n');
+    assert.equal(av(ed(e, 'pyproject.toml', 'version = "0"', '')).bloquear, false);
+    const multi = { cwd: d, tool_name: 'MultiEdit', tool_input: { file_path: 'pyproject.toml', edits: [
+      { old_string: 'name = "x"', new_string: 'name = "y"' }, { old_string: 'see', new_string: '' }] } };
+    assert.equal(av(multi).bloquear, true);
+  });
+  test('apply_patch: cabeçalho com espaço Unicode (U+0085, U+FEFF) à esquerda conta como tocando o arquivo', (t) => {
+    const p = projeto(t);
+    const nel = String.fromCharCode(0x85); const bom = String.fromCharCode(0xfeff);
+    assert.equal(av(ap(p, `${nel}*** Update File: pyproject.toml\n@@\n-line-length = 100\n+line-length = 200`)).bloquear, true);
+    assert.equal(av(ap(p, `${bom}*** Update File: .eslintrc.json\n@@\n-{"rules":{}}\n+{}`)).bloquear, true);
+  });
+  test('apply_patch: linha de contexto " *** End Patch" não encerra o patch (parser linha a linha)', (t) => {
+    const p = projeto(t); escrever(p, 'docs.md', 'foo\n*** End Patch\n');
+    const corpo = '*** Update File: pyproject.toml\n@@\n-name = "x"\n+name = "y"\n*** Update File: docs.md\n@@\n foo\n *** End Patch\n'
+      + '*** Update File: pyproject.toml\n@@\n-line-length = 100\n+line-length = 200';
+    assert.equal(av(ap(p, corpo)).bloquear, true);
+  });
+  test('apply_patch grande (pyproject 39 KB + patch 23 KB) decide em menos de 3 s', (t) => {
+    const d = py(t, '[project]\nname = "x"\ndeps = [\n' + '"x",\n'.repeat(8000) + '"x-",\n]\n\n[tool.ruff]\nline-length = 100\n');
+    const hifen = String.fromCharCode(0x2010);
+    for (const [ultima, esperado] of [[`-"x${hifen}",`, false], ['-"nope",', true]]) {
+      const ini = Date.now();
+      assert.equal(av(upd(d, '@@\n' + '-"x",\n'.repeat(4000) + ultima + '\n+"y",')).bloquear, esperado, ultima);
+      assert.ok(Date.now() - ini < 3000, `${Date.now() - ini} ms`);
+    }
+  });
+  test('orçamento de tempo estourado bloqueia com a escape na mensagem (fail closed)', (t) => {
+    const p = projeto(t);
+    const r = cp.avaliarEdicao(upd(p, '@@\n-name = "x"\n+name = "y"'), { env: {}, prazoMs: 0 });
+    assert.equal(r.bloquear, true); assert.match(r.motivo, /CBS_PERMITIR_CONFIG=1/);
+  });
 });

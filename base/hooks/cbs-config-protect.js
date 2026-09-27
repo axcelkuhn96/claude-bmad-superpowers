@@ -43,6 +43,15 @@ function existeNoDisco(p) {
   try { fs.lstatSync(p); return true; } catch (e) { return !(e && e.code === 'ENOENT'); }
 }
 
+
+// ---- orçamento de tempo: estourou → bloqueia (o timeout do hook, ao contrário, deixaria passar) ----
+const PRAZO_MS = 3000;
+class Prazo extends Error {}
+let limite = Infinity;
+function prazo() {
+  if (Date.now() >= limite) throw new Prazo();
+}
+
 // ---- pyproject.toml: [tool.ruff*]/[tool.mypy*] comparadas antes/depois da edição ----
 
 // Fim da string TOML que começa em i ("..", '..', """..""", '''..'''); string de uma linha para no \n.
@@ -65,6 +74,7 @@ function declaracoes(toml) {
   let tabela = '';
   for (let i = 0; i < s.length;) {
     if (' \t\n'.includes(s[i])) { i++; continue; }
+    prazo();
     const ini = i;
     let prof = 0;
     while (i < s.length && (s[i] !== '\n' || prof > 0)) {
@@ -78,53 +88,127 @@ function declaracoes(toml) {
     const cabecalho = texto[0] === '[';
     const nome = (cabecalho ? /^\[\[?([^\]]*)/.exec(texto)[1] : texto.split('=')[0]).replace(/["'\s]/g, '');
     if (cabecalho) tabela = nome;
-    out.push({ texto, cabecalho, chave: cabecalho || !tabela ? nome : `${tabela}.${nome}` });
+    out.push({ texto, chave: cabecalho || !tabela ? nome : `${tabela}.${nome}` });
   }
   return out;
 }
-// [tool.ruff*], [tool.mypy*] (e [[tool.mypy.overrides]]), tool.ruff.x = na raiz, ruff.x = em [tool], `tool = {..}`
-// inline na raiz; chave com escape (\u..) conta como protegida (fail closed).
-const protegida = (d) => /^tool\.(?:ruff|mypy)/.test(d.chave) || d.chave.includes('\\') || (!d.cabecalho && d.chave === 'tool');
+// Protegida: chave completa sob tool.ruff/tool.mypy ou prefixo delas — `[tool]`, `[[tool]]`, `tool = {..}` mudam onde
+// tool.ruff/tool.mypy moram; `[[tool.ruff]]` já cai no primeiro caso. Chave com escape (\u..) também (fail closed).
+const protegida = (d) => /^tool(?:$|\.(?:ruff|mypy))/.test(d.chave) || d.chave.includes('\\');
 // Texto das declarações protegidas de um pyproject.toml.
 export function secoesProtegidas(toml) {
   return declaracoes(toml).filter(protegida).map((d) => d.texto).join('\n');
 }
 
-// Edit do Claude Code: old_string tem de existir uma vez (ou replace_all). null = não aplica.
+// Edit do Claude Code: old_string tem de existir uma vez (ou replace_all). Devolve as leituras possíveis (null = não
+// aplica): com new_string vazio o Claude Code também apaga o \n seguinte ao trecho — as duas leituras são conferidas.
 function aplicarEdit(texto, e) {
   const lf = (v) => (typeof v === 'string' ? v.replace(/\r\n/g, '\n') : null);
   const [t, velho, novo] = [lf(texto), lf(e?.old_string), lf(e?.new_string)];
   if (t === null || velho === null || novo === null) return null;
-  if (!velho) return t.trim() ? null : novo;
+  if (!velho) return t.trim() ? null : [novo];
   const partes = t.split(velho);
   if (partes.length < 2 || (partes.length > 2 && e.replace_all !== true)) return null;
-  return partes.join(novo);
+  const leituras = [partes.join(novo)];
+  if (!novo && !velho.endsWith('\n') && t.includes(velho + '\n')) {
+    const p2 = t.split(velho + '\n');
+    leituras.push(e.replace_all === true ? p2.join('') : p2[0] + p2.slice(1).join(velho + '\n'));
+  }
+  return leituras;
+}
+// Edits em sequência (Edit = 1, MultiEdit = n). Leitura em que um edit não aplica sai (nela o Claude Code falharia
+// sem mudar nada); nenhuma sobra → não aplica.
+function aplicarEdits(texto, edits) {
+  let atuais = [texto];
+  for (const e of edits) {
+    atuais = [...new Set(atuais.flatMap((t) => aplicarEdit(t, e) || []))];
+    if (atuais.length > 64) throw new Prazo();
+  }
+  return atuais;
 }
 
 // ---- apply_patch do Codex: parser e aplicação compatíveis (codex-rs apply-patch: parser.rs, lib.rs, seek_sequence.rs) ----
+// Espaço do Rust (`char::is_whitespace` = Unicode White_Space): é o que o Codex apara. `bom`: também U+FEFF (o trim
+// do JS) — só nos cabeçalhos, onde reconhecer a mais só faz o hook conferir a mais.
+const ESPACO_RUST = new Set([9, 10, 11, 12, 13, 32, 0x85, 0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005,
+  0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000]);
+function aparar(s, inicio, bom) {
+  const esp = (c) => ESPACO_RUST.has(c) || (bom && c === 0xfeff);
+  let a = 0;
+  let b = s.length;
+  while (b > a && esp(s.charCodeAt(b - 1))) b--;
+  while (inicio && a < b && esp(s.charCodeAt(a))) a++;
+  return s.slice(a, b);
+}
+// Pontuação Unicode → ASCII do 4º nível do seek_sequence.
+const PONTUACAO = new Map([
+  [[0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015, 0x2212], '-'], [[0x2018, 0x2019, 0x201a, 0x201b], "'"],
+  [[0x201c, 0x201d, 0x201e, 0x201f], '"'],
+  [[0xa0, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x202f, 0x205f, 0x3000], ' '],
+].flatMap(([cs, r]) => cs.map((c) => [String.fromCharCode(c), r])));
 const NIVEIS = [
-  (s) => s, (s) => s.trimEnd(), (s) => s.trim(),
-  (s) => s.trim().replace(/[\u2010-\u2015\u2212]/g, '-').replace(/[\u2018-\u201B]/g, "'").replace(/[\u201C-\u201F]/g, '"')
-    .replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, ' '),
+  (s) => s, (s) => aparar(s, false), (s) => aparar(s, true),
+  (s) => [...aparar(s, true)].map((c) => PONTUACAO.get(c) ?? c).join(''),
 ];
+// Linhas do arquivo normalizadas por nível + índice linha → posições (calculado uma vez por arquivo).
+const cacheNiveis = new WeakMap();
+function nivel(linhas, n) {
+  let c = cacheNiveis.get(linhas);
+  if (!c) cacheNiveis.set(linhas, (c = []));
+  if (!c[n]) {
+    const norm = linhas.map(NIVEIS[n]);
+    const pos = new Map();
+    norm.forEach((l, i) => { const v = pos.get(l); if (v) v.push(i); else pos.set(l, [i]); });
+    c[n] = { norm, pos };
+  }
+  return c[n];
+}
+// seek_sequence: 1ª posição >= de onde o alvo casa, nível a nível. Só verifica as posições da linha mais rara do alvo.
 function buscar(linhas, alvo, de, fim) {
   if (!alvo.length) return de;
   if (alvo.length > linhas.length) return -1;
   const ini = fim ? linhas.length - alvo.length : de;
-  for (const norm of NIVEIS) {
-    for (let i = ini; i + alvo.length <= linhas.length; i++) {
-      if (alvo.every((l, k) => norm(linhas[i + k]) === norm(l))) return i;
+  const max = linhas.length - alvo.length;
+  for (let n = 0; n < NIVEIS.length; n++) {
+    prazo();
+    const { norm, pos } = nivel(linhas, n);
+    const a = alvo.map(NIVEIS[n]);
+    let ancora = 0;
+    let menor = Infinity;
+    for (let k = 0; k < a.length && menor; k++) {
+      const q = pos.get(a[k])?.length ?? 0;
+      if (q < menor) { menor = q; ancora = k; }
+    }
+    if (!menor) continue;
+    for (const p of pos.get(a[ancora])) {
+      const i = p - ancora;
+      if (i < ini) continue;
+      if (i > max) break;
+      prazo();
+      let k = 0;
+      while (k < a.length && norm[i + k] === a[k]) k++;
+      if (k === a.length) return i;
     }
   }
   return -1;
 }
-// Operações do corpo de um patch (entre Begin e End Patch). null = o Codex rejeitaria o patch.
-function operacoes(corpo, cwd) {
-  const linhas = corpo.split('\n');
+// Operações dos patches de um texto, linha a linha como o parser do Codex: o patch começa na linha que termina em
+// "*** Begin Patch" e acaba em "*** End Patch" em posição de cabeçalho (" *** End Patch" num hunk é contexto).
+// null = o Codex rejeitaria.
+function operacoes(texto, cwd) {
+  const linhas = texto.replace(/\r\n/g, '\n').split('\n');
   const ops = [];
   const abs = (p) => path.resolve(cwd, p);
+  let dentro = false;
+  let achou = false;
   for (let i = 0; i < linhas.length;) {
-    const cab = linhas[i++].trim();
+    const cab = aparar(linhas[i++], true, true);
+    if (!dentro) {
+      if (cab.endsWith('*** Begin Patch')) dentro = achou = true;
+      else if (achou && cab.startsWith('*** ')) return null; // cabeçalho depois do End Patch: o Codex rejeita
+      continue;
+    }
+    if (cab === '*** End Patch') { dentro = false; continue; }
     if (cab.startsWith('*** Add File: ')) {
       let conteudo = '';
       for (; i < linhas.length && linhas[i].startsWith('+'); i++) conteudo += linhas[i].slice(1) + '\n';
@@ -135,10 +219,10 @@ function operacoes(corpo, cwd) {
       const op = { tipo: 'Update', arquivo: abs(cab.slice(17)), destino: null, hunks: [] };
       if (linhas[i]?.startsWith('*** Move to: ')) op.destino = abs(linhas[i++].slice(13));
       while (i < linhas.length && !linhas[i].startsWith('***')) {
-        if (!linhas[i].trim()) { i++; continue; }
+        if (!aparar(linhas[i], true, true)) { i++; continue; }
         const h = { ctx: null, ctxVazio: false, velho: [], novo: [], fim: false };
         // "@@" + só espaço: sem contexto no Codex 0.156 (medido); versões antigas liam contexto = linha em branco
-        if (linhas[i].trimEnd() === '@@') h.ctxVazio = linhas[i++] !== '@@';
+        if (aparar(linhas[i], false) === '@@') h.ctxVazio = linhas[i++] !== '@@';
         else if (linhas[i].startsWith('@@ ')) h.ctx = linhas[i++].slice(3);
         else if (op.hunks.length) return null;
         let n = 0;
@@ -157,7 +241,7 @@ function operacoes(corpo, cwd) {
       ops.push(op);
     } else return null;
   }
-  return ops;
+  return achou && !dentro ? ops : null;
 }
 // Conteúdo depois dos hunks (compute_replacements + apply_replacements). null = não aplica.
 // `antigo`: lê "@@ " como contexto linha em branco (Codex antigo).
@@ -188,27 +272,39 @@ function aplicarHunks(texto, hunks, antigo) {
   if (linhas[linhas.length - 1] !== '') linhas.push('');
   return linhas.join('\n');
 }
-// Operações de todos os patches do payload (input, patch, command). undefined = sem patch; null = patch inválido.
-function opsDoPayload(payload, cwd) {
+// Textos do payload que trazem patch (input, patch, command).
+function textosDePatch(payload) {
   const ti = payload.tool_input || {};
-  const textos = [ti.input, ti.patch, comandoBash(payload)].filter((v) => typeof v === 'string' && v.includes('*** Begin Patch'));
+  return [ti.input, ti.patch, comandoBash(payload)].filter((v) => typeof v === 'string' && v.includes('*** Begin Patch'));
+}
+// Operações de todos os patches. undefined = sem patch; null = patch que o Codex rejeitaria.
+function opsDoPayload(textos, cwd) {
   if (!textos.length) return undefined;
   const ops = [];
   for (const t of textos) {
-    const corpos = [...t.replace(/\r\n/g, '\n').matchAll(/\*\*\* Begin Patch[^\n]*\n([\s\S]*?)\n[ \t]*\*\*\* End Patch/g)];
-    if (!corpos.length) return null;
-    for (const [, corpo] of corpos) {
-      const o = operacoes(corpo, cwd);
-      if (!o) return null;
-      ops.push(...o);
-    }
+    const o = operacoes(t, cwd);
+    if (!o) return null;
+    ops.push(...o);
   }
   return ops;
+}
+// Toda linha com cara de cabeçalho de patch (aparada como o Rust + U+FEFF) conta como tocando o arquivo, mesmo onde
+// o parser não chega (fail closed).
+function caminhosCitados(textos, cwd) {
+  const out = [];
+  for (const t of textos) {
+    for (const l of t.split('\n')) {
+      const m = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$/.exec(aparar(l, true, true));
+      if (m) out.push(path.resolve(cwd, m[1]));
+    }
+  }
+  return out;
 }
 // Aplica as operações em memória, na ordem do Codex: Map chave → conteúdo (null = apagado). null = não aplica.
 function simular(ops, antigo) {
   const vfs = new Map();
   for (const op of ops) {
+    prazo();
     const k = chave(op.arquivo);
     if (op.tipo !== 'Update') { vfs.set(k, op.tipo === 'Add' ? op.conteudo : null); continue; }
     const atual = vfs.has(k) ? vfs.get(k) : existeNoDisco(op.arquivo) ? lerTexto(op.arquivo) : null;
@@ -220,13 +316,13 @@ function simular(ops, antigo) {
   return vfs;
 }
 
-export function avaliarEdicao(payload, { env = process.env } = {}) {
-  if (String(env.CBS_PERMITIR_CONFIG || '') === '1') return { bloquear: false };
-  const ti = payload?.tool_input || {};
-  const cwd = typeof payload?.cwd === 'string' && payload.cwd ? payload.cwd : process.cwd();
-  const ops = opsDoPayload(payload || {}, cwd);
-  // união com o parser do Codex: pega cabeçalho indentado, que o Codex apara
-  const caminhos = new Set(caminhosEditados(payload));
+function avaliar(payload) {
+  const ti = payload.tool_input || {};
+  const cwd = typeof payload.cwd === 'string' && payload.cwd ? payload.cwd : process.cwd();
+  const textos = textosDePatch(payload);
+  const ops = opsDoPayload(textos, cwd);
+  // união: caminhos do cbs-comum, do parser do Codex e de toda linha com cara de cabeçalho
+  const caminhos = new Set([...caminhosEditados(payload), ...caminhosCitados(textos, cwd)]);
   for (const op of ops || []) for (const p of [op.arquivo, op.destino]) if (p) caminhos.add(p);
   let vfss;
   for (const arquivo of caminhos) {
@@ -243,16 +339,30 @@ export function avaliarEdicao(payload, { env = process.env } = {}) {
       vfss ??= ops ? [simular(ops, false), simular(ops, true)].filter(Boolean) : [];
       depois = vfss.filter((v) => v.has(chave(arquivo))).map((v) => v.get(chave(arquivo)) ?? '');
     } else if (typeof ti.content === 'string') depois = [ti.content];
-    else if (Array.isArray(ti.edits)) depois = [ti.edits.reduce((t, e) => (t === null ? null : aplicarEdit(t, e)), antes)];
-    else depois = [aplicarEdit(antes, ti)];
-    if (!depois.length || depois.some((d) => typeof d !== 'string')) {
+    else depois = aplicarEdits(antes, Array.isArray(ti.edits) ? ti.edits : [ti]);
+    if (!depois.length) {
       return { bloquear: true, motivo: msg('pyproject.toml (a edição não aplica no conteúdo atual; não dá para conferir [tool.ruff]/[tool.mypy])') };
     }
-    if (depois.some((d) => secoesProtegidas(d) !== secoesProtegidas(antes))) {
+    const secoes = secoesProtegidas(antes);
+    if (depois.some((d) => secoesProtegidas(d) !== secoes)) {
       return { bloquear: true, motivo: msg('pyproject.toml [tool.ruff]/[tool.mypy]') };
     }
   }
   return { bloquear: false };
+}
+
+// `prazoMs`: orçamento da análise (padrão 3 s); estourou → bloqueia.
+export function avaliarEdicao(payload, { env = process.env, prazoMs = PRAZO_MS } = {}) {
+  if (String(env.CBS_PERMITIR_CONFIG || '') === '1') return { bloquear: false };
+  limite = Date.now() + prazoMs;
+  try {
+    return avaliar(payload || {});
+  } catch (e) {
+    if (!(e instanceof Prazo)) throw e;
+    return { bloquear: true, motivo: msg(`pyproject.toml (edição grande demais para conferir [tool.ruff]/[tool.mypy] em ${prazoMs / 1000} s)`) };
+  } finally {
+    limite = Infinity;
+  }
 }
 
 function main() {
