@@ -263,7 +263,8 @@ describe('cbs-config-protect', () => {
     assert.equal(av(ap(p, '*** Update File: x.json\n*** Move to: .eslintrc.json')).bloquear, true);
     assert.equal(av(ap(p, '*** Add File: .eslintrc.json\n+{}')).bloquear, true);
     const q = tmpDoTeste(t, 'cbs-config-'); escrever(q, 'pyproject.toml', '[project]\nname = "x"\n'); escrever(q, 'tmp.toml', '[project]\nname = "y"\n');
-    assert.equal(av(ap(q, '*** Update File: tmp.toml\n*** Move to: pyproject.toml')).bloquear, false);
+    // Update sem hunk o Codex rejeita ("hunk is empty"): o Move precisa de um hunk para ser um patch válido
+    assert.equal(av(ap(q, '*** Update File: tmp.toml\n*** Move to: pyproject.toml\n@@\n-name = "y"\n+name = "z"')).bloquear, false);
   });
   test('apply_patch com CRLF em pyproject: hunk em [tool.ruff] bloqueia', (t) => {
     const p = projeto(t);
@@ -300,5 +301,66 @@ describe('cbs-config-protect', () => {
     assert.equal(av(ed(p, '.ESLINTRC.JSON')).bloquear, false);
     fs.linkSync(path.join(p, 'pint.json'), path.join(p, 'PINT.json'));
     assert.equal(av(ed(p, 'PINT.json')).bloquear, true);
+  });
+  // Fix round 2: comparação antes/depois das seções protegidas (re-review da Task 5).
+  const py = (t, texto) => { const d = tmpDoTeste(t, 'cbs-config-'); escrever(d, 'pyproject.toml', texto); return d; };
+  const upd = (d, corpo) => ap(d, `*** Update File: pyproject.toml\n${corpo}`);
+  test('apply_patch: linha em branco de [tool.mypy] trocada por cabeçalho novo tira chaves da seção → bloqueia', (t) => {
+    const d = py(t, '[project]\nname = "x"\n\n[tool.mypy]\nstrict = true\n\nwarn_unused_ignores = true\ndisallow_untyped_defs = true\n');
+    assert.equal(av(upd(d, '@@ strict = true\n-\n+[tool.x]')).bloquear, true);
+  });
+  test('apply_patch: linha vazia no hunk é contexto em branco (Codex), não acréscimo no fim → bloqueia', (t) => {
+    const d = py(t, '[tool.mypy]\nstrict = true\n\n[project]\nname = "x"\n');
+    assert.equal(av(upd(d, '@@ strict = true\n\n+ignore_missing_imports = true')).bloquear, true);
+  });
+  // "@@ " (espaço à direita): Codex 0.156 lê sem contexto (medido); versões antigas, contexto = 1ª linha em branco.
+  // Bloqueia se QUALQUER das duas leituras mexe em [tool.ruff]; passa quando as duas caem fora.
+  test('apply_patch: "@@ " com espaço — as duas leituras do Codex são conferidas', (t) => {
+    assert.equal(av(upd(py(t, '[project]\nx = 1\n\n[tool.ruff]\nx = 1\n'), '@@ \n-x = 1\n+x = 2')).bloquear, true);
+    assert.equal(av(upd(py(t, '[tool.ruff]\nx = 1\n\n[tool.other]\nx = 1\n'), '@@ \n-x = 1\n+x = 2')).bloquear, true);
+    assert.equal(av(upd(py(t, '[project]\nx = 1\n\n[tool.other]\nx = 1\n\n[tool.ruff]\ny = 1\n'), '@@ \n-x = 1\n+x = 2')).bloquear, false);
+  });
+  test('apply_patch: cabeçalho *** Update File: indentado (o Codex apara) bloqueia', (t) => {
+    const p = projeto(t);
+    assert.equal(av(ap(p, '  *** Update File: pyproject.toml\n@@\n-line-length = 100\n+line-length = 200')).bloquear, true);
+  });
+  test('pyproject: chaves pontilhadas tool.ruff.x na raiz e mypy.x em [tool] são protegidas', (t) => {
+    const d = py(t, 'tool.ruff.line-length = 100\n\n[project]\nname = "x"\n');
+    assert.equal(av(ed(d, 'pyproject.toml', 'line-length = 100', 'line-length = 200')).bloquear, true);
+    assert.equal(av(ed(d, 'pyproject.toml', 'name = "x"', 'name = "y"')).bloquear, false);
+    const e = py(t, '[project]\nname = "x"\n\n[tool]\nmypy.strict = true\n');
+    assert.equal(av(ed(e, 'pyproject.toml', 'mypy.strict = true', 'mypy.strict = false')).bloquear, true);
+  });
+  test('pyproject: linha de array começando com [ dentro de [tool.mypy] não encerra a seção', (t) => {
+    const d = py(t, '[tool.mypy]\nplugins = [\n  ["a"]\n]\nstrict = true\n');
+    assert.equal(av(ed(d, 'pyproject.toml', 'strict = true', 'strict = false')).bloquear, true);
+  });
+  test('pyproject: edição que não aplica no conteúdo atual bloqueia (Edit, MultiEdit, apply_patch)', (t) => {
+    const p = projeto(t);
+    assert.equal(av(ed(p, 'pyproject.toml', 'nao existe', 'x')).bloquear, true);
+    const multi = { cwd: p, tool_name: 'MultiEdit', tool_input: { file_path: 'pyproject.toml', edits: [
+      { old_string: 'name = "x"', new_string: 'name = "y"' }, { old_string: 'nao existe', new_string: 'x' }] } };
+    assert.equal(av(multi).bloquear, true);
+    assert.equal(av(upd(p, '@@\n-nao existe\n+x = 1')).bloquear, true);
+  });
+  test('pyproject: Edit com replace_all aplica em todas as ocorrências', (t) => {
+    const d = py(t, '[project]\nv = "1"\n\n[tool.ruff]\nv = "1"\n');
+    assert.equal(av({ cwd: d, tool_name: 'Edit', tool_input: { file_path: 'pyproject.toml', old_string: 'v = "1"', new_string: 'v = "2"', replace_all: true } }).bloquear, true);
+    const e = py(t, '[project]\nv = "1"\nw = "1"\n\n[tool.ruff]\nx = 1\n');
+    assert.equal(av({ cwd: e, tool_name: 'Edit', tool_input: { file_path: 'pyproject.toml', old_string: '"1"', new_string: '"2"', replace_all: true } }).bloquear, false);
+  });
+  test('variante de caixa via symlink para o mesmo alvo da config bloqueia (stat, não lstat)', { skip: !POSIX && 'POSIX' }, (t) => {
+    const p = projeto(t);
+    if (fs.existsSync(path.join(p, '.ESLINTRC.JSON'))) return; // FS case-insensitive: coberto pelo teste anterior
+    escrever(p, 'compartilhado.json', '{}');
+    fs.rmSync(path.join(p, '.eslintrc.json'));
+    fs.symlinkSync(path.join(p, 'compartilhado.json'), path.join(p, '.eslintrc.json'));
+    fs.symlinkSync(path.join(p, 'compartilhado.json'), path.join(p, '.ESLINTRC.JSON'));
+    assert.equal(av(ed(p, '.ESLINTRC.JSON')).bloquear, true);
+  });
+  test('E2E: payload acima de 16 MiB para pyproject.toml bloqueia', (t) => {
+    const p = projeto(t);
+    const r = rodarHook('cbs-config-protect.js', wr(p, 'pyproject.toml', 'x'.repeat(comum.LIMITE_STDIN)));
+    assert.equal(r.code, 2); assert.match(r.err, /CBS_PERMITIR_CONFIG=1/);
   });
 });
