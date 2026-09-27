@@ -57,6 +57,9 @@ function hooksCbs(settings) {
   return out.sort();
 }
 const HOOKS_ESPERADOS = ['PostToolUse:cbs-format.js', 'PreToolUse:cbs-config-protect.js', 'PreToolUse:cbs-no-verify.js', 'Stop:cbs-typecheck.js'];
+// arquivos instalados em ~/.claude/hooks (com marcador). TODO(T5): + 'cbs-config-protect.js' quando a T5 for mesclada.
+const HOOKS_ARQUIVOS = ['cbs-comum.js', 'cbs-format.js', 'cbs-no-verify.js', 'cbs-typecheck.js', 'cbs-node.sh'];
+const WIN = process.platform === 'win32';
 
 before(async () => {
   homeTmp = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-smoke-'));
@@ -190,15 +193,13 @@ assert.ok(cmdsBase.includes('blindar.md'), 'command /blindar no base');
   }
   assert.ok(await existe(path.join(claude, 'cbs-overrides', 'agents')), 'cbs-overrides/agents/ criado');
 
-  // hooks: todo arquivo de base/hooks (menos package.json) com marcador + package.json ESM + 4 entradas no settings.json, rtk intacto, backup
-  const hooksBase = (await fs.readdir(path.join(BASE, 'hooks'))).filter((n) => n !== 'package.json');
-  for (const h of ['cbs-comum.js', 'cbs-no-verify.js', 'cbs-node.sh']) assert.ok(hooksBase.includes(h), `${h} no base`);
-  for (const h of hooksBase) {
+  // hooks: arquivos com marcador + package.json ESM + 4 entradas no settings.json, rtk intacto, backup
+  for (const h of HOOKS_ARQUIVOS) {
     const p = path.join(claude, 'hooks', h);
     assert.ok(await existe(p), `hook ${h} copiado`);
     assert.match(await fs.readFile(p, 'utf8'), new RegExp(MARCADOR), `marcador em ${h}`);
   }
-  assert.equal(spawnSync('/bin/sh', ['-n', path.join(claude, 'hooks', 'cbs-node.sh')]).status, 0, 'launcher com marcador continua sh válido');
+  if (!WIN) assert.equal(spawnSync('/bin/sh', ['-n', path.join(claude, 'hooks', 'cbs-node.sh')]).status, 0, 'launcher com marcador continua sh válido');
   assert.equal(await fs.readFile(path.join(claude, 'hooks', '.cbs-node-path'), 'utf8'), `${process.execPath}\n`, 'node do instalador gravado pro launcher');
   assert.match(await fs.readFile(path.join(claude, 'hooks', 'package.json'), 'utf8'), /"type":\s*"module"/);
   const settings = await lerJson(path.join(claude, 'settings.json'));
@@ -270,8 +271,8 @@ test('instalar --sem-hooks copia os hooks mas não toca no settings.json; packag
     await fs.writeFile(pkg, '{ "name": "meus-hooks" }\n', 'utf8');
     const r = rodar(['instalar', '--apenas-global', '--skip-superpowers', '--sem-hooks']);
     assert.equal(r.status, 0, r.stdout + r.stderr);
-    assert.ok(await existe(path.join(outroHome, '.claude', 'hooks', 'cbs-no-verify.js')));
-    assert.ok(await existe(path.join(outroHome, '.claude', 'hooks', 'cbs-node.sh')));
+    for (const h of HOOKS_ARQUIVOS) assert.ok(await existe(path.join(outroHome, '.claude', 'hooks', h)), `hook ${h} copiado`);
+    assert.match(r.stdout, /registro no settings\.json pulado por --sem-hooks/);
     assert.ok(!(await existe(path.join(outroHome, '.claude', 'settings.json'))));
     assert.match(r.stdout, /package\.json existe sem "type": "module"/);
     assert.equal(await fs.readFile(pkg, 'utf8'), '{ "name": "meus-hooks" }\n');
@@ -279,6 +280,7 @@ test('instalar --sem-hooks copia os hooks mas não toca no settings.json; packag
     const a = rodar(['atualizar', '--skip-self-update', '--skip-bmad', '--sem-hooks']);
     assert.equal(a.status, 0, a.stdout + a.stderr);
     assert.match(a.stdout, /package\.json existe sem "type": "module"/, 'atualizar avisa igual ao instalar');
+    assert.match(a.stdout, /registro no settings\.json pulado por --sem-hooks/, 'atualizar diz o mesmo que o instalar');
     assert.ok(!(await existe(path.join(outroHome, '.claude', 'settings.json'))));
     assert.equal(await fs.readFile(pkg, 'utf8'), '{ "name": "meus-hooks" }\n');
   } finally {
@@ -305,6 +307,69 @@ test('atualizar com settings.json inválido aborta antes de copiar; com --sem-ho
     assert.equal(await fs.readFile(arq, 'utf8'), '[1, 2]');
   } finally {
     await fs.writeFile(arq, valido, 'utf8');
+  }
+});
+
+test('HOME com aspas: instalar/atualizar abortam antes de copiar e sugerem --sem-hooks; com --sem-hooks instalam', { skip: WIN && 'aspas não valem em caminho no Windows' }, async () => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-smoke-aspas-'));
+  const home = path.join(base, 'home"q');
+  await fs.mkdir(home);
+  const rodar = (args) => spawnSync(process.execPath, [CLI, ...args], {
+    encoding: 'utf8', env: { ...process.env, HOME: home, USERPROFILE: home }, cwd: home, input: '',
+  });
+  try {
+    const r = rodar(['instalar', '--apenas-global', '--skip-superpowers']);
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr, /caminho inseguro/);
+    assert.match(r.stderr, /--sem-hooks/);
+    assert.ok(!(await existe(path.join(home, '.claude', 'skills'))), 'nada copiado');
+    assert.ok(!(await existe(path.join(home, '.claude', 'hooks'))), 'nenhum hook copiado');
+
+    const s = rodar(['instalar', '--apenas-global', '--skip-superpowers', '--sem-hooks']);
+    assert.equal(s.status, 0, s.stdout + s.stderr);
+    assert.ok(await existe(path.join(home, '.claude', 'hooks', 'cbs-node.sh')));
+    assert.ok(await existe(path.join(home, '.claude', 'cbs-overrides', '.versao-instalada')));
+    assert.ok(!(await existe(path.join(home, '.claude', 'settings.json'))));
+
+    const piloto = path.join(home, '.claude', 'commands', 'piloto.md');
+    await fs.rm(piloto);
+    const a = rodar(['atualizar', '--skip-self-update', '--skip-bmad']);
+    assert.equal(a.status, 1, a.stdout + a.stderr);
+    assert.match(a.stderr, /caminho inseguro.*--sem-hooks/s);
+    assert.ok(!(await existe(piloto)), 'atualizar não copiou nada antes do abort');
+  } finally {
+    await fs.rm(base, { recursive: true, force: true });
+  }
+});
+
+test('node em caminho com $: sem --sem-hooks aborta antes de copiar; com --sem-hooks instala sem .cbs-node-path', { skip: WIN && 'POSIX' }, async () => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-smoke-node-'));
+  const node = path.join(base, 'bin$x', 'node');
+  await fs.mkdir(path.dirname(node));
+  try { await fs.link(process.execPath, node); } catch { await fs.copyFile(process.execPath, node); await fs.chmod(node, 0o755); }
+  const rodar = async (nome, args) => {
+    const home = path.join(base, nome);
+    await fs.mkdir(home, { recursive: true });
+    const r = spawnSync(node, [CLI, ...args], { encoding: 'utf8', env: { ...process.env, HOME: home, USERPROFILE: home }, cwd: home, input: '' });
+    return { ...r, claude: path.join(home, '.claude') };
+  };
+  try {
+    const r = await rodar('h1', ['instalar', '--apenas-global', '--skip-superpowers']);
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr, /bin\$x.*--sem-hooks/s);
+    assert.ok(!(await existe(path.join(r.claude, 'skills'))), 'nada copiado');
+
+    const s = await rodar('h2', ['instalar', '--apenas-global', '--skip-superpowers', '--sem-hooks']);
+    assert.equal(s.status, 0, s.stdout + s.stderr);
+    assert.match(s.stdout, /\.cbs-node-path não gravado/);
+    assert.ok(await existe(path.join(s.claude, 'hooks', 'cbs-node.sh')));
+    assert.ok(!(await existe(path.join(s.claude, 'hooks', '.cbs-node-path'))));
+
+    const a = await rodar('h2', ['atualizar', '--skip-self-update', '--skip-bmad', '--sem-hooks']);
+    assert.equal(a.status, 0, a.stdout + a.stderr);
+    assert.match(a.stdout, /\.cbs-node-path não gravado/);
+  } finally {
+    await fs.rm(base, { recursive: true, force: true });
   }
 });
 
@@ -353,7 +418,27 @@ test('status avisa quando o node gravado sumiu e quando o launcher sumiu', async
     assert.equal(code, 0, out);
     assert.match(out, /node gravado .*\/node\/sumiu\/bin\/node.* não existe mais/);
     assert.match(out, /launcher .*cbs-node\.sh ausente/);
+
+    // .cbs-node-path ilegível (aqui: virou diretório) é reportado, não tratado como "sem node gravado"
+    await fs.rm(nodePath);
+    await fs.mkdir(nodePath);
+    const d = cli(['status']);
+    assert.equal(d.code, 0, d.out);
+    assert.match(d.out, /\.cbs-node-path.*ilegível/);
+    await fs.rmdir(nodePath);
+
+    // settings.json inválido: status é só leitura — nada de "Nada foi gravado"
+    const arq = path.join(claude, 'settings.json');
+    const valido = await fs.readFile(arq, 'utf8');
+    await fs.writeFile(arq, '{ "hooks": ', 'utf8');
+    const i = cli(['status']);
+    await fs.writeFile(arq, valido, 'utf8');
+    assert.equal(i.code, 0, i.out);
+    assert.match(i.out, /Hooks CBS: ✗ settings\.json inválido/);
+    assert.match(i.out, /corrija o JSON/i);
+    assert.doesNotMatch(i.out, /Nada foi gravado/);
   } finally {
+    await fs.rm(nodePath, { recursive: true, force: true });
     await fs.writeFile(nodePath, salvoNode, 'utf8');
     await fs.writeFile(launcher, salvoLauncher, 'utf8');
   }

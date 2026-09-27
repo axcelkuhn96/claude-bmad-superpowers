@@ -6,7 +6,7 @@ import {
   ARQ_VERSAO_INSTALADA, ARQ_SETTINGS, MARCADOR, RAIZ_CLAUDE,
   garantirDir, lerVersaoPacote, existe,
 } from './caminhos.js';
-import { lerSettings, aplicarHooks, gravarCaminhoNode } from './hooks-settings.js';
+import { prevalidarHooks, aplicarHooks, gravarCaminhoNode } from './hooks-settings.js';
 import { tentarInstalarSuperpowers } from './superpowers.js';
 import { instalarBmad } from './instalar-bmad.js';
 import { temBmadAqui } from './bmad.js';
@@ -45,7 +45,7 @@ export async function garantirModelsOverride() {
 
 // hooks: arquivos com marcador (cbs-*.js, launcher cbs-node.sh); package.json ({"type":"module"}) SÓ se não existir (SP-2).
 // `copiar` troca a política de cópia (o atualizar preserva arquivo sem marcador).
-export async function copiarHooks(origem, destino, versao, copiar = copiarComMarcador) {
+async function copiarHooks(origem, destino, versao, copiar) {
   const pkgDestino = path.join(destino, 'package.json');
   const pkgExistia = await existe(pkgDestino);
   for (const ent of await fs.readdir(origem, { withFileTypes: true })) {
@@ -59,6 +59,24 @@ export async function copiarHooks(origem, destino, versao, copiar = copiarComMar
     }
     await copiar(path.join(origem, ent.name), path.join(destino, ent.name), versao);
   }
+}
+
+// hooks globais (instalar e atualizar): copia, grava o node pro launcher e registra no settings.json.
+// Sem --sem-hooks, prevalidarHooks já garantiu que nada aqui falha por caminho inseguro; com a flag, node
+// inseguro só deixa de ser gravado (o launcher procura outro).
+export async function instalarHooks(versao, semHooks, copiar = copiarComMarcador) {
+  await copiarHooks(path.join(RAIZ_BASE, 'hooks'), DIR_HOOKS, versao, copiar);
+  try {
+    await gravarCaminhoNode(DIR_HOOKS);
+  } catch (e) {
+    if (!semHooks) throw e;
+    console.log(`⚠  ${e.message} — .cbs-node-path não gravado; o launcher procura o node no PATH, nvm, fnm e volta.`);
+  }
+  if (semHooks) {
+    console.log('(registro no settings.json pulado por --sem-hooks)');
+    return { mudou: false, backup: null };
+  }
+  return aplicarHooks(ARQ_SETTINGS, DIR_HOOKS);
 }
 
 async function copiarArvore(origemBase, destinoBase, versao) {
@@ -82,8 +100,8 @@ export async function instalar(args = []) {
   const pularBmad = args.includes('--apenas-global') || args.includes('--skip-bmad');
   const pularSuperpowers = args.includes('--skip-superpowers');
   const semHooks = args.includes('--sem-hooks');
-  // settings.json inválido aborta ANTES de copiar qualquer coisa (SP-6)
-  if (!semHooks) await lerSettings(ARQ_SETTINGS, 'corrija o JSON ou rode com --sem-hooks');
+  // settings.json inválido ou caminho inseguro aborta ANTES de copiar qualquer coisa (SP-6)
+  if (!semHooks) await prevalidarHooks(ARQ_SETTINGS, DIR_HOOKS);
 
   await garantirDir(RAIZ_CLAUDE);
   await garantirDir(DIR_SKILLS);
@@ -132,15 +150,10 @@ export async function instalar(args = []) {
   }
 
   // hooks globais (cbs-*.js + launcher) + node do instalador pro launcher + merge idempotente no settings.json
-  const origemHooks = path.join(RAIZ_BASE, 'hooks');
-  if (await existe(origemHooks)) {
+  if (await existe(path.join(RAIZ_BASE, 'hooks'))) {
     console.log('→ Copiando hooks cbs-*...');
-    await copiarHooks(origemHooks, DIR_HOOKS, versao);
-    await gravarCaminhoNode(DIR_HOOKS);
-    if (semHooks) {
-      console.log('(registro no settings.json pulado por --sem-hooks)');
-    } else {
-      const r = await aplicarHooks(ARQ_SETTINGS, DIR_HOOKS);
+    const r = await instalarHooks(versao, semHooks);
+    if (!semHooks) {
       console.log(r.mudou
         ? `→ settings.json: hooks CBS registrados${r.backup ? ` (backup em ${r.backup})` : ''}`
         : '✓ settings.json: hooks CBS já registrados.');

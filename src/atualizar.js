@@ -10,8 +10,8 @@ import {
 import { tentarAtualizarSuperpowers } from './superpowers.js';
 import { listarProjetosBmad, atualizarBmadEmProjeto, limparProjetosInvalidos } from './bmad.js';
 import { tentarSelfUpdate } from './auto-update.js';
-import { garantirModelsOverride, copiarHooks } from './instalar.js';
-import { lerSettings, aplicarHooks, gravarCaminhoNode } from './hooks-settings.js';
+import { garantirModelsOverride, instalarHooks } from './instalar.js';
+import { prevalidarHooks } from './hooks-settings.js';
 
 async function arquivoTemMarcador(p) {
   try {
@@ -86,8 +86,8 @@ export async function atualizar(args = []) {
   console.log(`Versão do clone/pacote atual: ${versaoAtual}\n`);
 
   const semHooks = args.includes('--sem-hooks');
-  // settings.json inválido aborta ANTES de copiar qualquer coisa (SP-6)
-  if (!semHooks) await lerSettings(ARQ_SETTINGS, 'corrija o JSON ou rode com --sem-hooks');
+  // settings.json inválido ou caminho inseguro aborta ANTES de copiar qualquer coisa (SP-6)
+  if (!semHooks) await prevalidarHooks(ARQ_SETTINGS, DIR_HOOKS);
 
   // ETAPA 0 — Self-update (a menos que --skip-self-update)
   if (!args.includes('--skip-self-update')) {
@@ -119,15 +119,11 @@ export async function atualizar(args = []) {
     await atualizarArvore(path.join(RAIZ_BASE, 'agents'), DIR_AGENTS, versaoNova, resultado);
   }
   if (await existe(path.join(RAIZ_BASE, 'hooks'))) {
-    await copiarHooks(path.join(RAIZ_BASE, 'hooks'), DIR_HOOKS, versaoNova, async (origem, destino, versao) => {
-      const r = await copiarSeBase(origem, destino, versao);
-      resultado[r.acao].push(r.destino);
+    const r = await instalarHooks(versaoNova, semHooks, async (origem, destino, versao) => {
+      const c = await copiarSeBase(origem, destino, versao);
+      resultado[c.acao].push(c.destino);
     });
-    await gravarCaminhoNode(DIR_HOOKS);
-    if (!semHooks) {
-      const r = await aplicarHooks(ARQ_SETTINGS, DIR_HOOKS);
-      if (r.mudou) resultado.atualizado.push(ARQ_SETTINGS);
-    }
+    if (r.mudou) resultado.atualizado.push(ARQ_SETTINGS);
   }
   const models = await garantirModelsOverride();
   if (models.acao === 'criado') resultado.atualizado.push(models.destino);

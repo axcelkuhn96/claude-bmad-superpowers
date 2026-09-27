@@ -17,8 +17,12 @@ export function scriptCbs(comando) {
 }
 // Seguro dentro de aspas duplas no sh: sem $, crase, aspas nem quebra de linha (não há expansão possível).
 function exigirCaminhoSeguro(p) {
-  if (/[$`"\r\n]/.test(p)) throw new Error(`caminho inseguro para o comando do hook (contém $, crase, aspas ou quebra de linha): ${JSON.stringify(p)}`);
+  if (/[$`"\r\n]/.test(p)) throw new Error(`caminho inseguro para os hooks CBS (contém $, crase, aspas ou quebra de linha): ${JSON.stringify(p)}`);
   return p;
+}
+function exigirNodeSeguro(node) {
+  if (!path.isAbsolute(node)) throw new Error(`caminho do node precisa ser absoluto: ${JSON.stringify(node)}`);
+  exigirCaminhoSeguro(node);
 }
 // Hook roda via launcher POSIX (base/hooks/cbs-node.sh), que acha um node válido mesmo após troca de versão (H3).
 // Launcher ou script ausente (desinstalação parcial, hook ainda não instalado) → exit 0:
@@ -33,8 +37,7 @@ export function comandoHook(dirHooks, script) {
 }
 // O launcher tenta primeiro este caminho; o instalador/atualizar regrava a cada execução.
 export async function gravarCaminhoNode(dirHooks, node = process.execPath) {
-  if (!path.isAbsolute(node)) throw new Error(`caminho do node precisa ser absoluto: ${JSON.stringify(node)}`);
-  exigirCaminhoSeguro(node);
+  exigirNodeSeguro(node);
   await fs.mkdir(dirHooks, { recursive: true });
   const arq = path.join(dirHooks, '.cbs-node-path');
   await fs.writeFile(arq, `${node}\n`, 'utf8');
@@ -99,7 +102,10 @@ export function mesclarHooksCbs(settings, dirHooks) {
 
 const ehObjeto = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 
+const DICA_SEM_HOOKS = 'corrija o JSON ou rode com --sem-hooks';
+
 // `dica` é o que o usuário deve fazer; o `remover` não tem --sem-hooks, então o padrão só manda corrigir.
+// `dica` null = quem lê não grava nada (status): a mensagem não fala em gravação.
 export async function lerSettings(arquivo, dica = 'corrija o JSON') {
   let texto;
   try { texto = await fs.readFile(arquivo, 'utf8'); } catch (e) {
@@ -107,7 +113,8 @@ export async function lerSettings(arquivo, dica = 'corrija o JSON') {
     throw e;
   }
   if (!texto.trim()) return { existe: true, dados: {} };
-  const invalido = (motivo) => new Error(`settings.json inválido em ${arquivo}: ${motivo}. Nada foi gravado — ${dica}.`);
+  const acao = dica === null ? 'Corrija o JSON.' : `Nada foi gravado — ${dica}.`;
+  const invalido = (motivo) => new Error(`settings.json inválido em ${arquivo}: ${motivo}. ${acao}`);
   let dados;
   try { dados = JSON.parse(texto); } catch (e) { throw invalido(e.message); }
   if (!ehObjeto(dados)) throw invalido('o topo precisa ser um objeto JSON');
@@ -141,10 +148,22 @@ async function gravar(arquivo, dados, existia) {
 }
 
 export async function aplicarHooks(arquivo, dirHooks) {
-  const { existe, dados } = await lerSettings(arquivo, 'corrija o JSON ou rode com --sem-hooks');
+  const { existe, dados } = await lerSettings(arquivo, DICA_SEM_HOOKS);
   const { settings, mudou } = mesclarHooksCbs(dados, dirHooks);
   if (!mudou) return { mudou: false, backup: null };
   return { mudou: true, backup: await gravar(arquivo, settings, existe) };
+}
+
+// Tudo que faria o registro dos hooks falhar, checado ANTES de o instalar/atualizar copiar qualquer coisa (SP-6):
+// settings.json válido, ~/.claude/hooks e o node do instalador sem caractere inseguro.
+export async function prevalidarHooks(arquivo, dirHooks, node = process.execPath) {
+  await lerSettings(arquivo, DICA_SEM_HOOKS);
+  try {
+    comandoHook(dirHooks, HOOKS_CBS[0].script);
+    exigirNodeSeguro(node);
+  } catch (e) {
+    throw new Error(`${e.message}. Nada foi copiado — rode com --sem-hooks (instala sem registrar os hooks CBS).`);
+  }
 }
 
 export async function retirarHooks(arquivo) {

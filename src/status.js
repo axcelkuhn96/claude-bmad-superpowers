@@ -106,7 +106,7 @@ export async function status(_args = []) {
   }
   // hooks CBS registrados no settings.json (+ launcher e node gravado de que eles dependem)
   try {
-    const { dados } = await lerSettings(ARQ_SETTINGS);
+    const { dados } = await lerSettings(ARQ_SETTINGS, null);
     const hooks = listarHooksCbs(dados);
     console.log(`Hooks CBS ativos (${hooks.length}):`);
     for (const h of hooks) {
@@ -115,7 +115,13 @@ export async function status(_args = []) {
     }
     const launcher = path.join(DIR_HOOKS, 'cbs-node.sh');
     if (hooks.length && !(await existe(launcher))) console.log(`  ✗ launcher ${launcher} ausente — os hooks não rodam (rode atualizar)`);
-    const node = (await fs.readFile(path.join(DIR_HOOKS, '.cbs-node-path'), 'utf8').catch(() => '')).split('\n')[0];
+    const arqNode = path.join(DIR_HOOKS, '.cbs-node-path');
+    let node = '';
+    try {
+      node = (await fs.readFile(arqNode, 'utf8')).split('\n')[0];
+    } catch (e) {
+      if (e.code !== 'ENOENT') console.log(`  ⚠  ${arqNode} ilegível (${e.code || e.message}) — o launcher vai procurar o node no PATH, nvm, fnm e volta`);
+    }
     if (node && !(await existe(node))) {
       console.log(`  ⚠  node gravado (${node}) não existe mais — o launcher procura outro (PATH, nvm, fnm, volta); rode atualizar pra regravar`);
     }
