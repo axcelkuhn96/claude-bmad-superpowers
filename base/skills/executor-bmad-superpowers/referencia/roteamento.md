@@ -6,7 +6,7 @@ Rulebooks em `~/.claude/personas/dominios/{frontend,database,laravel,python,node
 
 | Domínio | Sinais de arquivo | Sinais de story |
 |---|---|---|
-| `frontend` | `resources/views/**/*.blade.php`, `src/components/`, `src/app/`, `pages/`, `*.tsx` / `*.vue` / `*.svelte`, `*.css`, `tailwind.config.*`, `app/Livewire/**`, `app/Filament/**` (parte de view) | tela, componente, UI/UX, layout, responsivo, landing, dark mode, filtro, dashboard |
+| `frontend` | `resources/views/**/*.blade.php`, `src/components/`, `src/app/`, `pages/`, `*.tsx` / `*.vue` / `*.svelte`, `*.css`, `tailwind.config.*`, `app/Livewire/**`, `app/Filament/**` (parte de view), `package.json` com `react-native`/`expo`, `app.json` com `expo`, `metro.config.*` | tela, componente, UI/UX, layout, responsivo, landing, dark mode, filtro, dashboard |
 | `database` | `database/migrations/`, `prisma/`, `alembic/`, `db/migrate/`, `*.sql`, models / entities / repositories, `app/Models/` quando muda schema ou query | tabela, coluna, índice, migration, query lenta, relatório, relação, banco, schema |
 | `laravel` | `composer.json` com `laravel/framework` + qualquer `app/**`, `routes/**`, `tests/**` | controller, job, policy, Form Request, Eloquent, artisan, Livewire, Inertia |
 | `python` | `pyproject.toml` / `requirements*.txt` + `*.py` | script, ETL, FastAPI / Django, pandas, cron, pytest |
@@ -17,7 +17,7 @@ Regras:
 - **Até 2 domínios por task**: uma **linguagem** (`laravel` | `python` | `node`) + uma **área** (`frontend` | `database` | `integracao`). Três = task grande demais → quebre no plano (cada parte com o seu domínio).
 - **Ordem no prompt**: persona dev → ponytail → linguagem → área. **Precedência em conflito**: regra inegociável de área vence a de linguagem; ambas vencem o corte do ponytail.
 - Repo Laravel + Vite/React: `laravel` é a linguagem e `frontend` a área; `node` só entra com servidor Node próprio (worker, BFF).
-- `package.json` só com React/Vue e sem servidor → `frontend`, não `node`.
+- `package.json` só com React/Vue, ou com `react-native`/`expo` (React Native), e sem servidor Node → `frontend`, não `node`.
 - Sem sinal → só persona dev + ponytail (comportamento herdado).
 - `frontend`: se o roteador `frontend.md` definir modo de superfície (operar | persuadir | ler | experienciar), anote `frontend/<modo>`; registre no contexto se existem `DESIGN.md`, `PRODUCT.md` ou `design-system/*/MASTER.md` — são entrada, nunca regenerados.
 
