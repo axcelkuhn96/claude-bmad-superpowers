@@ -15,9 +15,26 @@ export function scriptCbs(comando) {
   const m = typeof comando === 'string' ? comando.match(RE_CBS) : null;
   return m ? m[1] : null;
 }
-// Node absoluto de quem instalou: o hook não depende do PATH da sessão (nvm, GUI sem shell de login).
+// Seguro dentro de aspas duplas no sh: sem $, crase, aspas nem quebra de linha (não há expansão possível).
+function exigirCaminhoSeguro(p) {
+  if (/[$`"\r\n]/.test(p)) throw new Error(`caminho inseguro para o comando do hook (contém $, crase, aspas ou quebra de linha): ${JSON.stringify(p)}`);
+  return p;
+}
+// Hook roda via launcher POSIX (base/hooks/cbs-node.sh), que acha um node válido mesmo após troca de versão (H3).
 export function comandoHook(dirHooks, script) {
-  return `"${process.execPath}" "${path.join(dirHooks, script)}"`;
+  exigirCaminhoSeguro(dirHooks);
+  const comando = `sh "${path.join(dirHooks, 'cbs-node.sh')}" "${path.join(dirHooks, script)}"`;
+  if (scriptCbs(comando) !== script) throw new Error(`comando do hook não reconhecido como ${script}: ${comando}`);
+  return comando;
+}
+// O launcher tenta primeiro este caminho; o instalador/atualizar regrava a cada execução.
+export async function gravarCaminhoNode(dirHooks, node = process.execPath) {
+  if (!path.isAbsolute(node)) throw new Error(`caminho do node precisa ser absoluto: ${JSON.stringify(node)}`);
+  exigirCaminhoSeguro(node);
+  await fs.mkdir(dirHooks, { recursive: true });
+  const arq = path.join(dirHooks, '.cbs-node-path');
+  await fs.writeFile(arq, `${node}\n`, 'utf8');
+  return arq;
 }
 const clonar = (o) => JSON.parse(JSON.stringify(o ?? {}));
 

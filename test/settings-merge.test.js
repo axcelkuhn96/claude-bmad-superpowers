@@ -5,9 +5,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import {
   HOOKS_CBS, scriptCbs, comandoHook, mesclarHooksCbs, removerHooksCbs, listarHooksCbs, lerSettings, aplicarHooks, retirarHooks,
+  gravarCaminhoNode,
 } from '../src/hooks-settings.js';
+
+const LAUNCHER = fileURLToPath(new URL('../base/hooks/cbs-node.sh', import.meta.url));
 
 const DIR = path.join(path.sep, 'home', 'u', '.claude', 'hooks');
 const RTK = { matcher: 'Bash', hooks: [{ type: 'command', command: '/home/u/.claude/hooks/rtk-rewrite.sh' }] };
@@ -33,11 +38,54 @@ test('HOOKS_CBS: 4 hooks, matchers estreitos, nunca .*', () => {
   assert.ok(Object.isFrozen(HOOKS_CBS));
 });
 
-test('comando é o node absoluto do instalador + caminho absoluto do hook, ambos entre aspas, sem npx', () => {
+test('comando é sh + launcher cbs-node.sh + caminho absoluto do hook, entre aspas, sem npx', () => {
   const c = comandoHook(DIR, 'cbs-format.js');
-  assert.ok(path.isAbsolute(process.execPath));
-  assert.equal(c, `"${process.execPath}" "${path.join(DIR, 'cbs-format.js')}"`);
+  assert.equal(c, `sh "${path.join(DIR, 'cbs-node.sh')}" "${path.join(DIR, 'cbs-format.js')}"`);
   assert.doesNotMatch(c, /npx/);
+  assert.equal(scriptCbs(c), 'cbs-format.js');
+});
+
+test('launcher sozinho não conta como hook CBS', () => {
+  assert.equal(scriptCbs(`sh "${path.join(DIR, 'cbs-node.sh')}"`), null);
+  assert.deepEqual(listarHooksCbs({ hooks: { Stop: [{ hooks: [{ type: 'command', command: `sh "${path.join(DIR, 'cbs-node.sh')}"` }] }] } }), []);
+});
+
+test('comandoHook recusa HOME com $, crase, aspas ou quebra de linha', () => {
+  for (const ruim of ['/home/a$b/.claude/hooks', '/home/a`id`/.claude/hooks', '/home/a"b/.claude/hooks', '/home/a\nb/.claude/hooks']) {
+    assert.throws(() => comandoHook(ruim, 'cbs-format.js'), /caminho inseguro/, ruim);
+  }
+  assert.throws(() => mesclarHooksCbs({}, '/home/a$b/.claude/hooks'), /caminho inseguro/);
+});
+
+test('guarda: comandoHook falha se o comando gerado não for reconhecido como o próprio script', () => {
+  assert.throws(() => comandoHook(DIR, 'rtk-rewrite.sh'), /não reconhecido/);
+  assert.throws(() => comandoHook(path.join(path.sep, 'proj', 'hooks'), 'cbs-format.js'), /não reconhecido/);
+  for (const h of HOOKS_CBS) assert.equal(scriptCbs(comandoHook(DIR, h.script)), h.script);
+});
+
+test('aplicarHooks com HOME inseguro não grava nada', async (t) => {
+  const d = await tmpDir(t); const arq = path.join(d, 'settings.json');
+  await fs.writeFile(arq, '{}');
+  await assert.rejects(aplicarHooks(arq, '/home/a$b/.claude/hooks'), /caminho inseguro/);
+  assert.deepEqual(await fs.readdir(d), ['settings.json']);
+  assert.equal(await fs.readFile(arq, 'utf8'), '{}');
+});
+
+test('gravarCaminhoNode grava process.execPath em .cbs-node-path e sobrescreve a cada instalação', async (t) => {
+  const d = await tmpDir(t); const dir = path.join(d, '.claude', 'hooks');
+  const arq = await gravarCaminhoNode(dir, '/velho/bin/node');
+  assert.equal(arq, path.join(dir, '.cbs-node-path'));
+  assert.equal(await fs.readFile(arq, 'utf8'), '/velho/bin/node\n');
+  await gravarCaminhoNode(dir);
+  assert.equal(await fs.readFile(arq, 'utf8'), `${process.execPath}\n`);
+});
+
+test('gravarCaminhoNode recusa node relativo ou com $, crase, aspas', async (t) => {
+  const d = await tmpDir(t); const dir = path.join(d, 'hooks');
+  for (const ruim of ['node', '/opt/a$b/node', '/opt/a`id`/node', '/opt/a"b/node', '/opt/a\nb/node']) {
+    await assert.rejects(gravarCaminhoNode(dir, ruim), /caminho inseguro|absoluto/, ruim);
+  }
+  await assert.rejects(fs.access(path.join(dir, '.cbs-node-path')));
 });
 
 test('scriptCbs reconhece o hook com node absoluto, node nu e caminho Windows; ignora alheio', () => {
@@ -210,4 +258,79 @@ test('retirarHooks: ausente ou sem CBS não grava; inválido aborta só mandando
   });
   assert.equal(await fs.readFile(arq, 'utf8'), '{ruim');
   assert.deepEqual(await fs.readdir(d), ['settings.json']);
+});
+
+// ---- launcher base/hooks/cbs-node.sh (POSIX) ----
+// Ambiente montado à mão: HOME temporário, PATH só com as ferramentas que o launcher usa (sem node).
+const FERRAMENTAS = ['dirname', 'sed', 'sort', 'tail', 'cut'];
+async function cenario(t) {
+  const d = await tmpDir(t);
+  const home = path.join(d, 'home'); const hooks = path.join(home, '.claude', 'hooks'); const bin = path.join(d, 'bin');
+  await fs.mkdir(hooks, { recursive: true }); await fs.mkdir(bin);
+  for (const f of FERRAMENTAS) {
+    const r = spawnSync('/bin/sh', ['-c', `command -v ${f}`], { encoding: 'utf8' });
+    await fs.symlink(r.stdout.trim(), path.join(bin, f));
+  }
+  await fs.copyFile(LAUNCHER, path.join(hooks, 'cbs-node.sh'));
+  const js = path.join(hooks, 'cbs-x.js');
+  await fs.writeFile(js, "let e='';process.stdin.on('data',(c)=>{e+=c}).on('end',()=>{process.stdout.write('real:'+e);process.exit(Number(process.argv[2]||0))});");
+  const falso = async (arq, nome) => {
+    await fs.mkdir(path.dirname(arq), { recursive: true });
+    await fs.writeFile(arq, `#!/bin/sh\necho "${nome} $*"\n`, { mode: 0o755 });
+  };
+  const rodar = (args = [], input = '') => spawnSync('/bin/sh', [path.join(hooks, 'cbs-node.sh'), js, ...args], {
+    encoding: 'utf8', input, env: { HOME: home, PATH: bin },
+  });
+  return { d, home, hooks, bin, js, falso, rodar };
+}
+
+test('launcher: usa o node gravado, repassa stdin/stdout e o código de saída (2 e 0)', { skip: process.platform === 'win32' && 'POSIX' }, async (t) => {
+  const c = await cenario(t);
+  await gravarCaminhoNode(c.hooks, process.execPath);
+  const r2 = c.rodar(['2'], 'payload');
+  assert.deepEqual([r2.status, r2.stdout, r2.stderr], [2, 'real:payload', '']);
+  const r0 = c.rodar(['0'], 'x');
+  assert.deepEqual([r0.status, r0.stdout], [0, 'real:x']);
+});
+
+test('launcher: node gravado sumiu → cai no node do PATH', { skip: process.platform === 'win32' && 'POSIX' }, async (t) => {
+  const c = await cenario(t);
+  await gravarCaminhoNode(c.hooks, path.join(c.d, 'nao-existe', 'node'));
+  await c.falso(path.join(c.bin, 'node'), 'path-node');
+  const r = c.rodar(['a']);
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout, `path-node ${c.js} a\n`);
+});
+
+test('launcher: sem node gravado nem no PATH → node mais novo do nvm (ordem numérica)', { skip: process.platform === 'win32' && 'POSIX' }, async (t) => {
+  const c = await cenario(t);
+  for (const v of ['v9.11.2', 'v18.20.4', 'v22.3.0', 'v22.10.1']) await c.falso(path.join(c.home, '.nvm', 'versions', 'node', v, 'bin', 'node'), v);
+  const r = c.rodar();
+  assert.equal(r.stdout, `v22.10.1 ${c.js}\n`);
+});
+
+test('launcher: respeita NVM_DIR e cai no fnm/volta quando não há nvm', { skip: process.platform === 'win32' && 'POSIX' }, async (t) => {
+  const c = await cenario(t);
+  const outro = path.join(c.d, 'nvm-custom');
+  await c.falso(path.join(outro, 'versions', 'node', 'v20.1.0', 'bin', 'node'), 'nvmdir');
+  let r = spawnSync('/bin/sh', [path.join(c.hooks, 'cbs-node.sh'), c.js], { encoding: 'utf8', env: { HOME: c.home, PATH: c.bin, NVM_DIR: outro } });
+  assert.equal(r.stdout, `nvmdir ${c.js}\n`);
+  await c.falso(path.join(c.home, '.local', 'share', 'fnm', 'node-versions', 'v21.0.0', 'installation', 'bin', 'node'), 'fnm');
+  assert.equal(c.rodar().stdout, `fnm ${c.js}\n`);
+  await fs.rm(path.join(c.home, '.local'), { recursive: true });
+  await c.falso(path.join(c.home, '.volta', 'bin', 'node'), 'volta');
+  assert.equal(c.rodar().stdout, `volta ${c.js}\n`);
+});
+
+test('launcher: nenhum node em lugar nenhum → exit 0 sem saída', { skip: process.platform === 'win32' && 'POSIX' }, async (t) => {
+  const c = await cenario(t);
+  const r = c.rodar(['2'], 'payload');
+  assert.deepEqual([r.status, r.stdout, r.stderr], [0, '', '']);
+});
+
+test('launcher é POSIX: passa em sh -n e não usa bashismos óbvios', async () => {
+  const texto = await fs.readFile(LAUNCHER, 'utf8');
+  assert.equal(spawnSync('/bin/sh', ['-n', LAUNCHER]).status, 0);
+  assert.match(texto, /^#!\/bin\/sh\n/);
+  assert.doesNotMatch(texto, /\[\[|^\s*(function|local|declare|shopt|source)\s|\$\(\(|<<<|\$\{[^}]*\/\/|&>/m);
 });
