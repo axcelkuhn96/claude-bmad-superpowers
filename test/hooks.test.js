@@ -236,4 +236,69 @@ describe('cbs-config-protect', () => {
     assert.equal(r.code, 2); assert.equal(r.out, ''); assert.match(r.err, /CBS_PERMITIR_CONFIG=1/);
     assert.equal(rodarHook('cbs-config-protect.js', wr(p, 'src/app.ts', enorme)).code, 0);
   });
+  // Hunk com lado antigo de uma linha em branco: o timeout do rodarHook (10 s) transforma travamento em falha.
+  test('E2E: hunk de apply_patch com lado antigo em branco não trava (pyproject com e sem [tool.*])', (t) => {
+    const p = projeto(t);
+    const q = tmpDoTeste(t, 'cbs-config-'); escrever(q, 'pyproject.toml', '[project]\nname = "x"\n\ndependencies = []\n');
+    for (const dir of [q, p]) for (const velho of ['-', ' ']) {
+      const r = rodarHook('cbs-config-protect.js', ap(dir, `*** Update File: pyproject.toml\n@@\n${velho}\n+dependencies = ["b"]`));
+      assert.equal(r.code, 0, `'${velho}' ${dir === p ? 'com' : 'sem'} [tool.*]: ${r.err}`);
+    }
+  });
+  test('apply_patch em pyproject: linha em branco de [tool.mypy] (pelo contexto do @@) e acréscimo puro na última seção bloqueiam', (t) => {
+    const p = projeto(t);
+    assert.equal(av(ap(p, '*** Update File: pyproject.toml\n@@ strict = true\n-\n+ignore_missing_imports = true')).bloquear, true);
+    assert.equal(av(ap(p, '*** Update File: pyproject.toml\n@@\n+disallow_untyped_defs = false')).bloquear, true);
+    assert.equal(av(ap(p, '*** Update File: pyproject.toml\n@@\n+\n+[tool.pytest.ini_options]\n+testpaths = ["tests"]')).bloquear, false);
+  });
+  test('apply_patch: Add File sobre pyproject existente compara as seções protegidas', (t) => {
+    const p = projeto(t);
+    const add = (txt) => ap(p, `*** Add File: pyproject.toml\n${txt.split('\n').slice(0, -1).map((l) => '+' + l).join('\n')}`);
+    assert.equal(av(add(PYPROJECT.replace('[tool.ruff]\nline-length = 100\n\n', ''))).bloquear, true);
+    assert.equal(av(add(PYPROJECT.replace('name = "x"', 'name = "y"'))).bloquear, false);
+  });
+  test('apply_patch: Move to / Add File sobre pyproject com [tool.*] ou config protegida existente bloqueia', (t) => {
+    const p = projeto(t); escrever(p, 'tmp.toml', '[project]\nname = "y"\n'); escrever(p, 'x.json', '{}');
+    assert.equal(av(ap(p, '*** Update File: tmp.toml\n*** Move to: pyproject.toml\n@@\n-name = "y"\n+name = "z"')).bloquear, true);
+    assert.equal(av(ap(p, '*** Update File: x.json\n*** Move to: .eslintrc.json')).bloquear, true);
+    assert.equal(av(ap(p, '*** Add File: .eslintrc.json\n+{}')).bloquear, true);
+    const q = tmpDoTeste(t, 'cbs-config-'); escrever(q, 'pyproject.toml', '[project]\nname = "x"\n'); escrever(q, 'tmp.toml', '[project]\nname = "y"\n');
+    assert.equal(av(ap(q, '*** Update File: tmp.toml\n*** Move to: pyproject.toml')).bloquear, false);
+  });
+  test('apply_patch com CRLF em pyproject: hunk em [tool.ruff] bloqueia', (t) => {
+    const p = projeto(t);
+    const patch = ['*** Begin Patch', '*** Update File: pyproject.toml', '@@', '-line-length = 100', '+line-length = 200', '*** End Patch'].join('\r\n');
+    assert.equal(av({ cwd: p, tool_name: 'apply_patch', tool_input: { input: patch } }).bloquear, true);
+  });
+  test('symlink com nome comum apontando para config protegida bloqueia', { skip: !POSIX && 'POSIX' }, (t) => {
+    const p = projeto(t);
+    fs.symlinkSync(path.join(p, '.eslintrc.json'), path.join(p, 'lint.json'));
+    fs.symlinkSync(path.join(p, 'pyproject.toml'), path.join(p, 'cfg.toml'));
+    assert.equal(av(ed(p, 'lint.json')).bloquear, true);
+    assert.equal(av(ed(p, 'cfg.toml', 'line-length = 100', 'line-length = 200')).bloquear, true);
+    assert.equal(av(ed(p, 'cfg.toml', 'name = "x"', 'name = "y"')).bloquear, false);
+  });
+  test('bloqueia phpstan.dist.neon, .mypy.ini e stylelint.config.* existentes', (t) => {
+    const p = projeto(t);
+    for (const f of ['phpstan.dist.neon', '.mypy.ini', 'stylelint.config.js', 'stylelint.config.mjs', 'stylelint.config.cjs']) {
+      escrever(p, f, 'x'); assert.equal(av(ed(p, f)).bloquear, true, f);
+    }
+  });
+  test('MultiEdit em config protegida existente bloqueia', (t) => {
+    const p = projeto(t);
+    const payload = { cwd: p, tool_name: 'MultiEdit', tool_input: { file_path: '.eslintrc.json', edits: [{ old_string: '{"rules":{}}', new_string: '{}' }] } };
+    assert.equal(av(payload).bloquear, true);
+  });
+  // Variante de caixa: FS case-insensitive (macOS, Windows, WSL /mnt/c) abre a mesma config → bloqueia;
+  // Linux case-sensitive: outro arquivo, que ferramenta nenhuma lê → passa, a não ser que seja hardlink da config.
+  test('variante de caixa do nome: protegida só quando abre a mesma config', (t) => {
+    const p = projeto(t);
+    const insensivel = fs.existsSync(path.join(p, '.ESLINTRC.JSON'));
+    assert.equal(av(ed(p, '.ESLINTRC.JSON')).bloquear, insensivel);
+    if (insensivel) return;
+    escrever(p, '.ESLINTRC.JSON', '{}');
+    assert.equal(av(ed(p, '.ESLINTRC.JSON')).bloquear, false);
+    fs.linkSync(path.join(p, 'pint.json'), path.join(p, 'PINT.json'));
+    assert.equal(av(ed(p, 'PINT.json')).bloquear, true);
+  });
 });

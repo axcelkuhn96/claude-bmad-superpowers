@@ -7,19 +7,37 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { hookDesligado, lerStdin, lerPayload, lerTexto, caminhosEditados, comandoBash, ehEntrada, avisar, LIMITE_STDIN } from './cbs-comum.js';
 
+// Nomes exatos (as ferramentas procuram em minúsculas); variante de caixa é resolvida no disco por nomeVisto.
 export const PROTEGIDOS = [
-  /^\.eslintrc/i, /^eslint\.config\./i, /^\.prettierrc/i, /^prettier\.config\./i, /^biome\.jsonc?$/i,
-  /^pint\.json$/i, /^phpstan\.neon/i, /^phpstan-baseline\.neon$/i, /^\.php-cs-fixer/i, /^\.?ruff\.toml$/i, /^mypy\.ini$/i, /^\.stylelintrc/i,
+  /^\.eslintrc/, /^eslint\.config\./, /^\.prettierrc/, /^prettier\.config\./, /^biome\.jsonc?$/,
+  /^pint\.json$/, /^phpstan\.neon/, /^phpstan\.dist\.neon$/, /^phpstan-baseline\.neon$/, /^\.php-cs-fixer/, /^\.?ruff\.toml$/,
+  /^\.?mypy\.ini$/, /^\.stylelintrc/, /^stylelint\.config\./,
 ];
-const RE_CITA_PROTEGIDO = /(?:eslintrc|eslint\.config\.|prettierrc|prettier\.config\.|biome\.json|pint\.json|phpstan(?:-baseline)?\.neon|php-cs-fixer|ruff\.toml|mypy\.ini|stylelintrc|tool\.ruff|tool\.mypy)/i;
+const RE_CITA_PROTEGIDO = /(?:eslintrc|eslint\.config\.|prettierrc|prettier\.config\.|biome\.json|pint\.json|phpstan(?:-baseline|\.dist)?\.neon|php-cs-fixer|ruff\.toml|mypy\.ini|stylelintrc|stylelint\.config\.|tool\.ruff|tool\.mypy)/i;
 // [tool.ruff], [tool.ruff.lint], [tool.mypy], [[tool.mypy.overrides]]
 const SECAO_PROTEGIDA = /^\[\[?\s*tool\.(?:ruff|mypy)\s*[.\]]/;
 const CITA_SECAO = /\[\[?\s*tool\.(?:ruff|mypy)\b/;
 const msg = (nome) => `CBS: edição de ${nome} bloqueada (config de lint/format). Corrija o código em vez de afrouxar a regra. Se a mudança é legítima, rode com CBS_PERMITIR_CONFIG=1.`;
 
-export function ehProtegido(arquivo) {
+// Nome que as ferramentas enxergam. Variante de caixa (.ESLINTRC.JSON) só vale como o nome em minúsculas se abre o
+// mesmo arquivo: FS case-insensitive (macOS, Windows, WSL /mnt/c, ext4 casefold) ou hardlink. No Linux case-sensitive
+// é outro arquivo, que ferramenta nenhuma lê.
+function nomeVisto(arquivo) {
   const b = path.basename(arquivo);
+  const min = b.toLowerCase();
+  if (min === b) return b;
+  try {
+    const a = fs.lstatSync(arquivo, { bigint: true });
+    const m = fs.lstatSync(path.join(path.dirname(arquivo), min), { bigint: true });
+    return a.dev === m.dev && a.ino === m.ino ? min : b;
+  } catch { return b; }
+}
+export function ehProtegido(arquivo) {
+  const b = nomeVisto(arquivo);
   return PROTEGIDOS.some((re) => re.test(b));
+}
+function realOuNull(p) {
+  try { return fs.realpathSync(p); } catch { return null; }
 }
 // lstat: symlink quebrado conta como existente; erro que não é ENOENT também (fail closed, como o ECC)
 function existeNoDisco(p) {
@@ -41,6 +59,7 @@ export function secoesProtegidas(toml) {
 }
 // O trecho (old_string ou texto antigo de um hunk) cai, em alguma ocorrência, numa seção protegida?
 function trechoTocaSecao(toml, trecho) {
+  if (!trecho) return false; // indexOf('') casa em toda posição: laço sem fim
   if (CITA_SECAO.test(trecho)) return true;
   const flags = linhasProtegidas(toml);
   const linhasDoTrecho = trecho.split('\n').length - 1;
@@ -61,11 +80,12 @@ function blocosDoPatch(patch, cwd) {
   const blocos = [];
   let b = null;
   let h = null;
-  for (const l of patch.split('\n')) {
+  for (const l of patch.split(/\r?\n/)) {
     const m = /^\*\*\* (Add|Update|Delete) File: (.+)$/.exec(l);
-    if (m) { b = { arquivo: path.resolve(cwd, m[2].trim()), tipo: m[1], move: false, hunks: [] }; blocos.push(b); h = null; continue; }
+    if (m) { b = { arquivo: path.resolve(cwd, m[2].trim()), tipo: m[1], destino: null, hunks: [] }; blocos.push(b); h = null; continue; }
     if (!b) continue;
-    if (l.startsWith('*** Move to: ')) { b.move = true; continue; }
+    if (l.startsWith('*** Move to: ')) { b.destino = path.resolve(cwd, l.slice(13).trim()); continue; }
+    if (l.startsWith('*** End of File')) { if (h) h.fim = true; continue; }
     if (l.startsWith('***')) continue;
     if (l.startsWith('@@')) { h = { cabecalho: l, velho: [], novo: [] }; b.hunks.push(h); continue; }
     if (!h) { h = { cabecalho: '', velho: [], novo: [] }; b.hunks.push(h); }
@@ -75,6 +95,43 @@ function blocosDoPatch(patch, cwd) {
   return blocos;
 }
 
+// Linha onde a sequência começa, a partir de `de`, nos níveis do seek_sequence do Codex (exato → sem espaço à
+// direita → sem espaço nas pontas). -1 = não achou.
+function acharLinhas(linhas, alvo, de) {
+  for (const norm of [(s) => s, (s) => s.trimEnd(), (s) => s.trim()]) {
+    for (let i = de; i + alvo.length <= linhas.length; i++) {
+      if (alvo.every((l, k) => norm(linhas[i + k]) === norm(l))) return i;
+    }
+  }
+  return -1;
+}
+// Linhas novas que caem na seção onde o hunk é aplicado (as que vêm antes de um cabeçalho [..] próprio).
+function temSoltas(novo) {
+  const ate = novo.findIndex((l) => /^\s*\[/.test(l));
+  return (ate < 0 ? novo : novo.slice(0, ate)).some((l) => l.trim());
+}
+// Hunks de um Update File no pyproject. Texto antigo com conteúdo: qualquer ocorrência numa seção protegida bloqueia.
+// Sem texto antigo que conte, o local é o do Codex (codex-rs apply-patch): acréscimo puro vai para o fim do arquivo;
+// só linhas em branco = primeira em branco a partir do contexto do @@ e do hunk anterior (não achou → fail closed).
+function hunksAfrouxam(atual, hunks) {
+  const linhas = atual.split('\n');
+  if (linhas.length > 1 && linhas[linhas.length - 1] === '') linhas.pop();
+  const flags = linhasProtegidas(atual);
+  let pos = 0;
+  for (const h of hunks) {
+    if (CITA_SECAO.test(h.cabecalho) || h.novo.some((l) => CITA_SECAO.test(l))) return true;
+    const velho = h.velho.join('\n');
+    if (velho.trim() && trechoTocaSecao(atual, velho)) return true;
+    const ctx = h.cabecalho.startsWith('@@ ') ? h.cabecalho.slice(3) : '';
+    if (ctx && pos >= 0) { const c = acharLinhas(linhas, [ctx], pos); pos = c < 0 ? -1 : c + 1; }
+    if (!h.velho.length) { if (temSoltas(h.novo) && flags[flags.length - 1]) return true; continue; }
+    const i = pos < 0 ? -1 : acharLinhas(linhas, h.velho, h.fim ? Math.max(0, linhas.length - h.velho.length) : pos);
+    if (!velho.trim() && temSoltas(h.novo) && (i < 0 ? flags.some(Boolean) : flags[i])) return true;
+    pos = i < 0 ? -1 : i + h.velho.length;
+  }
+  return false;
+}
+
 function pyprojectAfrouxado(arquivo, atual, payload) {
   const ti = payload.tool_input || {};
   if (typeof ti.content === 'string') return secoesProtegidas(atual) !== secoesProtegidas(ti.content);
@@ -82,12 +139,15 @@ function pyprojectAfrouxado(arquivo, atual, payload) {
   for (const patch of [ti.input, ti.patch, comandoBash(payload)]) {
     if (typeof patch !== 'string' || !patch.includes('*** Begin Patch')) continue;
     for (const b of blocosDoPatch(patch, cwd)) {
-      if (b.arquivo !== arquivo) continue;
-      if (b.tipo === 'Delete' || b.move) { if (secoesProtegidas(atual)) return true; continue; }
-      for (const h of b.hunks) {
-        if (CITA_SECAO.test(h.cabecalho) || h.novo.some((l) => CITA_SECAO.test(l))) return true;
-        if (h.velho.length && trechoTocaSecao(atual, h.velho.join('\n'))) return true;
+      if (b.arquivo !== arquivo && b.destino !== arquivo) continue;
+      // Delete, Move da origem ou Move por cima de um pyproject existente: some/troca o arquivo inteiro
+      if (b.tipo === 'Delete' || b.destino) { if (secoesProtegidas(atual)) return true; continue; }
+      if (b.tipo === 'Add') { // Add File por cima de arquivo existente = Write
+        const novo = b.hunks.flatMap((h) => h.novo).map((l) => l + '\n').join('');
+        if (secoesProtegidas(atual) !== secoesProtegidas(novo)) return true;
+        continue;
       }
+      if (hunksAfrouxam(atual, b.hunks)) return true;
     }
   }
   const edits = Array.isArray(ti.edits) ? ti.edits : [ti];
@@ -102,11 +162,12 @@ function pyprojectAfrouxado(arquivo, atual, payload) {
 export function avaliarEdicao(payload, { env = process.env } = {}) {
   if (String(env.CBS_PERMITIR_CONFIG || '') === '1') return { bloquear: false };
   for (const arquivo of caminhosEditados(payload)) {
-    const nome = path.basename(arquivo);
-    const protegido = ehProtegido(arquivo);
-    if (!protegido && nome.toLowerCase() !== 'pyproject.toml') continue;
     if (!existeNoDisco(arquivo)) continue; // SP-3: criação inicial não enfraquece nada (inclui destino de Move)
-    if (protegido) return { bloquear: true, motivo: msg(nome) };
+    // symlink: nome comum apontando para uma config conta como a config
+    const alvos = [arquivo, realOuNull(arquivo)].filter(Boolean);
+    const protegido = alvos.find((p) => ehProtegido(p));
+    if (protegido) return { bloquear: true, motivo: msg(path.basename(protegido)) };
+    if (!alvos.some((p) => nomeVisto(p) === 'pyproject.toml')) continue;
     if (pyprojectAfrouxado(arquivo, lerTexto(arquivo), payload)) {
       return { bloquear: true, motivo: msg('pyproject.toml [tool.ruff]/[tool.mypy]') };
     }
