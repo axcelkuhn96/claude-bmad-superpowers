@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cbs-no-verify.js — PreToolUse (Bash): bloqueia bypass de hooks git (--no-verify, commit/am -n, -c core.hooksPath=…).
+// cbs-no-verify.mjs — PreToolUse (Bash): bloqueia bypass de hooks git (--no-verify, commit/am -n, -c core.hooksPath=…).
 // Fail-closed por construção: o gatilho é o TEXTO CRU — palavra `git` + flag de bypass (--no-verify ou prefixo,
 // core.hooksPath=, ou -n agrupado quando há commit/am) → BLOQUEIA. O parser só REBAIXA para liberar quando a análise
 // é certa E cada flag está provadamente em dado: argumento de echo/printf/grep/rg/gh, valor de -m/-F em commit/tag/merge,
@@ -9,7 +9,7 @@
 // aceito: heredoc cujo texto contém "--no-verify" bloqueia — escape: CBS_HOOKS_DESLIGADOS=no-verify.
 // Adaptado de affaan-m/ECC @ e482e57, scripts/hooks/block-no-verify.js — MIT License,
 // Copyright (c) 2026 Affaan Mustafa. Licença: https://github.com/affaan-m/ECC/blob/e482e57/LICENSE
-import { hookDesligado, lerStdin, lerPayload, comandoBash, ehEntrada, avisar } from './cbs-comum.js';
+import { hookDesligado, lerStdin, lerPayload, comandoBash, ehEntrada, avisar } from './cbs-comum.mjs';
 
 // --- Do ECC (block-no-verify.js:21-31, 38-84, 210-275, 396-404), sem mudança: subcomandos, flags de bypass e
 // opções de valor do git commit. O resto do ECC (scanner por string) foi substituído pela lógica fail-closed abaixo. ---

@@ -13,7 +13,7 @@ import { temBmadAqui } from './bmad.js';
 
 function rodapeParaArquivo(p, versao) {
   if (p.endsWith('.md')) return `\n\n<!-- ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/ pra não perder no /atualizar -->\n`;
-  if (p.endsWith('.js')) return `\n\n// ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/scripts/ pra não perder no /atualizar\n`;
+  if (/\.m?js$/.test(p)) return `\n\n// ${MARCADOR} v${versao} — edite em ~/.claude/cbs-overrides/scripts/ pra não perder no /atualizar\n`;
   if (p.endsWith('.sh')) return `\n\n# ${MARCADOR} v${versao} — arquivo do pacote; o /atualizar sobrescreve\n`;
   return '';
 }
@@ -29,7 +29,7 @@ async function copiarComMarcador(origem, destino, versao) {
   const limpo = limparMarcadorAntigo(conteudo).trimEnd();
   await garantirDir(path.dirname(destino));
   await fs.writeFile(destino, limpo + rodapeParaArquivo(destino, versao), 'utf8');
-  if (destino.endsWith('.js')) await fs.chmod(destino, 0o755);
+  if (/\.m?js$/.test(destino)) await fs.chmod(destino, 0o755);
 }
 
 // models.yml (modelo por papel) é do usuário: copia o default SÓ se não existir
@@ -43,22 +43,25 @@ export async function garantirModelsOverride() {
   return { acao: 'criado', destino };
 }
 
-// hooks: arquivos com marcador (cbs-*.js, launcher cbs-node.sh); package.json ({"type":"module"}) SÓ se não existir (SP-2).
+// hooks: arquivos com marcador (cbs-*.mjs — ESM pela extensão, sem package.json em ~/.claude/hooks —, launcher cbs-node.sh).
 // `copiar` troca a política de cópia (o atualizar preserva arquivo sem marcador).
 async function copiarHooks(origem, destino, versao, copiar) {
-  const pkgDestino = path.join(destino, 'package.json');
-  const pkgExistia = await existe(pkgDestino);
   for (const ent of await fs.readdir(origem, { withFileTypes: true })) {
-    if (!ent.isFile()) continue;
-    if (ent.name === 'package.json') {
-      if (!pkgExistia) { await garantirDir(destino); await fs.copyFile(path.join(origem, ent.name), pkgDestino); }
-      else if (!/"type"\s*:\s*"module"/.test(await fs.readFile(pkgDestino, 'utf8'))) {
-        console.log(`⚠  ${pkgDestino} existe sem "type": "module" — os hooks CBS (ESM) não vão carregar; ajuste manualmente.`);
-      }
-      continue;
-    }
-    await copiar(path.join(origem, ent.name), path.join(destino, ent.name), versao);
+    if (ent.isFile()) await copiar(path.join(origem, ent.name), path.join(destino, ent.name), versao);
   }
+}
+
+// cbs-*.js com marcador = hooks das builds 0.13-dev (antes do .mjs); sem marcador é do usuário e fica.
+async function apagarHooksJsLegados(dir) {
+  const apagados = [];
+  for (const ent of await fs.readdir(dir, { withFileTypes: true })) {
+    const p = path.join(dir, ent.name);
+    if (ent.isFile() && /^cbs-[a-z-]+\.js$/.test(ent.name) && (await fs.readFile(p, 'utf8')).includes(MARCADOR)) {
+      await fs.rm(p);
+      apagados.push(ent.name);
+    }
+  }
+  if (apagados.length) console.log(`→ hooks .js antigos removidos (agora .mjs): ${apagados.join(', ')}`);
 }
 
 // hooks globais (instalar e atualizar): copia, grava o node pro launcher e registra no settings.json.
@@ -73,10 +76,14 @@ export async function instalarHooks(versao, semHooks, copiar = copiarComMarcador
     console.log(`⚠  ${e.message} — .cbs-node-path não gravado; o launcher procura o node no PATH, nvm, fnm e volta.`);
   }
   if (semHooks) {
+    // settings.json intocado pode ainda apontar pros cbs-*.js antigos: eles ficam
     console.log('(registro no settings.json pulado por --sem-hooks)');
     return { mudou: false, backup: null };
   }
-  return aplicarHooks(ARQ_SETTINGS, DIR_HOOKS);
+  const r = await aplicarHooks(ARQ_SETTINGS, DIR_HOOKS);
+  // só depois de o settings.json trocar as entradas .js pelas .mjs: nenhuma entrada fica apontando pra arquivo apagado
+  await apagarHooksJsLegados(DIR_HOOKS);
+  return r;
 }
 
 async function copiarArvore(origemBase, destinoBase, versao) {
@@ -149,7 +156,7 @@ export async function instalar(args = []) {
     await copiarArvore(origemAgents, DIR_AGENTS, versao);
   }
 
-  // hooks globais (cbs-*.js + launcher) + node do instalador pro launcher + merge idempotente no settings.json
+  // hooks globais (cbs-*.mjs + launcher) + node do instalador pro launcher + merge idempotente no settings.json
   if (await existe(path.join(RAIZ_BASE, 'hooks'))) {
     console.log('→ Copiando hooks cbs-*...');
     const r = await instalarHooks(versao, semHooks);

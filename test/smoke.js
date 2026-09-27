@@ -51,14 +51,14 @@ async function lerJson(p) { return JSON.parse(await fs.readFile(p, 'utf8')); }
 function hooksCbs(settings) {
   const out = [];
   for (const [ev, gs] of Object.entries(settings.hooks || {})) for (const g of gs) for (const h of g.hooks) {
-    const m = String(h.command).match(/[\\/]\.claude[\\/]hooks[\\/](cbs-[a-z-]+\.js)/);
+    const m = String(h.command).match(/[\\/]\.claude[\\/]hooks[\\/](cbs-[a-z-]+\.mjs)/);
     if (m) out.push(`${ev}:${m[1]}`);
   }
   return out.sort();
 }
-const HOOKS_ESPERADOS = ['PostToolUse:cbs-format.js', 'PreToolUse:cbs-config-protect.js', 'PreToolUse:cbs-no-verify.js', 'Stop:cbs-typecheck.js'];
-// arquivos instalados em ~/.claude/hooks (com marcador). TODO(T5): + 'cbs-config-protect.js' quando a T5 for mesclada.
-const HOOKS_ARQUIVOS = ['cbs-comum.js', 'cbs-format.js', 'cbs-no-verify.js', 'cbs-typecheck.js', 'cbs-node.sh'];
+const HOOKS_ESPERADOS = ['PostToolUse:cbs-format.mjs', 'PreToolUse:cbs-config-protect.mjs', 'PreToolUse:cbs-no-verify.mjs', 'Stop:cbs-typecheck.mjs'];
+// arquivos instalados em ~/.claude/hooks (com marcador). TODO(T5): + 'cbs-config-protect.mjs' quando a T5 for mesclada.
+const HOOKS_ARQUIVOS = ['cbs-comum.mjs', 'cbs-format.mjs', 'cbs-no-verify.mjs', 'cbs-typecheck.mjs', 'cbs-node.sh'];
 const WIN = process.platform === 'win32';
 
 before(async () => {
@@ -193,7 +193,7 @@ assert.ok(cmdsBase.includes('blindar.md'), 'command /blindar no base');
   }
   assert.ok(await existe(path.join(claude, 'cbs-overrides', 'agents')), 'cbs-overrides/agents/ criado');
 
-  // hooks: arquivos com marcador + package.json ESM + 4 entradas no settings.json, rtk intacto, backup
+  // hooks: arquivos com marcador (.mjs = ESM pela extensão, sem package.json) + 4 entradas no settings.json, rtk intacto, backup
   for (const h of HOOKS_ARQUIVOS) {
     const p = path.join(claude, 'hooks', h);
     assert.ok(await existe(p), `hook ${h} copiado`);
@@ -201,12 +201,33 @@ assert.ok(cmdsBase.includes('blindar.md'), 'command /blindar no base');
   }
   if (!WIN) assert.equal(spawnSync('/bin/sh', ['-n', path.join(claude, 'hooks', 'cbs-node.sh')]).status, 0, 'launcher com marcador continua sh válido');
   assert.equal(await fs.readFile(path.join(claude, 'hooks', '.cbs-node-path'), 'utf8'), `${process.execPath}\n`, 'node do instalador gravado pro launcher');
-  assert.match(await fs.readFile(path.join(claude, 'hooks', 'package.json'), 'utf8'), /"type":\s*"module"/);
+  assert.ok(!(await existe(path.join(claude, 'hooks', 'package.json'))), 'instalar não cria ~/.claude/hooks/package.json');
   const settings = await lerJson(path.join(claude, 'settings.json'));
   assert.deepEqual(hooksCbs(settings), HOOKS_ESPERADOS);
   assert.deepEqual(settings.hooks.PreToolUse[0], RTK_GRUPO);
   assert.equal(settings.model, 'opus');
   assert.ok(await existe(path.join(claude, 'settings.json.cbs-backup')));
+});
+
+test('hooks instalados rodam pelo launcher sem package.json; hook .js CommonJS do usuário em ~/.claude/hooks segue funcionando', { skip: WIN && 'POSIX' }, async () => {
+  const env = { ...process.env, HOME: homeTmp };
+  for (const k of Object.keys(env)) if (k.startsWith('CBS_')) delete env[k];
+  const cmd = (await lerJson(path.join(claude, 'settings.json'))).hooks.PreToolUse
+    .flatMap((g) => g.hooks).find((h) => /cbs-no-verify\.mjs/.test(h.command)).command;
+  const rodar = (command) => spawnSync('/bin/sh', ['-c', cmd], { encoding: 'utf8', env, input: JSON.stringify({ tool_name: 'Bash', tool_input: { command } }) });
+  const r = rodar('git commit --no-verify -m x');
+  assert.equal(r.status, 2, r.stdout + r.stderr); assert.match(r.stderr, /CBS: bloqueado/);
+  const ok = rodar('git status');
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr); assert.equal(ok.stdout + ok.stderr, '');
+
+  const cjs = path.join(claude, 'hooks', 'meu-hook.js');
+  await fs.writeFile(cjs, "const fs = require('node:fs'); process.stdout.write(typeof fs.readFileSync);\n", 'utf8');
+  try {
+    const u = spawnSync(process.execPath, [cjs], { encoding: 'utf8', env });
+    assert.equal(u.status, 0, u.stderr); assert.equal(u.stdout, 'function');
+  } finally {
+    await fs.rm(cjs);
+  }
 });
 
 test('instalar --apenas-global copia base/scripts/*.js executáveis e com marcador', async (t) => {
@@ -246,7 +267,7 @@ test('atualizar --skip-self-update --skip-bmad preserva models.yml e override se
   const nodePath = path.join(claude, 'hooks', '.cbs-node-path');
   await fs.writeFile(nodePath, '/node/velho/bin/node\n', 'utf8');
   // hook do pacote apagado → atualizar recopia
-  await fs.rm(path.join(claude, 'hooks', 'cbs-no-verify.js'));
+  await fs.rm(path.join(claude, 'hooks', 'cbs-no-verify.mjs'));
 
   const { code, out } = cli(['atualizar', '--skip-self-update', '--skip-bmad']);
   assert.equal(code, 0, out);
@@ -256,11 +277,12 @@ test('atualizar --skip-self-update --skip-bmad preserva models.yml e override se
   assert.match(out, /customização\(ões\) preservada\(s\)/);
   assert.deepEqual(hooksCbs(await lerJson(path.join(claude, 'settings.json'))), HOOKS_ESPERADOS);
   assert.equal(await fs.readFile(nodePath, 'utf8'), `${process.execPath}\n`);
-  assert.match(await fs.readFile(path.join(claude, 'hooks', 'cbs-no-verify.js'), 'utf8'), new RegExp(MARCADOR));
-  assert.doesNotMatch(out, /hooks[\\/]package\.json/, 'package.json ESM do pacote não aparece como customização');
+  assert.match(await fs.readFile(path.join(claude, 'hooks', 'cbs-no-verify.mjs'), 'utf8'), new RegExp(MARCADOR));
+  assert.doesNotMatch(out, /hooks[\\/]package\.json/, 'atualizar não fala de package.json em hooks/');
+  assert.ok(!(await existe(path.join(claude, 'hooks', 'package.json'))), 'atualizar não cria ~/.claude/hooks/package.json');
 });
 
-test('instalar --sem-hooks copia os hooks mas não toca no settings.json; package.json alheio sem ESM → aviso, preservado', async () => {
+test('instalar --sem-hooks copia os hooks mas não toca no settings.json; package.json alheio preservado, sem aviso (hooks .mjs)', async () => {
   const outroHome = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-smoke-semhooks-'));
   const rodar = (args) => spawnSync(process.execPath, [CLI, ...args], {
     encoding: 'utf8', env: { ...process.env, HOME: outroHome, USERPROFILE: outroHome }, cwd: outroHome, input: '',
@@ -274,17 +296,101 @@ test('instalar --sem-hooks copia os hooks mas não toca no settings.json; packag
     for (const h of HOOKS_ARQUIVOS) assert.ok(await existe(path.join(outroHome, '.claude', 'hooks', h)), `hook ${h} copiado`);
     assert.match(r.stdout, /registro no settings\.json pulado por --sem-hooks/);
     assert.ok(!(await existe(path.join(outroHome, '.claude', 'settings.json'))));
-    assert.match(r.stdout, /package\.json existe sem "type": "module"/);
+    assert.doesNotMatch(r.stdout, /hooks[\\/]package\.json|"type": "module"/);
     assert.equal(await fs.readFile(pkg, 'utf8'), '{ "name": "meus-hooks" }\n');
 
     const a = rodar(['atualizar', '--skip-self-update', '--skip-bmad', '--sem-hooks']);
     assert.equal(a.status, 0, a.stdout + a.stderr);
-    assert.match(a.stdout, /package\.json existe sem "type": "module"/, 'atualizar avisa igual ao instalar');
+    assert.doesNotMatch(a.stdout, /hooks[\\/]package\.json|"type": "module"/, 'atualizar também não fala do package.json de hooks/');
     assert.match(a.stdout, /registro no settings\.json pulado por --sem-hooks/, 'atualizar diz o mesmo que o instalar');
     assert.ok(!(await existe(path.join(outroHome, '.claude', 'settings.json'))));
     assert.equal(await fs.readFile(pkg, 'utf8'), '{ "name": "meus-hooks" }\n');
   } finally {
     await fs.rm(outroHome, { recursive: true, force: true });
+  }
+});
+
+// Estado deixado por uma build 0.13-dev (hooks .js + package.json type:module): entradas .js no settings.json,
+// cbs-*.js com marcador e o package.json exatamente como base/hooks/package.json era.
+const PKG_DEV = '{ "type": "module" }\n';
+const HOOKS_LEGADO = ['cbs-comum.js', 'cbs-no-verify.js', 'cbs-format.js', 'cbs-typecheck.js', 'cbs-config-protect.js'];
+async function montarLegado(home, pkgTexto) {
+  const dir = path.join(home, '.claude', 'hooks');
+  await fs.mkdir(dir, { recursive: true });
+  const cmd = (s) => { const l = path.join(dir, 'cbs-node.sh'); const js = path.join(dir, s); return `[ ! -f "${l}" ] || [ ! -f "${js}" ] || sh "${l}" "${js}"`; };
+  const grupo = (matcher, s, timeout) => ({ ...(matcher ? { matcher } : {}), hooks: [{ type: 'command', command: cmd(s), timeout }] });
+  const settings = {
+    model: 'opus',
+    hooks: {
+      PreToolUse: [RTK_GRUPO, grupo('Bash', 'cbs-no-verify.js', 10), grupo('Edit|Write|MultiEdit', 'cbs-config-protect.js', 10)],
+      PostToolUse: [grupo('Edit|Write|MultiEdit', 'cbs-format.js', 30)],
+      Stop: [grupo(null, 'cbs-typecheck.js', 90)],
+    },
+  };
+  await fs.writeFile(path.join(home, '.claude', 'settings.json'), JSON.stringify(settings, null, 2) + '\n', 'utf8');
+  for (const f of HOOKS_LEGADO) await fs.writeFile(path.join(dir, f), `// velho\n\n// ${MARCADOR} v0.13.0 — edite em ~/.claude/cbs-overrides/scripts/ pra não perder no /atualizar\n`, 'utf8');
+  await fs.writeFile(path.join(dir, 'cbs-node.sh'), `#!/bin/sh\nexit 0\n\n# ${MARCADOR} v0.13.0 — arquivo do pacote; o /atualizar sobrescreve\n`, 'utf8');
+  await fs.writeFile(path.join(dir, 'cbs-meu.js'), '// meu, sem marcador\n', 'utf8');
+  await fs.writeFile(path.join(dir, 'package.json'), pkgTexto, 'utf8');
+  return dir;
+}
+
+test('atualizar sobre build 0.13-dev (hooks .js): troca entradas .js pelas .mjs e apaga cbs-*.js do pacote; --sem-hooks não mexe', async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-smoke-legado-'));
+  const rodar = (args) => spawnSync(process.execPath, [CLI, ...args], {
+    encoding: 'utf8', env: { ...process.env, HOME: home, USERPROFILE: home }, cwd: home, input: '',
+  });
+  try {
+    const dir = await montarLegado(home, PKG_DEV);
+    const arq = path.join(home, '.claude', 'settings.json');
+    const antes = await fs.readFile(arq, 'utf8');
+
+    // --sem-hooks: settings.json intocado, então os .js que ele ainda referencia ficam
+    const s = rodar(['atualizar', '--skip-self-update', '--skip-bmad', '--sem-hooks']);
+    assert.equal(s.status, 0, s.stdout + s.stderr);
+    assert.equal(await fs.readFile(arq, 'utf8'), antes);
+    for (const f of HOOKS_LEGADO) assert.ok(await existe(path.join(dir, f)), `${f} mantido com --sem-hooks`);
+
+    const a = rodar(['atualizar', '--skip-self-update', '--skip-bmad']);
+    assert.equal(a.status, 0, a.stdout + a.stderr);
+    const depois = await lerJson(arq);
+    assert.deepEqual(hooksCbs(depois), HOOKS_ESPERADOS);
+    assert.doesNotMatch(JSON.stringify(depois), /cbs-[a-z-]+\.js\b/, 'nenhuma entrada .js sobrou');
+    assert.deepEqual(depois.hooks.PreToolUse[0], RTK_GRUPO);
+    assert.equal(depois.model, 'opus');
+    for (const f of HOOKS_LEGADO) assert.ok(!(await existe(path.join(dir, f))), `${f} (do pacote) apagado`);
+    assert.equal(await fs.readFile(path.join(dir, 'cbs-meu.js'), 'utf8'), '// meu, sem marcador\n', 'cbs-*.js sem marcador preservado');
+    for (const h of HOOKS_ARQUIVOS) assert.match(await fs.readFile(path.join(dir, h), 'utf8'), new RegExp(MARCADOR), `${h} instalado`);
+    assert.equal(await fs.readFile(path.join(dir, 'package.json'), 'utf8'), PKG_DEV, 'atualizar não mexe no package.json');
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test('remover sobre build 0.13-dev: tira entradas .js e cbs-*.js do pacote; package.json só sai se byte-igual ao da 0.13-dev', async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-smoke-legado-rm-'));
+  const rodar = (args) => spawnSync(process.execPath, [CLI, ...args], {
+    encoding: 'utf8', env: { ...process.env, HOME: home, USERPROFILE: home }, cwd: home, input: '',
+  });
+  try {
+    const outroPkg = '{"type":"module"}\n';
+    const dir = await montarLegado(home, outroPkg);
+    const r = rodar(['remover', '-y']);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /4 entrada\(s\) CBS removida\(s\) do settings\.json/);
+    assert.deepEqual(await lerJson(path.join(home, '.claude', 'settings.json')), SETTINGS_INICIAL);
+    for (const f of [...HOOKS_LEGADO, 'cbs-node.sh']) assert.ok(!(await existe(path.join(dir, f))), `${f} apagado`);
+    assert.ok(await existe(path.join(dir, 'cbs-meu.js')), 'cbs-*.js sem marcador preservado');
+    assert.equal(await fs.readFile(path.join(dir, 'package.json'), 'utf8'), outroPkg, 'package.json diferente do da 0.13-dev preservado');
+
+    await fs.writeFile(path.join(dir, 'package.json'), PKG_DEV, 'utf8');
+    const d = rodar(['remover', '-y']);
+    assert.equal(d.status, 0, d.stdout + d.stderr);
+    assert.match(d.stdout, /hooks[\\/]package\.json/);
+    assert.ok(!(await existe(path.join(dir, 'package.json'))), 'package.json da 0.13-dev apagado');
+    assert.ok(await existe(path.join(dir, 'cbs-meu.js')));
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
   }
 });
 
@@ -401,8 +507,8 @@ test('status depois de instalar lista skills, personas e models.yml', () => {
   assert.match(out, /Modelo por papel: ✓/);
   assert.match(out, /Skills de domínio detectadas:/);
   assert.match(out, /Hooks CBS ativos \(4\)/);
-  assert.match(out, /Stop → cbs-typecheck\.js/);
-  assert.match(out, /PreToolUse \[Bash\] → cbs-no-verify\.js$/m);
+  assert.match(out, /Stop → cbs-typecheck\.mjs/);
+  assert.match(out, /PreToolUse \[Bash\] → cbs-no-verify\.mjs$/m);
   assert.doesNotMatch(out, /launcher .* ausente|node gravado .* não existe/);
 });
 
@@ -497,9 +603,9 @@ test('remover -y apaga só arquivos com marcador e preserva cbs-overrides', asyn
   assert.match(out, /superpowers@superpowers-marketplace/);
   assert.match(out, /bmad-method uninstall/);
   assert.deepEqual(await lerJson(path.join(claude, 'settings.json')), SETTINGS_INICIAL, 'settings.json volta ao estado anterior');
-  assert.ok(!(await existe(path.join(claude, 'hooks', 'cbs-no-verify.js'))), 'hook com marcador removido');
+  assert.ok(!(await existe(path.join(claude, 'hooks', 'cbs-no-verify.mjs'))), 'hook com marcador removido');
   assert.ok(!(await existe(path.join(claude, 'hooks', 'cbs-node.sh'))), 'launcher removido');
   assert.ok(!(await existe(path.join(claude, 'hooks', '.cbs-node-path'))), 'node gravado removido');
-  assert.ok(await existe(path.join(claude, 'hooks', 'package.json')), 'package.json sem marcador preservado (SP-2)');
+  assert.deepEqual((await fs.readdir(path.join(claude, 'hooks'))).filter((f) => f.startsWith('cbs-')), [], 'nenhum cbs-* sobrou em hooks/');
   assert.match(out, /4 entrada\(s\) CBS removida\(s\) do settings\.json/);
 });

@@ -1,4 +1,4 @@
-// cbs-comum.js — utilitários dos hooks CBS (Claude Code + Codex). ESM, sem dependências.
+// cbs-comum.mjs — utilitários dos hooks CBS (Claude Code + Codex). ESM, sem dependências.
 // Regras: nunca quebrar a sessão (erro interno → exit 0), nada no stdout sem motivo, sem npx, sem shell.
 import fs from 'node:fs';
 import os from 'node:os';

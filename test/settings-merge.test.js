@@ -33,18 +33,18 @@ const tmpDir = async (t) => {
 };
 
 test('HOOKS_CBS: 4 hooks, matchers estreitos, nunca .*', () => {
-  assert.deepEqual(HOOKS_CBS.map((h) => h.script).sort(), ['cbs-config-protect.js', 'cbs-format.js', 'cbs-no-verify.js', 'cbs-typecheck.js']);
+  assert.deepEqual(HOOKS_CBS.map((h) => h.script).sort(), ['cbs-config-protect.mjs', 'cbs-format.mjs', 'cbs-no-verify.mjs', 'cbs-typecheck.mjs']);
   for (const h of HOOKS_CBS) assert.ok(h.matcher === null || !h.matcher.includes('.*'), h.script);
   assert.ok(Object.isFrozen(HOOKS_CBS));
 });
 
 test('comando é launcher-e-script-se-existirem + sh cbs-node.sh + caminho absoluto do hook, entre aspas, sem npx', () => {
-  const c = comandoHook(DIR, 'cbs-format.js');
+  const c = comandoHook(DIR, 'cbs-format.mjs');
   const l = path.join(DIR, 'cbs-node.sh');
-  const js = path.join(DIR, 'cbs-format.js');
+  const js = path.join(DIR, 'cbs-format.mjs');
   assert.equal(c, `[ ! -f "${l}" ] || [ ! -f "${js}" ] || sh "${l}" "${js}"`);
   assert.doesNotMatch(c, /npx/);
-  assert.equal(scriptCbs(c), 'cbs-format.js');
+  assert.equal(scriptCbs(c), 'cbs-format.mjs');
 });
 
 test('launcher sozinho não conta como hook CBS', () => {
@@ -54,14 +54,14 @@ test('launcher sozinho não conta como hook CBS', () => {
 
 test('comandoHook recusa HOME com $, crase, aspas ou quebra de linha', () => {
   for (const ruim of ['/home/a$b/.claude/hooks', '/home/a`id`/.claude/hooks', '/home/a"b/.claude/hooks', '/home/a\nb/.claude/hooks']) {
-    assert.throws(() => comandoHook(ruim, 'cbs-format.js'), /caminho inseguro/, ruim);
+    assert.throws(() => comandoHook(ruim, 'cbs-format.mjs'), /caminho inseguro/, ruim);
   }
   assert.throws(() => mesclarHooksCbs({}, '/home/a$b/.claude/hooks'), /caminho inseguro/);
 });
 
 test('guarda: comandoHook falha se o comando gerado não for reconhecido como o próprio script', () => {
   assert.throws(() => comandoHook(DIR, 'rtk-rewrite.sh'), /não reconhecido/);
-  assert.throws(() => comandoHook(path.join(path.sep, 'proj', 'hooks'), 'cbs-format.js'), /não reconhecido/);
+  assert.throws(() => comandoHook(path.join(path.sep, 'proj', 'hooks'), 'cbs-format.mjs'), /não reconhecido/);
   for (const h of HOOKS_CBS) assert.equal(scriptCbs(comandoHook(DIR, h.script)), h.script);
 });
 
@@ -91,20 +91,55 @@ test('gravarCaminhoNode recusa node relativo ou com $, crase, aspas', async (t) 
 });
 
 test('scriptCbs reconhece o hook com node absoluto, node nu e caminho Windows; ignora alheio', () => {
-  assert.equal(scriptCbs(comandoHook(DIR, 'cbs-no-verify.js')), 'cbs-no-verify.js');
-  assert.equal(scriptCbs('"/opt/node v22/bin/node" "/home/u/.claude/hooks/cbs-format.js"'), 'cbs-format.js');
-  assert.equal(scriptCbs('node "/velho/.claude/hooks/cbs-typecheck.js"'), 'cbs-typecheck.js');
-  assert.equal(scriptCbs('"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\u\\.claude\\hooks\\cbs-config-protect.js"'), 'cbs-config-protect.js');
+  assert.equal(scriptCbs(comandoHook(DIR, 'cbs-no-verify.mjs')), 'cbs-no-verify.mjs');
+  assert.equal(scriptCbs('"/opt/node v22/bin/node" "/home/u/.claude/hooks/cbs-format.mjs"'), 'cbs-format.mjs');
+  assert.equal(scriptCbs('node "/velho/.claude/hooks/cbs-typecheck.mjs"'), 'cbs-typecheck.mjs');
+  assert.equal(scriptCbs('"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\u\\.claude\\hooks\\cbs-config-protect.mjs"'), 'cbs-config-protect.mjs');
   assert.equal(scriptCbs('/home/u/.claude/hooks/rtk-rewrite.sh'), null);
-  assert.equal(scriptCbs('node /proj/hooks/cbs-format.js'), null);
+  assert.equal(scriptCbs('node /proj/hooks/cbs-format.mjs'), null);
   assert.equal(scriptCbs(undefined), null);
+});
+
+// Builds 0.13-dev gravaram os hooks como .js (+ package.json type:module): entradas .js são CBS legadas, a trocar/remover.
+const LEGADO = ['cbs-no-verify.js', 'cbs-config-protect.js', 'cbs-format.js', 'cbs-typecheck.js'];
+const comandoLegado = (s) => { const l = path.join(DIR, 'cbs-node.sh'); const js = path.join(DIR, s); return `[ ! -f "${l}" ] || [ ! -f "${js}" ] || sh "${l}" "${js}"`; };
+const comLegado = () => {
+  const s = inicial();
+  s.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: comandoLegado('cbs-no-verify.js'), timeout: 10 }] });
+  s.hooks.PreToolUse.push({ matcher: 'Edit|Write|MultiEdit', hooks: [{ type: 'command', command: comandoLegado('cbs-config-protect.js'), timeout: 10 }] });
+  s.hooks.PostToolUse = [{ matcher: 'Edit|Write|MultiEdit', hooks: [{ type: 'command', command: comandoLegado('cbs-format.js'), timeout: 30 }] }];
+  s.hooks.Stop = [{ hooks: [{ type: 'command', command: 'node "/velho/.claude/hooks/cbs-typecheck.js"', timeout: 90 }] }];
+  return s;
+};
+
+test('scriptCbs reconhece entrada legada .js (build 0.13-dev) e o comandoHook só gera .mjs', () => {
+  for (const s of LEGADO) assert.equal(scriptCbs(comandoLegado(s)), s);
+  assert.equal(scriptCbs('node "/velho/.claude/hooks/cbs-typecheck.js"'), 'cbs-typecheck.js');
+  assert.equal(scriptCbs('node /proj/hooks/cbs-format.js'), null);
+  for (const h of HOOKS_CBS) assert.match(comandoHook(DIR, h.script), /cbs-[a-z-]+\.mjs"$/);
+});
+
+test('legado .js: merge troca as entradas .js pelas .mjs (uma por hook) sem tocar no alheio; é idempotente', () => {
+  const { settings, mudou } = mesclarHooksCbs(comLegado(), DIR);
+  assert.equal(mudou, true);
+  assert.deepEqual(contar(settings), { 'cbs-no-verify.mjs': 1, 'cbs-config-protect.mjs': 1, 'cbs-format.mjs': 1, 'cbs-typecheck.mjs': 1 });
+  assert.doesNotMatch(JSON.stringify(settings), /cbs-[a-z-]+\.js\b/);
+  assert.deepEqual(settings.hooks.PreToolUse[0], RTK);
+  assert.deepEqual(settings, mesclarHooksCbs(inicial(), DIR).settings);
+  assert.equal(mesclarHooksCbs(settings, DIR).mudou, false);
+});
+
+test('legado .js: remover tira as entradas .js e volta ao estado anterior', () => {
+  const r = removerHooksCbs(comLegado());
+  assert.equal(r.removidos, 4);
+  assert.deepEqual(r.settings, inicial());
 });
 
 test('merge em settings vazio cria as 4 entradas', () => {
   const { settings, mudou } = mesclarHooksCbs({}, DIR);
   assert.equal(mudou, true);
-  assert.deepEqual(contar(settings), { 'cbs-no-verify.js': 1, 'cbs-config-protect.js': 1, 'cbs-format.js': 1, 'cbs-typecheck.js': 1 });
-  const stop = listarHooksCbs(settings).find((h) => h.script === 'cbs-typecheck.js');
+  assert.deepEqual(contar(settings), { 'cbs-no-verify.mjs': 1, 'cbs-config-protect.mjs': 1, 'cbs-format.mjs': 1, 'cbs-typecheck.mjs': 1 });
+  const stop = listarHooksCbs(settings).find((h) => h.script === 'cbs-typecheck.mjs');
   assert.equal(stop.evento, 'Stop'); assert.equal(stop.matcher, null);
   for (const h of listarHooksCbs(settings)) {
     const def = HOOKS_CBS.find((d) => d.script === h.script);
@@ -129,12 +164,12 @@ test('merge é idempotente: a segunda passada não muda nada', () => {
 
 test('merge corrige duplicata e caminho antigo (node nu) sem tocar no alheio', () => {
   const s = inicial();
-  s.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'node "/velho/.claude/hooks/cbs-no-verify.js"' }] });
-  s.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'node "/velho/.claude/hooks/cbs-no-verify.js"' }] });
+  s.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'node "/velho/.claude/hooks/cbs-no-verify.mjs"' }] });
+  s.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'node "/velho/.claude/hooks/cbs-no-verify.mjs"' }] });
   const { settings, mudou } = mesclarHooksCbs(s, DIR);
   assert.equal(mudou, true);
-  assert.equal(contar(settings)['cbs-no-verify.js'], 1);
-  assert.equal(listarHooksCbs(settings).find((h) => h.script === 'cbs-no-verify.js').command, comandoHook(DIR, 'cbs-no-verify.js'));
+  assert.equal(contar(settings)['cbs-no-verify.mjs'], 1);
+  assert.equal(listarHooksCbs(settings).find((h) => h.script === 'cbs-no-verify.mjs').command, comandoHook(DIR, 'cbs-no-verify.mjs'));
   assert.deepEqual(settings.hooks.PreToolUse[0], RTK);
 });
 
@@ -157,7 +192,7 @@ test('remover em settings que não tinha hooks não deixa "hooks" vazio', () => 
 });
 
 test('remover mantém hook alheio no mesmo grupo de um CBS', () => {
-  const s = { hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo fim' }, { type: 'command', command: 'node "/h/.claude/hooks/cbs-typecheck.js"' }] }] } };
+  const s = { hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo fim' }, { type: 'command', command: 'node "/h/.claude/hooks/cbs-typecheck.mjs"' }] }] } };
   assert.deepEqual(removerHooksCbs(s).settings, { hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo fim' }] }] } });
 });
 
@@ -195,7 +230,7 @@ test('aplicarHooks em settings.json ausente cria o arquivo sem backup', async (t
   const d = await tmpDir(t); const arq = path.join(d, 'sub', 'settings.json');
   const r = await aplicarHooks(arq, DIR);
   assert.deepEqual(r, { mudou: true, backup: null });
-  assert.deepEqual(contar(JSON.parse(await fs.readFile(arq, 'utf8'))), { 'cbs-no-verify.js': 1, 'cbs-config-protect.js': 1, 'cbs-format.js': 1, 'cbs-typecheck.js': 1 });
+  assert.deepEqual(contar(JSON.parse(await fs.readFile(arq, 'utf8'))), { 'cbs-no-verify.mjs': 1, 'cbs-config-protect.mjs': 1, 'cbs-format.mjs': 1, 'cbs-typecheck.mjs': 1 });
 });
 
 test('aplicarHooks com JSON inválido não grava nada e sugere --sem-hooks', async (t) => {
@@ -228,7 +263,7 @@ test('settings real: instalar duas vezes = uma entrada por hook CBS; remover dev
   await aplicarHooks(arq, DIR);
   await aplicarHooks(arq, DIR);
   const depois = JSON.parse(await fs.readFile(arq, 'utf8'));
-  assert.deepEqual(contar(depois), { 'cbs-no-verify.js': 1, 'cbs-config-protect.js': 1, 'cbs-format.js': 1, 'cbs-typecheck.js': 1 });
+  assert.deepEqual(contar(depois), { 'cbs-no-verify.mjs': 1, 'cbs-config-protect.mjs': 1, 'cbs-format.mjs': 1, 'cbs-typecheck.mjs': 1 });
   assert.deepEqual(depois.hooks.PreToolUse[0], RTK);
   const { hooks: _h, ...semHooks } = depois; const { hooks: _r, ...realSemHooks } = real();
   assert.deepEqual(semHooks, realSemHooks);
@@ -274,7 +309,7 @@ async function cenario(t) {
     await fs.symlink(r.stdout.trim(), path.join(bin, f));
   }
   await fs.copyFile(LAUNCHER, path.join(hooks, 'cbs-node.sh'));
-  const js = path.join(hooks, 'cbs-x.js');
+  const js = path.join(hooks, 'cbs-x.mjs');
   await fs.writeFile(js, "let e='';process.stdin.on('data',(c)=>{e+=c}).on('end',()=>{process.stdout.write('real:'+e);process.exit(Number(process.argv[2]||0))});");
   const falso = async (arq, nome) => {
     await fs.mkdir(path.dirname(arq), { recursive: true });
@@ -342,24 +377,24 @@ test('comando: launcher apagado (desinstalação parcial) → exit 0 sem saída,
   const c = await cenario(t);
   await gravarCaminhoNode(c.hooks, process.execPath);
   await fs.rm(path.join(c.hooks, 'cbs-node.sh'));
-  const r = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-x.js')], { encoding: 'utf8', input: 'payload', env: { HOME: c.home, PATH: c.bin } });
+  const r = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-x.mjs')], { encoding: 'utf8', input: 'payload', env: { HOME: c.home, PATH: c.bin } });
   assert.deepEqual([r.status, r.stdout, r.stderr], [0, '', '']);
 });
 
 test('comando: script do hook ausente (ainda não instalado ou apagado) → exit 0 sem saída', { skip: process.platform === 'win32' && 'POSIX' }, async (t) => {
   const c = await cenario(t);
   await gravarCaminhoNode(c.hooks, process.execPath);
-  const r = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-nao-instalado.js')], { encoding: 'utf8', input: 'payload', env: { HOME: c.home, PATH: c.bin } });
+  const r = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-nao-instalado.mjs')], { encoding: 'utf8', input: 'payload', env: { HOME: c.home, PATH: c.bin } });
   assert.deepEqual([r.status, r.stdout, r.stderr], [0, '', '']);
 });
 
 test('comando: hook que sai com 2 devolve 2 (bloqueio intencional preservado); 0 devolve 0', { skip: process.platform === 'win32' && 'POSIX' }, async (t) => {
   const c = await cenario(t);
   await gravarCaminhoNode(c.hooks, process.execPath);
-  await fs.writeFile(path.join(c.hooks, 'cbs-bloqueia.js'), "process.stderr.write('bloqueado');process.exit(2);");
+  await fs.writeFile(path.join(c.hooks, 'cbs-bloqueia.mjs'), "process.stderr.write('bloqueado');process.exit(2);");
   const env = { HOME: c.home, PATH: c.bin };
-  const r2 = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-bloqueia.js')], { encoding: 'utf8', env });
+  const r2 = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-bloqueia.mjs')], { encoding: 'utf8', env });
   assert.deepEqual([r2.status, r2.stderr], [2, 'bloqueado']);
-  const r0 = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-x.js')], { encoding: 'utf8', input: 'oi', env });
+  const r0 = spawnSync('/bin/sh', ['-c', comandoHook(c.hooks, 'cbs-x.mjs')], { encoding: 'utf8', input: 'oi', env });
   assert.deepEqual([r0.status, r0.stdout], [0, 'real:oi']);
 });

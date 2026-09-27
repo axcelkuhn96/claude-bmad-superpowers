@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cbs-format.js — PostToolUse (Edit|Write|MultiEdit; Codex: apply_patch): formata SÓ o arquivo editado com a
+// cbs-format.mjs — PostToolUse (Edit|Write|MultiEdit; Codex: apply_patch): formata SÓ o arquivo editado com a
 // ferramenta do próprio projeto (pint / ruff format / biome / prettier) quando há ferramenta E config; silencioso
 // sem ferramenta; nunca npx. Também acumula o caminho por session_id para o typecheck do Stop.
 // Detecção derivada de affaan-m/ECC @ e482e57 (scripts/lib/resolve-formatter.js, scripts/hooks/post-edit-format.js,
@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { hookDesligado, lerStdin, lerPayload, lerTexto, caminhosEditados, acharRaiz, binLocal, noPath, ehEntrada, avisar, registrarEdicao } from './cbs-comum.js';
+import { hookDesligado, lerStdin, lerPayload, lerTexto, caminhosEditados, acharRaiz, binLocal, noPath, ehEntrada, avisar, registrarEdicao } from './cbs-comum.mjs';
 
 const EXT_WEB = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.css', '.json', '.md']);
 const BIOME_CFG = ['biome.json', 'biome.jsonc'];

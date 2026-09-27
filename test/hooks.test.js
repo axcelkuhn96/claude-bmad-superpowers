@@ -49,7 +49,7 @@ function escrever(raiz, rel, conteudo = '', modo) {
   if (modo) fs.chmodSync(p, modo);
   return p;
 }
-const comum = await import(pathToFileURL(path.join(HOOKS, 'cbs-comum.js')).href);
+const comum = await import(pathToFileURL(path.join(HOOKS, 'cbs-comum.mjs')).href);
 
 describe('cbs-comum', () => {
   test('CBS_HOOKS=off desliga os quatro', () => {
@@ -124,12 +124,12 @@ describe('cbs-comum', () => {
     assert.equal(comum.lerTexto(path.join(r, 'nao-existe.txt')), '');
   });
   test('ehEntrada é falso quando o módulo é importado', () => {
-    assert.equal(comum.ehEntrada(pathToFileURL(path.join(HOOKS, 'cbs-comum.js')).href), false);
+    assert.equal(comum.ehEntrada(pathToFileURL(path.join(HOOKS, 'cbs-comum.mjs')).href), false);
   });
 });
 
 // ── Task 6: cbs-format (formatador do projeto) + acumulador por sessão ──
-const fmt = await import(pathToFileURL(path.join(HOOKS, 'cbs-format.js')).href);
+const fmt = await import(pathToFileURL(path.join(HOOKS, 'cbs-format.mjs')).href);
 const EXE = '#!/bin/sh\nexit 0\n';
 describe('cbs-format — escolha do formatador', { skip: !POSIX && 'binários falsos POSIX' }, () => {
   test('php em projeto Laravel com vendor/bin/pint → pint', (t) => {
@@ -242,7 +242,7 @@ describe('cbs-comum — endurecimento da Task 6', { skip: !POSIX && 'POSIX' }, (
     const d = tmpDoTeste(t);
     const fd = fs.openSync(d, 'r');
     t.after(() => fs.closeSync(fd));
-    const r = spawnSync(process.execPath, [path.join(HOOKS, 'cbs-format.js')], {
+    const r = spawnSync(process.execPath, [path.join(HOOKS, 'cbs-format.mjs')], {
       stdio: [fd, 'pipe', 'pipe'], encoding: 'utf8', timeout: 10_000, env: { ...envLimpo(), HOME: d, TMPDIR: d },
     });
     assert.equal(r.status, 0); assert.equal(r.stdout, '');
@@ -261,33 +261,33 @@ describe('cbs-format — E2E', { skip: !POSIX && 'POSIX' }, () => {
   test('formata com o binário do projeto, acumula e fica em silêncio', (t) => {
     const p = tmpDoTeste(t); const log = projetoBiome(p);
     const a = escrever(p, 'src/a.ts', 'const x=1');
-    const r = rodarHook('cbs-format.js', { session_id: 'e2e-fmt', cwd: p, tool_name: 'Edit', tool_input: { file_path: 'src/a.ts' } }, { TMPDIR: p });
+    const r = rodarHook('cbs-format.mjs', { session_id: 'e2e-fmt', cwd: p, tool_name: 'Edit', tool_input: { file_path: 'src/a.ts' } }, { TMPDIR: p });
     assert.equal(r.code, 0); assert.equal(r.out, ''); assert.equal(r.err, '');
     assert.match(fs.readFileSync(log, 'utf8'), /format --write .*src\/a\.ts/);
     assert.deepEqual(comum.lerAcumulador('e2e-fmt', p), [a]);
   });
   test('arquivo sem ferramenta → exit 0 sem saída', (t) => {
     const p = tmpDoTeste(t); escrever(p, 'notas.txt', 'x');
-    const r = rodarHook('cbs-format.js', { session_id: 'e2e-fmt2', cwd: p, tool_name: 'Write', tool_input: { file_path: 'notas.txt' } }, { TMPDIR: p });
+    const r = rodarHook('cbs-format.mjs', { session_id: 'e2e-fmt2', cwd: p, tool_name: 'Write', tool_input: { file_path: 'notas.txt' } }, { TMPDIR: p });
     assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
   });
   test('stdin vazio ou inválido → exit 0 sem saída', () => {
     for (const payload of ['', '{', '[1]']) {
-      const r = rodarHook('cbs-format.js', payload);
+      const r = rodarHook('cbs-format.mjs', payload);
       assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
     }
   });
   test('CBS_HOOKS=off não formata nem acumula', (t) => {
     const p = tmpDoTeste(t); const log = projetoBiome(p);
     escrever(p, 'a.ts', '');
-    rodarHook('cbs-format.js', { session_id: 'e2e-off', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p, CBS_HOOKS: 'off' });
+    rodarHook('cbs-format.mjs', { session_id: 'e2e-off', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p, CBS_HOOKS: 'off' });
     assert.equal(fs.existsSync(log), false);
     assert.deepEqual(comum.lerAcumulador('e2e-off', p), []);
   });
   test('format desligado ainda acumula para o typecheck', (t) => {
     const p = tmpDoTeste(t); const log = projetoBiome(p);
     const a = escrever(p, 'a.ts', '');
-    const r = rodarHook('cbs-format.js', { session_id: 'e2e-sofmt', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p, CBS_HOOKS_DESLIGADOS: 'format' });
+    const r = rodarHook('cbs-format.mjs', { session_id: 'e2e-sofmt', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p, CBS_HOOKS_DESLIGADOS: 'format' });
     assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
     assert.equal(fs.existsSync(log), false);
     assert.deepEqual(comum.lerAcumulador('e2e-sofmt', p), [a]);
@@ -295,7 +295,7 @@ describe('cbs-format — E2E', { skip: !POSIX && 'POSIX' }, () => {
   test('typecheck desligado formata mas não acumula', (t) => {
     const p = tmpDoTeste(t); const log = projetoBiome(p);
     escrever(p, 'a.ts', '');
-    rodarHook('cbs-format.js', { session_id: 'e2e-sotc', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p, CBS_HOOKS_DESLIGADOS: 'typecheck' });
+    rodarHook('cbs-format.mjs', { session_id: 'e2e-sotc', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p, CBS_HOOKS_DESLIGADOS: 'typecheck' });
     assert.equal(fs.existsSync(log), true);
     assert.deepEqual(comum.lerAcumulador('e2e-sotc', p), []);
   });
@@ -303,7 +303,7 @@ describe('cbs-format — E2E', { skip: !POSIX && 'POSIX' }, () => {
     const p = tmpDoTeste(t); const log = projetoBiome(p);
     const b = escrever(p, 'src/b.ts', ''); const novo = escrever(p, 'src/novo.ts', '');
     const patch = '*** Begin Patch\n*** Delete File: src/apagado.ts\n*** Update File: src/velho.ts\n*** Move to: src/novo.ts\n@@\n-x\n+y\n*** Update File: src/b.ts\n@@\n-x\n+y\n*** End Patch';
-    const r = rodarHook('cbs-format.js', { session_id: 'e2e-patch', cwd: p, tool_name: 'apply_patch', tool_input: { command: ['apply_patch', patch] } }, { TMPDIR: p });
+    const r = rodarHook('cbs-format.mjs', { session_id: 'e2e-patch', cwd: p, tool_name: 'apply_patch', tool_input: { command: ['apply_patch', patch] } }, { TMPDIR: p });
     assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
     const chamadas = fs.readFileSync(log, 'utf8');
     assert.doesNotMatch(chamadas, /apagado|velho/);
@@ -313,7 +313,7 @@ describe('cbs-format — E2E', { skip: !POSIX && 'POSIX' }, () => {
     const p = tmpDoTeste(t); escrever(p, 'package.json', '{}'); escrever(p, 'biome.json', '{}');
     escrever(p, 'node_modules/.bin/biome', '#!/bin/sh\nexit 3\n', 0o755);
     const a = escrever(p, 'a.ts', 'const x=1');
-    const r = rodarHook('cbs-format.js', { session_id: 'e2e-falha', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p });
+    const r = rodarHook('cbs-format.mjs', { session_id: 'e2e-falha', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p });
     assert.equal(r.code, 0); assert.equal(r.out, '');
     assert.match(r.err, /^\[cbs\] format: biome falhou em a\.ts \(exit 3\)/);
     assert.equal(fs.readFileSync(a, 'utf8'), 'const x=1');
@@ -322,7 +322,7 @@ describe('cbs-format — E2E', { skip: !POSIX && 'POSIX' }, () => {
     const p = tmpDoTeste(t); const log = projetoBiome(p);
     escrever(p, 'a.ts', '');
     fs.symlinkSync(path.join(p, 'alvo'), comum.arquivoAcumulador('e2e-link', p));
-    const r = rodarHook('cbs-format.js', { session_id: 'e2e-link', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p });
+    const r = rodarHook('cbs-format.mjs', { session_id: 'e2e-link', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p });
     assert.equal(r.code, 0); assert.equal(r.out, '');
     assert.equal(fs.existsSync(log), true);
     assert.equal(fs.existsSync(path.join(p, 'alvo')), false);
@@ -416,7 +416,7 @@ describe('cbs-format — fix round 1', { skip: !POSIX && 'POSIX' }, () => {
     const log = projetoBiome(shared);
     escrever(shared, 'user-owned/sess/scratch.ts', 'const x=1');
     fs.chmodSync(shared, 0o1777);
-    const res = rodarHook('cbs-format.js', { session_id: 'e2e-1777', cwd: shared, tool_name: 'Write', tool_input: { file_path: 'user-owned/sess/scratch.ts' } }, { TMPDIR: r });
+    const res = rodarHook('cbs-format.mjs', { session_id: 'e2e-1777', cwd: shared, tool_name: 'Write', tool_input: { file_path: 'user-owned/sess/scratch.ts' } }, { TMPDIR: r });
     assert.equal(res.code, 0); assert.equal(res.out + res.err, '');
     assert.equal(fs.existsSync(log), false);
   });
@@ -436,7 +436,7 @@ describe('cbs-format — fix round 1', { skip: !POSIX && 'POSIX' }, () => {
     // Como o biome real: sem --no-errors-on-unmatched, arquivo ignorado sai com 1.
     escrever(p, 'node_modules/.bin/biome', '#!/bin/sh\nfor a in "$@"; do [ "$a" = --no-errors-on-unmatched ] && exit 0; done\nexit 1\n', 0o755);
     escrever(p, 'ignorado.ts', '');
-    const r = rodarHook('cbs-format.js', { session_id: 'e2e-ign', cwd: p, tool_input: { file_path: 'ignorado.ts' } }, { TMPDIR: p });
+    const r = rodarHook('cbs-format.mjs', { session_id: 'e2e-ign', cwd: p, tool_input: { file_path: 'ignorado.ts' } }, { TMPDIR: p });
     assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
   });
   test('.mts e .cts são formatados como .ts', (t) => {
@@ -455,7 +455,7 @@ describe('cbs-format — fix round 1', { skip: !POSIX && 'POSIX' }, () => {
     const p = tmpDoTeste(t); escrever(p, 'package.json', '{}'); escrever(p, 'biome.json', '{}');
     escrever(p, 'node_modules/.bin/biome', '#!/bin/sh\nkill -9 $$\n', 0o755);
     escrever(p, 'a.ts', '');
-    const r = rodarHook('cbs-format.js', { session_id: 'e2e-sinal', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p });
+    const r = rodarHook('cbs-format.mjs', { session_id: 'e2e-sinal', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p });
     assert.equal(r.code, 0);
     assert.match(r.err, /^\[cbs\] format: biome falhou em a\.ts \(exit SIGKILL\)/);
   });
@@ -470,7 +470,7 @@ describe('cbs-format — fix round 1', { skip: !POSIX && 'POSIX' }, () => {
 });
 
 // ── Task 7: cbs-typecheck (Stop) — typecheck em lote das stacks tocadas na sessão ──
-const tc = await import(pathToFileURL(path.join(HOOKS, 'cbs-typecheck.js')).href);
+const tc = await import(pathToFileURL(path.join(HOOKS, 'cbs-typecheck.mjs')).href);
 // H2: nunca lê *.tsbuildinfo velho nem grava buildinfo no repo; --composite false evita o TS6379 do composite;
 // --emitDeclarationOnly false e --tsBuildInfoFile null evitam o TS5053/TS5069 que as próprias flags provocam no TS 4.9.
 const ARGS_TSC = ['--noEmit', '--pretty', 'false', '--composite', 'false', '--incremental', 'false', '--tsBuildInfoFile', 'null', '--emitDeclarationOnly', 'false'];
@@ -611,52 +611,52 @@ describe('cbs-typecheck — E2E Stop', { skip: !POSIX && 'POSIX' }, () => {
   test('bloqueia uma vez e, com stop_hook_active, só avisa e limpa', (t) => {
     const { p, a } = projetoTs(t, '#!/bin/sh\necho "src/a.ts(1,5): error TS2322: Type string is not assignable to type number."\nexit 2\n');
     comum.registrarEdicao('e2e-tc', [a], p);
-    const r1 = rodarHook('cbs-typecheck.js', { session_id: 'e2e-tc', cwd: p, stop_hook_active: false }, { TMPDIR: p });
+    const r1 = rodarHook('cbs-typecheck.mjs', { session_id: 'e2e-tc', cwd: p, stop_hook_active: false }, { TMPDIR: p });
     assert.equal(r1.code, 0); assert.equal(r1.err, '');
     const j = JSON.parse(r1.out);
     assert.equal(j.decision, 'block'); assert.match(j.reason, /src\/a\.ts\(1,5\): error TS2322/);
     assert.equal(r1.out.trim().split('\n').length, 1, 'um único JSON no stdout');
     assert.deepEqual(comum.lerAcumulador('e2e-tc', p), [a], 'acumulador mantido após o bloqueio');
-    const r2 = rodarHook('cbs-typecheck.js', { session_id: 'e2e-tc', cwd: p, stop_hook_active: true }, { TMPDIR: p });
+    const r2 = rodarHook('cbs-typecheck.mjs', { session_id: 'e2e-tc', cwd: p, stop_hook_active: true }, { TMPDIR: p });
     assert.equal(r2.code, 0); assert.equal(r2.out, ''); assert.match(r2.err, /só aviso/);
     assert.deepEqual(comum.lerAcumulador('e2e-tc', p), [], 'acumulador limpo');
   });
   test('passa em silêncio e limpa quando o tsc sai 0', (t) => {
     const { p, a } = projetoTs(t, EXE0);
     comum.registrarEdicao('e2e-ok', [a], p);
-    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-ok', cwd: p }, { TMPDIR: p });
+    const r = rodarHook('cbs-typecheck.mjs', { session_id: 'e2e-ok', cwd: p }, { TMPDIR: p });
     assert.equal(r.code, 0); assert.equal(r.out + r.err, ''); assert.deepEqual(comum.lerAcumulador('e2e-ok', p), []);
   });
   test('erro só em arquivo não editado não bloqueia (SP-5)', (t) => {
     const { p, a } = projetoTs(t, '#!/bin/sh\necho "src/outro.ts(1,1): error TS2322: x"\nexit 2\n');
     comum.registrarEdicao('e2e-outro', [a], p);
-    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-outro', cwd: p }, { TMPDIR: p });
+    const r = rodarHook('cbs-typecheck.mjs', { session_id: 'e2e-outro', cwd: p }, { TMPDIR: p });
     assert.equal(r.code, 0); assert.equal(r.out + r.err, ''); assert.deepEqual(comum.lerAcumulador('e2e-outro', p), []);
   });
   test('estouro do teto só avisa', (t) => {
     const { p, a } = projetoTs(t, '#!/bin/sh\nsleep 5\n');
     comum.registrarEdicao('e2e-teto', [a], p);
     const inicio = Date.now();
-    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-teto', cwd: p }, { TMPDIR: p, CBS_TYPECHECK_TETO_MS: '300' });
+    const r = rodarHook('cbs-typecheck.mjs', { session_id: 'e2e-teto', cwd: p }, { TMPDIR: p, CBS_TYPECHECK_TETO_MS: '300' });
     assert.equal(r.code, 0); assert.equal(r.out, ''); assert.match(r.err, /teto/);
     assert.ok(Date.now() - inicio < 4000, 'não espera o processo morto terminar');
     assert.deepEqual(comum.lerAcumulador('e2e-teto', p), []);
   });
   test('sem acumulador: silêncio total', (t) => {
     const p = tmpDoTeste(t);
-    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-vazio', cwd: p }, { TMPDIR: p });
+    const r = rodarHook('cbs-typecheck.mjs', { session_id: 'e2e-vazio', cwd: p }, { TMPDIR: p });
     assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
   });
   test('stdin vazio ou inválido → exit 0 sem saída', () => {
     for (const payload of ['', '{', '[1]']) {
-      const r = rodarHook('cbs-typecheck.js', payload);
+      const r = rodarHook('cbs-typecheck.mjs', payload);
       assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
     }
   });
   test('typecheck desligado: não roda nem consome o acumulador', (t) => {
     const { p, a } = projetoTs(t, '#!/bin/sh\necho "src/a.ts(1,5): error TS2322: x"\nexit 2\n');
     comum.registrarEdicao('e2e-desl', [a], p);
-    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-desl', cwd: p }, { TMPDIR: p, CBS_HOOKS_DESLIGADOS: 'typecheck' });
+    const r = rodarHook('cbs-typecheck.mjs', { session_id: 'e2e-desl', cwd: p }, { TMPDIR: p, CBS_HOOKS_DESLIGADOS: 'typecheck' });
     assert.equal(r.code, 0); assert.equal(r.out + r.err, ''); assert.deepEqual(comum.lerAcumulador('e2e-desl', p), [a]);
   });
   test('solution-style do Vite com erro de tipo → bloqueia (H4)', (t) => {
@@ -665,7 +665,7 @@ describe('cbs-typecheck — E2E Stop', { skip: !POSIX && 'POSIX' }, () => {
     const { p, a } = projetoTs(t, tsc, '{ "files": [], "references": [{ "path": "./tsconfig.app.json" }, { "path": "./tsconfig.node.json" }] }');
     escrever(p, 'tsconfig.app.json', '{ "include": ["src"] }'); escrever(p, 'tsconfig.node.json', '{ "include": ["vite.config.ts"] }');
     comum.registrarEdicao('e2e-sol', [a], p);
-    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-sol', cwd: p }, { TMPDIR: p });
+    const r = rodarHook('cbs-typecheck.mjs', { session_id: 'e2e-sol', cwd: p }, { TMPDIR: p });
     assert.equal(r.code, 0); assert.match(JSON.parse(r.out).reason, /TS2322/);
   });
   test('incremental com *.tsbuildinfo velho: não lê nem regrava o buildinfo e bloqueia (H2)', (t) => {
@@ -675,7 +675,7 @@ describe('cbs-typecheck — E2E Stop', { skip: !POSIX && 'POSIX' }, () => {
     const buildinfo = escrever(p, '.cache/app.tsbuildinfo', 'velho');
     const tmpSessao = tmpDoTeste(t, 'cbs-tmp-');
     comum.registrarEdicao('e2e-inc', [a], tmpSessao);
-    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-inc', cwd: p }, { TMPDIR: tmpSessao });
+    const r = rodarHook('cbs-typecheck.mjs', { session_id: 'e2e-inc', cwd: p }, { TMPDIR: tmpSessao });
     assert.equal(r.code, 0); assert.match(JSON.parse(r.out).reason, /TS1479/);
     assert.equal(fs.readFileSync(buildinfo, 'utf8'), 'velho');
   });
@@ -686,7 +686,7 @@ describe('cbs-typecheck — E2E Stop', { skip: !POSIX && 'POSIX' }, () => {
     const { p, a } = projetoTs(t, tsc, '{ "compilerOptions": { "composite": true, "outDir": "dist" } }');
     const tmpSessao = tmpDoTeste(t, 'cbs-tmp-');
     comum.registrarEdicao('e2e-comp', [a], tmpSessao);
-    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-comp', cwd: p }, { TMPDIR: tmpSessao });
+    const r = rodarHook('cbs-typecheck.mjs', { session_id: 'e2e-comp', cwd: p }, { TMPDIR: tmpSessao });
     assert.equal(r.code, 0); assert.match(JSON.parse(r.out).reason, /TS2322/);
     assert.equal(fs.existsSync(path.join(p, 'dist')), false);
   });
@@ -697,7 +697,7 @@ describe('cbs-typecheck — E2E Stop', { skip: !POSIX && 'POSIX' }, () => {
     const a = escrever(p, 'app/A.php', '<?php'); escrever(p, 'app/B.php', '<?php');
     const tmpSessao = tmpDoTeste(t, 'cbs-tmp-');
     comum.registrarEdicao('e2e-php', [a], tmpSessao);
-    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-php', cwd: p }, { TMPDIR: tmpSessao });
+    const r = rodarHook('cbs-typecheck.mjs', { session_id: 'e2e-php', cwd: p }, { TMPDIR: tmpSessao });
     assert.equal(r.code, 0); assert.match(JSON.parse(r.out).reason, /A\.php:3:Undefined variable/);
     assert.equal(fs.readFileSync(log, 'utf8').trim(), `analyse --no-progress --error-format=raw ${a}`);
   });
@@ -708,7 +708,7 @@ describe('cbs-typecheck — E2E Stop', { skip: !POSIX && 'POSIX' }, () => {
     const p = tmpDoTeste(t, 'cbs-proj-');
     const tmpSessao = tmpDoTeste(t, 'cbs-tmp-');
     comum.registrarEdicao('e2e-fora', [fora.a], tmpSessao);
-    const r = rodarHook('cbs-typecheck.js', { session_id: 'e2e-fora', cwd: p }, { TMPDIR: tmpSessao });
+    const r = rodarHook('cbs-typecheck.mjs', { session_id: 'e2e-fora', cwd: p }, { TMPDIR: tmpSessao });
     assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
     assert.equal(fs.existsSync(marca), false);
     assert.deepEqual(comum.lerAcumulador('e2e-fora', tmpSessao), []);
@@ -759,7 +759,7 @@ describe('cbs-typecheck — fix round 1 (unidade)', { skip: !POSIX && 'POSIX' },
     escrever(p, 'tsconfig.app.json', '{}'); escrever(p, 'node_modules/.bin/tsc', EXE0, 0o755);
     const a = escrever(p, 'src/a.ts', '');
     // Em subprocesso: sem a chave por realpath a recursão é exponencial e travaria o próprio npm test.
-    const codigo = `const tc = await import(${JSON.stringify(pathToFileURL(path.join(HOOKS, 'cbs-typecheck.js')).href)});
+    const codigo = `const tc = await import(${JSON.stringify(pathToFileURL(path.join(HOOKS, 'cbs-typecheck.mjs')).href)});
       process.stdout.write(JSON.stringify(tc.planejarChecagens([${JSON.stringify(a)}], { PATH: '' }).map((x) => x.args.at(-1))));`;
     const r = spawnSync(process.execPath, ['--input-type=module', '-e', codigo], { encoding: 'utf8', timeout: 5000, env: envLimpo() });
     assert.equal(r.error, undefined, 'terminou antes de 5 s');
@@ -776,7 +776,7 @@ describe('cbs-typecheck — fix round 1 (E2E)', { skip: !POSIX && 'POSIX' }, () 
   function stop(t, sessao, arquivos, payload, env = {}) {
     const tmpSessao = tmpDoTeste(t, 'cbs-tmp-');
     comum.registrarEdicao(sessao, arquivos, tmpSessao);
-    const r = rodarHook('cbs-typecheck.js', { session_id: sessao, ...payload }, { TMPDIR: tmpSessao, ...env });
+    const r = rodarHook('cbs-typecheck.mjs', { session_id: sessao, ...payload }, { TMPDIR: tmpSessao, ...env });
     return { ...r, acumulador: comum.lerAcumulador(sessao, tmpSessao) };
   }
   const ERRO_A = 'echo "src/a.ts(1,5): error TS2322: Type string is not assignable to type number."';
@@ -850,7 +850,7 @@ describe('cbs-typecheck — fix round 1 (E2E)', { skip: !POSIX && 'POSIX' }, () 
   });
 });
 
-const noVerify = await import(pathToFileURL(path.join(HOOKS, 'cbs-no-verify.js')).href);
+const noVerify = await import(pathToFileURL(path.join(HOOKS, 'cbs-no-verify.mjs')).href);
 describe('cbs-no-verify', () => {
   const BLOQUEIA = [
     'git commit --no-verify -m "msg"',
@@ -1003,33 +1003,33 @@ describe('cbs-no-verify', () => {
   });
   test('motivo cita o subcomando git', () => assert.match(noVerify.checarComando('git commit -m x && git push --no-verify').motivo, /git push/));
   test('E2E: bloqueio sai 2 com motivo no stderr e stdout vazio', () => {
-    const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } });
+    const r = rodarHook('cbs-no-verify.mjs', { tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } });
     assert.equal(r.code, 2); assert.equal(r.out, ''); assert.match(r.err, /no-verify/);
   });
   test('E2E: comando sem git sai 0 em silêncio', () => {
-    const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: 'ls' } });
+    const r = rodarHook('cbs-no-verify.mjs', { tool_name: 'Bash', tool_input: { command: 'ls' } });
     assert.equal(r.code, 0); assert.equal(r.out, ''); assert.equal(r.err, '');
   });
   test('E2E: payload inválido sai 0 em silêncio', () => {
-    const r = rodarHook('cbs-no-verify.js', '{');
+    const r = rodarHook('cbs-no-verify.mjs', '{');
     assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
   });
   test('E2E: CBS_HOOKS_DESLIGADOS=no-verify libera', () => {
-    const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } }, { CBS_HOOKS_DESLIGADOS: 'no-verify' });
+    const r = rodarHook('cbs-no-verify.mjs', { tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } }, { CBS_HOOKS_DESLIGADOS: 'no-verify' });
     assert.equal(r.code, 0); assert.equal(r.out, ''); assert.equal(r.err, '');
   });
   test('E2E: argv do Codex (array) também é checado', () => {
     for (const command of [['git', 'commit', '--no-verify', '-m', 'x'], ['bash', '-lc', 'git push --no-verify']]) {
-      const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command } });
+      const r = rodarHook('cbs-no-verify.mjs', { tool_name: 'Bash', tool_input: { command } });
       assert.equal(r.code, 2, JSON.stringify(command)); assert.equal(r.out, ''); assert.match(r.err, /no-verify/);
     }
-    const ok = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: ['git', 'status'] } });
+    const ok = rodarHook('cbs-no-verify.mjs', { tool_name: 'Bash', tool_input: { command: ['git', 'status'] } });
     assert.equal(ok.code, 0); assert.equal(ok.out + ok.err, '');
   });
   test('E2E: erro interno sai 0 com aviso [cbs] no stderr', (t) => {
     // Preload que quebra RegExp#test (usado já no caminho rápido de checarComando) simula falha interna.
     const boom = escrever(tmpDoTeste(t), 'boom.cjs', "RegExp.prototype.test = function () { throw new Error('boom'); };\n");
-    const r = rodarHook('cbs-no-verify.js', { tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } }, { NODE_OPTIONS: `--require=${boom}` });
+    const r = rodarHook('cbs-no-verify.mjs', { tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } }, { NODE_OPTIONS: `--require=${boom}` });
     assert.equal(r.code, 0); assert.equal(r.out, ''); assert.match(r.err, /^\[cbs\] no-verify: erro interno ignorado \(boom\)/);
   });
 });
@@ -1039,14 +1039,14 @@ describe('cbs-no-verify', () => {
 describe('codex-hooks.json', () => {
   const cfg = JSON.parse(fs.readFileSync(path.join(RAIZ, 'base', 'codex', 'hooks', 'codex-hooks.json'), 'utf8'));
   const entradas = Object.entries(cfg.hooks).flatMap(([ev, gs]) => gs.flatMap((g) => g.hooks.map((h) => ({ ev, matcher: g.matcher, ...h }))));
-  const script = (e) => e.command.match(/cbs-[a-z-]+\.js/)[0];
+  const script = (e) => e.command.match(/cbs-[a-z-]+\.mjs/)[0];
   // Mesma guarda do settings.json do Claude Code (comandoHook): launcher OU script ausente → no-op; aqui com $HOME literal.
   const comandoCodex = (s) => comandoHook('/CBS-HOME/.claude/hooks', s).replaceAll('/CBS-HOME', '$HOME');
   test('só eventos que o Codex aceita', () => {
     for (const ev of Object.keys(cfg.hooks)) assert.ok(['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop'].includes(ev), ev);
   });
   test('os 4 scripts CBS, cada um uma vez, com o evento e o timeout do settings.json do Claude Code', () => {
-    assert.deepEqual(entradas.map(script).sort(), ['cbs-config-protect.js', 'cbs-format.js', 'cbs-no-verify.js', 'cbs-typecheck.js']);
+    assert.deepEqual(entradas.map(script).sort(), ['cbs-config-protect.mjs', 'cbs-format.mjs', 'cbs-no-verify.mjs', 'cbs-typecheck.mjs']);
     for (const e of entradas) {
       const h = HOOKS_CBS.find((d) => d.script === script(e));
       assert.equal(e.ev, h.evento, h.script); assert.equal(e.timeout, h.timeout, h.script);
@@ -1054,13 +1054,18 @@ describe('codex-hooks.json', () => {
   });
   test('matchers com os nomes reais de ferramenta do Codex (Bash, apply_patch); Stop sem matcher', () => {
     // config-protect também em Bash: `apply_patch` rodado pelo shell chega como tool_name "Bash" (medido na review da T10).
-    const esperado = { 'cbs-no-verify.js': '^Bash$', 'cbs-config-protect.js': '^(Bash|apply_patch)$', 'cbs-format.js': '^apply_patch$', 'cbs-typecheck.js': undefined };
+    const esperado = { 'cbs-no-verify.mjs': '^Bash$', 'cbs-config-protect.mjs': '^(Bash|apply_patch)$', 'cbs-format.mjs': '^apply_patch$', 'cbs-typecheck.mjs': undefined };
     for (const e of entradas) assert.equal(e.matcher, esperado[script(e)], script(e));
   });
-  for (const s of ['cbs-config-protect.js', 'cbs-format.js', 'cbs-no-verify.js', 'cbs-typecheck.js']) {
-    const skip = s === 'cbs-config-protect.js' && 'TODO(T5): cbs-config-protect.js chega com o merge da T5';
+  for (const s of ['cbs-config-protect.mjs', 'cbs-format.mjs', 'cbs-no-verify.mjs', 'cbs-typecheck.mjs']) {
+    const skip = s === 'cbs-config-protect.mjs' && 'TODO(T5): cbs-config-protect.mjs chega com o merge da T5';
     test(`${s} existe em base/hooks`, { skip }, () => assert.ok(fs.existsSync(path.join(HOOKS, s)), s));
   }
+  test('base/hooks: hooks são .mjs (ESM pela extensão) — nenhum cbs-*.js nem package.json', () => {
+    const nomes = fs.readdirSync(HOOKS);
+    assert.deepEqual(nomes.filter((n) => n === 'package.json' || /^cbs-.*\.js$/.test(n)), []);
+    assert.ok(nomes.includes('cbs-comum.mjs'));
+  });
   test('comando = launcher POSIX (H3) com a guarda do comandoHook; nenhum matcher .*, nenhum npx, todos com timeout', { skip: !POSIX && 'POSIX' }, () => {
     for (const e of entradas) {
       assert.equal(e.command, comandoCodex(script(e)));
@@ -1092,7 +1097,7 @@ describe('codex-hooks.json', () => {
     const home = tmpDoTeste(t, 'cbs-home-');
     const dir = path.join(home, '.claude', 'hooks');
     fs.mkdirSync(dir, { recursive: true });
-    for (const f of ['cbs-node.sh', 'cbs-no-verify.js', 'cbs-comum.js', 'package.json']) fs.copyFileSync(path.join(HOOKS, f), path.join(dir, f));
+    for (const f of ['cbs-node.sh', 'cbs-no-verify.mjs', 'cbs-comum.mjs']) fs.copyFileSync(path.join(HOOKS, f), path.join(dir, f));
     fs.writeFileSync(path.join(dir, '.cbs-node-path'), `${process.execPath}\n`);
     const cmd = cfg.hooks.PreToolUse.find((g) => g.matcher === '^Bash$').hooks[0].command;
     const payload = (command) => JSON.stringify({

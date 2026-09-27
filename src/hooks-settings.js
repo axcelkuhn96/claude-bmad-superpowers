@@ -1,15 +1,17 @@
 // Merge/remoção idempotente dos hooks CBS em ~/.claude/settings.json.
-// Entradas CBS são reconhecidas pelo comando (…/.claude/hooks/cbs-*.js); hooks e chaves alheias nunca são tocados.
+// Entradas CBS são reconhecidas pelo comando (…/.claude/hooks/cbs-*.mjs); hooks e chaves alheias nunca são tocados.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
 export const HOOKS_CBS = Object.freeze([
-  { evento: 'PreToolUse', matcher: 'Bash', script: 'cbs-no-verify.js', timeout: 10 },
-  { evento: 'PreToolUse', matcher: 'Edit|Write|MultiEdit', script: 'cbs-config-protect.js', timeout: 10 },
-  { evento: 'PostToolUse', matcher: 'Edit|Write|MultiEdit', script: 'cbs-format.js', timeout: 30 },
-  { evento: 'Stop', matcher: null, script: 'cbs-typecheck.js', timeout: 90 },
+  { evento: 'PreToolUse', matcher: 'Bash', script: 'cbs-no-verify.mjs', timeout: 10 },
+  { evento: 'PreToolUse', matcher: 'Edit|Write|MultiEdit', script: 'cbs-config-protect.mjs', timeout: 10 },
+  { evento: 'PostToolUse', matcher: 'Edit|Write|MultiEdit', script: 'cbs-format.mjs', timeout: 30 },
+  { evento: 'Stop', matcher: null, script: 'cbs-typecheck.mjs', timeout: 90 },
 ].map((h) => Object.freeze(h)));
-const RE_CBS = /[\\/]\.claude[\\/]hooks[\\/](cbs-[a-z-]+\.js)/;
+// SP-7: cbs-*.mjs. `.js` = legado das builds 0.13-dev (hooks .js + package.json type:module): reconhecido só
+// pra ser trocado (mesclar) ou removido (remover) — nenhum script de HOOKS_CBS termina em .js.
+const RE_CBS = /[\\/]\.claude[\\/]hooks[\\/](cbs-[a-z-]+\.m?js)/;
 
 export function scriptCbs(comando) {
   const m = typeof comando === 'string' ? comando.match(RE_CBS) : null;

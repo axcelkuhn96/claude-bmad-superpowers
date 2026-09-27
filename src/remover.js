@@ -18,6 +18,18 @@ async function arquivoTemMarcador(p) {
   }
 }
 
+// ~/.claude/hooks/package.json byte a byte como as builds 0.13-dev o gravavam (base/hooks/package.json até virar .mjs).
+// Qualquer outro conteúdo é do usuário e fica.
+const PKG_HOOKS_DEV = Buffer.from('{ "type": "module" }\n');
+async function ehPkgHooksDev(p) {
+  try {
+    return (await fs.lstat(p)).isFile() && (await fs.readFile(p)).equals(PKG_HOOKS_DEV);
+  } catch (e) {
+    if (e.code === 'ENOENT') return false;
+    throw e;
+  }
+}
+
 async function coletarRemoviveis(dir, lista) {
   if (!(await existe(dir))) return;
   const entradas = await fs.readdir(dir, { withFileTypes: true });
@@ -64,6 +76,8 @@ export async function remover(args = []) {
   // node gravado pro launcher (sem marcador: é só um caminho)
   const nodeGravado = path.join(DIR_HOOKS, '.cbs-node-path');
   if (await existe(nodeGravado)) alvos.push(nodeGravado);
+  const pkgHooks = path.join(DIR_HOOKS, 'package.json');
+  if (await ehPkgHooksDev(pkgHooks)) alvos.push(pkgHooks);
 
   if (alvos.length === 0 && entradasCbs === 0) {
     console.log('Nada pra remover.');

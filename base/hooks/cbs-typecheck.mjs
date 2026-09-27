@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cbs-typecheck.js — Stop: typecheck em lote só das stacks tocadas na sessão (acumulador do cbs-format).
+// cbs-typecheck.mjs — Stop: typecheck em lote só das stacks tocadas na sessão (acumulador do cbs-format).
 // tsc (node_modules/.bin + tsconfig.json) · phpstan (vendor/bin + phpstan.neon*) · mypy|pyright (configurados no projeto).
 // Falha → {"decision":"block","reason":…} UMA vez; com stop_hook_active só avisa; teto de 60 s → só avisa. Nunca npx.
 // Derivado de affaan-m/ECC @ e482e57, scripts/hooks/stop-format-typecheck.js — MIT License,
@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { hookDesligado, lerStdin, lerPayload, lerTexto, acharRaiz, binLocal, noPath, ehEntrada, avisar, lerAcumulador, arquivoAcumulador } from './cbs-comum.js';
+import { hookDesligado, lerStdin, lerPayload, lerTexto, acharRaiz, binLocal, noPath, ehEntrada, avisar, lerAcumulador, arquivoAcumulador } from './cbs-comum.mjs';
 
 export const TETO_MS = 60_000;
 const MAX_MOTIVO = 1500;

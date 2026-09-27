@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ ! -f \"$HOME/.claude/hooks/cbs-node.sh\" ] || [ ! -f \"$HOME/.claude/hooks/cbs-no-verify.js\" ] || sh \"$HOME/.claude/hooks/cbs-node.sh\" \"$HOME/.claude/hooks/cbs-no-verify.js\"",
+            "command": "[ ! -f \"$HOME/.claude/hooks/cbs-node.sh\" ] || [ ! -f \"$HOME/.claude/hooks/cbs-no-verify.mjs\" ] || sh \"$HOME/.claude/hooks/cbs-node.sh\" \"$HOME/.claude/hooks/cbs-no-verify.mjs\"",
             "timeout": 10
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ ! -f \"$HOME/.claude/hooks/cbs-node.sh\" ] || [ ! -f \"$HOME/.claude/hooks/cbs-config-protect.js\" ] || sh \"$HOME/.claude/hooks/cbs-node.sh\" \"$HOME/.claude/hooks/cbs-config-protect.js\"",
+            "command": "[ ! -f \"$HOME/.claude/hooks/cbs-node.sh\" ] || [ ! -f \"$HOME/.claude/hooks/cbs-config-protect.mjs\" ] || sh \"$HOME/.claude/hooks/cbs-node.sh\" \"$HOME/.claude/hooks/cbs-config-protect.mjs\"",
             "timeout": 10
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ ! -f \"$HOME/.claude/hooks/cbs-node.sh\" ] || [ ! -f \"$HOME/.claude/hooks/cbs-format.js\" ] || sh \"$HOME/.claude/hooks/cbs-node.sh\" \"$HOME/.claude/hooks/cbs-format.js\"",
+            "command": "[ ! -f \"$HOME/.claude/hooks/cbs-node.sh\" ] || [ ! -f \"$HOME/.claude/hooks/cbs-format.mjs\" ] || sh \"$HOME/.claude/hooks/cbs-node.sh\" \"$HOME/.claude/hooks/cbs-format.mjs\"",
             "timeout": 30
           }
         ]
@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ ! -f \"$HOME/.claude/hooks/cbs-node.sh\" ] || [ ! -f \"$HOME/.claude/hooks/cbs-typecheck.js\" ] || sh \"$HOME/.claude/hooks/cbs-node.sh\" \"$HOME/.claude/hooks/cbs-typecheck.js\"",
+            "command": "[ ! -f \"$HOME/.claude/hooks/cbs-node.sh\" ] || [ ! -f \"$HOME/.claude/hooks/cbs-typecheck.mjs\" ] || sh \"$HOME/.claude/hooks/cbs-node.sh\" \"$HOME/.claude/hooks/cbs-typecheck.mjs\"",
             "timeout": 90
           }
         ]
