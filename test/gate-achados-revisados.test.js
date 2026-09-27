@@ -65,7 +65,8 @@ test('hash revisado para ESTE projeto suprime o achado histórico', opts, (t) =>
 
 test('hash revisado de OUTRO projeto não suprime', opts, (t) => {
   const c = cenario(); limpar(t, c);
-  gravarRevisados(c.home, { [path.join(os.tmpdir(), 'outro-projeto-inexistente')]: [c.hash] });
+  // Chave de um diretório EXISTENTE e diferente do projeto: exercita a comparação real !== alvo.
+  gravarRevisados(c.home, { [fs.realpathSync(c.home)]: [c.hash] });
   assert.equal(rodarGate(c).status, 1);
 });
 
