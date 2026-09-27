@@ -60,7 +60,7 @@ npx claude-bmad-superpowers instalar
 
 Isso faz, em ordem:
 
-1. **Skills + comandos + personas** → copia as 7 skills, 11 comandos e as personas (`ponytail.md`, `dominios/*.md`, `review/*.md`) pra `~/.claude/skills/`, `~/.claude/commands/` e `~/.claude/personas/`; copia `models.yml` pra `~/.claude/cbs-overrides/models.yml` **só se não existir**.
+1. **Skills + comandos + personas** → copia as 7 skills, 12 comandos e as personas (`ponytail.md`, `dominios/*.md`, `review/*.md`) pra `~/.claude/skills/`, `~/.claude/commands/` e `~/.claude/personas/`; copia `models.yml` pra `~/.claude/cbs-overrides/models.yml` **só se não existir**.
 2. **Superpowers** → detecta o plugin; se não estiver instalado, mostra o comando exato pra rodar **dentro do Claude Code** (instalação de plugin não funciona via CLI fora do app).
 3. **BMAD** → instala no diretório atual se você estiver dentro de um projeto (interativo, em PT-BR). Pra pular: `--apenas-global`.
 
@@ -72,7 +72,7 @@ Isso faz, em ordem:
 |---|---|
 | `--apenas-global` / `--skip-bmad` | Não instala BMAD no diretório atual (só skills/comandos/Superpowers) |
 | `--skip-superpowers` | Não tenta instalar o plugin Superpowers |
-| `--sem-hooks` | Não instala os hooks CBS (`~/.claude/hooks/cbs-*.js`) no `settings.json` |
+| `--sem-hooks` | Copia os hooks CBS (`~/.claude/hooks/cbs-*.mjs`) mas não os registra no `settings.json` (não persiste: o próximo `atualizar` sem a flag registra) |
 
 Verifique a qualquer momento:
 
@@ -95,7 +95,7 @@ cbs status
 | Atalho fim-a-fim | `/piloto [--auto] <ideia>` | grelhar + refinar (gate 1) + executar (gate 2 + integração) numa conversa só |
 | Quer revisar o que foi feito | `/revisar [escopo]` | Code review + cobertura + segurança (lentes `personas/review/`), relatório em `docs/analises/`; só corrige com seu OK. É também o gate final automático do `/executar` e `/piloto`. |
 | Vai trocar de sessão/agente | `/handoff [foco]` | Compacta a conversa num documento de continuação (referencia artefatos, redige segredos, sugere próximas skills). |
-| Quer auditar a config de agentes | `/blindar` | AgentShield estático em ~/.claude, ~/.codex e no projeto; relatório em `docs/analises/` (read-only) |
+| Quer auditar a config de agentes | `/blindar` | AgentShield estático em ~/.claude, ~/.codex e no projeto; relatório em `docs/analises/` (read-only). O relatório traz achados da sua config global: não commite em repo público |
 
 Comandos de manutenção:
 
@@ -335,7 +335,7 @@ Regras: **até 2 domínios por task** (uma linguagem + uma área; 3 = quebrar a 
 
 `laravel.md`, `python.md`, `node.md` (com seção "Testes") e as seções React/React Native de `frontend-referencia.md` trazem regras duras adaptadas do ECC (MIT), cada uma com uma seção **"Build quebrado"** — lida pelo `cbs-build-fixer` quando uma task fica BLOCKED por build/typecheck.
 
-**Gate de segurança**: a lente `seguranca` manda rodar `node ~/.claude/scripts/gate-seguranca.js` (gitleaks + semgrep com baseline + audit da stack + AgentShield; override em `~/.claude/cbs-overrides/scripts/`) antes de DONE em task backend; o executor roda de novo na Fase 7 antes do push e o `/revisar` em diff backend. Exit 1 bloqueia. **gitleaks ausente ou com erro reprova o gate** (mudança de comportamento — instale o binário); `.gitleaks.toml` ausente no HEAD não reprova, o gate usa as regras default do gitleaks. Achados históricos do gitleaks já revisados ficam fora do gate: lista opcional por projeto em `~/.claude/cbs-overrides/gate-achados-revisados.json`. Quando o diff toca config de agente (`.claude/`, `.codex/`, `CLAUDE.md`, `AGENTS.md`, `.mcp.json`, `hooks.json`/`hooks/`), o gate roda o **AgentShield** em modo estático (nunca `--opus`); achado alto ou crítico reprova, sem supressão. Demais ferramentas ausentes viram "gate parcial" no report, nunca aprovação silenciosa.
+**Gate de segurança**: a lente `seguranca` manda rodar `node ~/.claude/scripts/gate-seguranca.js` (gitleaks + semgrep com baseline + audit da stack + AgentShield; override em `~/.claude/cbs-overrides/scripts/`) antes de DONE em task backend; o executor roda de novo na Fase 7 antes do push e o `/revisar` em diff backend. Exit 1 bloqueia. **gitleaks ausente ou com erro reprova o gate** (mudança de comportamento — instale o binário); `.gitleaks.toml` ausente no HEAD não reprova, o gate usa as regras default do gitleaks. Achados históricos do gitleaks já revisados ficam fora do gate: lista opcional por projeto em `~/.claude/cbs-overrides/gate-achados-revisados.json`. Quando o diff (ou o working tree) toca config de agente — `.claude/`, `.codex/`, `CLAUDE.md`, `AGENTS.md`, `.mcp.json` ou `hooks.json` em qualquer profundidade, ou `hooks/` só na raiz do repo (um `src/hooks/` de React não dispara) —, o gate roda o **AgentShield** em modo estático (nunca `--opus`); achado alto ou crítico reprova, sem supressão (corrija a config ou aceite o REPROVADO conscientemente); ausente ou com erro vira gate parcial. Demais ferramentas ausentes viram "gate parcial" no report, nunca aprovação silenciosa.
 
 ### TDD por tipo de tarefa
 
@@ -389,20 +389,32 @@ O motor da execução é sempre o `superpowers:subagent-driven-development`. Esc
 
 ## Hooks globais
 
-4 hooks em `~/.claude/hooks/cbs-*.js` (ESM, sem dependências, sem `npx`), Claude Code **e** Codex, ligados por padrão via merge idempotente no `settings.json` (backup automático; hooks e chaves de outras ferramentas nunca são tocados):
+4 hooks em `~/.claude/hooks/cbs-*.mjs` (ESM pela extensão, sem dependências, sem `npx`), Claude Code **e** Codex, ligados por padrão via merge idempotente no `settings.json` (backup automático; hooks e chaves de outras ferramentas nunca são tocados). Não há `package.json` em `~/.claude/hooks`: hooks `.js` CommonJS seus ali continuam funcionando.
 
 | Hook | Evento / matcher | O que faz |
 |---|---|---|
-| `cbs-format.js` | PostToolUse `Edit\|Write\|MultiEdit` | Formata só o arquivo editado com pint, `ruff format`, biome ou prettier **do projeto** (binário + config locais); em silêncio quando não há ferramenta |
-| `cbs-no-verify.js` | PreToolUse `Bash` | Bloqueia `--no-verify`, `-n`/`--no-verify` em commit/am, `-c core.hooksPath=…` em commit/push/merge/rebase/am/cherry-pick; fail-closed (texto ambíguo bloqueia); não marca falso positivo em string, echo, `grep`/`gh` ou mensagem de commit |
-| `cbs-config-protect.js` | PreToolUse `Edit\|Write\|MultiEdit` | Bloqueia editar config existente de lint/format/typecheck (ESLint, Prettier, Biome, Pint, PHPStan, Ruff, mypy, Stylelint, `[tool.ruff]`/`[tool.mypy]` do `pyproject.toml`); criar config nova é permitido |
-| `cbs-typecheck.js` | Stop | Roda tsc/phpstan/mypy\|pyright só nas stacks tocadas na sessão; bloqueia o fim do turno **uma vez** com o resumo dos erros; teto de 60 s; nunca escreve buildinfo/cache no repo do usuário |
+| `cbs-format.mjs` | PostToolUse `Edit\|Write\|MultiEdit` | Formata só o arquivo editado com pint, `ruff format`, biome ou prettier **do projeto** (binário + config locais); em silêncio quando não há ferramenta |
+| `cbs-no-verify.mjs` | PreToolUse `Bash` | Bloqueia `--no-verify`, `-n`/`--no-verify` em commit/am, `-c core.hooksPath=…` em commit/push/merge/rebase/am/cherry-pick; fail-closed (texto ambíguo bloqueia); não bloqueia os casos comuns de string, echo, `grep`/`gh` ou mensagem de commit |
+| `cbs-config-protect.mjs` | PreToolUse `Edit\|Write\|MultiEdit` | Bloqueia qualquer mudança em config existente de lint/format/typecheck (ESLint, Prettier, Biome, Pint, PHPStan, PHP-CS-Fixer, Ruff, mypy, Stylelint, `[tool.ruff]`/`[tool.mypy]` do `pyproject.toml`); análise que falha ou passa de 3 s bloqueia; criar config nova é permitido |
+| `cbs-typecheck.mjs` | Stop | Roda tsc/phpstan/mypy\|pyright só nas stacks tocadas na sessão; bloqueia o fim do turno **uma vez** com o resumo dos erros; teto de 60 s; nunca escreve buildinfo/cache no repo do usuário |
 
-Env: `CBS_HOOKS=off` desliga todos; `CBS_HOOKS_DESLIGADOS=format,typecheck,no-verify,config` desliga os escolhidos; `CBS_PERMITIR_CONFIG=1` é o escape pontual do `cbs-config-protect`. Rodam via um launcher POSIX (`~/.claude/hooks/cbs-node.sh`) que acha um `node` válido mesmo depois de troca de versão no nvm/fnm/volta; launcher ou script ausente nunca bloqueia a sessão (o hook vira no-op). `cbs instalar --sem-hooks` / `cbs atualizar --sem-hooks` pula a instalação; `cbs status` lista os hooks CBS ativos; `cbs remover` tira só as entradas CBS do `settings.json`.
+Env: `CBS_HOOKS=off` desliga todos; `CBS_HOOKS_DESLIGADOS=format,typecheck,no-verify,config` desliga os escolhidos; `CBS_PERMITIR_CONFIG=1` é o escape pontual do `cbs-config-protect`. Rodam via um launcher POSIX (`~/.claude/hooks/cbs-node.sh`) que acha um `node` válido mesmo depois de troca de versão no nvm/fnm/volta; launcher ou script ausente nunca bloqueia a sessão (o hook vira no-op). `format` e `typecheck` só rodam binário que outro usuário local não consegue plantar (dono = você ou root; diretórios não graváveis por outros).
 
-**Codex:** os mesmos 4 hooks chegam pelo plugin (`codex-hooks.json`) e exigem o CBS instalado em `~/.claude`; precisam estar marcados como confiáveis no Codex pra rodar. `apply_patch` roteado pelo shell só é coberto pelo `cbs-config-protect`, não por format/typecheck.
+`cbs instalar --sem-hooks` / `cbs atualizar --sem-hooks` copia os arquivos mas não registra os hooks no `settings.json`. **Não é persistente**: o próximo `cbs atualizar` (ou `/atualizar`) sem a flag registra de novo — pra manter desligado, exporte `CBS_HOOKS=off`. `cbs status` lista os hooks CBS ativos; `cbs remover` tira só as entradas CBS do `settings.json`. `atualizar` e `remover` também limpam o legado das builds de desenvolvimento 0.13-dev: entradas `cbs-*.js` no `settings.json`, os `cbs-*.js` com marcador e o `~/.claude/hooks/package.json` só quando é byte a byte o da dev (`{ "type": "module" }`).
+
+**Codex:** os mesmos 4 hooks chegam pelo plugin (`codex-hooks.json`: no-verify em `Bash`, config-protect em `Bash|apply_patch`, format em `apply_patch`, typecheck no Stop) e exigem o CBS instalado em `~/.claude`. Precisam estar marcados como confiáveis no Codex; sem isso ficam inertes, sem aviso.
 
 **Windows:** exige Git Bash (`sh`) — os hooks não têm caminho nativo `.cmd`/PowerShell. Latência medida < 100 ms no caminho vazio (sem match).
+
+### Limitações conhecidas
+
+- **Codex, `apply_patch` rodado pelo shell** (chega ao hook como `Bash`): só o `cbs-config-protect` cobre essa rota — o Codex não dispara PostToolUse ali, então format e typecheck não veem essas edições. Como o Codex não informa o diretório, config protegida ou `pyproject.toml` em caminho **relativo** é bloqueada pelo nome, mesmo sem afrouxar nada (escape `CBS_PERMITIR_CONFIG=1`, ou use a ferramenta `apply_patch`). Patch fora do texto do comando (`apply_patch < arquivo.patch`) não é inspecionável e passa. O hook roda com `$SHELL -c`: validado com sh, bash e zsh; fish e nushell não verificados.
+- **Diretório não confiável = no-op silencioso** de format e typecheck: root num container sobre bind mount de outro dono, WSL em `/mnt/c` (777) e diretórios 777 (ex.: `storage/` do Laravel). No Windows os dois também ficam em silêncio (shims `.cmd` não são resolvidos).
+- **Falsos positivos** (fail-closed de propósito):
+  - `cbs-no-verify`: `xargs -n1 git commit`, `git commit -- --no-verify`, `git log --grep "--no-verify"`, `git -c core.hooksPath=… log`, heredoc cujo texto cita `--no-verify` — escape `CBS_HOOKS_DESLIGADOS=no-verify`. Fora do alcance: `git pull --no-verify`, `--config-env`/`GIT_CONFIG_*`/`git config core.hooksPath`, `HUSKY=0`, alias (`git ci -n`).
+  - `cbs-config-protect`: comentário ou espaço mudado dentro de `[tool.ruff]`/`[tool.mypy]`; comando Bash que só cita um cabeçalho de patch com nome protegido (heredoc gravando um `.patch`, mensagem de commit); patch que o hook não consegue aplicar igual ao Codex — escape `CBS_PERMITIR_CONFIG=1`.
+- **`cbs-typecheck`**: phpstan e mypy recebem os arquivos tocados na linha de comando, o que sobrepõe `paths` do `phpstan.neon` e `files` do mypy; `CLAUDE_PROJECT_DIR` velho ou inexistente → nada é checado; `tsc` içado na raiz de um monorepo → sem checagem.
+- Pré-existente (desde a 0.12): `~/.claude/scripts/package.json` (`{ "type": "module" }`) faz `.js` CommonJS seus em `~/.claude/scripts/` falharem no load; o `atualizar` o preserva e o `remover` não o apaga.
 
 ## CLI de referência
 
@@ -421,7 +433,7 @@ cbs status           # versões (pacote, Superpowers, BMAD por projeto), skills/
 | `--skip-self-update` | Não tenta atualizar o próprio pacote (git pull / npx @latest) |
 | `--skip-bmad` | Não mexe no BMAD dos projetos registrados |
 | `--auto-bmad` / `-y` | Atualiza BMAD em todos os projetos sem perguntar (padrão quando não há TTY) |
-| `--sem-hooks` | Não atualiza/reinstala os hooks CBS no `settings.json` |
+| `--sem-hooks` | Não registra os hooks CBS no `settings.json` nesta execução (o próximo `atualizar` sem a flag registra de novo) |
 
 O `atualizar` detecta como o pacote foi instalado (clone git ou npm) e se atualiza sozinho; depois reescreve só a camada base, **preservando suas customizações** (veja abaixo).
 
@@ -450,7 +462,7 @@ Quer alterar um comando ou persona sem perder no update? Crie a versão custom e
 ## Desinstalar
 
 ```bash
-cbs remover          # remove skills/comandos do pacote; preserva cbs-overrides/
+cbs remover          # remove skills/comandos/hooks do pacote e as entradas CBS do settings.json; preserva cbs-overrides/
 ```
 
 Não desinstala o Superpowers nem o BMAD — a saída mostra os comandos pra isso (`/plugin uninstall superpowers@superpowers-marketplace`, `npx bmad-method uninstall`).
@@ -487,3 +499,4 @@ MIT — veja [LICENSE](LICENSE).
 - [BMAD-METHOD](https://github.com/bmad-code-org/BMAD-METHOD) — BMad Code
 - [Superpowers](https://github.com/obra/superpowers) — Jesse Vincent (obra)
 - [Claude Code](https://claude.com/claude-code) — Anthropic
+- [ECC](https://github.com/affaan-m/ECC) — Affaan Mustafa (MIT): hooks, regras de persona e casos de teste portados do commit `e482e57`

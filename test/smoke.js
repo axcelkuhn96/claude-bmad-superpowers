@@ -635,3 +635,21 @@ test('remover -y apaga só arquivos com marcador e preserva cbs-overrides', asyn
   assert.deepEqual((await fs.readdir(path.join(claude, 'hooks'))).filter((f) => f.startsWith('cbs-')), [], 'nenhum cbs-* sobrou em hooks/');
   assert.match(out, /4 entrada\(s\) CBS removida\(s\) do settings\.json/);
 });
+
+test('base/hooks derivados do ECC têm crédito MIT, nenhum hook invoca npx e npm test cobre todos os arquivos de teste', async () => {
+  const dirHooks = path.join(BASE, 'hooks');
+  for (const h of ['cbs-format.mjs', 'cbs-no-verify.mjs', 'cbs-config-protect.mjs', 'cbs-typecheck.mjs']) {
+    assert.match(await fs.readFile(path.join(dirHooks, h), 'utf8'), /Copyright \(c\) 2026 Affaan Mustafa/, `crédito MIT em ${h}`);
+  }
+  // F3: invocação de npx (literal de string/argumento de spawn ou comando de shell), não a palavra no comentário
+  for (const h of await fs.readdir(dirHooks)) {
+    const txt = await fs.readFile(path.join(dirHooks, h), 'utf8');
+    assert.doesNotMatch(txt, /(['"`])npx\b/, `sem npx como string/argumento em ${h}`);
+    assert.doesNotMatch(txt, /(?:^|[;&|(]\s*|\$\(\s*)npx\b/m, `sem npx como comando em ${h}`);
+  }
+  const pkg = JSON.parse(await fs.readFile(path.join(RAIZ, 'package.json'), 'utf8'));
+  const testes = (await fs.readdir(path.join(RAIZ, 'test'))).filter((n) => n.endsWith('.js'));
+  for (const t of testes) assert.match(pkg.scripts.test, new RegExp(`test/${t.replaceAll('.', '\\.')}(\\s|$)`), `${t} no npm test`);
+  assert.equal(pkg.version, (await fs.readFile(path.join(BASE, 'VERSAO'), 'utf8')).trim());
+  assert.equal(pkg.version, '0.13.0');
+});
