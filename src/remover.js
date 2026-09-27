@@ -21,7 +21,7 @@ async function arquivoTemMarcador(p) {
 // ~/.claude/hooks/package.json byte a byte como as builds 0.13-dev o gravavam (base/hooks/package.json até virar .mjs).
 // Qualquer outro conteúdo é do usuário e fica.
 const PKG_HOOKS_DEV = Buffer.from('{ "type": "module" }\n');
-async function ehPkgHooksDev(p) {
+export async function ehPkgHooksDev(p) {
   try {
     return (await fs.lstat(p)).isFile() && (await fs.readFile(p)).equals(PKG_HOOKS_DEV);
   } catch (e) {

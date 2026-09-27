@@ -7,6 +7,7 @@ import {
   garantirDir, lerVersaoPacote, existe,
 } from './caminhos.js';
 import { prevalidarHooks, aplicarHooks, gravarCaminhoNode } from './hooks-settings.js';
+import { ehPkgHooksDev } from './remover.js';
 import { tentarInstalarSuperpowers } from './superpowers.js';
 import { instalarBmad } from './instalar-bmad.js';
 import { temBmadAqui } from './bmad.js';
@@ -51,8 +52,9 @@ async function copiarHooks(origem, destino, versao, copiar) {
   }
 }
 
-// cbs-*.js com marcador = hooks das builds 0.13-dev (antes do .mjs); sem marcador é do usuário e fica.
-async function apagarHooksJsLegados(dir) {
+// Legado das builds 0.13-dev (antes do .mjs): cbs-*.js com marcador (sem marcador é do usuário e fica) e o
+// package.json type:module byte-igual ao da dev, que quebra hooks .js CommonJS do usuário em ~/.claude/hooks.
+async function apagarLegadoHooksDev(dir) {
   const apagados = [];
   for (const ent of await fs.readdir(dir, { withFileTypes: true })) {
     const p = path.join(dir, ent.name);
@@ -62,6 +64,11 @@ async function apagarHooksJsLegados(dir) {
     }
   }
   if (apagados.length) console.log(`→ hooks .js antigos removidos (agora .mjs): ${apagados.join(', ')}`);
+  const pkg = path.join(dir, 'package.json');
+  if (await ehPkgHooksDev(pkg)) {
+    await fs.rm(pkg);
+    console.log(`→ ${pkg} da 0.13-dev removido (os hooks CBS agora são .mjs e não precisam dele)`);
+  }
 }
 
 // hooks globais (instalar e atualizar): copia, grava o node pro launcher e registra no settings.json.
@@ -76,13 +83,13 @@ export async function instalarHooks(versao, semHooks, copiar = copiarComMarcador
     console.log(`⚠  ${e.message} — .cbs-node-path não gravado; o launcher procura o node no PATH, nvm, fnm e volta.`);
   }
   if (semHooks) {
-    // settings.json intocado pode ainda apontar pros cbs-*.js antigos: eles ficam
+    // settings.json intocado pode ainda apontar pros cbs-*.js antigos: eles (e o package.json da dev) ficam
     console.log('(registro no settings.json pulado por --sem-hooks)');
     return { mudou: false, backup: null };
   }
   const r = await aplicarHooks(ARQ_SETTINGS, DIR_HOOKS);
   // só depois de o settings.json trocar as entradas .js pelas .mjs: nenhuma entrada fica apontando pra arquivo apagado
-  await apagarHooksJsLegados(DIR_HOOKS);
+  await apagarLegadoHooksDev(DIR_HOOKS);
   return r;
 }
 

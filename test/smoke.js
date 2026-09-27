@@ -335,7 +335,7 @@ async function montarLegado(home, pkgTexto) {
   return dir;
 }
 
-test('atualizar sobre build 0.13-dev (hooks .js): troca entradas .js pelas .mjs e apaga cbs-*.js do pacote; --sem-hooks não mexe', async () => {
+test('atualizar sobre build 0.13-dev (hooks .js): troca entradas .js pelas .mjs, apaga cbs-*.js e o package.json da dev; --sem-hooks não mexe', async () => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-smoke-legado-'));
   const rodar = (args) => spawnSync(process.execPath, [CLI, ...args], {
     encoding: 'utf8', env: { ...process.env, HOME: home, USERPROFILE: home }, cwd: home, input: '',
@@ -344,12 +344,18 @@ test('atualizar sobre build 0.13-dev (hooks .js): troca entradas .js pelas .mjs 
     const dir = await montarLegado(home, PKG_DEV);
     const arq = path.join(home, '.claude', 'settings.json');
     const antes = await fs.readFile(arq, 'utf8');
+    // hook CommonJS do usuário: quebra com o package.json type:module da dev (review T9b)
+    const cjs = path.join(dir, 'meu-cjs.js');
+    await fs.writeFile(cjs, "module.exports = 1; process.stdout.write('cjs ok');\n", 'utf8');
+    const rodarCjs = () => spawnSync(process.execPath, [cjs], { encoding: 'utf8' });
+    assert.match(rodarCjs().stderr, /module is not defined in ES module scope/, 'pré-condição: package.json da dev quebra o CJS');
 
     // --sem-hooks: settings.json intocado, então os .js que ele ainda referencia ficam
     const s = rodar(['atualizar', '--skip-self-update', '--skip-bmad', '--sem-hooks']);
     assert.equal(s.status, 0, s.stdout + s.stderr);
     assert.equal(await fs.readFile(arq, 'utf8'), antes);
     for (const f of HOOKS_LEGADO) assert.ok(await existe(path.join(dir, f)), `${f} mantido com --sem-hooks`);
+    assert.equal(await fs.readFile(path.join(dir, 'package.json'), 'utf8'), PKG_DEV, 'package.json mantido com --sem-hooks');
 
     const a = rodar(['atualizar', '--skip-self-update', '--skip-bmad']);
     assert.equal(a.status, 0, a.stdout + a.stderr);
@@ -361,7 +367,27 @@ test('atualizar sobre build 0.13-dev (hooks .js): troca entradas .js pelas .mjs 
     for (const f of HOOKS_LEGADO) assert.ok(!(await existe(path.join(dir, f))), `${f} (do pacote) apagado`);
     assert.equal(await fs.readFile(path.join(dir, 'cbs-meu.js'), 'utf8'), '// meu, sem marcador\n', 'cbs-*.js sem marcador preservado');
     for (const h of HOOKS_ARQUIVOS) assert.match(await fs.readFile(path.join(dir, h), 'utf8'), new RegExp(MARCADOR), `${h} instalado`);
-    assert.equal(await fs.readFile(path.join(dir, 'package.json'), 'utf8'), PKG_DEV, 'atualizar não mexe no package.json');
+    assert.ok(!(await existe(path.join(dir, 'package.json'))), 'package.json da 0.13-dev apagado');
+    assert.match(a.stdout, /hooks[\\/]package\.json/, 'atualizar avisa que apagou o package.json');
+    const u = rodarCjs();
+    assert.equal(u.status, 0, u.stderr); assert.equal(u.stdout, 'cjs ok');
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test('atualizar sobre build 0.13-dev preserva package.json que não é byte-igual ao da dev', async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-smoke-legado-pkg-'));
+  try {
+    const outroPkg = '{"type":"module"}\n';
+    const dir = await montarLegado(home, outroPkg);
+    const a = spawnSync(process.execPath, [CLI, 'atualizar', '--skip-self-update', '--skip-bmad'], {
+      encoding: 'utf8', env: { ...process.env, HOME: home, USERPROFILE: home }, cwd: home, input: '',
+    });
+    assert.equal(a.status, 0, a.stdout + a.stderr);
+    assert.deepEqual(hooksCbs(await lerJson(path.join(home, '.claude', 'settings.json'))), HOOKS_ESPERADOS);
+    assert.equal(await fs.readFile(path.join(dir, 'package.json'), 'utf8'), outroPkg, 'package.json do usuário intocado');
+    assert.doesNotMatch(a.stdout, /hooks[\\/]package\.json/);
   } finally {
     await fs.rm(home, { recursive: true, force: true });
   }
