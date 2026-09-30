@@ -129,6 +129,33 @@ export function noPath(nome, env = process.env) {
   return null;
 }
 
+// Interpretador do shebang resolvível? `#!/abs/interp` precisa ser executável; `#!/usr/bin/env [-S] nome` precisa de
+// `nome` num diretório absoluto do PATH (noPath). Não → ferramenta indisponível (ex.: vendor/bin/pint sem php): o hook
+// pula em silêncio sem chamar o spawn. Sem shebang, relativo ou ilegível → true (o spawn decide).
+export function interpretadorDisponivel(bin, env = process.env) {
+  if (WIN) return true;
+  let linha;
+  try {
+    const fd = fs.openSync(bin, 'r');
+    try {
+      const buf = Buffer.alloc(256); // teto do shebang no Linux
+      linha = buf.toString('utf8', 0, fs.readSync(fd, buf, 0, buf.length, 0));
+    } finally { fs.closeSync(fd); }
+  } catch { return true; }
+  if (!linha.startsWith('#!')) return true;
+  const [interp, ...args] = linha.slice(2).split('\n')[0].trim().split(/\s+/);
+  if (!interp || !path.isAbsolute(interp)) return true;
+  if (!executavel(interp)) return false;
+  if (path.basename(interp) !== 'env') return true;
+  const nome = args.find((a) => !a.startsWith('-') && !a.includes('='));
+  if (!nome) return true;
+  return path.isAbsolute(nome) ? executavel(nome) : noPath(nome, env) !== null;
+}
+
+// Resultado do spawnSync de ferramenta indisponível (silêncio, não é falha): exit 127 (comando não encontrado, ex.:
+// `env php` sem php) ou spawn que nem começou por ENOENT/EACCES (interpretador ausente ou sem permissão).
+export const ferramentaIndisponivel = (r) => r.status === 127 || ['ENOENT', 'EACCES'].includes(r.error?.code);
+
 export function ehEntrada(metaUrl) {
   try {
     return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(metaUrl));

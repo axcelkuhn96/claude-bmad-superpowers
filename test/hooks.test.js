@@ -850,6 +850,126 @@ describe('cbs-typecheck — fix round 1 (E2E)', { skip: !POSIX && 'POSIX' }, () 
   });
 });
 
+// ── 0.13.1: ferramenta indisponível (vendor/bin/pint sem php, exit 127, ENOENT/EACCES) é silenciosa no format e no
+// typecheck; só a falha real do formatador avisa. Evidência: 92 × "pint falhou (exit 127)" em projetos Laravel sem php. ──
+const LINUX = process.platform === 'linux'; // shebang aninhado (interpretador que é script) só no Linux
+describe('cbs-comum — interpretador do shebang', { skip: !POSIX && 'POSIX' }, () => {
+  test('#!/usr/bin/env nome: resolve só por diretório absoluto do PATH', (t) => {
+    const p = tmpDoTeste(t); const bin = escrever(p, 'bin/fmt', '#!/usr/bin/env cbs-interp\n', 0o755);
+    const dir = tmpDoTeste(t, 'cbs-path-'); escrever(dir, 'cbs-interp', EXE0, 0o755);
+    assert.equal(comum.interpretadorDisponivel(bin, { PATH: tmpDoTeste(t, 'cbs-vazio-') }), false);
+    assert.equal(comum.interpretadorDisponivel(bin, { PATH: dir }), true);
+    assert.equal(comum.interpretadorDisponivel(bin, { PATH: path.relative(process.cwd(), dir) }), false, 'entrada relativa do PATH não conta');
+  });
+  test('#!/usr/bin/env -S nome --flag: pula as opções do env', (t) => {
+    const p = tmpDoTeste(t); const bin = escrever(p, 'fmt', '#!/usr/bin/env -S cbs-interp --flag\n', 0o755);
+    const dir = tmpDoTeste(t, 'cbs-path-'); escrever(dir, 'cbs-interp', EXE0, 0o755);
+    assert.equal(comum.interpretadorDisponivel(bin, { PATH: dir }), true);
+    assert.equal(comum.interpretadorDisponivel(bin, { PATH: '' }), false);
+  });
+  test('#!/caminho/absoluto: precisa existir e ser executável', (t) => {
+    const p = tmpDoTeste(t); const naoExec = escrever(p, 'naoexec', EXE0, 0o644);
+    assert.equal(comum.interpretadorDisponivel(escrever(p, 'a', '#!/nao/existe/php\n', 0o755), {}), false);
+    assert.equal(comum.interpretadorDisponivel(escrever(p, 'b', `#!${naoExec}\n`, 0o755), {}), false);
+    assert.equal(comum.interpretadorDisponivel(escrever(p, 'c', '#!/bin/sh\nexit 0\n', 0o755), {}), true);
+  });
+  test('sem shebang (binário nativo) ou ilegível → disponível (o spawn decide)', (t) => {
+    const p = tmpDoTeste(t);
+    assert.equal(comum.interpretadorDisponivel(escrever(p, 'nativo', '\x7fELF\x02\x01', 0o755), {}), true);
+    assert.equal(comum.interpretadorDisponivel(path.join(p, 'nao-existe'), {}), true);
+  });
+});
+describe('cbs-format — ferramenta indisponível é silenciosa (0.13.1)', { skip: !POSIX && 'POSIX' }, () => {
+  function laravel(t, pint) {
+    const p = tmpDoTeste(t); escrever(p, 'composer.json', '{}'); escrever(p, 'artisan', '');
+    escrever(p, 'vendor/bin/pint', pint, 0o755);
+    return { p, a: escrever(p, 'app/A.php', '<?php\n$x=1;') };
+  }
+  const editar = (p, sessao, env = {}) => rodarHook('cbs-format.mjs', { session_id: sessao, cwd: p, tool_name: 'Edit', tool_input: { file_path: 'app/A.php' } }, { TMPDIR: p, ...env });
+  test('E2E: vendor/bin/pint com #!/usr/bin/env php e sem php no PATH → exit 0, stderr vazio, arquivo mantido', (t) => {
+    const { p, a } = laravel(t, '#!/usr/bin/env php\n<?php echo "rodou";\n');
+    const r = editar(p, 'ind-pint', { PATH: tmpDoTeste(t, 'cbs-sem-php-') });
+    assert.equal(r.code, 0); assert.equal(r.out, ''); assert.equal(r.err, '');
+    assert.equal(fs.readFileSync(a, 'utf8'), '<?php\n$x=1;');
+  });
+  test('E2E: pint, ruff, biome e prettier com interpretador ausente → silêncio', (t) => {
+    const semInterp = '#!/usr/bin/env cbs-interpretador-ausente\n';
+    const casos = {
+      pint: [['composer.json', '{}'], ['artisan', ''], ['vendor/bin/pint', semInterp, 0o755], ['A.php', '<?php']],
+      ruff: [['pyproject.toml', '[tool.ruff]\n'], ['.venv/bin/ruff', semInterp, 0o755], ['m.py', 'x=1']],
+      biome: [['package.json', '{}'], ['biome.json', '{}'], ['node_modules/.bin/biome', semInterp, 0o755], ['a.ts', 'const x=1']],
+      prettier: [['package.json', '{}'], ['.prettierrc', '{}'], ['node_modules/.bin/prettier', semInterp, 0o755], ['a.ts', 'const x=1']],
+    };
+    for (const [ferramenta, arquivos] of Object.entries(casos)) {
+      const p = tmpDoTeste(t);
+      for (const [rel, conteudo, modo] of arquivos) escrever(p, rel, conteudo, modo);
+      const alvo = arquivos.at(-1)[0];
+      assert.equal(fmt.escolherFormatador(path.join(p, alvo), { PATH: '' })?.ferramenta, ferramenta, 'o formatador é escolhido');
+      const r = rodarHook('cbs-format.mjs', { session_id: `ind-${ferramenta}`, cwd: p, tool_input: { file_path: alvo } }, { TMPDIR: p, PATH: tmpDoTeste(t, 'cbs-vazio-') });
+      assert.equal(r.code, 0, ferramenta); assert.equal(r.out + r.err, '', ferramenta);
+    }
+  });
+  test('E2E: wrapper que sai 127 (comando interno ausente) → silêncio', (t) => {
+    const { p } = laravel(t, '#!/bin/sh\necho "php: command not found" >&2\nexit 127\n');
+    const r = editar(p, 'ind-127');
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
+  });
+  test('E2E: falha real do pint (exit 1) mantém o aviso curto', (t) => {
+    const { p, a } = laravel(t, '#!/bin/sh\nexit 1\n');
+    const r = editar(p, 'ind-falha');
+    assert.equal(r.code, 0); assert.equal(r.out, '');
+    assert.equal(r.err, '[cbs] format: pint falhou em A.php (exit 1) — arquivo mantido\n');
+    assert.equal(fs.readFileSync(a, 'utf8'), '<?php\n$x=1;');
+  });
+  test('rodarFormatador: ENOENT/EACCES do spawn (interpretador aninhado ausente ou sem permissão) → null', { skip: !LINUX && 'Linux' }, (t) => {
+    const p = tmpDoTeste(t);
+    const naoExec = escrever(p, 'naoexec', EXE0, 0o644);
+    const semPy = escrever(p, 'sem-py', '#!/nao/existe/python3\n', 0o755);
+    const semPerm = escrever(p, 'sem-perm', `#!${naoExec}\n`, 0o755);
+    for (const interp of [semPy, semPerm]) {
+      const bin = escrever(p, `fmt-${path.basename(interp)}`, `#!${interp}\n`, 0o755);
+      assert.equal(comum.interpretadorDisponivel(bin, {}), true, 'o pré-check não pega o aninhado; o spawn pega');
+      assert.equal(fmt.rodarFormatador({ bin, args: [], raiz: p }), null, interp);
+    }
+  });
+});
+describe('cbs-typecheck — ferramenta indisponível não bloqueia nem avisa (0.13.1)', { skip: !POSIX && 'POSIX' }, () => {
+  function stop(t, sessao, arquivos, cwd, env = {}) {
+    const tmpSessao = tmpDoTeste(t, 'cbs-tmp-');
+    comum.registrarEdicao(sessao, arquivos, tmpSessao);
+    const r = rodarHook('cbs-typecheck.mjs', { session_id: sessao, cwd }, { TMPDIR: tmpSessao, ...env });
+    return { ...r, acumulador: comum.lerAcumulador(sessao, tmpSessao) };
+  }
+  function laravel(t, phpstan) {
+    const p = tmpDoTeste(t, 'cbs-tc-'); escrever(p, 'composer.json', '{}'); escrever(p, 'phpstan.neon', '');
+    escrever(p, 'vendor/bin/phpstan', phpstan, 0o755);
+    return { p, a: escrever(p, 'app/A.php', '<?php') };
+  }
+  test('E2E: phpstan com #!/usr/bin/env php e sem php no PATH → sem bloqueio, silêncio, limpa', (t) => {
+    const { p, a } = laravel(t, '#!/usr/bin/env php\n<?php exit(1);\n');
+    const r = stop(t, 'ind-phpstan', [a], p, { PATH: tmpDoTeste(t, 'cbs-sem-php-') });
+    assert.equal(r.code, 0); assert.equal(r.out, ''); assert.equal(r.err, ''); assert.deepEqual(r.acumulador, []);
+  });
+  test('E2E: wrapper do mypy que sai 127 → sem bloqueio, silêncio', (t) => {
+    const p = tmpDoTeste(t, 'cbs-py-'); escrever(p, 'pyproject.toml', '[tool.mypy]\n');
+    escrever(p, '.venv/bin/mypy', '#!/bin/sh\necho "python3: command not found" >&2\nexit 127\n', 0o755);
+    const r = stop(t, 'ind-mypy', [escrever(p, 'm.py', '')], p);
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, ''); assert.deepEqual(r.acumulador, []);
+  });
+  test('E2E: interpretador aninhado ausente (spawn ENOENT) → silêncio, sem "não rodou"', { skip: !LINUX && 'Linux' }, (t) => {
+    const { p, a } = laravel(t, '');
+    const interp = escrever(p, 'interp', '#!/nao/existe/php\n', 0o755);
+    escrever(p, 'vendor/bin/phpstan', `#!${interp}\n`, 0o755);
+    const r = stop(t, 'ind-enoent', [a], p);
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
+  });
+  test('E2E: falha real do phpstan (exit 1) continua bloqueando', (t) => {
+    const { p, a } = laravel(t, '#!/bin/sh\necho "app/A.php:1:Erro real"\nexit 1\n');
+    const r = stop(t, 'ind-real', [a], p);
+    assert.equal(r.code, 0); assert.match(JSON.parse(r.out).reason, /A\.php:1:Erro real/);
+  });
+});
+
 const noVerify = await import(pathToFileURL(path.join(HOOKS, 'cbs-no-verify.mjs')).href);
 describe('cbs-no-verify', () => {
   const BLOQUEIA = [

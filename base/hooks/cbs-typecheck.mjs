@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { hookDesligado, lerStdin, lerPayload, lerTexto, acharRaiz, binLocal, noPath, ehEntrada, avisar, lerAcumulador, arquivoAcumulador } from './cbs-comum.mjs';
+import { hookDesligado, lerStdin, lerPayload, lerTexto, acharRaiz, binLocal, noPath, interpretadorDisponivel, ferramentaIndisponivel, ehEntrada, avisar, lerAcumulador, arquivoAcumulador } from './cbs-comum.mjs';
 
 export const TETO_MS = 60_000;
 const MAX_MOTIVO = 1500;
@@ -98,6 +98,8 @@ export function executar(planos, tetoMs = TETO_MS) {
   for (const p of planos) {
     const resta = tetoMs - (Date.now() - inicio);
     if (resta <= 0) return { falhas, estourou: true };
+    // Ferramenta indisponível (phpstan sem php, wrapper do mypy sem python): pula em silêncio — não bloqueia nem avisa.
+    if (!interpretadorDisponivel(p.bin)) continue;
     // mypy: cache num dir temporário apagado depois — nunca grava .mypy_cache no repo (espírito do H2).
     const cache = p.cacheTemp ? fs.mkdtempSync(path.join(os.tmpdir(), 'cbs-mypy-')) : null;
     let r;
@@ -108,6 +110,7 @@ export function executar(planos, tetoMs = TETO_MS) {
       if (cache) fs.rmSync(cache, { recursive: true, force: true });
     }
     if (r.error && r.error.code === 'ETIMEDOUT') return { falhas, estourou: true };
+    if (ferramentaIndisponivel(r)) continue;
     if (r.error) { avisar(`typecheck: ${path.basename(p.bin)} não rodou (${r.error.code})`); continue; }
     if (r.status !== 0) {
       const saida = `${r.stdout || ''}\n${r.stderr || ''}`;

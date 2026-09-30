@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { hookDesligado, lerStdin, lerPayload, lerTexto, caminhosEditados, acharRaiz, binLocal, noPath, ehEntrada, avisar, registrarEdicao } from './cbs-comum.mjs';
+import { hookDesligado, lerStdin, lerPayload, lerTexto, caminhosEditados, acharRaiz, binLocal, noPath, interpretadorDisponivel, ferramentaIndisponivel, ehEntrada, avisar, registrarEdicao } from './cbs-comum.mjs';
 
 const EXT_WEB = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.css', '.json', '.md']);
 const BIOME_CFG = ['biome.json', 'biome.jsonc'];
@@ -55,10 +55,13 @@ export function escolherFormatador(arquivo, env = process.env) {
   return null;
 }
 
-// Roda o formatador sem shell; devolve null quando deu certo, senão o motivo (erro, sinal ou código de saída).
+// Roda o formatador sem shell; devolve null quando deu certo ou a ferramenta está indisponível (interpretador do
+// shebang ausente, exit 127, ENOENT/EACCES: silêncio), senão o motivo (erro, sinal ou código de saída).
 // SIGKILL no timeout: formatador que ignora SIGTERM não prende o hook.
 export function rodarFormatador(f, timeoutMs = TIMEOUT_MS) {
+  if (!interpretadorDisponivel(f.bin)) return null;
   const r = spawnSync(f.bin, f.args, { cwd: f.raiz, stdio: 'ignore', timeout: timeoutMs, killSignal: 'SIGKILL', shell: false });
+  if (ferramentaIndisponivel(r)) return null;
   return r.error || r.status !== 0 ? String(r.error?.code ?? r.signal ?? r.status) : null;
 }
 
