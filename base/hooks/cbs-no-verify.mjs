@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // cbs-no-verify.mjs — PreToolUse (Bash): bloqueia bypass de hooks git (--no-verify, commit/am -n, -c core.hooksPath=…).
-// Fail-closed por construção: o gatilho é o TEXTO CRU — palavra `git` + flag de bypass (--no-verify ou prefixo,
-// core.hooksPath=, ou -n agrupado quando há commit/am) → BLOQUEIA. O parser só REBAIXA para liberar quando a análise
-// é certa E cada flag está provadamente em dado: argumento de echo/printf/grep/rg/gh, valor de -m/-F em commit/tag/merge,
-// comentário, -n de comando onde ele não é --no-verify (head, git log…), ou script de sh -c/eval que, analisado
-// sozinho, libera. Bug de parser vira falso positivo, nunca falso negativo.
-// Incerto (heredoc, $'…', aspa sem fechar, comando > 64 KB, sh -c aninhado demais) → vale o texto cru. Trade-off
-// aceito: heredoc cujo texto contém "--no-verify" bloqueia — escape: CBS_HOOKS_DESLIGADOS=no-verify.
+// A flag só conta na lista de argumentos da PRÓPRIA invocação do git (mesmo comando simples: `;`, `&&`, `||`, `|`, `&`,
+// quebra de linha, subshell e $( ) separam), com git em qualquer posição (sudo, env, nice, timeout, xargs, find -exec…).
+// --no-verify (ou prefixo) conta em commit/push/merge/rebase/am/cherry-pick; -n (inclusive agrupado) só em commit/am.
+// Dado nunca conta: corpo de heredoc, argumento de echo/printf/grep/rg/gh, valor de -m/-F, comentário.
+// Fail-closed onde o texto vira comando: sh -c / eval / su -c / ssh '…' / rebase -x '…' (palavra com git + flag é
+// analisada como script), heredoc lido por shell (`bash <<EOF`, `cat <<EOF | sh`) e $( ) em heredoc sem aspas.
+// Incerto (aspa ou heredoc sem fechar, $'…', comando > 64 KB, aninhamento ou custo demais) → texto cru EM ORDEM:
+// flag só depois de `git` (e -n só depois de git … commit/am). Escape: CBS_HOOKS_DESLIGADOS=no-verify.
 // Adaptado de affaan-m/ECC @ e482e57, scripts/hooks/block-no-verify.js — MIT License,
 // Copyright (c) 2026 Affaan Mustafa. Licença: https://github.com/affaan-m/ECC/blob/e482e57/LICENSE
 import { hookDesligado, lerStdin, lerPayload, comandoBash, ehEntrada, avisar } from './cbs-comum.mjs';
@@ -151,98 +152,132 @@ function isNoVerifyLongFlag(value) {
   return value.length >= '--no-v'.length && '--no-verify'.startsWith(value);
 }
 
-// --- CBS: fail-closed por construção ---
+// --- CBS: flag de bypass só na lista de argumentos do próprio git ---
 
 const MAX_COMMAND = 64 * 1024;
 const MAX_NESTING = 3;
+const MAX_WORK = 200_000;  // palavras visitadas por chamada do hook; estourou → texto cru em ordem
 const LITERAL = 0;
 const CODE = 1;
 const COMMENT = 2;
 const EXPANSION = 3;  // `$` dentro de aspas duplas: expande antes do comando ver o texto
+const BODY = 4;       // corpo (e linha terminadora) de heredoc: dado
 
-// Subcomandos em que -n é --no-verify.
+// Subcomandos em que -n é --no-verify (nos outros é --dry-run, --no-commit, --no-stat…).
 const SHORT_N_SUBCOMMANDS = new Set(['commit', 'am']);
-// Subcomandos git em que -n é outra coisa (dry-run, no-stat, no-commit, contagem…).
-const GIT_SUBCOMMANDS_N_IS_OTHER = new Set(['log', 'show', 'shortlog', 'reflog', 'rev-list', 'whatchanged', 'format-patch',
-  'grep', 'push', 'pull', 'fetch', 'merge', 'rebase', 'cherry-pick', 'revert', 'clean', 'add', 'rm', 'mv', 'tag', 'diff',
-  'status', 'blame']);
 // Comandos cujos argumentos são só dado (não executam nada).
 const DATA_COMMANDS = new Set(['echo', 'printf', 'grep', 'egrep', 'fgrep', 'rg', 'gh']);
-// Comandos em que -n é opção própria (e que não executam outro comando).
-const N_IS_OTHER_COMMANDS = new Set([...DATA_COMMANDS, 'head', 'tail', 'ls', 'sort', 'uniq', 'cut', 'wc', 'nl', 'cat',
-  'diff', 'sed', 'jq']);
 // Palavras reservadas antes do comando de verdade.
 const KEYWORDS = new Set(['!', 'if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', 'time']);
 const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set(['-c', '-C', '--work-tree', '--git-dir', '--namespace', '--super-prefix']);
 const MESSAGE_OPTIONS = new Set(['-m', '--message', '-F', '--file']);
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish']);
+// Executam o stdin como script (corpo de heredoc que chega neles é código, não dado).
+const STDIN_RUNNERS = new Set([...SHELLS, 'mksh', 'ash', 'tcsh', 'csh', 'ssh']);
 const SHELL_OPTIONS_WITH_VALUE = new Set(['-o', '+o', '-O', '+O', '--rcfile', '--init-file']);
+const ESTOURO = Symbol('orçamento de análise');
 
 const isGitWord = (w) => /(^|\/)git(\.exe)?$/i.test(w);
+const baseName = (w) => w.split('/').pop();
 
 // Palavras do texto cru: corta em qualquer metacaractere (mesmo entre aspas) e tira aspas, \, $ e variáveis —
-// superconjunto de toda palavra que o shell poderia montar.
+// superconjunto de toda palavra que o shell poderia montar. `X=valor` também rende `valor` (pode virar comando: $X).
 function rawWords(text) {
   return text.split(/[\s;&|()`<>{},]+/)
     .map(w => w.replace(/\$\{[^}]*\}|\$[A-Za-z_]\w*|\$[0-9#?!@*$-]/g, '').replace(/[\\"'$]/g, ''))
+    .flatMap(w => (/^[A-Za-z_]\w*=./.test(w) ? [w, w.replace(/^[A-Za-z_]\w*=/, '')] : [w]))
     .filter(Boolean);
 }
 
-function nearestSubcommand(words, i, forwardFirst) {
-  const find = (from, step) => {
-    for (let j = from; j >= 0 && j < words.length; j += step) if (GIT_COMMANDS_WITH_NO_VERIFY.includes(words[j])) return words[j];
-    return null;
-  };
-  return forwardFirst ? find(i + 1, 1) ?? find(i - 1, -1) : find(i - 1, -1) ?? find(i + 1, 1);
+/**
+ * Pré-filtro: `git` + flag de bypass em qualquer lugar do texto cru (-n só se há commit/am). Sem isso, libera.
+ */
+function mayBypass(text) {
+  const words = rawWords(text);
+  if (!words.some(isGitWord)) return false;
+  const nCounts = words.some(w => SHORT_N_SUBCOMMANDS.has(w));
+  return words.some(w => w.toLowerCase().includes(GIT_CONFIG_KEY_PREFIX) || isNoVerifyLongFlag(w) ||
+    (nCounts && isCommitNoVerifyShortFlag(w)));
 }
 
 /**
- * Gatilho cru: `git` (em `context`) + flag de bypass (em `text`). -n só conta se `context` tem commit/am.
+ * Texto cru em ordem (análise incerta): a flag só conta depois de `git`; -n só depois de git … commit/am.
  */
-function findBypass(text, context = text) {
-  const contextWords = rawWords(context);
-  if (!contextWords.some(isGitWord)) return null;
-  const nCounts = contextWords.some(w => SHORT_N_SUBCOMMANDS.has(w));
-  const words = text === context ? contextWords : rawWords(text);
-  for (let i = 0; i < words.length; i++) {
-    const hooksPath = words[i].toLowerCase().includes(GIT_CONFIG_KEY_PREFIX);
-    if (hooksPath || isNoVerifyLongFlag(words[i]) || (nCounts && isCommitNoVerifyShortFlag(words[i]))) {
-      return { hooksPath, command: nearestSubcommand(words, i, hooksPath) };
-    }
+function rawBypass(text) {
+  let git = false;
+  let command = null;
+  let nCounts = false;
+  for (const w of rawWords(text)) {
+    if (isGitWord(w)) { git = true; continue; }
+    if (!git) continue;
+    if (GIT_COMMANDS_WITH_NO_VERIFY.includes(w)) { command = w; nCounts ||= SHORT_N_SUBCOMMANDS.has(w); continue; }
+    const hooksPath = w.toLowerCase().includes(GIT_CONFIG_KEY_PREFIX);
+    if (hooksPath || isNoVerifyLongFlag(w) || (nCounts && isCommitNoVerifyShortFlag(w))) return { hooksPath, command };
   }
   return null;
 }
 
+const uncertainRaw = (text, why) => { const r = rawBypass(text); return r && { ...r, uncertain: why }; };
+
 /**
- * Classifica cada posição: CODE (sintaxe do shell), LITERAL (entre aspas ou escapado), COMMENT, EXPANSION.
- * Devolve null quando a análise é incerta: heredoc, $'…' ou aspa / substituição sem fechar.
+ * Classifica cada posição: CODE (sintaxe do shell), LITERAL (entre aspas ou escapado), COMMENT, EXPANSION, BODY.
+ * Devolve { kind, heredocs } ou null quando a análise é incerta: $'…' ou aspa / substituição / heredoc sem fechar.
  */
 function scanShell(input) {
-  const n = input.length;
-  const kind = new Uint8Array(n);
-  const stack = [];
-  for (let i = 0; i < n; i++) {
+  const kind = new Uint8Array(input.length);
+  const heredocs = [];
+  return scanRange(input, kind, heredocs, 0, input.length, 0) ? { kind, heredocs } : null;
+}
+
+// bodyLevel > 0: corpo de heredoc com delimitador sem aspas (dentro de $( ) de outro corpo, nível 2…) — o texto é
+// dado, mas $( ) e crase executam. Aninhamento além de MAX_NESTING é incerto.
+function scanRange(input, kind, heredocs, from, to, bodyLevel) {
+  if (bodyLevel > MAX_NESTING) return false;
+  const stack = bodyLevel ? ['H'] : [];
+  const pending = [];
+  for (let i = from; i < to; i++) {
     const c = input[i];
     const top = stack[stack.length - 1];
     if (top === "'") {
       if (c === "'") { stack.pop(); kind[i] = CODE; }
       continue;
     }
-    if (top === '"') {
-      if (c === '\\') { if ('"\\$`\n'.includes(input[i + 1] ?? '')) kind[i] = CODE; i++; continue; }
-      if (c === '"') { stack.pop(); kind[i] = CODE; continue; }
+    if (top === '"' || top === 'H') {
+      if (top === 'H') kind[i] = BODY;
+      if (c === '\\') {
+        if (top === '"' && '"\\$`\n'.includes(input[i + 1] ?? '')) kind[i] = CODE;
+        i++;
+        if (top === 'H' && i < to) kind[i] = BODY;
+        continue;
+      }
+      if (c === '"' && top === '"') { stack.pop(); kind[i] = CODE; continue; }
       if (c === '$' && input[i + 1] === '(') { kind[i] = kind[i + 1] = CODE; i++; stack.push('$('); continue; }
-      if (c === '$') { kind[i] = EXPANSION; continue; }
+      if (c === '$') { if (top === '"') kind[i] = EXPANSION; continue; }
       if (c === '`') { kind[i] = CODE; stack.push('`'); }
       continue;
     }
     kind[i] = CODE;
     if (c === '\\') { i++; continue; }
-    if (c === '$' && input[i + 1] === "'") return null;
-    if (c === '<' && input[i + 1] === '<' && input[i + 2] !== '<' && input[i - 1] !== '<') return null;
+    if (c === '\n' && pending.length) {
+      const end = readBodies(input, kind, heredocs, i + 1, to, pending, bodyLevel + 1);
+      if (end < 0) return false;
+      pending.length = 0;
+      i = end - 1;
+      continue;
+    }
+    if (c === '$' && input[i + 1] === "'") return false;
+    if (c === '<' && input[i + 1] === '<' && input[i + 2] !== '<' && input[i - 1] !== '<') {
+      const h = heredocOperator(input, i, to);
+      if (!h) return false;
+      heredocs.push(h);
+      pending.push(h);
+      kind[i + 1] = CODE;
+      i++;
+      continue;
+    }
     if (c === "'" || c === '"') { stack.push(c); continue; }
     if (c === '#' && (i === 0 || (kind[i - 1] === CODE && /[\s;&|()`]/.test(input[i - 1])))) {
-      for (; i < n && input[i] !== '\n'; i++) kind[i] = COMMENT;
+      for (; i < to && input[i] !== '\n'; i++) kind[i] = COMMENT;
       i--;
       continue;
     }
@@ -251,18 +286,76 @@ function scanShell(input) {
     if (c === ')') { if (top === '$(' || top === '(') stack.pop(); continue; }
     if (c === '`') { if (top === '`') stack.pop(); else stack.push('`'); }
   }
-  return stack.length ? null : kind;
+  return stack.length === (bodyLevel ? 1 : 0) && !pending.length;
+}
+
+// `<<` / `<<-` + delimitador. Aspas ou \ em qualquer parte do delimitador = corpo literal (sem $( ) nem crase).
+function heredocOperator(input, i, to) {
+  let j = i + 2;
+  const dash = input[j] === '-';
+  if (dash) j++;
+  while (j < to && (input[j] === ' ' || input[j] === '\t')) j++;
+  let delim = '';
+  let quoted = false;
+  while (j < to && !/[\s;&|<>()]/.test(input[j])) {
+    const c = input[j];
+    if (c === "'" || c === '"') {
+      const close = input.indexOf(c, j + 1);
+      if (close < 0 || close >= to) return null;
+      delim += input.slice(j + 1, close);
+      quoted = true;
+      j = close + 1;
+    } else if (c === '\\') {
+      if (j + 1 >= to) return null;
+      delim += input[j + 1];
+      quoted = true;
+      j += 2;
+    } else {
+      delim += c;
+      j++;
+    }
+  }
+  return delim ? { op: i, delimEnd: j, delim, dash, quoted, body: null } : null;
+}
+
+// Corpos dos heredocs pendentes, em sequência, a partir da linha seguinte ao operador. Devolve a posição da quebra
+// de linha depois do último terminador (ou `to`); -1 se algum não fecha.
+function readBodies(input, kind, heredocs, from, to, pending, bodyLevel) {
+  let p = from;
+  let end = to;
+  for (const h of pending) {
+    let q = p;
+    let e;
+    for (;;) {
+      if (q > to) return -1;
+      e = input.indexOf('\n', q);
+      if (e < 0 || e > to) e = to;
+      const line = input.slice(q, e);
+      if ((h.dash ? line.replace(/^\t+/, '') : line) === h.delim) break;
+      if (e >= to) return -1;
+      q = e + 1;
+    }
+    h.body = [p, q];
+    if (h.quoted) kind.fill(BODY, p, q);
+    else if (!scanRange(input, kind, heredocs, p, q, bodyLevel)) return -1;
+    kind.fill(BODY, q, e);
+    if (e < to) kind[e] = BODY;
+    end = e;
+    p = e + 1;
+  }
+  return end;
 }
 
 /**
- * Comandos simples do input: listas de palavras { start, end, value (sem aspas), target (alvo de
+ * Comandos simples do input: { words, heredocs }. Cada palavra: { start, end, value (sem aspas), target (alvo de
  * redirecionamento), subst (contém $( ) / crase), expands (contém $var) }. $( ), ( ) e crase abrem um contexto
- * próprio; a palavra de fora que contém a substituição continua depois dela.
+ * próprio; a palavra de fora que contém a substituição continua depois dela. Corpo de heredoc não vira palavra.
  */
-function simpleCommands(input, kind) {
+function simpleCommands(input, { kind, heredocs }) {
   const commands = [];
   const stack = [];
-  const context = (opener) => ({ opener, words: [], word: null, redirectNext: false });
+  const operators = new Map(heredocs.map(h => [h.op, h]));
+  const context = (opener) => ({ opener, words: [], word: null, redirectNext: false, heredocs: [] });
   let ctx = context(null);
   const startWord = (i) => {
     if (!ctx.word) {
@@ -273,7 +366,12 @@ function simpleCommands(input, kind) {
     return ctx.word;
   };
   const endWord = () => { if (ctx.word) { ctx.words.push(ctx.word); ctx.word = null; } };
-  const endCommand = () => { endWord(); if (ctx.words.length) commands.push(ctx.words); ctx.words = []; };
+  const endCommand = () => {
+    endWord();
+    if (ctx.words.length || ctx.heredocs.length) commands.push({ words: ctx.words, heredocs: ctx.heredocs });
+    ctx.words = [];
+    ctx.heredocs = [];
+  };
   const open = (opener) => { stack.push(ctx); ctx = context(opener); };
   const close = (i) => {
     endCommand();
@@ -283,7 +381,7 @@ function simpleCommands(input, kind) {
 
   for (let i = 0; i < input.length; i++) {
     const c = input[i];
-    if (kind[i] === COMMENT) { endCommand(); continue; }
+    if (kind[i] === COMMENT || kind[i] === BODY) { endCommand(); continue; }
     if (kind[i] === LITERAL || kind[i] === EXPANSION) {
       const w = startWord(i);
       w.value += c;
@@ -301,6 +399,13 @@ function simpleCommands(input, kind) {
       continue;
     }
     if (/\s/.test(c)) { if (c === '\n') endCommand(); else endWord(); continue; }
+    const heredoc = operators.get(i);
+    if (heredoc) {
+      endWord();
+      ctx.heredocs.push(heredoc);
+      i = heredoc.delimEnd - 1;
+      continue;
+    }
     const redirect = c === '<' || c === '>' ||
       (c === '&' && (input[i - 1] === '>' || input[i - 1] === '<' || input[i + 1] === '>')) ||
       (c === '|' && input[i - 1] === '>');
@@ -314,6 +419,7 @@ function simpleCommands(input, kind) {
     if (c === ';' || c === '|' || c === '&') { endCommand(); continue; }
     const w = startWord(i);
     if (c === '"' || c === "'" || c === '\\') continue;  // sintaxe de aspas: não entra no valor
+    if (c === '$' && input[i + 1] === '"') continue;       // $"…" (locale) é aspa dupla
     w.value += c;
     if (c === '$') w.expands = true;
   }
@@ -321,86 +427,160 @@ function simpleCommands(input, kind) {
   return commands;
 }
 
-// Opções de mensagem do git commit/tag/merge: o valor delas é dado.
-function clearGitData(args, clear) {
-  let i = 0;
-  while (i < args.length && args[i].value.startsWith('-')) i += GIT_GLOBAL_OPTIONS_WITH_VALUE.has(args[i].value) ? 2 : 1;
-  const sub = args[i]?.value;
-  const rest = args.slice(i + 1);
-  if (GIT_SUBCOMMANDS_N_IS_OTHER.has(sub)) rest.filter(w => isCommitNoVerifyShortFlag(w.value)).forEach(clear);
-  let skipNext = false;
-  for (const w of rest) {
-    if (skipNext) { skipNext = false; clear(w); continue; }
-    if (w.value === '--') break;
-    if (sub === 'commit') {
-      if (commitOptionConsumesNextValue(w.value)) skipNext = true;
-      else if (commitOptionContainsInlineValue(w.value)) clear(w);
-    } else if (sub === 'tag' || sub === 'merge') {
-      if (MESSAGE_OPTIONS.has(w.value)) skipNext = true;
-      else if (/^--(message|file)=|^-[a-zA-Z]*[mF][\s\S]/.test(w.value)) clear(w);
+// Expansão de chaves ({a,b}) só o bastante para achar a flag em `git push {--no-verify,}`; no máximo 64 variantes.
+function braceVariants(value, out = [], left = { n: 64 }) {
+  let open = -1;
+  let comma = -1;
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i];
+    if (c === '{') { open = i; comma = -1; } else if (c === ',' && open >= 0) comma = i;
+    else if (c === '}' && open >= 0 && comma > open) {
+      if (--left.n < 0) break;
+      for (const alt of value.slice(open + 1, i).split(',')) braceVariants(value.slice(0, open) + alt + value.slice(i + 1), out, left);
+      return out;
     }
   }
+  out.push(value);
+  return out;
 }
 
-// Script de sh -c / eval só vira dado se não expande nada fora e, analisado sozinho, libera.
-function scriptIsClean(words, depth, info) {
-  if (!words.length || words.some(w => w.subst || w.expands)) return false;
-  if (depth >= MAX_NESTING) { info.uncertain ??= 'sh -c / eval aninhado demais'; return false; }
-  const r = analyze(words.map(w => w.value).join(' '), depth + 1);
-  if (r?.uncertain) info.uncertain ??= r.uncertain;
-  return !r;
+/**
+ * Argumentos de uma invocação do git (a partir de `start`, logo depois da palavra git). Marca em `data` os valores de
+ * mensagem (-m/-F…). Bypass: core.hooksPath= nas opções globais; --no-verify (ou prefixo) em commit/push/merge/rebase/
+ * am/cherry-pick; -n (inclusive agrupado) em commit/am. Subcomando que expande ($SUB) vale como qualquer um deles.
+ */
+function gitBypass(args, start, data, work) {
+  let i = start;
+  let hooksPath = false;
+  for (; i < args.length && args[i].value.startsWith('-'); i++) {
+    if (--work.left < 0) throw ESTOURO;
+    if (GIT_GLOBAL_OPTIONS_WITH_VALUE.has(args[i].value)) i++;
+    if (args[i]?.value.toLowerCase().includes(GIT_CONFIG_KEY_PREFIX)) hooksPath = true;
+  }
+  const subWord = args[i];
+  const sub = subWord?.value;
+  const command = GIT_COMMANDS_WITH_NO_VERIFY.includes(sub) ? sub : null;
+  if (hooksPath) return { hooksPath: true, command };
+  const unknown = Boolean(subWord && (subWord.subst || subWord.expands));
+  const nCounts = SHORT_N_SUBCOMMANDS.has(sub) || unknown;
+  for (let j = i + 1; j < args.length; j++) {
+    if (--work.left < 0) throw ESTOURO;
+    const value = args[j].value;
+    if ((command || unknown) && (value.includes('{') ? braceVariants(value) : [value])
+      .some(v => isNoVerifyLongFlag(v) || (nCounts && isCommitNoVerifyShortFlag(v)))) {
+      return { hooksPath: false, command };
+    }
+    if (sub === 'commit') {
+      if (commitOptionConsumesNextValue(value)) { if (j + 1 < args.length) data.add(args[++j]); }
+      else if (commitOptionContainsInlineValue(value)) data.add(args[j]);
+    } else if (MESSAGE_OPTIONS.has(value)) {
+      if (j + 1 < args.length) data.add(args[++j]);
+    } else if (/^--(message|file)=|^-[a-zA-Z]*[mF][\s\S]/.test(value)) data.add(args[j]);
+  }
+  return null;
 }
 
-function shellScriptWord(args) {
+// Índice do script de `sh -c SCRIPT [args…]` (ou -1).
+function shellScriptIndex(args, from) {
   let hasC = false;
-  for (let j = 0; j < args.length; j++) {
+  for (let j = from; j < args.length; j++) {
     const value = args[j].value;
     if (SHELL_OPTIONS_WITH_VALUE.has(value)) { j++; continue; }
     if (/^[-+]/.test(value)) { if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(value)) hasC = true; continue; }
-    return hasC ? args[j] : null;
+    return hasC ? j : -1;
+  }
+  return -1;
+}
+
+// Shell que lê o script do stdin (`| sh`, `bash -s`, `sudo bash`), ou ssh: corpo de heredoc vira código.
+function readsStdinScript(args) {
+  const j = args.findIndex(w => STDIN_RUNNERS.has(baseName(w.value)));
+  if (j < 0) return false;
+  if (baseName(args[j].value) === 'ssh') return true;
+  const rest = args.slice(j + 1);
+  return rest.some(w => w.value === '-s') || rest.every(w => /^[-+]/.test(w.value) && !/^-[a-zA-Z]*c/.test(w.value));
+}
+
+function nested(text, depth, work) {
+  if (depth >= MAX_NESTING) return uncertainRaw(text, 'sh -c / eval aninhado demais');
+  return analyze(text, depth + 1, work);
+}
+
+const withAssigned = (env, text, why) =>
+  uncertainRaw(`${env.assigned} ${text}`, why) ?? uncertainRaw(`${text} ${env.assigned}`, why);
+
+// env: { input, depth, work, stdinScript (algum comando executa o stdin), assigned (valores de X=… do input) }.
+function checkCommand({ words, heredocs }, env) {
+  const { input, depth, work } = env;
+  const args = words.filter(w => !w.target);
+  let k = 0;
+  while (k < args.length && (KEYWORDS.has(args[k].value) || /^[A-Za-z_]\w*=/.test(args[k].value))) k++;
+  const cmd = args[k];
+  const name = cmd ? baseName(cmd.value) : '';
+  if (cmd && DATA_COMMANDS.has(name)) return null;
+  const data = new Set();
+  let r = null;
+  // git em qualquer posição (sudo, env, nice, timeout, xargs, find -exec…); comando que expande ($GIT) também.
+  for (let j = k; j < args.length && !r; j++) {
+    const w = args[j];
+    if ((isGitWord(w.value) && !w.subst) || (j === k && (w.subst || w.expands))) r = gitBypass(args, j + 1, data, work);
+  }
+  if (r) return r;
+  // sh -c / eval com $var ou $( ): o texto só existe em tempo de execução — vale o texto cru em ordem do script junto
+  // com os valores atribuídos no próprio input (X='; git push', F=-n); args posicionais ("$@") entram no script.
+  const shell = args.findIndex((w, j) => j >= k && SHELLS.has(baseName(w.value)));
+  const script = shell < 0 ? -1 : shellScriptIndex(args, shell + 1);
+  if (script >= 0) {
+    const text = args.slice(script).map(w => w.value).join(' ');
+    if (args[script].subst || args[script].expands) r = withAssigned(env, text, 'sh -c com variável ou substituição');
+    else if (script + 1 < args.length) r = rawBypass(text);
+    if (r) return r;
+  }
+  if (name === 'eval') {
+    const rest = args.slice(k + 1);
+    const text = rest.map(w => w.value).join(' ');
+    r = rest.some(w => w.subst || w.expands)
+      ? withAssigned(env, text, 'eval com variável ou substituição')
+      : nested(text, depth, work);
+    if (r) return r;
+  }
+  // Palavra que contém um comando git com flag (sh -c '…', su -c '…', ssh h '…', rebase -x '…', <<< '…'): é script.
+  for (const w of words) {
+    if (data.has(w)) continue;
+    const text = w.value.replace(/^[A-Za-z_]\w*=/, '');
+    if (mayBypass(text) && (r = nested(text, depth, work))) return r;
+  }
+  if (env.stdinScript) {
+    for (const h of heredocs) if ((r = nested(input.slice(h.body[0], h.body[1]), depth, work))) return r;
   }
   return null;
 }
 
 /**
- * Máscara do que é dado provado (vira espaço antes da segunda passada do gatilho cru).
- */
-function dataMask(input, kind, depth, info) {
-  const cleared = new Uint8Array(input.length);
-  for (let i = 0; i < input.length; i++) if (kind[i] === COMMENT) cleared[i] = 1;
-  const clear = (w) => { if (!w.subst) cleared.fill(1, w.start, w.end); };
-  for (const words of simpleCommands(input, kind)) {
-    const args = words.filter(w => !w.target);
-    let k = 0;
-    while (k < args.length && (KEYWORDS.has(args[k].value) || /^[A-Za-z_]\w*=/.test(args[k].value))) k++;
-    if (k >= args.length) continue;
-    const name = args[k].value.split('/').pop();
-    const rest = args.slice(k + 1);
-    if (DATA_COMMANDS.has(name)) rest.forEach(clear);
-    else if (N_IS_OTHER_COMMANDS.has(name)) rest.filter(w => isCommitNoVerifyShortFlag(w.value)).forEach(clear);
-    else if (isGitWord(args[k].value)) clearGitData(rest, clear);
-    else if (SHELLS.has(name)) {
-      const script = shellScriptWord(rest);
-      if (script && scriptIsClean([script], depth, info)) clear(script);
-    } else if (name === 'eval' && scriptIsClean(rest, depth, info)) rest.forEach(clear);
-  }
-  return cleared;
-}
-
-/**
  * null = libera; senão { hooksPath, command, uncertain? } = bloqueia.
  */
-function analyze(input, depth = 0) {
-  const hit = findBypass(input);
-  if (!hit) return null;
-  if (input.length > MAX_COMMAND) return { ...hit, uncertain: 'comando acima de 64 KB' };
-  const kind = scanShell(input);
-  if (!kind) return { ...hit, uncertain: "heredoc, $'…' ou aspa sem fechar" };
-  const info = {};
-  const cleared = dataMask(input, kind, depth, info);
-  const leftover = input.replace(/[\s\S]/g, (c, i) => (cleared[i] ? ' ' : c));
-  const r = findBypass(leftover, input);
-  return r ? { ...r, uncertain: info.uncertain } : null;
+function analyze(input, depth = 0, work = { left: MAX_WORK }) {
+  if (!mayBypass(input)) return null;
+  if (input.length > MAX_COMMAND) return uncertainRaw(input, 'comando acima de 64 KB');
+  const scan = scanShell(input);
+  if (!scan) return uncertainRaw(input, "aspa ou heredoc sem fechar, $'…'");
+  try {
+    const commands = simpleCommands(input, scan);
+    const env = {
+      input, depth, work,
+      stdinScript: commands.some(c => readsStdinScript(c.words.filter(w => !w.target))),
+      assigned: commands.flatMap(c => c.words).filter(w => /^[A-Za-z_]\w*=/.test(w.value))
+        .map(w => w.value.replace(/^[A-Za-z_]\w*=/, '')).join(' '),
+    };
+    for (const c of commands) {
+      const r = checkCommand(c, env);
+      if (r) return r;
+    }
+    return null;
+  } catch (e) {
+    if (e !== ESTOURO || depth > 0) throw e;
+    return uncertainRaw(input, 'comando grande demais para analisar');
+  }
 }
 
 // --- CBS ---
