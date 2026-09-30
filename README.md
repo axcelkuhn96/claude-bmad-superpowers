@@ -204,7 +204,8 @@ O executor repassa isso ao `subagent-driven-development` como override da seçã
                   → commit dos relatórios → apaga o workspace do plano
                   → 🛑 gate de integração: finishing-a-development-branch (uma vez, sempre)
 
-/revisar     →  code review + cobertura + segurança (subagents general-purpose,
+/revisar     →  code review + cobertura + segurança (subagents nomeados rev-*,
+                agente reviewer/final_reviewer do models.yml,
                 lentes por caminho) → docs/analises/<data>-revisao-<slug>.md →
                 "Corrigir? [s/N]"
 
@@ -252,7 +253,7 @@ claude: modo: auto
 
 - **`executor-bmad-superpowers`** — orquestrador que **não implementa inline**. Modo `--auto`, `models.yml`, branch `feat/<slug>` se estava em main. Stories BMAD → `writing-plans` → roteamento por domínio e tipo por task → `subagent-driven-development` com personas **por caminho** → `revisor` como gate final condicional → `verification-before-completion` → entrega em `docs/analises/` → `finishing-a-development-branch`. Tabelas e templates em `referencia/` (roteamento, dispatch, persona-dev, entrega).
 
-- **`revisor`** — code review + cobertura de testes + segurança em subagents `general-purpose` read-only, cada um lendo por caminho o ponytail, os domínios detectados no diff e as lentes `review/seguranca.md` (só com superfície) e `review/cobertura-de-testes.md`; E2E com Playwright quando há UI sem teste. Relatório em `docs/analises/`. Modo standalone (`/revisar`, pergunta antes de corrigir) e modo gate (chamada pelo executor; 🔴 → um fix dispatch + uma re-review).
+- **`revisor`** — code review + cobertura de testes + segurança em subagents read-only nomeados (`rev-<escopo>`; `general-purpose` ou o agente `reviewer`/`final_reviewer` do `models.yml`), cada um lendo por caminho o ponytail, os domínios detectados no diff e as lentes `review/seguranca.md` (só com superfície) e `review/cobertura-de-testes.md`; E2E com Playwright quando há UI sem teste. Relatório em `docs/analises/`. Modo standalone (`/revisar`, pergunta antes de corrigir) e modo gate (chamada pelo executor; 🔴 → um fix dispatch + uma re-review).
 
 - **`grelhar`** — interrogatório implacável, **uma pergunta por vez no seletor interativo do CLI**, 2-4 opções com tradeoff e `(Recomendado)` na primeira. Busca **fatos** sozinha e pergunta só **decisões**. Roda na Etapa 1 do `/piloto`; em modo auto registra a recomendação como `SUPOSIÇÃO`. Adaptada de [mattpocock/skills](https://github.com/mattpocock/skills).
 
@@ -411,7 +412,7 @@ Env: `CBS_HOOKS=off` desliga todos; `CBS_HOOKS_DESLIGADOS=format,typecheck,no-ve
 - **Codex, `apply_patch` rodado pelo shell** (chega ao hook como `Bash`): só o `cbs-config-protect` cobre essa rota — o Codex não dispara PostToolUse ali, então format e typecheck não veem essas edições. Como o Codex não informa o diretório, config protegida ou `pyproject.toml` em caminho **relativo** é bloqueada pelo nome, mesmo sem afrouxar nada (escape `CBS_PERMITIR_CONFIG=1`, ou use a ferramenta `apply_patch`). Patch fora do texto do comando (`apply_patch < arquivo.patch`) não é inspecionável e passa. O hook roda com `$SHELL -c`: validado com sh, bash e zsh; fish e nushell não verificados.
 - **Diretório não confiável = no-op silencioso** de format e typecheck: root num container sobre bind mount de outro dono, WSL em `/mnt/c` (777) e diretórios 777 (ex.: `storage/` do Laravel). No Windows os dois também ficam em silêncio (shims `.cmd` não são resolvidos).
 - **Falsos positivos** (fail-closed de propósito):
-  - `cbs-no-verify`: `xargs -n1 git commit`, `git commit -- --no-verify`, `git log --grep "--no-verify"`, `git -c core.hooksPath=… log`, heredoc cujo texto cita `--no-verify` — escape `CBS_HOOKS_DESLIGADOS=no-verify`. Fora do alcance: `git pull --no-verify`, `--config-env`/`GIT_CONFIG_*`/`git config core.hooksPath`, `HUSKY=0`, alias (`git ci -n`).
+  - `cbs-no-verify`: `git commit -- --no-verify` e `git log --grep "--no-verify"` (o marcador aparece na mesma invocação git), `git -c core.hooksPath=… log`, `xargs -n1 git commit` — escape `CBS_HOOKS_DESLIGADOS=no-verify`. Passam sem bloqueio: flags fora da invocação git (`pgrep -f "git commit"`, `find -name`, `echo -ne`, `nice -n`), `-n` fora de commit/am (`cherry-pick -n`) e heredoc cujo corpo cita `--no-verify` (corpo é dado). Fora do alcance: `git pull --no-verify`, `--config-env`/`GIT_CONFIG_*`/`git config core.hooksPath`, `HUSKY=0`, alias (`git ci -n`).
   - `cbs-config-protect`: comentário ou espaço mudado dentro de `[tool.ruff]`/`[tool.mypy]`; comando Bash que só cita um cabeçalho de patch com nome protegido (heredoc gravando um `.patch`, mensagem de commit); patch que o hook não consegue aplicar igual ao Codex — escape `CBS_PERMITIR_CONFIG=1`.
 - **`cbs-typecheck`**: phpstan e mypy recebem os arquivos tocados na linha de comando, o que sobrepõe `paths` do `phpstan.neon` e `files` do mypy; `CLAUDE_PROJECT_DIR` velho ou inexistente → nada é checado; `tsc` içado na raiz de um monorepo → sem checagem.
 - Pré-existente (desde a 0.12): `~/.claude/scripts/package.json` (`{ "type": "module" }`) faz `.js` CommonJS seus em `~/.claude/scripts/` falharem no load; o `atualizar` o preserva e o `remover` não o apaga.

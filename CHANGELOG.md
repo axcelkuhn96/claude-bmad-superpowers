@@ -4,7 +4,13 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
-### Alterado
+## [0.13.1] - 2026-09-30
+
+### Corrigido
+- **`cbs-no-verify`, falsos positivos**: as flags só contam dentro da mesma invocação git; `-n` só conta em `commit`/`am`; corpo de heredoc é dado. `pgrep -f "git commit"`, `find -name`, `echo -ne`, `nice -n` e `cherry-pick -n` passam. Medido em 9.993 comandos reais: 116 → 5 bloqueios, nenhum bloqueio novo.
+- **`cbs-format`/`cbs-typecheck`**: ferramenta ou interpretador indisponível (exit 127, ENOENT, EACCES) vira skip silencioso. Acaba o ruído "pint falhou (exit 127)" sem PHP e os bloqueios falsos no Stop. O diretório do node é anexado ao PATH do spawn, então tsc/prettier/biome rodam mesmo com o node fora do PATH.
+
+### Adicionado
 - **Subagentes nomeados**: todo dispatch das skills e comandos passa `name` curto, kebab-case, único na sessão, no padrão `<papel>-<escopo>` (`impl-t3`, `rev-t3`, `rerev-t3-r2`, `explore-auth`, `rev-final`), pra você falar com o agente por `@nome`/`SendMessage`. Regra canônica em `executor-bmad-superpowers/referencia/dispatch.md` §2; o override de Model Selection passado ao SDD exige `name` em todo implementer e reviewer. Codex: nome do agente de `~/.codex/agents` quando existir; nome da instância no mesmo padrão quando o runtime aceitar.
 
 ## [0.13.0] - 2026-09-27

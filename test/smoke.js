@@ -651,7 +651,7 @@ test('base/hooks derivados do ECC têm crédito MIT, nenhum hook invoca npx e np
   const testes = (await fs.readdir(path.join(RAIZ, 'test'))).filter((n) => n.endsWith('.js'));
   for (const t of testes) assert.match(pkg.scripts.test, new RegExp(`test/${t.replaceAll('.', '\\.')}(\\s|$)`), `${t} no npm test`);
   assert.equal(pkg.version, (await fs.readFile(path.join(BASE, 'VERSAO'), 'utf8')).trim());
-  assert.equal(pkg.version, '0.13.0');
+  assert.equal(pkg.version, '0.13.1');
 });
 
 test('dispatch.md traz a regra de nomear todo subagente (endereço pra @nome)', async () => {
