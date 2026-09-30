@@ -659,4 +659,7 @@ test('dispatch.md traz a regra de nomear todo subagente (endereço pra @nome)', 
   assert.match(txt, /Todo dispatch nomeia o subagente \(`name`\)/);
   assert.match(txt, /`<papel>-<escopo>`/);
   assert.match(txt, /`@nome`\/`SendMessage`/);
+  for (const s of ['executor-bmad-superpowers', 'grelhar', 'investigador-de-ideia', 'refinador-de-prompt', 'revisor', 'wayfinder']) {
+    assert.ok((await fs.readFile(path.join(BASE, 'skills', s, 'SKILL.md'), 'utf8')).includes('dispatch.md` §2'), `ponteiro pra regra de nome em ${s}`);
+  }
 });

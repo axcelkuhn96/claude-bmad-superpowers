@@ -52,7 +52,7 @@ Override por argumento (vence o arquivo): `models=implementer_backend:sonnet,rev
 
 Ao invocar o SDD, repasse como **override da seção Model Selection** (não como Global Constraint — Global Constraints são requisitos da spec):
 
-> "Para esta execução, substitua a tabela de Model Selection: implementer → `<implementer_backend>` (tasks com domínio `frontend`: `<implementer_frontend>`); task reviewer e re-reviewer → `<reviewer>`; fix rounds 4–5 → `<architect>`; review final da branch → `<final_reviewer>`. Quando o valor é nome de agente, dispare com `subagent_type` igual a esse nome; senão `model:` igual a esse modelo. Especifique um dos dois em todo dispatch. Todo dispatch de implementer e reviewer passa também `name`: implementer `impl-t<N>` (fix round `fix-t<N>-r<R>`), task reviewer `rev-t<N>`, re-reviewer `rerev-t<N>-r<R>`, review final `rev-final`."
+> "Para esta execução, substitua a tabela de Model Selection: implementer → `<implementer_backend>` (tasks com domínio `frontend`: `<implementer_frontend>`); task reviewer e re-reviewer → `<reviewer>`; fix rounds 4–5 → `<architect>`; review final da branch → `<final_reviewer>`. Quando o valor é nome de agente, dispare com `subagent_type` igual a esse nome; senão `model:` igual a esse modelo. Especifique um dos dois em todo dispatch. Todo dispatch passa também `name` (nome da instância, independe de `subagent_type`): implementer `impl-t<N>` (fix round `fix-t<N>-r<R>`), task reviewer `rev-t<N>`, re-reviewer `rerev-t<N>-r<R>`, review final `rev-final`, fix wave `fix-final`, build fixer `build-t<N>`; nome já usado na sessão → sufixo `-2`, `-3`."
 
 ## Saída enxuta (regra dura)
 
