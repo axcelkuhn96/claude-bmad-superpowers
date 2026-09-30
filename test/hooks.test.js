@@ -852,31 +852,16 @@ describe('cbs-typecheck — fix round 1 (E2E)', { skip: !POSIX && 'POSIX' }, () 
 
 // ── 0.13.1: ferramenta indisponível (vendor/bin/pint sem php, exit 127, ENOENT/EACCES) é silenciosa no format e no
 // typecheck; só a falha real do formatador avisa. Evidência: 92 × "pint falhou (exit 127)" em projetos Laravel sem php. ──
-const LINUX = process.platform === 'linux'; // shebang aninhado (interpretador que é script) só no Linux
-describe('cbs-comum — interpretador do shebang', { skip: !POSIX && 'POSIX' }, () => {
-  test('#!/usr/bin/env nome: resolve só por diretório absoluto do PATH', (t) => {
-    const p = tmpDoTeste(t); const bin = escrever(p, 'bin/fmt', '#!/usr/bin/env cbs-interp\n', 0o755);
-    const dir = tmpDoTeste(t, 'cbs-path-'); escrever(dir, 'cbs-interp', EXE0, 0o755);
-    assert.equal(comum.interpretadorDisponivel(bin, { PATH: tmpDoTeste(t, 'cbs-vazio-') }), false);
-    assert.equal(comum.interpretadorDisponivel(bin, { PATH: dir }), true);
-    assert.equal(comum.interpretadorDisponivel(bin, { PATH: path.relative(process.cwd(), dir) }), false, 'entrada relativa do PATH não conta');
+describe('cbs-comum — ferramenta indisponível e node do hook no PATH (0.13.1)', () => {
+  test('ferramentaIndisponivel: exit 127, ENOENT e EACCES; falha real, sinal e timeout não', () => {
+    for (const r of [{ status: 127 }, { status: null, error: { code: 'ENOENT' } }, { status: null, error: { code: 'EACCES' } }]) assert.equal(comum.ferramentaIndisponivel(r), true, JSON.stringify(r));
+    for (const r of [{ status: 0 }, { status: 1 }, { status: 2 }, { status: null, signal: 'SIGKILL' }, { status: null, error: { code: 'ETIMEDOUT' } }]) assert.equal(comum.ferramentaIndisponivel(r), false, JSON.stringify(r));
   });
-  test('#!/usr/bin/env -S nome --flag: pula as opções do env', (t) => {
-    const p = tmpDoTeste(t); const bin = escrever(p, 'fmt', '#!/usr/bin/env -S cbs-interp --flag\n', 0o755);
-    const dir = tmpDoTeste(t, 'cbs-path-'); escrever(dir, 'cbs-interp', EXE0, 0o755);
-    assert.equal(comum.interpretadorDisponivel(bin, { PATH: dir }), true);
-    assert.equal(comum.interpretadorDisponivel(bin, { PATH: '' }), false);
-  });
-  test('#!/caminho/absoluto: precisa existir e ser executável', (t) => {
-    const p = tmpDoTeste(t); const naoExec = escrever(p, 'naoexec', EXE0, 0o644);
-    assert.equal(comum.interpretadorDisponivel(escrever(p, 'a', '#!/nao/existe/php\n', 0o755), {}), false);
-    assert.equal(comum.interpretadorDisponivel(escrever(p, 'b', `#!${naoExec}\n`, 0o755), {}), false);
-    assert.equal(comum.interpretadorDisponivel(escrever(p, 'c', '#!/bin/sh\nexit 0\n', 0o755), {}), true);
-  });
-  test('sem shebang (binário nativo) ou ilegível → disponível (o spawn decide)', (t) => {
-    const p = tmpDoTeste(t);
-    assert.equal(comum.interpretadorDisponivel(escrever(p, 'nativo', '\x7fELF\x02\x01', 0o755), {}), true);
-    assert.equal(comum.interpretadorDisponivel(path.join(p, 'nao-existe'), {}), true);
+  test('envComNode: diretório do node do hook no FIM do PATH, resto do env intacto', () => {
+    const dirNode = path.dirname(process.execPath);
+    const env = comum.envComNode({ PATH: ['/a', '/b'].join(path.delimiter), X: '1' });
+    assert.equal(env.PATH, ['/a', '/b', dirNode].join(path.delimiter)); assert.equal(env.X, '1');
+    assert.equal(comum.envComNode({}).PATH, dirNode);
   });
 });
 describe('cbs-format — ferramenta indisponível é silenciosa (0.13.1)', { skip: !POSIX && 'POSIX' }, () => {
@@ -921,16 +906,32 @@ describe('cbs-format — ferramenta indisponível é silenciosa (0.13.1)', { ski
     assert.equal(r.err, '[cbs] format: pint falhou em A.php (exit 1) — arquivo mantido\n');
     assert.equal(fs.readFileSync(a, 'utf8'), '<?php\n$x=1;');
   });
-  test('rodarFormatador: ENOENT/EACCES do spawn (interpretador aninhado ausente ou sem permissão) → null', { skip: !LINUX && 'Linux' }, (t) => {
-    const p = tmpDoTeste(t);
-    const naoExec = escrever(p, 'naoexec', EXE0, 0o644);
-    const semPy = escrever(p, 'sem-py', '#!/nao/existe/python3\n', 0o755);
-    const semPerm = escrever(p, 'sem-perm', `#!${naoExec}\n`, 0o755);
-    for (const interp of [semPy, semPerm]) {
-      const bin = escrever(p, `fmt-${path.basename(interp)}`, `#!${interp}\n`, 0o755);
-      assert.equal(comum.interpretadorDisponivel(bin, {}), true, 'o pré-check não pega o aninhado; o spawn pega');
-      assert.equal(fmt.rodarFormatador({ bin, args: [], raiz: p }), null, interp);
-    }
+  test('rodarFormatador: shebang sem interpretador → null (env nome e env -S → 127; #!/abs ausente → ENOENT; sem permissão → EACCES)', (t) => {
+    const p = tmpDoTeste(t); const naoExec = escrever(p, 'naoexec', EXE0, 0o644);
+    const shebangs = ['#!/usr/bin/env cbs-interpretador-ausente', '#!/usr/bin/env -S cbs-interpretador-ausente --flag', '#!/nao/existe/php', `#!${naoExec}`];
+    shebangs.forEach((s, i) => assert.equal(fmt.rodarFormatador({ bin: escrever(p, `fmt${i}`, `${s}\n`, 0o755), args: [], raiz: p }), null, s));
+  });
+  // Prettier falso em node: registra os argumentos num log.
+  function projetoPrettierNode(p) {
+    escrever(p, 'package.json', '{}'); escrever(p, '.prettierrc', '{}');
+    const log = path.join(p, 'chamadas.log');
+    escrever(p, 'node_modules/.bin/prettier', `#!/usr/bin/env node\nrequire('fs').appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(' ') + '\\n');\n`, 0o755);
+    escrever(p, 'a.ts', 'const x=1');
+    return log;
+  }
+  test('E2E: prettier com #!/usr/bin/env node roda sem node no PATH (node do hook no fim do PATH)', (t) => {
+    const p = tmpDoTeste(t); const log = projetoPrettierNode(p);
+    const r = rodarHook('cbs-format.mjs', { session_id: 'node-prettier', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p, PATH: tmpDoTeste(t, 'cbs-sem-node-') });
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
+    assert.match(fs.readFileSync(log, 'utf8'), /^--write .*a\.ts$/m);
+  });
+  test('E2E: node do PATH do usuário vence o do hook (o do hook entra no fim, nunca no início)', (t) => {
+    const p = tmpDoTeste(t); const log = projetoPrettierNode(p);
+    const dir = tmpDoTeste(t, 'cbs-path-'); const marca = path.join(dir, 'usou-node-do-usuario');
+    escrever(dir, 'node', `#!/bin/sh\n: > "${marca}"\n`, 0o755); // builtin: o PATH do teste não tem touch
+    const r = rodarHook('cbs-format.mjs', { session_id: 'node-usuario', cwd: p, tool_input: { file_path: 'a.ts' } }, { TMPDIR: p, PATH: dir });
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
+    assert.equal(fs.existsSync(marca), true); assert.equal(fs.existsSync(log), false);
   });
 });
 describe('cbs-typecheck — ferramenta indisponível não bloqueia nem avisa (0.13.1)', { skip: !POSIX && 'POSIX' }, () => {
@@ -956,12 +957,24 @@ describe('cbs-typecheck — ferramenta indisponível não bloqueia nem avisa (0.
     const r = stop(t, 'ind-mypy', [escrever(p, 'm.py', '')], p);
     assert.equal(r.code, 0); assert.equal(r.out + r.err, ''); assert.deepEqual(r.acumulador, []);
   });
-  test('E2E: interpretador aninhado ausente (spawn ENOENT) → silêncio, sem "não rodou"', { skip: !LINUX && 'Linux' }, (t) => {
-    const { p, a } = laravel(t, '');
-    const interp = escrever(p, 'interp', '#!/nao/existe/php\n', 0o755);
-    escrever(p, 'vendor/bin/phpstan', `#!${interp}\n`, 0o755);
+  test('E2E: interpretador ausente (spawn ENOENT) → silêncio, sem "não rodou"', (t) => {
+    const { p, a } = laravel(t, '#!/nao/existe/php\n');
     const r = stop(t, 'ind-enoent', [a], p);
-    assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, ''); assert.deepEqual(r.acumulador, []);
+  });
+  test('E2E: interpretador sem permissão de execução (spawn EACCES) → silêncio, sem "não rodou"', (t) => {
+    const { p, a } = laravel(t, '');
+    const naoExec = escrever(p, 'php-sem-x', EXE0, 0o644);
+    escrever(p, 'vendor/bin/phpstan', `#!${naoExec}\n`, 0o755);
+    const r = stop(t, 'ind-eacces', [a], p);
+    assert.equal(r.code, 0); assert.equal(r.out + r.err, ''); assert.deepEqual(r.acumulador, []);
+  });
+  test('E2E: tsc com #!/usr/bin/env node roda sem node no PATH e o erro de tipo bloqueia', (t) => {
+    const p = tmpDoTeste(t, 'cbs-tc-'); escrever(p, 'tsconfig.json', '{}');
+    escrever(p, 'node_modules/.bin/tsc', '#!/usr/bin/env node\nconsole.log("src/a.ts(1,5): error TS2322: Type string is not assignable to type number.");\nprocess.exit(2);\n', 0o755);
+    const a = escrever(p, 'src/a.ts', 'let x: number = "s";');
+    const r = stop(t, 'node-tsc', [a], p, { PATH: tmpDoTeste(t, 'cbs-sem-node-') });
+    assert.equal(r.code, 0); assert.equal(r.err, ''); assert.match(JSON.parse(r.out).reason, /src\/a\.ts\(1,5\): error TS2322/);
   });
   test('E2E: falha real do phpstan (exit 1) continua bloqueando', (t) => {
     const { p, a } = laravel(t, '#!/bin/sh\necho "app/A.php:1:Erro real"\nexit 1\n');
