@@ -2,6 +2,11 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [Unreleased]
+
+### Alterado
+- **Subagentes nomeados**: todo dispatch das skills e comandos passa `name` curto, kebab-case, único na sessão, no padrão `<papel>-<escopo>` (`impl-t3`, `rev-t3`, `rerev-t3-r2`, `explore-auth`, `rev-final`), pra você falar com o agente por `@nome`/`SendMessage`. Regra canônica em `executor-bmad-superpowers/referencia/dispatch.md` §2; o override de Model Selection passado ao SDD exige `name` em todo implementer e reviewer. Codex: nome do agente de `~/.codex/agents` quando existir; nome da instância no mesmo padrão quando o runtime aceitar.
+
 ## [0.13.0] - 2026-09-27
 
 Traz do ECC (affaan-m/ECC, MIT, commit e482e57) só o que serve às stacks Laravel, Node/TypeScript, React/React Native e Python. Nada novo é carregado por sessão.

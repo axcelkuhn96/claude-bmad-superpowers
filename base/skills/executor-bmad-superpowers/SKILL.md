@@ -46,13 +46,13 @@ Resolução por papel: (1) override do argumento; (2) `models.yml`; (3) default.
 
 ## Runtime (Claude Code ou Codex)
 
-Detecte antes do primeiro dispatch. **Claude Code**: existe a ferramenta `Agent` com `subagent_type`/`model` → use a coluna `claude:`. **Codex**: o dispatch é por nome de agente (`~/.codex/agents/*.toml`) ou existe `CODEX_HOME`/`CODEX_CLI_PATH` no ambiente → use **somente** a coluna `codex:` (nome do agente), **nunca** nome de modelo nem effort; agente ausente → despache sem nome e deixe o `default_subagent_model` do `config.toml` decidir. Nos dois runtimes e em qualquer SO, personas e scripts ficam em `~/.claude/personas/` e `~/.claude/scripts/` (o instalador resolve o home).
+Detecte antes do primeiro dispatch. **Claude Code**: existe a ferramenta `Agent` com `subagent_type`/`model` → use a coluna `claude:`. **Codex**: o dispatch é por nome de agente (`~/.codex/agents/*.toml`) ou existe `CODEX_HOME`/`CODEX_CLI_PATH` no ambiente → use **somente** a coluna `codex:` (nome do agente), **nunca** nome de modelo nem effort; agente ausente → despache sem nome e deixe o `default_subagent_model` do `config.toml` decidir. Nos dois runtimes e em qualquer SO, personas e scripts ficam em `~/.claude/personas/` e `~/.claude/scripts/` (o instalador resolve o home). Todo dispatch é **nomeado** (`name: <papel>-<escopo>`, ex.: `explore-auth`, `build-t3`, `fix-final`) — regra em `referencia/dispatch.md` §2.
 
 Override por argumento (vence o arquivo): `models=implementer_backend:sonnet,reviewer:opus` (parcial; valor = agente ou modelo) ou `modelo=opus` (todos os papéis, modelo direto). Nomes antigos aceitos como sinônimos: `implementer` → `implementer_backend` + `implementer_frontend`; `final_review` → `final_reviewer`; `e2e` → `tester`; `investigar` → `explorer`.
 
 Ao invocar o SDD, repasse como **override da seção Model Selection** (não como Global Constraint — Global Constraints são requisitos da spec):
 
-> "Para esta execução, substitua a tabela de Model Selection: implementer → `<implementer_backend>` (tasks com domínio `frontend`: `<implementer_frontend>`); task reviewer e re-reviewer → `<reviewer>`; fix rounds 4–5 → `<architect>`; review final da branch → `<final_reviewer>`. Quando o valor é nome de agente, dispare com `subagent_type` igual a esse nome; senão `model:` igual a esse modelo. Especifique um dos dois em todo dispatch."
+> "Para esta execução, substitua a tabela de Model Selection: implementer → `<implementer_backend>` (tasks com domínio `frontend`: `<implementer_frontend>`); task reviewer e re-reviewer → `<reviewer>`; fix rounds 4–5 → `<architect>`; review final da branch → `<final_reviewer>`. Quando o valor é nome de agente, dispare com `subagent_type` igual a esse nome; senão `model:` igual a esse modelo. Especifique um dos dois em todo dispatch. Todo dispatch de implementer e reviewer passa também `name`: implementer `impl-t<N>` (fix round `fix-t<N>-r<R>`), task reviewer `rev-t<N>`, re-reviewer `rerev-t<N>-r<R>`, review final `rev-final`."
 
 ## Saída enxuta (regra dura)
 

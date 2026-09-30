@@ -653,3 +653,10 @@ test('base/hooks derivados do ECC têm crédito MIT, nenhum hook invoca npx e np
   assert.equal(pkg.version, (await fs.readFile(path.join(BASE, 'VERSAO'), 'utf8')).trim());
   assert.equal(pkg.version, '0.13.0');
 });
+
+test('dispatch.md traz a regra de nomear todo subagente (endereço pra @nome)', async () => {
+  const txt = await fs.readFile(path.join(BASE, 'skills', 'executor-bmad-superpowers', 'referencia', 'dispatch.md'), 'utf8');
+  assert.match(txt, /Todo dispatch nomeia o subagente \(`name`\)/);
+  assert.match(txt, /`<papel>-<escopo>`/);
+  assert.match(txt, /`@nome`\/`SendMessage`/);
+});

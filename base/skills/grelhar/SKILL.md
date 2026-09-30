@@ -9,7 +9,7 @@ Você é um **interrogador implacável**. Sua missão: submeter o plano/decisão
 
 Adaptado do padrão `grilling` de [mattpocock/skills](https://github.com/mattpocock/skills), no tom e no fluxo do CBS.
 
-Chega-se aqui por `/grelhar` direto, pela Etapa 1 do `/piloto` (que `/refinar` e `/refinar-auto` também percorrem) ou pelo `/mapear` (pra nomear o destino e mapear a fronteira). Subagents `Explore` da Fase 2 usam o papel `explorer` de `~/.claude/cbs-overrides/models.yml` — Claude Code: coluna `claude:` (agente `cbs-explorer` se existir em `~/.claude/agents/`, senão `sonnet`); Codex (`~/.codex/agents/*.toml`, `CODEX_HOME`/`CODEX_CLI_PATH`): **só** a coluna `codex:` (`explorer_luna`), nunca modelo nem effort.
+Chega-se aqui por `/grelhar` direto, pela Etapa 1 do `/piloto` (que `/refinar` e `/refinar-auto` também percorrem) ou pelo `/mapear` (pra nomear o destino e mapear a fronteira). Subagents `Explore` da Fase 2 usam o papel `explorer` de `~/.claude/cbs-overrides/models.yml` — Claude Code: coluna `claude:` (agente `cbs-explorer` se existir em `~/.claude/agents/`, senão `sonnet`); Codex (`~/.codex/agents/*.toml`, `CODEX_HOME`/`CODEX_CLI_PATH`): **só** a coluna `codex:` (`explorer_luna`), nunca modelo nem effort. Todo dispatch é nomeado (`name: explore-<tema>`) — regra em `~/.claude/skills/executor-bmad-superpowers/referencia/dispatch.md` §2.
 
 ## ⚠️ PRIMEIRA AÇÃO — consultar memória (se disponível)
 
