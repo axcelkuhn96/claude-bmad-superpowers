@@ -129,6 +129,18 @@ export function noPath(nome, env = process.env) {
   return null;
 }
 
+// Env do spawn das ferramentas: o diretório do node que roda o hook vai no FIM do PATH (nunca no início: o PATH do
+// usuário vence). Shims `#!/usr/bin/env node` (tsc, pyright, biome, prettier) rodam mesmo quando o node do hook veio do
+// cbs-node.sh (.cbs-node-path, nvm) e não está no PATH.
+export function envComNode(env = process.env) {
+  const dirNode = path.dirname(process.execPath);
+  return { ...env, PATH: env.PATH ? `${env.PATH}${path.delimiter}${dirNode}` : dirNode };
+}
+
+// Resultado do spawnSync de ferramenta indisponível (silêncio, não é falha): exit 127 (comando não encontrado, ex.:
+// `env php` sem php) ou spawn que nem começou por ENOENT/EACCES (interpretador do shebang ausente ou sem permissão).
+export const ferramentaIndisponivel = (r) => r.status === 127 || ['ENOENT', 'EACCES'].includes(r.error?.code);
+
 export function ehEntrada(metaUrl) {
   try {
     return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(metaUrl));

@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { hookDesligado, lerStdin, lerPayload, lerTexto, acharRaiz, binLocal, noPath, ehEntrada, avisar, lerAcumulador, arquivoAcumulador } from './cbs-comum.mjs';
+import { hookDesligado, lerStdin, lerPayload, lerTexto, acharRaiz, binLocal, noPath, envComNode, ferramentaIndisponivel, ehEntrada, avisar, lerAcumulador, arquivoAcumulador } from './cbs-comum.mjs';
 
 export const TETO_MS = 60_000;
 const MAX_MOTIVO = 1500;
@@ -103,11 +103,13 @@ export function executar(planos, tetoMs = TETO_MS) {
     let r;
     try {
       // SIGKILL: ferramenta que ignora SIGTERM não prende o hook além do teto.
-      r = spawnSync(p.bin, cache ? ['--cache-dir', cache, ...p.args] : p.args, { cwd: p.raiz, encoding: 'utf8', timeout: resta, killSignal: 'SIGKILL', shell: false, maxBuffer: 16 << 20 });
+      r = spawnSync(p.bin, cache ? ['--cache-dir', cache, ...p.args] : p.args, { cwd: p.raiz, encoding: 'utf8', timeout: resta, killSignal: 'SIGKILL', shell: false, maxBuffer: 16 << 20, env: envComNode() });
     } finally {
       if (cache) fs.rmSync(cache, { recursive: true, force: true });
     }
     if (r.error && r.error.code === 'ETIMEDOUT') return { falhas, estourou: true };
+    // Ferramenta indisponível (phpstan sem php, wrapper do mypy sem python): pula em silêncio — não bloqueia nem avisa.
+    if (ferramentaIndisponivel(r)) continue;
     if (r.error) { avisar(`typecheck: ${path.basename(p.bin)} não rodou (${r.error.code})`); continue; }
     if (r.status !== 0) {
       const saida = `${r.stdout || ''}\n${r.stderr || ''}`;
