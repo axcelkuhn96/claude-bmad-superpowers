@@ -924,6 +924,30 @@ describe('cbs-no-verify', () => {
     'sudo git push --no-verify',
     'git push {--no-verify,}',
     'git am -n 0001.patch',
+    // 0.13.1: heredoc é analisado (não cai mais no texto cru) — bypass real fora do corpo continua bloqueado.
+    "git commit -n -m \"$(cat <<'EOF'\nmsg\nEOF\n)\"",
+    "cat > a <<'EOF'\nx\nEOF\ngit commit -q -n -m x",
+    "cat <<-EOF\n\tx\n\tEOF\ngit push --no-verify",
+    "cat <<'A' <<'B'\na\nA\nb\nB\ngit push --no-verify",
+    'cat <<EOF\n$(git push --no-verify)\nEOF',
+    'cat <<EOF\n`git push --no-verify`\nEOF',
+    "bash <<'EOF'\ngit push --no-verify\nEOF",
+    "cat <<'EOF' | sh\ngit commit -n -m x\nEOF",
+    "bash <<< 'git push --no-verify'",
+    'git commit -n -m x <<EOF\nsem terminador',
+    // 0.13.1: flag na lista de argumentos do próprio git, mesmo atrás de wrapper.
+    'nice -n 10 git commit -n -m x',
+    'sudo -u deploy git commit -an -m x',
+    'timeout 60 git push --no-verify',
+    'xargs git commit -n -m x',
+    'find . -name x -exec git commit -n -m y \\;',
+    'git commit -nm "msg"',
+    'git -C d commit -q -m x -n',
+    'git commit -m x; git am -n 0001.patch',
+    'git rebase -x "git commit --amend -n" main',
+    "ssh host 'git push --no-verify'",
+    "X='git push --no-verify'; bash -c \"$X\"",
+    "export F=-n; eval git commit $F -m x",
   ];
   const LIBERA = [
     'git commit -m "hello"',
@@ -962,6 +986,40 @@ describe('cbs-no-verify', () => {
     "bash -c 'echo $X --no-verify' && git status",
     'git push -n origin main && git commit -m "x"',
     'printf "%s\\n" "--no-verify" && git commit -m x',
+    // 0.13.1: falsos positivos reais (docs/analises/2026-09-30-falhas-hooks-cbs.md) — -n de outro segmento.
+    'find tests -name test_x.py; git add -A . ; git commit -q -m "fix(r): y"',
+    '[ $? -ne 0 ]; git commit -q -m y',
+    'nice -n 15 npx eslint a; git commit -q -m y',
+    'echo -ne "a\\n"; git commit -q -m y',
+    'git commit --only a.ts -m "test: x" | tail -1; git status --short | grep -i tmp; find . -path ./node_modules -prune -o -name "*tmp*" -print | head',
+    'git commit -q -m x\nfind . -name "*.py" | head',
+    'xargs -n1 git commit -q -m x',
+    // git só citado dentro de string (padrão do pgrep), sem commit de verdade.
+    'pgrep -f "gate|git commit"; [ $? -ne 0 ]',
+    "timeout 500 bash -c 'until pgrep -f \"gate_x|git commit\" >/dev/null; [ $? -ne 0 ]; do sleep 5; done' ; cat f; git log --oneline -3",
+    // -n que não é --no-verify: cherry-pick (--no-commit), push (--dry-run), merge/rebase (--no-stat).
+    'git cherry-pick -n 28a43ab9c 2>&1 | tail -3; git commit -q -C 28a43ab9c --only -- a b 2>&1 | tail -3',
+    'git cherry-pick -n abc123',
+    'git push -n origin main',
+    'git merge -n feature',
+    'git rebase -n main',
+    'git log --grep "--no-verify"',
+    // Corpo de heredoc é dado (<<EOF, <<-EOF, <<'EOF', <<"EOF").
+    "grep -n \"npm_\" a.md ; git add a.md && git commit -m \"$(cat <<'EOF'\ndocs: x\n\nCo-Authored-By: C <n@a.com>\nEOF\n)\"",
+    "git commit -m \"$(cat <<'EOF'\nfix: explica -n e --no-verify\nEOF\n)\"",
+    "cat > docs/r.md <<'EOF'\nnunca rode git push --no-verify nem git commit -n\nEOF\ngit add docs/r.md && git commit -q -m \"docs: r\" && git push origin main",
+    "python3 - <<'EOF'\ns = open('a').read()\nassert s.count('-n') == 1\nEOF\ngit commit -q -m x",
+    'cat <<-EOF > a\n\tsed -n 1p\n\tEOF\ngit commit -q -m x',
+    'cat <<"EOF" > a\n-n --no-verify\nEOF\ngit commit -q -m x',
+    'cat <<EOF > a\n$HOME -n\nEOF\ngit commit -q -m x',
+    "cat <<'A' > a; cat <<'B' > b\ngit commit -n\nA\ngit push --no-verify\nB\ngit commit -q -m x",
+    // sh -c com variável: só os valores atribuídos no input (X=…) entram no texto cru, não os outros comandos.
+    "N=/tmp/x; git commit -q -m y; cat > $N/one.sh <<'E'\nnice -n 15 python a.py\nE\nnohup setsid bash -c \"$N/one.sh a; $N/one.sh b\" >/dev/null 2>&1 &",
+    // Terminador indentado sem <<- não fecha o heredoc: a linha do git é corpo (dado).
+    'cat <<EOF\n  EOF\ngit push --no-verify\nEOF',
+    // Texto cru (análise incerta) só conta flag DEPOIS de git (e -n depois de git … commit).
+    'echo "sem fim; find . -name x; git commit -q -m y',
+    "printf $'a\\n'; nice -n 5 make; git commit -q -m y",
   ];
   for (const c of BLOQUEIA) test(`bloqueia: ${c}`, () => assert.equal(noVerify.checarComando(c).bloquear, true));
   for (const c of LIBERA) test(`libera: ${c}`, () => assert.equal(noVerify.checarComando(c).bloquear, false));
@@ -996,10 +1054,66 @@ describe('cbs-no-verify', () => {
     assert.match(r.motivo, /Análise incerta/);
   });
   test('bloqueio por análise incerta explica o escape CBS_HOOKS_DESLIGADOS=no-verify', () => {
-    const r = noVerify.checarComando("cat >f <<'EOF'\ndon't\nEOF\ngit commit -n -m x");
+    const r = noVerify.checarComando('echo "x; git commit -n -m y');
     assert.equal(r.bloquear, true);
     assert.match(r.motivo, /CBS_HOOKS_DESLIGADOS=no-verify/);
     assert.doesNotMatch(noVerify.checarComando('git push --no-verify').motivo, /CBS_HOOKS_DESLIGADOS/);
+  });
+  test('heredoc bem formado não é "análise incerta"', () => {
+    const r = noVerify.checarComando("cat >f <<'EOF'\ndon't\nEOF\ngit commit -n -m x");
+    assert.equal(r.bloquear, true);
+    assert.doesNotMatch(r.motivo, /Análise incerta/);
+  });
+  // Formato dos 9 comandos que estouraram o timeout de 10 s (2026-09-28/30): heredoc python/php grande, grep, docker.
+  // A causa medida foi a máquina travada (swap), não o parser; aqui o parser fica sob 200 ms mesmo no caminho cheio.
+  const corpo = (linha, bytes) => Array.from({ length: Math.ceil(bytes / linha.length) }, (_, i) => linha.replace('#', i)).join('\n');
+  const TIMEOUTS = [
+    `python3 - <<'EOF'\np='a.blade.php'\ns=open(p).read()\n${corpo('rep("""  if (f.dataset.x === \'1\') { e.preventDefault(); } // -n #""","""  x -n --no-verify #""")', 12000)}\nEOF`,
+    `cat > tests/Feature/XTest.php <<'EOF'\n<?php\nnamespace Tests;\n${corpo('    public function test_#(): void { $this->assertSame(\'-n\', $x); } // git commit -n', 19000)}\nEOF`,
+    `cd /p/views && python3 - <<'E'\np='_estilos.blade.php'\ns=open(p).read()\n${corpo('r("--mzp-#: var(--c, #fa8b0c);","--mzp-#: var(--a, #c9853a);")', 4500)}\nE`,
+    `cd /p/views && python3 - <<'EOF'\np='a.blade.php'\ns=open(p).read()\n${corpo('s=s.replace("padding: .#rem;","padding: .5rem;")', 1700)}\nEOF`,
+    'cd /p/MizuAprov; grep -n "YMZAID" MZAPRV22.tlpp | head -30',
+    'cd /p/tests && cat test_x.py; grep -ln "visual_builder" *.py | head -20',
+    `cd /p && python3 - <<'EOF'\np='t.py'\ns=open(p).read()\ns+='''\n${corpo('# EVID-# o servidor devolve `CANDIDATE_SPENT_SQL`; $(x) -n', 6300)}\n'''\nopen(p,'w').write(s)\nEOF`,
+    `cd /p/dashboard && python3 - <<'EOF'\np='a.test.tsx'\ns=open(p).read()\n${corpo('s=s.replace("""  it(\'caso #\', async () => {""","""  it(\'caso # -n\', async () => {""")', 3500)}\nEOF`,
+    "docker exec r-1 redis-cli --scan --pattern 'bull:*:failed' 2>&1 | head; docker exec r-1 redis-cli --scan --pattern 'bull:*semantic*' 2>&1 | head -5",
+  ];
+  test('comandos que estouraram o timeout decidem em < 200 ms (inclusive com git commit no fim)', () => {
+    for (const c of TIMEOUTS.flatMap((x) => [x, `${x}\ngit commit -q -m "x"`])) {
+      const t0 = performance.now();
+      const r = noVerify.checarComando(c);
+      const ms = performance.now() - t0;
+      assert.equal(r.bloquear, false, c.slice(0, 60));
+      assert.ok(ms < 200, `${c.slice(0, 40)}…: ${ms.toFixed(1)} ms`);
+    }
+  });
+  test('muitos heredocs (ou um sem fim) decidem em tempo linear', () => {
+    const casos = [
+      ["cat <<'E'\nx -n\nE\n".repeat(3000) + 'git commit -n -m x', true],
+      ['cat' + ' <<E'.repeat(8000) + '\n' + 'E\n'.repeat(8000) + 'git push --no-verify', true],
+      ['git commit -q -m x <<E\n' + 'texto\n'.repeat(9000), false],
+      ["cat <<EOF\n" + '$(echo -n x) '.repeat(4000) + '\nEOF\ngit commit -q -m x', false],
+      // heredoc sem aspas aninhado em $( ) de outro corpo, 3000 níveis: além do limite vira texto cru, sem recursão funda.
+      ['cat <<Z\n' + Array.from({ length: 3000 }, (_, k) => `$(cat <<A${k}\n`).join('') + 'x\n' +
+        Array.from({ length: 3000 }, (_, k) => `A${2999 - k}\n)`).join('\n') + '\nZ\ngit push --no-verify', true],
+    ];
+    for (const [c, bloquear] of casos) {
+      const t0 = performance.now();
+      const r = noVerify.checarComando(c);
+      const ms = performance.now() - t0;
+      assert.equal(r.bloquear, bloquear, c.slice(0, 30));
+      assert.ok(ms < 200, `${c.slice(0, 30)}…: ${ms.toFixed(1)} ms`);
+    }
+  });
+  test('E2E: caminho vazio (sem git) sai 0 em < 100 ms (melhor de 5)', () => {
+    let melhor = Infinity;
+    for (let i = 0; i < 5; i++) {
+      const t0 = performance.now();
+      const r = rodarHook('cbs-no-verify.mjs', { tool_name: 'Bash', tool_input: { command: TIMEOUTS[4] } });
+      melhor = Math.min(melhor, performance.now() - t0);
+      assert.equal(r.code, 0); assert.equal(r.out + r.err, '');
+    }
+    assert.ok(melhor < 100, `${melhor.toFixed(1)} ms`);
   });
   test('motivo cita o subcomando git', () => assert.match(noVerify.checarComando('git commit -m x && git push --no-verify').motivo, /git push/));
   test('E2E: bloqueio sai 2 com motivo no stderr e stdout vazio', () => {
