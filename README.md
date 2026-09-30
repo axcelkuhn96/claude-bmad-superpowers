@@ -191,8 +191,8 @@ O executor repassa isso ao `subagent-driven-development` como override da seçã
                   → Global Constraints do plano recebem os CAMINHOS dos rulebooks
                   → 🛑 gate 2: "Posso implementar? [s/N]"  (pulado em --auto)
                   → superpowers:subagent-driven-development (models.yml)
-                       · implementer general-purpose lê por caminho:
-                         persona-dev → ponytail → linguagem → área
+                       · implementer (agente do models.yml, name impl-t<N>)
+                         lê por caminho: persona-dev → ponytail → linguagem → área
                        · task reviewer (spec + qualidade) lê ponytail + domínio
                          + review/seguranca.md quando backend
                        · re-reviewer nos fix rounds; reviewer final lê
@@ -279,9 +279,9 @@ BMAD e Superpowers **rodam sempre em conjunto**, em camadas — não são altern
 
 ### Como BMAD entra sem virar uma persona solta
 
-Os agentes BMAD (`bmad-agent-dev`, `bmad-agent-pm`, …) **nunca são dispachados como tipo de subagent** — isso traria uma persona com agenda própria pra dentro da execução. **Todo subagent continua `general-purpose`**, e a disciplina chega por **caminho de arquivo**:
+Os agentes BMAD (`bmad-agent-dev`, `bmad-agent-pm`, …) **nunca são dispachados como tipo de subagent** — isso traria uma persona com agenda própria pra dentro da execução. **Todo subagent é `general-purpose` ou o agente do `models.yml` (`cbs-*`), sempre com `name`** (`<papel>-<escopo>`, ex.: `impl-t3`, `rev-t3` — o endereço pra `@nome`), e a disciplina chega por **caminho de arquivo**:
 
-| Subagent (`general-purpose`) | Lê por caminho |
+| Subagent (`general-purpose` ou agente do `models.yml`) | Lê por caminho |
 |---|---|
 | Implementer | `skills/executor-bmad-superpowers/referencia/persona-dev.md` (Amelia destilada: story como contrato, `[x]` por task, File List, Dev Agent Record, Ready for Review) → `ponytail.md` → domínios |
 | Task reviewer / re-reviewer | `ponytail.md` → domínios → `review/seguranca.md` (quando backend) |

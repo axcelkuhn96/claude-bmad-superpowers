@@ -28,7 +28,7 @@ Invoque `Skill` com `skill: "refinador-de-prompt"` passando a entrada + resumo d
 
 ## Etapa 3 — Executar
 
-Invoque `Skill` com `skill: "executor-bmad-superpowers"` passando o caminho do prompt + modo + models. O executor tem o **gate 2** (aprovação do plano, só no modo normal) e o **gate de integração** (`finishing-a-development-branch`, em qualquer modo). Não há outro ponto de parada: implementação delegada ao `superpowers:subagent-driven-development` na branch atual (`feat/<slug>` se estava em main), personas por caminho, revisão final automática (`revisor`) quando houver gatilho.
+Invoque `Skill` com `skill: "executor-bmad-superpowers"` passando o caminho do prompt + modo + models. O executor tem o **gate 2** (aprovação do plano, só no modo normal) e o **gate de integração** (`finishing-a-development-branch`, em qualquer modo). Não há outro ponto de parada: implementação delegada ao `superpowers:subagent-driven-development` na branch atual (`feat/<slug>` se estava em main), personas por caminho, subagents nomeados (`name: <papel>-<escopo>`, endereçáveis por `@nome`), revisão final automática (`revisor`) quando houver gatilho.
 
 Entrada do usuário:
 

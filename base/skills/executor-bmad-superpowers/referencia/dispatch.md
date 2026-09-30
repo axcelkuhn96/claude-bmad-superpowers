@@ -36,6 +36,8 @@ Preencha `<nome>` da branch e apague linhas que não se aplicam ao projeto (ex.:
 
 `subagent_type` é `general-purpose` **ou** o nome do agente do `models.yml` quando ele existe em `~/.claude/agents/` (Codex: `~/.codex/agents/`); `model:` só quando o papel resolve pra modelo cru.
 
+**Nome (todo dispatch).** Todo dispatch nomeia o subagente (`name`), curto, kebab-case, único na sessão, no padrão `<papel>-<escopo>` (ex.: `impl-t3`, `rev-t3`, `fix-t3-r2`, `explore-auth`, `rev-final`); o nome é o endereço para `@nome`/`SendMessage`. Nome já usado na sessão → sufixo `-2`, `-3` (`rev-t3-2`). `name` é o nome da **instância**: independe de `subagent_type` e do agente do `models.yml` (`subagent_type: cbs-reviewer` + `name: rev-t3`). Codex: use o nome do agente em `~/.codex/agents` quando existir; o nome da instância segue o mesmo padrão quando o runtime aceitar — o "despacha sem nome" do Codex acima quer dizer **sem agente**, não sem `name`. Por quê: o usuário fala com os agentes pelo `@nome` — subagente sem nome não tem endereço. Nomes dos papéis da tabela abaixo: implementer `impl-t<N>` (fix round `fix-t<N>-r<R>`), task reviewer `rev-t<N>`, re-reviewer `rerev-t<N>-r<R>`, reviewer final `rev-final`, fix wave `fix-final`, build fixer `build-t<N>`, tester `e2e-t<N>`, explorer / search `explore-<tema>` / `search-<tema>`.
+
 Defaults do `models.yml` (agente `claude` instalado pelo pacote em `~/.claude/agents/`, com o modelo/effort do frontmatter dele — usado como fallback se o agente faltar — e agente `codex`). **No Codex use só a coluna `codex`** — nunca modelo nem effort; agente ausente → dispatch sem nome (`default_subagent_model` do `config.toml`):
 
 | Papel | Default `claude` | Fallback modelo/effort | Default `codex` |
