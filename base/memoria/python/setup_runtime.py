@@ -16,6 +16,8 @@ PINS = (
     "onnxruntime==1.30.0",
     "tokenizers==0.23.2",
     "numpy==2.5.3",
+    "httpx==0.28.1",
+    "httpcore==1.0.9",
 )
 MODEL_SHA256 = (
     "ca456c06b3a9505ddfd9131408916d"

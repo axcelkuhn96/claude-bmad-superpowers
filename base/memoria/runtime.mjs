@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 export const RUNTIME_PINS = Object.freeze({
   python: '>=3.11', sdk: 'mem0ai==2.2.1', qdrant: 'qdrant-client==1.19.1',
   onnx: 'onnxruntime==1.30.0', tokenizers: 'tokenizers==0.23.2', numpy: 'numpy==2.5.3',
+  httpx: 'httpx==0.28.1', httpcore: 'httpcore==1.0.9',
   modelSha256: [
     'ca456c06b3a9505ddfd9131408916d',
     'd79290368331e7d76bb621f1cba6bc8665',
