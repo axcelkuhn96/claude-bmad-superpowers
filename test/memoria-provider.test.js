@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 import { spawnSync } from 'node:child_process';
 import { initializeSession, resolveProject } from '../base/memoria/provider.mjs';
 import { authorizeDestination, readLocalTrust, writeLocalTrust } from '../base/memoria/trust.mjs';
@@ -78,6 +79,59 @@ test('identidade explícita é igual na raiz, subdir, symlink e worktree mapeada
     assert.equal(r.projectId, 'project-one', cwd);
     assert.equal(r.projectRoot, await fs.realpath(root), cwd);
   }
+});
+
+test('Git herdado não desvia cwd de A para identidade e trust de B', async (t) => {
+  const a = await fixture(t);
+  const b = await fixture(t);
+  await putConfig(b.root, config('trusted-b', 'b-collection'));
+  const before = { ...process.env };
+  process.env.GIT_DIR = path.join(b.root, '.git');
+  process.env.GIT_WORK_TREE = b.root;
+  process.env.GIT_CONFIG_COUNT = '1';
+  process.env.GIT_CONFIG_KEY_0 = 'core.worktree';
+  process.env.GIT_CONFIG_VALUE_0 = b.root;
+  try {
+    const result = await resolveProject(a.root, 'foreign', { stateRoot: a.stateRoot });
+    assert.deepEqual(result, { provider: 'claude-mem' });
+  } finally {
+    for (const key of Object.keys(process.env).filter((key) => key.startsWith('GIT_'))) delete process.env[key];
+    for (const [key, value] of Object.entries(before).filter(([key]) => key.startsWith('GIT_'))) process.env[key] = value;
+  }
+});
+
+test('worktree sem seleção local bloqueia; seleção equivalente por semântica compartilha estado', async (t) => {
+  const { dir, root, stateRoot } = await fixture(t);
+  await putConfig(root);
+  git(root, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'initial');
+  const worktree = path.join(dir, 'worktree');
+  git(root, 'worktree', 'add', '-q', '-b', 'separate', worktree);
+  await initializeSession(root, 'shared', options(stateRoot));
+  assert.deepEqual(await resolveProject(worktree, 'shared', { stateRoot }),
+    { provider: 'blocked', reason: 'worktree_config_changed' });
+  await fs.mkdir(path.join(worktree, '.cbs'));
+  const equivalent = config();
+  await fs.writeFile(path.join(worktree, '.cbs', 'memoria.json'), JSON.stringify({
+    embedding: { fingerprint: equivalent.embedding.fingerprint, dimension: 384, model: equivalent.embedding.model },
+    qdrant: { api_key_env: equivalent.qdrant.api_key_env, collection: equivalent.qdrant.collection,
+      url: equivalent.qdrant.url }, project_id: equivalent.project_id, provider: equivalent.provider,
+  }, null, 2));
+  const shared = await resolveProject(worktree, 'shared', { stateRoot });
+  assert.equal(shared.provider, 'mem0');
+  assert.equal(shared.projectRoot, root);
+  await putConfig(worktree, config('different'));
+  assert.deepEqual(await resolveProject(worktree, 'shared', { stateRoot }),
+    { provider: 'blocked', reason: 'worktree_config_changed' });
+});
+
+test('worktree sem seleção continua default quando principal não selecionou Mem0', async (t) => {
+  const { dir, root, stateRoot } = await fixture(t);
+  await putConfig(root, { provider: 'claude-mem' });
+  git(root, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'initial');
+  const worktree = path.join(dir, 'default-worktree');
+  git(root, 'worktree', 'add', '-q', '-b', 'default-branch', worktree);
+  assert.deepEqual(await resolveProject(worktree, 'default', { stateRoot }), { provider: 'claude-mem' });
+  await assert.rejects(fs.access(stateRoot), { code: 'ENOENT' });
 });
 
 test('duas máquinas sintéticas usam o ID explícito mas estado e trust locais distintos', async (t) => {
@@ -164,10 +218,10 @@ test('ativação só lê segredo e conecta após aprovação local da identidade
   const deps = {
     readSecret: () => { reads++; return 'synthetic-secret'; },
     lookup: async () => ['10.4.5.6'],
-    probeCollection: async () => { connections++; return { result: { config: {
+    probeCollection: async (_url, _collection, key) => { connections++; return key ? { statusCode: 200, body: { result: { config: {
       params: { vectors: { size: 384, distance: 'Cosine' } },
       metadata: { cbs_embedding_fingerprint: expectedFingerprint },
-    } } }; },
+    } } } } : { statusCode: 401 }; },
   };
   const tuple = { version: 1, projectRoot: resolution.projectRoot, projectId: resolution.projectId,
     url: resolution.destination.url, collection: resolution.destination.collection,
@@ -179,7 +233,7 @@ test('ativação só lê segredo e conecta após aprovação local da identidade
   const valid = await validateDestination(resolution, expectedFingerprint, { ...deps, approve: async () => tuple });
   assert.equal(valid.kind, 'authorized');
   assert.equal(reads, 1);
-  assert.equal(connections, 1);
+  assert.equal(connections, 2);
 });
 
 test('ativação bloqueia URL pública, key ausente, coleção ausente e embedding incompatível', async () => {
@@ -190,7 +244,8 @@ test('ativação bloqueia URL pública, key ausente, coleção ausente e embeddi
     url: destination.url, collection: destination.collection, apiKeyEnv: destination.apiKeyEnv };
   let calls = 0;
   const deps = { approve: async () => tuple, readSecret: () => 'synthetic-secret',
-    lookup: async () => ['8.8.8.8'], probeCollection: async () => { calls++; return {}; } };
+    lookup: async () => ['8.8.8.8'], probeCollection: async (_url, _collection, key) => {
+      calls++; return key ? { statusCode: 200, body: {} } : { statusCode: 401 }; } };
   assert.deepEqual(await validateDestination(resolution, fingerprint, deps), { kind: 'blocked', reason: 'public_destination' });
   assert.equal(calls, 0);
   assert.deepEqual(await validateDestination(resolution, fingerprint, { ...deps, lookup: async () => ['10.0.0.1'],
@@ -201,19 +256,58 @@ test('ativação bloqueia URL pública, key ausente, coleção ausente e embeddi
     { result: { config: { params: { vectors: { size: 384 } }, metadata: { cbs_embedding_fingerprint: 'wrong' } } } },
   ]) {
     const result = await validateDestination(resolution, fingerprint, { ...deps, lookup: async () => ['10.0.0.1'],
-      probeCollection: async () => response });
+      probeCollection: async (_url, _collection, key) => key ? { statusCode: 200, body: response } : { statusCode: 401 } });
     assert.equal(result.kind, 'blocked');
   }
+});
+
+test('ativação recusa servidor local que responde à coleção sem chave', async (t) => {
+  const fingerprint = config().embedding.fingerprint;
+  const server = http.createServer((_req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ result: { config: { params: { vectors: { size: 384, distance: 'Cosine' } },
+      metadata: { cbs_embedding_fingerprint: fingerprint } } } }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const destination = { url: `http://127.0.0.1:${server.address().port}`, collection: 'cbs-p', apiKeyEnv: 'CBS_MEMORIA_TEST_KEY' };
+  const resolution = { provider: 'mem0', projectRoot: '/projects/p', projectId: 'p', destination };
+  const tuple = { version: 1, projectRoot: resolution.projectRoot, projectId: resolution.projectId,
+    url: destination.url, collection: destination.collection, apiKeyEnv: destination.apiKeyEnv };
+  const result = await validateDestination(resolution, fingerprint,
+    { approve: async () => tuple, readSecret: () => 'fixture-key' });
+  assert.deepEqual(result, { kind: 'blocked', reason: 'unprotected_destination' });
+});
+
+test('autorização posterior bloqueia DNS público antes de ler chave e entrega endereço pinado se privado', async (t) => {
+  const { root, stateRoot } = await fixture(t);
+  await putConfig(root);
+  const session = await initializeSession(root, 'dns', options(stateRoot));
+  await writeLocalTrust(session.stateDir, { version: 1, projectRoot: session.projectRoot, projectId: session.projectId,
+    url: session.destination.url, collection: session.destination.collection,
+    apiKeyEnv: session.destination.apiKeyEnv });
+  let reads = 0;
+  const readSecret = () => { reads++; return 'fixture-key'; };
+  const optionsPrivate = { stateRoot, lookup: async () => ['10.1.2.3'] };
+  const pinned = await authorizeCurrentDestination(root, 'dns', readSecret, optionsPrivate);
+  assert.equal(pinned.kind, 'authorized');
+  assert.equal(pinned.connection.address, '10.1.2.3');
+  assert.equal(pinned.connection.hostname, 'qdrant.internal');
+  assert.equal(reads, 1);
+  const publicNow = await authorizeCurrentDestination(root, 'dns', readSecret,
+    { stateRoot, lookup: async () => ['8.8.8.8'] });
+  assert.deepEqual(publicNow, { kind: 'blocked', reason: 'public_destination' });
+  assert.equal(reads, 1);
 });
 
 test('ativação só persiste trust após preflight e revalida config antes do segredo', async (t) => {
   const { root, stateRoot } = await fixture(t);
   await putConfig(root);
   const preflight = { lookup: async () => ['10.1.2.3'], readSecret: () => 'fixture-key',
-    probeCollection: async (_url, _collection, _key) => ({ result: { config: {
+    probeCollection: async (_url, _collection, key) => key ? { statusCode: 200, body: { result: { config: {
       params: { vectors: { size: 384, distance: 'Cosine' } },
       metadata: { cbs_embedding_fingerprint: config().embedding.fingerprint },
-    } } }) };
+    } } } } : { statusCode: 401 } };
   const denied = await activateProject(root, { stateRoot, ...preflight, approve: async () => false,
     applyNative: async () => { throw new Error('native mutation before approval'); } });
   assert.equal(denied.reason, 'trust_changed');
@@ -225,7 +319,8 @@ test('ativação só persiste trust após preflight e revalida config antes do s
   const session = await initializeSession(root, 'fresh', options(stateRoot));
   let reads = 0;
   const readSecret = () => { reads++; return 'fixture-key'; };
-  assert.equal((await authorizeCurrentDestination(root, 'fresh', readSecret, { stateRoot })).kind, 'authorized');
+  assert.equal((await authorizeCurrentDestination(root, 'fresh', readSecret,
+    { stateRoot, lookup: async () => ['10.1.2.3'] })).kind, 'authorized');
   assert.equal(reads, 1);
   await putConfig(root, config('project-one', 'changed'));
   assert.deepEqual(await authorizeCurrentDestination(root, 'fresh', readSecret, { stateRoot }),

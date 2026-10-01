@@ -7,7 +7,8 @@ import { promisify } from 'node:util';
 const runFile = promisify(execFile);
 
 async function git(cwd, ...args) {
-  const { stdout } = await runFile('git', ['-C', cwd, ...args], { timeout: 5000, maxBuffer: 1024 * 1024 });
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  const { stdout } = await runFile('git', ['-C', cwd, ...args], { env, timeout: 5000, maxBuffer: 1024 * 1024 });
   return stdout.trim();
 }
 
@@ -17,6 +18,10 @@ export async function identifyProject(cwd) {
   let activeRoot;
   try { activeRoot = await fs.realpath(await git(realCwd, 'rev-parse', '--show-toplevel')); }
   catch { return { kind: 'non_git', cwd: realCwd }; }
+  if (path.relative(activeRoot, realCwd).startsWith('..' + path.sep) ||
+      path.relative(activeRoot, realCwd) === '..' || path.isAbsolute(path.relative(activeRoot, realCwd))) {
+    return { kind: 'unsupported_git' };
+  }
   try {
     if (await git(realCwd, 'rev-parse', '--is-bare-repository') !== 'false') return { kind: 'unsupported_git' };
     const lines = (await git(realCwd, 'worktree', 'list', '--porcelain')).split('\n');

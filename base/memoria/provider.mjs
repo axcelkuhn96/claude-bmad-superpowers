@@ -12,22 +12,29 @@ const isObject = (x) => x !== null && typeof x === 'object' && !Array.isArray(x)
 const idValid = (x) => typeof x === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(x);
 
 async function configFor(scope) {
-  const file = path.join(scope.projectRoot, '.cbs', 'memoria.json');
+  async function read(root) {
+    try { return await fs.readFile(path.join(root, '.cbs', 'memoria.json'), 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  }
   let data;
-  try { data = await fs.readFile(file, 'utf8'); } catch (error) {
-    if (error.code !== 'ENOENT') return blocked('invalid_config');
-    if (scope.activeRoot !== scope.projectRoot) {
-      try { await fs.access(path.join(scope.activeRoot, '.cbs', 'memoria.json')); return blocked('worktree_config_changed'); }
-      catch (e) { if (e.code !== 'ENOENT') return blocked('invalid_config'); }
-    }
-    return null;
-  }
-  if (scope.activeRoot !== scope.projectRoot) {
-    try {
-      const active = await fs.readFile(path.join(scope.activeRoot, '.cbs', 'memoria.json'), 'utf8');
-      if (active !== data) return blocked('worktree_config_changed');
-    } catch (error) { if (error.code !== 'ENOENT') return blocked('invalid_config'); }
-  }
+  let active;
+  try {
+    data = await read(scope.projectRoot);
+    if (scope.activeRoot !== scope.projectRoot) active = await read(scope.activeRoot);
+  } catch { return blocked('invalid_config'); }
+  const main = parseConfig(data);
+  if (main?.provider === 'blocked') return main;
+  if (scope.activeRoot === scope.projectRoot) return main;
+  const local = parseConfig(active);
+  if (local?.provider === 'blocked') return local;
+  if (main?.provider === 'mem0' && !local) return blocked('worktree_config_changed');
+  if (main?.provider === 'claude-mem' && !local) return { provider: 'claude-mem' };
+  if (JSON.stringify(main) !== JSON.stringify(local)) return blocked('worktree_config_changed');
+  return local;
+}
+
+function parseConfig(data) {
+  if (data === null) return null;
   let c;
   try { c = JSON.parse(data); } catch { return blocked('invalid_config'); }
   if (!isObject(c) || !['mem0', 'claude-mem'].includes(c.provider)) return blocked('invalid_config');
@@ -40,7 +47,10 @@ async function configFor(scope) {
       c.embedding.fingerprint !== `${RUNTIME_PINS.modelSha256}:${RUNTIME_PINS.tokenizerSha256}`) {
     return blocked('invalid_config');
   }
-  return c;
+  return { provider: 'mem0', project_id: c.project_id,
+    qdrant: { url: c.qdrant.url, collection: c.qdrant.collection, api_key_env: c.qdrant.api_key_env },
+    embedding: { model: c.embedding.model, dimension: c.embedding.dimension,
+      fingerprint: c.embedding.fingerprint } };
 }
 
 function stateDirFor(scope, options) {

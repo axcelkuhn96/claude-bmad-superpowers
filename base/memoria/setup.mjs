@@ -1,6 +1,6 @@
 import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { authorizeDestination, readLocalTrust, trustTuple, writeLocalTrust } from './trust.mjs';
-import { validateDestination } from './activation.mjs';
+import { pinDestination, validateDestination } from './activation.mjs';
 import { applyNativeExclusion, restoreNativeExclusion } from './native.mjs';
 
 const blocked = (reason) => ({ kind: 'blocked', reason });
@@ -40,5 +40,13 @@ export async function authorizeCurrentDestination(cwd, sessionId, readSecret, op
   const localTrust = await readLocalTrust(resolution.stateDir);
   const current = await inspectConfiguration(cwd, options);
   if (!same(resolution, current)) return blocked('session_changed');
-  return authorizeDestination(resolution, localTrust, readSecret);
+  const expected = trustTuple(resolution);
+  if (!localTrust || Object.entries(expected).some(([key, value]) => localTrust[key] !== value)) {
+    return blocked('trust_changed');
+  }
+  const pin = await pinDestination(resolution.destination.url, options);
+  if (pin.kind !== 'pinned') return pin;
+  if (!same(resolution, await inspectConfiguration(cwd, options))) return blocked('session_changed');
+  const auth = authorizeDestination(resolution, localTrust, readSecret);
+  return auth.kind === 'authorized' ? { ...auth, connection: pin.connection } : auth;
 }
