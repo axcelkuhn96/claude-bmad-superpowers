@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { identifyProject } from './project-id.mjs';
 
 const run = promisify(execFile);
@@ -13,6 +14,35 @@ const hash = (value) => createHash('sha256').update(value).digest('hex');
 const stateRoot = (options) => options.stateRoot ?? path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
 const snapshotFile = (root, cli, options) => path.join(stateRoot(options), hash(root), `native-${cli}.json`);
 const configFile = (root, cli) => path.join(root, cli === 'claude' ? '.claude/settings.local.json' : '.codex/config.toml');
+const captureEvents = { claude: ['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'SessionEnd'],
+  codex: ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'] };
+const captureScript = fileURLToPath(new URL('./capture-hook.mjs', import.meta.url));
+const hookFile = root => path.join(root, '.codex', 'hooks.json');
+function captureCommand(cli, event) {
+  if ([process.execPath, captureScript].some(value => /[$`"\r\n]/.test(value))) return null;
+  return `"${process.execPath}" "${captureScript}" ${cli} ${event}`;
+}
+function editCaptureHooks(raw, cli, remove = false) {
+  let value;
+  try { value = raw === null ? {} : JSON.parse(raw); } catch { return null; }
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      (value.hooks !== undefined && (!value.hooks || typeof value.hooks !== 'object' || Array.isArray(value.hooks)))) return null;
+  const hooks = { ...(value.hooks ?? {}) };
+  for (const event of captureEvents[cli]) {
+    const command = captureCommand(cli, event);
+    if (!command || (hooks[event] !== undefined && !Array.isArray(hooks[event]))) return null;
+    const groups = hooks[event] ?? [];
+    const ours = group => group?.hooks?.some(h => h?.command === command);
+    if (groups.some(group => group?.hooks?.some(h => typeof h?.command === 'string' &&
+        h.command.includes('capture-hook.mjs') && h.command !== command))) return null;
+    hooks[event] = remove ? groups.filter(group => !ours(group)) :
+      groups.some(ours) ? groups : [...groups, { hooks: [{ type: 'command', command, timeout: 10 }] }];
+    if (!hooks[event].length) delete hooks[event];
+  }
+  if (Object.keys(hooks).length) value.hooks = hooks;
+  else delete value.hooks;
+  return JSON.stringify(value, null, 2) + '\n';
+}
 
 async function safeFile(file) {
   try {
@@ -33,8 +63,8 @@ async function tracked(root, file) {
     return !!stdout.trim();
   } catch { return true; }
 }
-async function excludePlan(root, cli) {
-  const relative = path.relative(root, configFile(root, cli));
+async function excludePlan(root, cli, target = configFile(root, cli)) {
+  const relative = path.relative(root, target);
   try {
     await run('git', ['-C', root, 'check-ignore', '-q', '--', relative], { timeout: 5000 });
     return { added: false };
@@ -159,15 +189,33 @@ export async function applyNativeExclusion(root, options = {}) {
   const raw = await readOptional(file);
   const edit = (cli === 'claude' ? claudeEdit : codexEdit)(raw);
   if (!edit) return blocked('invalid_native_config');
+  const capturePath = cli === 'claude' ? file : hookFile(root);
+  if (!await safeParent(capturePath) || !await safeFile(capturePath) ||
+      (cli === 'codex' && await tracked(root, capturePath))) return blocked('unsafe_capture_hooks');
+  const captureRaw = cli === 'claude' ? edit.raw : await readOptional(capturePath);
+  const captureEdit = editCaptureHooks(captureRaw, cli);
+  if (!captureEdit) return blocked('invalid_capture_hooks');
   const exclude = await excludePlan(root, cli);
-  if (!exclude) return blocked('unsafe_git_exclude');
+  const captureExclude = cli === 'codex' ? await excludePlan(root, cli, capturePath) : { added: false };
+  if (!exclude || !captureExclude) return blocked('unsafe_git_exclude');
   const save = { cli, file, existed: raw !== null, had: edit.had, previous: edit.previous,
     hadEnabledPlugins: cli === 'claude' && raw !== null && Object.hasOwn(JSON.parse(raw), 'enabledPlugins'),
-    hadSection: edit.hadSection, old: edit.old, exclude };
+    hadSection: edit.hadSection, old: edit.old, exclude,
+    capturePath, captureExisted: cli === 'codex' && captureRaw !== null, captureExclude,
+    pluginChecked: cli === 'codex' };
   await writeAtomic(snapshot, JSON.stringify(save) + '\n');
-  try { await writeAtomic(file, edit.raw); await addExclude(exclude); }
+  try {
+    await writeAtomic(file, cli === 'claude' ? captureEdit : edit.raw);
+    if (cli === 'codex') await writeAtomic(capturePath, captureEdit);
+    await addExclude(exclude);
+    await addExclude(captureExclude);
+  }
   catch (error) {
     if (raw === null) await fs.rm(file, { force: true }); else await writeAtomic(file, raw);
+    if (cli === 'codex') {
+      if (captureRaw === null) await fs.rm(capturePath, { force: true });
+      else await writeAtomic(capturePath, captureRaw);
+    }
     await fs.rm(snapshot, { force: true });
     return blocked('native_write_failed');
   }
@@ -188,14 +236,54 @@ export async function restoreNativeExclusion(root, options = {}) {
   if (raw === null) return blocked('native_config_changed');
   const edit = (cli === 'claude' ? claudeEdit : codexEdit)(raw, saved);
   if (!edit) return blocked('native_config_changed');
+  const hasCapture = Object.hasOwn(saved, 'capturePath');
+  const capturePath = saved.capturePath;
+  if (hasCapture && (capturePath !== (cli === 'claude' ? file : hookFile(root)) ||
+      !await safeFile(capturePath))) return blocked('unsafe_capture_hooks');
+  const captureRaw = hasCapture ? await readOptional(capturePath) : null;
+  const captureEdit = hasCapture ? editCaptureHooks(cli === 'claude' ? edit.raw : captureRaw, cli, true) : edit.raw;
+  if (!captureEdit || (hasCapture && cli === 'codex' && captureRaw === null)) return blocked('capture_hooks_changed');
   if (saved.exclude?.added && !(await readOptional(saved.exclude.file))?.includes(saved.exclude.block)) {
     return blocked('git_exclude_changed');
   }
-  if (saved.existed) await writeAtomic(file, edit.raw);
-  else if (cli === 'claude' && Object.keys(JSON.parse(edit.raw)).length === 0) await fs.rm(file);
+  if (saved.captureExclude?.added && !(await readOptional(saved.captureExclude.file))?.includes(saved.captureExclude.block)) {
+    return blocked('git_exclude_changed');
+  }
+  if (saved.existed) await writeAtomic(file, cli === 'claude' ? captureEdit : edit.raw);
+  else if (cli === 'claude' && Object.keys(JSON.parse(captureEdit)).length === 0) await fs.rm(file);
   else if (cli === 'codex' && !edit.raw.trim()) await fs.rm(file);
-  else await writeAtomic(file, edit.raw);
+  else await writeAtomic(file, cli === 'claude' ? captureEdit : edit.raw);
+  if (cli === 'codex' && hasCapture) {
+    if (!saved.captureExisted && Object.keys(JSON.parse(captureEdit)).length === 0) await fs.rm(capturePath);
+    else await writeAtomic(capturePath, captureEdit);
+  }
   if (!await removeExclude(saved.exclude)) return blocked('git_exclude_changed');
+  if (!await removeExclude(saved.captureExclude)) return blocked('git_exclude_changed');
   await fs.rm(snapshot);
   return { kind: 'restored' };
+}
+
+export async function verifyNativeCapture(root, options = {}) {
+  const { cli } = options;
+  if (!captureEvents[cli] || process.platform === 'win32' || !process.getuid) return blocked('native_windows_unproved');
+  if (root !== await fs.realpath(root).catch(() => null)) return blocked('unsupported_git');
+  const file = configFile(root, cli);
+  const capturePath = cli === 'claude' ? file : hookFile(root);
+  if (!await safeFile(file) || !await safeFile(capturePath) || await tracked(root, file) ||
+      (cli === 'codex' && await tracked(root, capturePath))) return blocked('unsafe_native_config');
+  let saved;
+  try { saved = JSON.parse(await fs.readFile(snapshotFile(root, cli, options), 'utf8')); }
+  catch { return blocked('missing_native_snapshot'); }
+  if (saved.cli !== cli || saved.file !== file || saved.capturePath !== capturePath ||
+      (cli === 'codex' && saved.pluginChecked !== true)) return blocked('native_snapshot_changed');
+  const raw = await readOptional(file);
+  const captureRaw = await readOptional(capturePath);
+  if (!raw || !captureRaw || !(cli === 'claude' ? claudeEdit(raw, saved) : codexEdit(raw, saved))) {
+    return blocked('native_config_changed');
+  }
+  let hooks;
+  try { hooks = JSON.parse(captureRaw).hooks; } catch { return blocked('capture_hooks_changed'); }
+  if (!captureEvents[cli].every(event => hooks?.[event]?.some(group =>
+    group?.hooks?.some(h => h?.command === captureCommand(cli, event))))) return blocked('capture_hooks_changed');
+  return { kind: 'verified' };
 }
