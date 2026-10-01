@@ -1,0 +1,265 @@
+# Memória CBS Mem0 Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. The user's “pode aplicar o plano” on 2026-10-01 authorizes execution; there is no second plan approval gate.
+
+**Goal:** Offer Mem0 OSS as an explicit, isolated project choice in Claude Code and Codex, with extraction/embedding on the client and only private Qdrant on the server.
+
+**Architecture:** Preserve claude-mem as the default and freeze a provider per session. For opt-in projects, native hooks capture durable transcript slices into a local outbox, a local CLI extracts reviewed candidates, and a local Python Mem0/E5 adapter stores and recalls them from project-scoped Qdrant. M0-01 is a hard native-exclusivity gate before product code or deployment.
+
+**Tech Stack:** Existing Node ESM package (Node ≥18, no new dependency for default), optional isolated Python runtime with pinned Mem0 OSS 2.2.1 and multilingual-E5-small ONNX 384d, Qdrant private/authenticated.
+
+**Spec:** `/home/axcel/cbs-lab/docs/prds/cbs-memoria.md`; canonical epic and seven stories in `/home/axcel/cbs-lab/docs/stories/cbs-memoria-mem0/`. Prior corrected benchmark is exploratory evidence, not acceptance.
+
+## Global Constraints
+
+- Product checkout: `/home/axcel/claude-bmad-superpowers`, branch `feat/cbs-memoria`, base `68c311d96f2e2336636979ae15fc694c188b1ced` from `release/0.13.1`; preserve this branch and use no new worktree.
+- The user's approval covers this plan and M0-01 probes. No npm/GitHub publication, push, merge, version bump, global claude-mem change, or N8N change. Stop product code if M0-01 fails either CLI; write the evidence and decision. Installed CLIs at intake: Claude 2.1.287 and Codex 0.159.3; actual global claude-mem is off. Preserve that state and its hash. User authorized the `claude2` account/profile for probes; do not change global config. Task 5 may use it for a configured Sonnet alternative if the CLI route is proved; initial Sol choice remains.
+- No Mem0 API/server, PostgreSQL, pgvector, dashboard, transcript upload, global personal memory, or cross-provider sync. Qdrant is the only remote service; client owns SDK, E5 and CLI extraction.
+- The default project needs only Node ≥18 and retains current claude-mem behavior. Opt-in trust is local, outside the repository; an untrusted `.cbs/memoria.json` never chooses a secret or destination. Provider changes take effect only in a new session.
+- Initial auto-publication is off. Active memories require source/actor/date/scope and review. Never reinterpret a tool or assistant report as a human rule; current human instruction outranks recalled text.
+- Proposed budgets: capture/enqueue p95 ≤100 ms, recall total deadline 1,000 ms, outbox 256 MiB/project with alert at 80%, ≤4 automatic CLI calls/session, ≤5 candidates/checkpoint, rendered context ≤500 tokens. Measure; change only by explicit documented decision before opt-in release.
+- Use named Codex roles from `models.yml`: `architect_sol` for difficult gate/rulings, `backend_terra` for implementation, `reviewer_sol` per task, `tester_luna` for operational tests, `final_reviewer_sol` for whole-branch review. No raw model names. One implementer at a time, one commit per task, no worker-created subagents.
+- Preserve user changes. Read exact `/home/axcel/AGENTS.md` and the story before work. Browser automation, if needed, uses Playwright Python `/tmp/pwval` with visible Chrome on `DISPLAY=:1`; never `agent-browser`.
+
+### Rulebooks CBS (read by path before acting; first existing path wins)
+
+- Implementer: `~/.claude/skills/executor-bmad-superpowers/referencia/persona-dev.md` (fallback `/home/axcel/claude-bmad-superpowers/base/skills/executor-bmad-superpowers/referencia/persona-dev.md`).
+- All: `~/.claude/cbs-overrides/personas/ponytail.md` → `~/.claude/personas/ponytail.md`; language `~/.claude/cbs-overrides/personas/dominios/<node|python>.md` → `~/.claude/personas/dominios/<node|python>.md`; area `integracao`/`database` where marked.
+- Reviewers: `~/.claude/cbs-overrides/personas/review/seguranca.md` → `~/.claude/personas/review/seguranca.md` for backend; final also `cobertura-de-testes.md`. If absent, record path in report and continue.
+- Summary: smallest change; preserve validation/security/tests; read persona→ponytail→language→area; RED→GREEN for business rules, measured E2E for operational work; backend runs `node ~/.claude/scripts/gate-seguranca.js` and records any partial gate; reports hold evidence; branch `feat/cbs-memoria`, no worktree.
+
+## File and interface map (proposed; verify against M0-01/SDK before editing)
+
+| Boundary | Files and contract |
+|---|---|
+| Native integration | Existing `src/hooks-settings.js`, `src/instalar.js`, `src/remover.js`, `src/caminhos.js`, `base/codex/hooks/codex-hooks.json`, `base/hooks/`. Probe before altering. The present installer writes Claude hooks globally; the Codex manifest exists but installation/trust behavior is unproved. |
+| Selection | New `base/memoria/provider.mjs`, `project-id.mjs`, `trust.mjs`; `resolveProject(cwd, sessionId)` returns frozen `{provider, projectRoot, projectId, destination, stateDir}` or a typed blocked result. `authorizeDestination` compares local tuple before reading `api_key_env`. |
+| Bridge and store | New `base/memoria/python/mem0_adapter.py`, pinned optional runtime manifest, `base/memoria/ledger.mjs`. JSON-lines bridge request/result must carry external operation ID, source session, project identity, publication state and verified remote ID; no secret in argv/log. |
+| Capture | New `base/memoria/transcript.mjs`, `outbox.mjs`, `checkpoint.mjs`; `checkpointId(projectId, cli, sessionId, byteStart, byteEnd, hash, policyVersion)`; append durable item before cursor advances, ACK only after store verification. |
+| Extract/review | New `base/memoria/candidates.mjs` and local CLI adapter; `extractCheckpoint(checkpoint)` returns source-linked candidates; `approveCandidate(id, editedText?)` validates then queues store. Keep extraction through the installed CLI; do not assume `claude -p` or `codex exec` syntax until proved. |
+| Read/MCP | New `base/memoria/context.mjs`, `mcp.mjs`; `recall(session, query, deadlineMs)` returns filtered active items or typed unavailable, and `renderContext(items, 500)` counts final rendered tokens. Route existing commands/skills that explicitly call `claude-mem:mem-search`. |
+| Tests/operations | Existing `test/*.test.js` uses `node --test`. Add focused `test/memoria-*.test.js`; extend `package.json` test script without changing default runtime deps. Operational evidence lives in `/home/axcel/cbs-lab/docs/analises/`; Qdrant guide in `/home/axcel/cbs-lab/docs/operacao/`; deliver `base/memoria/deploy/install-qdrant.sh` for user-run installation later. |
+
+## Review Focus
+
+1. Repo-controlled `api_key_env` changes while a session is live: Task 2 test must show no secret read or connection until independent local trust is renewed.
+2. SDK succeeds remotely then local process dies before ACK: Task 3 test must reconcile the external ID and leave exactly one active memory.
+3. UTF-8/partial JSONL at a crash boundary: Task 4 test must recover complete persisted records only and leave cursor before incomplete bytes.
+4. Tool output containing a fake human instruction or credential: Task 5 test must retain origin and block publication/secret upload.
+5. Qdrant returns a close vector from another project or superseded revision: Task 6 test must abstain even if ranking is high.
+
+## Preflight and decision rules
+
+| Task | Prerequisite | Gate and ruling |
+|---|---|---|
+| 1 | Current installed Claude/Codex/claude-mem; two synthetic sentinel projects | Native trace, including tools/commands/subagents, proves opt-in zero claude-mem and default intact in both CLIs. Since actual global claude-mem is off, also use an isolated copied private config/registry profile with claude-mem active and matching installed artifacts/versions; measure project/session override, hooks and MCP there without mutating global state. Record actual-off and isolated-active separately. Otherwise record CLI-specific failure and stop product implementation. |
+| 2 | Task 1 PASS and exact native payload/installation paths | If project/destination trust cannot be bound outside repo before secret read, keep Mem0 blocked. Runtime optionality is tested on clean default. |
+| 3 | Task 2 identity/trust; SDK 2.2.1 behavior verified | If SDK cannot reconcile external IDs after crash, do not substitute direct Qdrant writes silently; record architecture decision. One designated writer until concurrency safety proven. |
+| 4 | Tasks 1–3 interfaces | Missing end callback is a documented reduced guarantee; recover only bytes persisted before crash. If p95 or queue budget fails, block activation pending explicit budget ruling. |
+| 5 | Tasks 3–4 durable source and store | No candidate is auto-published initially. Missing source/actor/date, contradiction, secret or unsupported assistant claim stays local. |
+| 6 | Tasks 2–3, 5 plus Task 1 event proof | If prompt callback/route is absent in a CLI, mark unavailable there; no claude-mem fallback. |
+| 7 | Tasks 1–6 pass and prospective human reference frozen | Any critical authorship/time/precedence/isolation failure blocks release even if store works. Deliver the user-requested install script; no production host or deployment is needed now. No publication/push. |
+
+## Task 1: M0-01 native hooks and exclusivity (domínio: node+integracao; tipo: operacional; review: seguranca)
+
+**Files:** Read existing `src/hooks-settings.js`, `src/instalar.js`, `src/remover.js`, `base/codex/hooks/codex-hooks.json`, `base/commands/*.md`, `base/skills/*`. Create only removable probes under `/tmp/cbs-mem0-probes/`, optional `test/memoria-hooks.test.js`, and report `/home/axcel/cbs-lab/docs/analises/2026-10-01-prova-hooks-mem0.md`. No product code before PASS.
+
+**Interfaces:** Produces a per-CLI event/payload/trust/transcript matrix, an observed project-only claude-mem exclusion mechanism, and exact hook/MCP installation paths for Tasks 2/4/6. Label observed, unavailable, and untested separately.
+
+- [ ] Capture versions/manifests and hash current global claude-mem-off state without changing it. Create two disposable projects with distinct synthetic strings and, if isolatable, a copied private claude-mem-active profile using the installed artifacts/versions; record profile differences, paths and cleanup command in the report. Never toggle global claude-mem.
+- [ ] Make the probes record JSON lines `{cli,version,project,event,cwd,session,transcript,hookOrigin,mcpTool,contextEffect,writeDestination}`, with secrets and private transcript bodies omitted. A missing line is “not fired”, a line with no effect is “fired/early exit”, a line with effect is “fired/acted”.
+- [ ] In real Claude Code and Codex sessions, exercise root, subdirectory, mapped worktree, parallel default/opt-in, prompt context, Stop, PreCompact, SessionEnd, MCP matcher/direct call, CBS command/skill/subagent, normal exit, interruption/terminal close and Qdrant unavailable. Compare the unchanged actual-off profile with the isolated-active profile; verify stored byte offsets after restart rather than assuming a final callback.
+- [ ] Record the decisive assertion as a matrix, not a text answer: for every opt-in run under isolated-active profile, `claudeMemCaptures === 0 && claudeMemRecalls === 0 && claudeMemTools === 0`; simultaneously default sentinel must show the profile's active behavior. Actual-off profile must retain its off behavior. If no project-only exclusion exists with matching installed versions/artifacts, Task 1 FAIL and all later product tasks stay blocked.
+- [ ] If a small repeatable harness is needed, write a `node:test` fixture with a failing positive control and passing zero-effect condition. Run `node --test test/memoria-hooks.test.js` and save versions, commands, sanitized traces and cleanup in the report; commit only product-repo harness if useful.
+
+## Task 2: M0-02 selection, trust, identity and optional runtime (domínio: node+integracao; tipo: regra-de-negocio; review: seguranca)
+
+**Files:** Create `base/memoria/provider.mjs`, `project-id.mjs`, `trust.mjs`, optional runtime manifest/setup script under `base/memoria/python/`, `test/memoria-provider.test.js`; modify `src/instalar.js`, `src/caminhos.js`, `src/hooks-settings.js` only as proved by Task 1.
+
+**Interfaces:** `resolveProject(cwd: string, sessionId: string): Promise<Resolution>` returns frozen `{provider,projectRoot,projectId,destination:{url,collection,apiKeyEnv},stateDir}` or `{provider:'blocked',reason}`. `authorizeDestination(resolution: Resolution, localTrust: TrustTuple, readSecret: (envName:string)=>string|undefined): {kind:'authorized',key:string}|{kind:'blocked',reason:string}` compares canonical root + URL + collection + env-name **before** calling `readSecret`. Task 3 consumes only authorized destination; Tasks 4/6 consume frozen session provider.
+
+- [ ] Write failing tests for: no config/default without Python; same explicit `project_id` at root/subdir/worktree and on second machine; nested independent ID; malformed config; provider change mid-session blocked; changed URL, collection or env-name yields `blocked: trust_changed` with a spy asserting zero env reads/connections. Example key assertion: `assert.equal(secretReads, 0)` after changing only `qdrant.collection`.
+- [ ] Run `node --test test/memoria-provider.test.js` to observe RED; implement minimal resolution with canonical project root and explicit worktree mapping, schema validation and local trust record outside repo; rerun GREEN. Do not infer identity from basename or silently inherit nested project config.
+- [ ] Add explicit activation/validation command only after native trust route is known. It rejects missing key, public/unprotected URL, absent or dimension/fingerprint-incompatible collection before session use; creating collection/key is a separate explicit setup action.
+- [ ] Provision pinned optional Python/SDK/E5 in project CBS state; set SDK history path and disable telemetry before construction. Test by snapshotting `~/.mem0` and OpenAI env access before/after SDK init in opt-in and default paths; default must not create runtime or state. Run Node 18 tests and `npm test`.
+- [ ] Document pin (SDK, ONNX model+tokenizer checksums, 384d, normalization, E5 `query:`/`passage:` prefixes) and trust record format without secret. Commit Task 2 when the reviewer accepts both default regression and trust tests.
+
+Concrete RED test for `test/memoria-provider.test.js` (the module is proposed here, not asserted to exist today):
+
+```js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { authorizeDestination } from '../base/memoria/trust.mjs';
+
+test('changed collection blocks before reading the credential', () => {
+  const destination = { url: 'https://qdrant.internal', collection: 'cbs-p-new', apiKeyEnv: 'CBS_MEMORIA_QDRANT_KEY' };
+  const resolution = { provider: 'mem0', projectRoot: '/projects/p', projectId: 'p', destination, stateDir: '/tmp/p-state' };
+  const trusted = { projectRoot: '/projects/p', url: destination.url, collection: 'cbs-p-old', apiKeyEnv: destination.apiKeyEnv };
+  let reads = 0;
+  const result = authorizeDestination(resolution, trusted, () => { reads++; return 'synthetic-secret'; });
+  assert.deepEqual(result, { kind: 'blocked', reason: 'trust_changed' });
+  assert.equal(reads, 0);
+});
+```
+
+## Task 3: M0-03 local Mem0, remote Qdrant and consistency (domínio: python+database; tipo: regra-de-negocio; review: seguranca)
+
+**Files:** Create `base/memoria/python/mem0_adapter.py`, `base/memoria/ledger.mjs`, `test/memoria-store.test.js` plus Python focused tests if useful. Reuse Task 2 runtime/config.
+
+**Interfaces:** JSON-lines bridge request `{op:'store'|'search', externalId,projectId,sessionId,text,metadata,queryVector?}`, result `{kind:'stored',externalId,sdkId,qdrantId,verified:true}|{kind:'pending'|'conflict'|'items',...}`; each line is one JSON object, no secret field. Node facade `reconcileStore(operation: {externalId,projectId,...}, deps: {findRemote,addViaSdk,ackLocal}): Promise<{kind:'stored',externalId,sdkId,qdrantId,verified:true}|{kind:'pending',reason}>`; `searchProject({projectId,queryVector}) → items`. Task 4 owns transport cursor; Task 5 calls only approved-store entry. Exact **SDK internals** are pinned by observed 2.2.1 source in this task; the facade contract here is independent of them.
+
+- [ ] First inspect actual pinned SDK `add(infer=False)`, provider construction, Qdrant ID/payload, history path and query filter. Freeze a fixture with no OpenAI key and a provider spy that raises on any LLM generation.
+- [ ] Write RED tests that store via SDK with `user_id=project_id`, `run_id=session_id`, then search by project without `run_id`; verify another session/CLI sees it, another project does not, and zero secondary LLM calls. Confirm E5 384d and exact fingerprint before writing.
+- [ ] Write RED crash matrix: before local enqueue, after local enqueue, before remote store, after remote store/before ACK, after ACK, and replay; assert one active external ID and ACK only after a remote read verifies payload. Use source+policy-derived external IDs, never text similarity or clock. Keep failure codes/attempts; timeout is pending, not empty success.
+- [ ] Implement local ledger, SDK/Qdrant ID reconciliation and immutable correction with `supersedes_id`, validity and conservative reads during partial update. Test a later human correction suppresses the old active version, while concurrent corrections become conflict. Enforce one designated writer across machines unless a real concurrency proof passes; second reader/capturer holds outbox until explicit transfer.
+- [ ] Exercise authenticated private remote Qdrant A→B and unauthorized collection access with the actual credential scope; note an admin-wide key limits pilot to one owner/private network. Test incompatible dimension/fingerprint and no `~/.mem0/history.db` or telemetry. Run focused tests, `npm test`, security gate and commit.
+
+Concrete RED test for `test/memoria-store.test.js`:
+
+```js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { reconcileStore } from '../base/memoria/ledger.mjs';
+
+test('remote write before local ACK is reconciled without another SDK add', async () => {
+  const operation = { externalId: 'src-claude-s1-0-84-v1', projectId: 'p' };
+  const remote = { externalId: operation.externalId, projectId: 'p', sdkId: 'sdk-7', qdrantId: 'q-7', status: 'active' };
+  let adds = 0;
+  const acks = [];
+  const result = await reconcileStore(operation, {
+    findRemote: async (externalId) => externalId === remote.externalId ? remote : null,
+    addViaSdk: async () => { adds++; throw new Error('duplicate write'); },
+    ackLocal: async (externalId, proof) => { acks.push({ externalId, proof }); },
+  });
+  assert.deepEqual(result, { kind: 'stored', externalId: operation.externalId, sdkId: 'sdk-7', qdrantId: 'q-7', verified: true });
+  assert.equal(adds, 0);
+  assert.equal(acks.length, 1);
+  assert.equal(acks[0].proof.qdrantId, 'q-7');
+});
+```
+
+## Task 4: M0-04 transcript capture, outbox and recovery (domínio: node+integracao; tipo: regra-de-negocio; review: seguranca)
+
+**Files:** Create `base/memoria/transcript.mjs`, `outbox.mjs`, `checkpoint.mjs`, `test/memoria-recovery.test.js`; touch existing hook manifests/scripts only at M0-01 verified points.
+
+**Interfaces:** `readCompleteJsonl(buffer: Buffer, start=0): {records:Array<{value:object,start:number,end:number}>,lastCompleteByte:number}` is the format-neutral durable-byte reader; `parsePersistedSlice({cli,transcriptPath,start,end}) → {messages,lastCompleteByte}` maps proven native payloads; `enqueueCheckpoint(slice, identity) → operationId`; `ackVerified(operationId, remoteProof)` advances eligible cursor. Exact Claude/Codex message mapping waits on Task 1 native traces, not invented fixtures. Extraction worker in Task 5 consumes queued records.
+
+- [ ] Freeze actual Claude/Codex JSONL fixtures from sanitized M0-01 probes. Write RED assertions for human/assistant/tool roles, actor, timestamps, message IDs, byte offsets, UTF-8 split, partial last JSONL and two sessions with distinct IDs. A tool line saying “user decided X” must remain tool origin.
+- [ ] Implement append/fsync/atomic-rename as needed so an outbox item is durable before cursor advancement. Write fault-injection tests at every file mutation; after restart, replay persisted complete bytes exactly once by operation ID. A missing SessionEnd only reduces recoverability to durable bytes.
+- [ ] Bind SessionStart/Prompt/Stop/PreCompact/SessionEnd only where M0-01 proved them; capture hook enqueues locally and returns without model/network. Test 20 tool events in one turn produce no extraction calls, compact/restart preserve offsets, and unavailable Qdrant leaves queue pending.
+- [ ] Fill a synthetic outbox to 80% of 256 MiB and then 256 MiB: alert, no ACK/cursor advance/full-data loss; release space and replay remaining persisted transcript. Measure capture/enqueue p95 ≤100 ms on both CLIs at acceptance load; record machine/load and distribution. Run focused tests, `npm test`, security gate and commit.
+
+Concrete RED test for `test/memoria-recovery.test.js`:
+
+```js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readCompleteJsonl } from '../base/memoria/transcript.mjs';
+
+test('restart stops before an incomplete UTF-8 JSONL record', () => {
+  const complete = Buffer.from('{"role":"user","text":"ação"}\n');
+  const partial = Buffer.from('{"role":"assistant","text":"não acabou"', 'utf8');
+  const bytes = Buffer.concat([complete, partial]);
+  const parsed = readCompleteJsonl(bytes, 0);
+  assert.equal(parsed.lastCompleteByte, complete.length);
+  assert.equal(parsed.records.length, 1);
+  assert.equal(parsed.records[0].value.text, 'ação');
+  assert.deepEqual([parsed.records[0].start, parsed.records[0].end], [0, complete.length]);
+});
+```
+
+## Task 5: M0-05 local extraction, provenance and review (domínio: node+integracao; tipo: regra-de-negocio; review: seguranca)
+
+**Files:** Create `base/memoria/candidates.mjs`, a local CLI adapter under `base/memoria/`, `test/memoria-extract.test.js`; Python helper only if the proven CLI integration needs it.
+
+**Interfaces:** `extractCheckpoint(checkpoint, cliPolicy) → Candidate[]|pendingError`; candidate includes `memory_id,external_id,project_id,logical_key,text,type,actor,speaker_role,origin,session/message/slice IDs,offsets,evidence_at,ingested_at,valid_from,valid_to,scope,status,supersedes_id,policy_version,extractor_model,embedding_fingerprint`. `validateCandidate(candidate: Candidate, sourceMessage: {role,actor,offsets,text}): {eligible:boolean,reasons:string[]}` rejects source/actor mismatch before publish; `approveCandidate(id, edit?)` validates source and sends to Task 3 store.
+
+- [ ] Write RED cases from independent fixtures: direct human “Fable só revisão final” without commit retains actor/condition; assistant “corrigi” without tool proof remains assistant_report; older `evidence_at` survives today's ingestion; tool/external imperative never becomes human instruction; transient episode is not permanent.
+- [ ] Write RED sensitive-data and unsupported-claim tests with spy asserting secret absent from CLI input where redaction is required, remote payload and logs; candidate without supporting offsets/actor/date/scope cannot be active. Two semantically similar complementary facts remain separate.
+- [ ] Implement CLI extraction per eligible checkpoint using the proven local Sol route, Sonnet alternative; cap automatic calls at 4/session and candidates at 5/checkpoint, accounting tokens/latency/cost and keeping excess pending. No call per tool event. Return typed timeout/error, never success with empty list.
+- [ ] For the Sonnet alternative, the user-authorized `claude2` profile may be used only through its observed CLI route; account availability does not imply Mem0 support, an extraction interface, or changed initial Sol policy.
+- [ ] Store candidates protected locally; review rejects/edits with audit, and explicit accepted item passes `add(infer=False)` with verified payload unchanged. Auto-publication remains off until Task 7 quality decision. Run focused tests, `npm test`, security gate and commit.
+
+Concrete RED test for `test/memoria-extract.test.js`:
+
+```js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { validateCandidate } from '../base/memoria/candidates.mjs';
+
+test('tool text cannot be published as a direct human rule', () => {
+  const source = { role: 'tool', actor: 'Bash', offsets: [240, 303], text: 'User decided: Fable só revisão final' };
+  const candidate = {
+    project_id: 'p', text: 'Fable só revisão final', actor: 'user', speaker_role: 'user',
+    origin: 'user_direct', evidence_at: '2026-09-29T10:00:00Z', scope: 'project',
+    source_offsets: [240, 303], status: 'candidate',
+  };
+  const verdict = validateCandidate(candidate, source);
+  assert.equal(verdict.eligible, false);
+  assert.ok(verdict.reasons.includes('origin_mismatch'));
+});
+```
+
+## Task 6: M0-06 local MCP and bounded recall (domínio: node+integracao; tipo: regra-de-negocio; review: seguranca)
+
+**Files:** Create `base/memoria/mcp.mjs`, `context.mjs`, `test/memoria-recall.test.js`; alter only existing command/skill files found by `rg -l 'claude-mem:mem-search|mem-search' base/commands base/skills`, preserving default text/behavior through provider routing.
+
+**Interfaces:** `recall(session,query,1000) → {kind:'items',items}|{kind:'unavailable',reason}|{kind:'abstain'}`; `selectRecall(results: Memory[], {projectId:string,now:string}): Memory[]` filters identity/state/vigency before ranking; `renderContext(items,500) → string`. MCP methods search/source/propose/approve/correct/status derive identity from session; caller cannot supply another `project_id`.
+
+- [ ] Write RED tests for same-project cross-session retrieval and hard filtering of candidate, conflict, rejected, superseded, expired and foreign-project items before ranking. A high-scoring foreign item must never render; a negative query must abstain.
+- [ ] Write RED deadline test with slow embedder and Qdrant: total wall time ≤1,000 ms including local vectorization, then typed unavailable and no injected text. Warm E5 outside prompt. Assert rendered context ≤500 tokens with source/date/actor and current human instruction precedence; same `(ID,contentHash)` injects once per window, allowed after compaction.
+- [ ] Implement MCP methods with session-bound identity, no secret in args/logs; source text from local transcript only on its machine, otherwise return remote metadata with clear limitation. Test explicit correction removes prior version from recall.
+- [ ] Route prompts, commands, skills and subagents per frozen provider using observed native paths. In default sentinel, claude-mem call remains; in Mem0 sentinel, claude-mem calls stay zero even with Qdrant down. Run both CLI E2E, focused tests, `npm test`, security gate and commit.
+
+Concrete RED test for `test/memoria-recall.test.js`:
+
+```js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { selectRecall } from '../base/memoria/context.mjs';
+
+test('high vector score never bypasses project and revision filters', () => {
+  const base = { valid_from: '2026-09-01T00:00:00Z', valid_to: null, text: 'Synthetic fact' };
+  const hits = [
+    { ...base, memory_id: 'foreign', project_id: 'other', status: 'active', score: 0.99 },
+    { ...base, memory_id: 'old', project_id: 'p', status: 'superseded', score: 0.98 },
+    { ...base, memory_id: 'current', project_id: 'p', status: 'active', score: 0.70 },
+  ];
+  assert.deepEqual(selectRecall(hits, { projectId: 'p', now: '2026-10-01T00:00:00Z' }).map(x => x.memory_id), ['current']);
+});
+```
+
+## Task 7: M0-07 prospective acceptance, operations and release ruling (domínio: python+integracao; tipo: operacional; review: seguranca)
+
+**Files:** Create `base/memoria/deploy/install-qdrant.sh` in product repo, `/home/axcel/cbs-lab/docs/operacao/qdrant-memoria.md`, `/home/axcel/cbs-lab/docs/analises/2026-10-01-memoria-mem0-aceite.md` and focused script smoke test in product repo. Do not publish or deploy to shared production.
+
+**Interfaces:** `install-qdrant.sh` reads `QDRANT_API_KEY_FILE` (required existing mode-0600 secret file), `QDRANT_DATA_DIR` (required persistent directory) and `QDRANT_BIND_IP` (required loopback/private address); container name `cbs-mem0-qdrant`, image version/digest pinned in script, port 6333, restart policy. It rejects missing/unsafe inputs before Docker calls, never places the key in an argv/log, and repeat invocation keeps existing volume/container data. Produces signed-off or blocked release ruling with raw prospective cases, CPU/RAM/disk/network/latency/calls/cost measurements, restore trace and rollback trace. No automatic activation from a passing script alone.
+
+- [ ] Before outputs, freeze new real post-development source sessions, task questions and reference answers for Claude and Codex with/without memory; include positive facts, negatives, human rule, correction, attribution, historical date and project isolation. Human reviewer records omission, unsupported claim, benefit and harm per arm.
+- [ ] Exercise two authorized machines/CLIs against an isolated private authenticated Qdrant test instance, writer designation/transfer, retry after store-before-ACK crash, and correction. Freeze a backup, restore into a clean instance and verify active/history IDs and payload consistency. Guide states volume, network, auth, backup/restore, key rotation and capability limit of broad admin credentials.
+- [ ] Write `base/memoria/deploy/install-qdrant.sh` with a pinned Qdrant image/version, persistent volume, private bind/network configuration, API key supplied only by environment/secret file with safe permissions, restart policy, idempotent non-destructive repeat run, and explicit backup/restore commands in the guide. Write a failing shell/Docker smoke test for re-run preserving a marker point and rejecting missing key/public bind; run RED then implement and run GREEN in isolated localhost Docker if available. Do not embed credentials or require target-server details. User will run the script on the server later.
+
+Concrete RED shell test for `test/memoria-qdrant-install.sh`; this safety test runs without Docker, while the separate persistence smoke needs isolated Docker:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+script="$(cd "$(dirname "$0")/.." && pwd)/base/memoria/deploy/install-qdrant.sh"
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+printf 'synthetic-test-key\n' > "$scratch/key"
+chmod 600 "$scratch/key"
+set +e
+missing_output="$(QDRANT_API_KEY_FILE="$scratch/missing" QDRANT_DATA_DIR="$scratch/data" QDRANT_BIND_IP=127.0.0.1 bash "$script" 2>&1)"
+missing_status=$?
+public_output="$(QDRANT_API_KEY_FILE="$scratch/key" QDRANT_DATA_DIR="$scratch/data" QDRANT_BIND_IP=0.0.0.0 bash "$script" 2>&1)"
+public_status=$?
+set -e
+test "$missing_status" -ne 0
+test "$public_status" -ne 0
+[[ "$missing_output" == *QDRANT_API_KEY_FILE* ]]
+[[ "$public_output" == *QDRANT_BIND_IP* ]]
+```
+- [ ] Measure p50/p95 and peak CPU/RAM/disk/network on clients and Qdrant for capture, extraction, E5, store, recall and replay; count Sol/Sonnet calls, tokens and cost. Compare measured values with 100 ms, 1,000 ms, 256 MiB, 4 calls, 5 candidates and 500 tokens. Base capacity advice on measurements, not invented RAM floor.
+- [ ] Remove opt-in for a fresh session; verify claude-mem default returns for that project while Mem0 outbox/candidates remain inspectable and no automatic sync occurs. Re-run product `npm test`, operational E2E and security gate; dispatch `final_reviewer_sol` with `cobertura-de-testes` and `seguranca` lenses.
+- [ ] Issue release ruling: block on any critical identity, attribution, time, precedence, human-rule or isolation failure; require at least one documented prospective task improved by memory and no material harm before recommending opt-in. Preserve reports/commits locally. Do not push, merge, publish or bump version.
