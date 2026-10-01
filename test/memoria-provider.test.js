@@ -300,6 +300,27 @@ test('autorização posterior bloqueia DNS público antes de ler chave e entrega
   assert.equal(reads, 1);
 });
 
+test('mudança de config ou trust durante DNS bloqueia antes de ler chave', async (t) => {
+  const { root, stateRoot } = await fixture(t);
+  await putConfig(root);
+  const session = await initializeSession(root, 'race', options(stateRoot));
+  const tuple = { version: 1, projectRoot: session.projectRoot, projectId: session.projectId,
+    url: session.destination.url, collection: session.destination.collection,
+    apiKeyEnv: session.destination.apiKeyEnv };
+  await writeLocalTrust(session.stateDir, tuple);
+  let reads = 0;
+  const readSecret = () => { reads++; return 'fixture-key'; };
+  const configChanged = await authorizeCurrentDestination(root, 'race', readSecret, { stateRoot,
+    lookup: async () => { await putConfig(root, config('changed')); return ['10.1.2.3']; } });
+  assert.deepEqual(configChanged, { kind: 'blocked', reason: 'session_changed' });
+  await putConfig(root);
+  const trustChanged = await authorizeCurrentDestination(root, 'race', readSecret, { stateRoot,
+    lookup: async () => { await writeLocalTrust(session.stateDir, { ...tuple, collection: 'changed' });
+      return ['10.1.2.3']; } });
+  assert.deepEqual(trustChanged, { kind: 'blocked', reason: 'trust_changed' });
+  assert.equal(reads, 0);
+});
+
 test('ativação só persiste trust após preflight e revalida config antes do segredo', async (t) => {
   const { root, stateRoot } = await fixture(t);
   await putConfig(root);
