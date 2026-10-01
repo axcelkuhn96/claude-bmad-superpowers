@@ -273,6 +273,9 @@ def execute(request: dict, client, state: Path) -> dict:
 
 
 def main() -> int:
+    os.environ['OMP_NUM_THREADS'] = '2'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
     request = json.loads(sys.stdin.readline())
     state = Path(os.environ['CBS_MEMORIA_STATE']).resolve()
     os.environ['MEM0_DIR'] = str(state / 'mem0')

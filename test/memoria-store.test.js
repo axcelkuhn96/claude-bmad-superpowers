@@ -87,6 +87,30 @@ test('bridge reauthorizes every operation and never serializes the key', async (
   assert.equal(JSON.stringify(requests).includes('private-secret'), false);
 });
 
+test('bridge caps numerical threads in the Python child without changing parent environment', async () => {
+  const names = ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'];
+  const previous = Object.fromEntries(names.map(name => [name, process.env[name]]));
+  try {
+    for (const name of names) process.env[name] = '64';
+    const result = await runBridgeOperation('cwd', 's', { op: 'find', projectId: 'p', externalId: 'x' }, () => '', {
+      resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir: '/tmp/state', destination: { collection: 'c' } }),
+      authorize: async () => ({ kind: 'authorized', key: 'private-secret', connection: {} }),
+      run: async (_python, _script, _request, env) => {
+        assert.deepEqual(names.map(name => env[name]), ['2', '1', '1']);
+        assert.deepEqual(names.map(name => process.env[name]), ['64', '64', '64']);
+        return { kind: 'items', items: [] };
+      },
+    });
+    assert.equal(result.kind, 'items');
+    assert.deepEqual(names.map(name => process.env[name]), ['64', '64', '64']);
+  } finally {
+    for (const name of names) {
+      if (previous[name] === undefined) delete process.env[name];
+      else process.env[name] = previous[name];
+    }
+  }
+});
+
 test('search derives project identity from frozen session', async () => {
   const requests = [];
   const options = {

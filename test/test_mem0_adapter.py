@@ -1,6 +1,8 @@
 import importlib.util
+import io
 import math
 import os
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,61 @@ spec.loader.exec_module(adapter)
 
 
 class AdapterTest(unittest.TestCase):
+    def test_e5_passes_bounded_options_to_onnx_without_loading_model(self):
+        sessions = []
+        class Options:
+            def __init__(self):
+                self.entries = {}
+            def add_session_config_entry(self, name, value):
+                self.entries[name] = value
+        class Session:
+            def __init__(self, model, *, sess_options, providers):
+                sessions.append((model, sess_options, providers))
+            def get_inputs(self):
+                return []
+        tokenizer = SimpleNamespace(enable_truncation=lambda **kwargs: None)
+        fake_ort = SimpleNamespace(SessionOptions=Options, InferenceSession=Session,
+                                   ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL='sequential'))
+        fake_tokenizers = SimpleNamespace(Tokenizer=SimpleNamespace(from_file=lambda path: tokenizer))
+        with patch.dict(sys.modules, {'numpy': SimpleNamespace(), 'onnxruntime': fake_ort,
+                                      'tokenizers': fake_tokenizers}), \
+             patch.dict(os.environ, {'CBS_MEMORIA_MODEL': '/tmp/model.onnx',
+                                     'CBS_MEMORIA_TOKENIZER': '/tmp/tokenizer.json'}), \
+             patch.object(adapter, '_digest', side_effect=[adapter.MODEL_SHA256, adapter.TOKENIZER_SHA256]):
+            adapter.E5Embedder()
+        self.assertEqual(len(sessions), 1)
+        model, options, providers = sessions[0]
+        self.assertEqual(model, '/tmp/model.onnx')
+        self.assertEqual((options.intra_op_num_threads, options.inter_op_num_threads,
+                          options.execution_mode), (2, 1, 'sequential'))
+        self.assertEqual(options.entries, {'session.intra_op.allow_spinning': '0',
+                                           'session.inter_op.allow_spinning': '0'})
+        self.assertEqual(providers, ['CPUExecutionProvider'])
+
+    def test_direct_entry_caps_inherited_threads_before_sdk_import(self):
+        values_at_import = []
+        class FakeQdrantModule:
+            def __getattr__(self, name):
+                if name != 'QdrantClient':
+                    raise AttributeError(name)
+                values_at_import.append(tuple(os.environ[key] for key in
+                    ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')))
+                return lambda **kwargs: SimpleNamespace(close=lambda: None)
+        inherited = {'OMP_NUM_THREADS': '64', 'OPENBLAS_NUM_THREADS': '64',
+                     'MKL_NUM_THREADS': '64', 'CBS_MEMORIA_STATE': '/tmp/state',
+                     'CBS_MEMORIA_API_KEY': 'private-secret'}
+        output = io.StringIO()
+        with patch.dict(os.environ, inherited), patch.dict(sys.modules, {'qdrant_client': FakeQdrantModule()}), \
+             patch.object(sys, 'stdin', io.StringIO('{"connection": {}}\n')), \
+             patch.object(sys, 'stdout', output), \
+             patch.object(adapter, 'PinnedTransport', return_value=SimpleNamespace(close=lambda: None)), \
+             patch.object(adapter, 'execute', return_value={'kind': 'items', 'items': []}):
+            self.assertEqual(adapter.main(), 0)
+            self.assertEqual(tuple(os.environ[key] for key in
+                ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')), ('2', '1', '1'))
+        self.assertEqual(values_at_import, [('2', '1', '1')])
+        self.assertNotIn('private-secret', output.getvalue())
+
     def test_e5_bounds_onnx_threads_and_returns_normalized_384d_vector(self):
         if not os.environ.get('CBS_MEMORIA_MODEL') or not os.environ.get('CBS_MEMORIA_TOKENIZER'):
             self.skipTest('pinned E5 artifacts not supplied')

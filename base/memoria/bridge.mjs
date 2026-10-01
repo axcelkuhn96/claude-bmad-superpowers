@@ -48,7 +48,8 @@ export async function runBridgeOperation(cwd, sessionId, operation, readSecret, 
   if (auth.kind !== 'authorized') return auth;
   const request = { ...operation, collection: resolution.destination.collection, connection: auth.connection };
   const env = { ...runtimeEnvironment(state), CBS_MEMORIA_STATE: state,
-    CBS_MEMORIA_MODEL: model, CBS_MEMORIA_TOKENIZER: tokenizer, CBS_MEMORIA_API_KEY: auth.key };
+    CBS_MEMORIA_MODEL: model, CBS_MEMORIA_TOKENIZER: tokenizer, CBS_MEMORIA_API_KEY: auth.key,
+    OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1', MKL_NUM_THREADS: '1' };
   return (options.run ?? runPython)(path.join(state, 'runtime', 'bin', 'python'), script, request, env);
 }
 
