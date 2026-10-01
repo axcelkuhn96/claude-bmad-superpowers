@@ -1,6 +1,8 @@
 import importlib.util
-from pathlib import Path
+import math
+import os
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,6 +13,22 @@ spec.loader.exec_module(adapter)
 
 
 class AdapterTest(unittest.TestCase):
+    def test_e5_bounds_onnx_threads_and_returns_normalized_384d_vector(self):
+        if not os.environ.get('CBS_MEMORIA_MODEL') or not os.environ.get('CBS_MEMORIA_TOKENIZER'):
+            self.skipTest('pinned E5 artifacts not supplied')
+        embedder = adapter.E5Embedder()
+        options = embedder.session.get_session_options()
+        self.assertEqual(options.intra_op_num_threads, 2)
+        self.assertEqual(options.inter_op_num_threads, 1)
+        import onnxruntime as ort
+        self.assertEqual(options.execution_mode, ort.ExecutionMode.ORT_SEQUENTIAL)
+        self.assertEqual(options.get_session_config_entry('session.intra_op.allow_spinning'), '0')
+        self.assertEqual(options.get_session_config_entry('session.inter_op.allow_spinning'), '0')
+        vector = embedder.embed('Uma memória curta.', 'search')
+        self.assertEqual(len(vector), 384)
+        self.assertTrue(all(math.isfinite(value) for value in vector))
+        self.assertAlmostEqual(math.sqrt(sum(value * value for value in vector)), 1.0, places=5)
+
     def test_pin_rejects_other_destination_before_transport(self):
         pin = {'url': 'https://qdrant.fixture.invalid:6333/', 'hostname': 'qdrant.fixture.invalid',
                'address': '127.0.0.1', 'port': 6333, 'protocol': 'https:', 'servername': 'qdrant.fixture.invalid'}

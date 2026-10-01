@@ -93,7 +93,13 @@ class E5Embedder:
             raise ValueError('embedding_fingerprint_mismatch')
         self.tokenizer = Tokenizer.from_file(str(tokenizer))
         self.tokenizer.enable_truncation(max_length=512)
-        self.session = ort.InferenceSession(str(model), providers=['CPUExecutionProvider'])
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 2
+        options.inter_op_num_threads = 1
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.add_session_config_entry('session.intra_op.allow_spinning', '0')
+        options.add_session_config_entry('session.inter_op.allow_spinning', '0')
+        self.session = ort.InferenceSession(str(model), sess_options=options, providers=['CPUExecutionProvider'])
         self.input_names = {item.name for item in self.session.get_inputs()}
 
     def embed(self, text: str, memory_action: str = 'add') -> list[float]:
