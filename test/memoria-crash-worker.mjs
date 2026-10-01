@@ -72,6 +72,7 @@ const result = await withProjectLock(path.join(root, 'ledger-state'), () => reco
     try { fs.writeSync(fd, JSON.stringify({ sdkId: proof.sdkId, status: proof.status })); fs.fsyncSync(fd); }
     finally { fs.closeSync(fd); }
     crash('after_ack');
+    return { kind: 'acked', operationId: id };
   },
 }));
 fs.writeSync(1, JSON.stringify(result) + '\n');

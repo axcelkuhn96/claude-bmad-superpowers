@@ -44,12 +44,25 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   catch { return blocked('missing_transcript'); }
   if (!stat.isFile() || stat.uid !== process.getuid()) return blocked('unsafe_transcript');
   const outbox = createOutbox(session.stateDir);
-  const { queuedEnd } = await outbox.cursor(cli, payload.session_id);
-  const parsed = await parsePersistedSlice({ cli, transcriptPath, start: queuedEnd,
-    sessionId: payload.session_id });
-  if (parsed.lastCompleteByte === queuedEnd) return { kind: 'no_complete_bytes', queuedEnd };
-  const sliceHash = createHash('sha256').update(parsed.completeBytes).digest('hex');
-  return outbox.enqueueCheckpoint({ cli, sessionId: payload.session_id, start: queuedEnd,
-    end: parsed.lastCompleteByte, sliceHash, messages: parsed.messages },
-  { projectId: session.projectId, policyVersion: POLICY_VERSION });
+  let { queuedEnd } = await outbox.cursor(cli, payload.session_id);
+  let last = { kind: 'no_complete_bytes', queuedEnd };
+  while (queuedEnd < stat.size) {
+    let parsed;
+    try {
+      parsed = await parsePersistedSlice({ cli, transcriptPath, start: queuedEnd,
+        sessionId: payload.session_id, expectedFile: stat });
+    } catch (error) {
+      if (['oversized_transcript_record', 'unsafe_transcript', 'transcript_session_mismatch'].includes(error.message) ||
+          error.code === 'ELOOP') return blocked(error.code === 'ELOOP' ? 'unsafe_transcript' : error.message);
+      throw error;
+    }
+    if (parsed.lastCompleteByte === queuedEnd) return last;
+    const sliceHash = createHash('sha256').update(parsed.completeBytes).digest('hex');
+    last = await outbox.enqueueCheckpoint({ cli, sessionId: payload.session_id, start: queuedEnd,
+      end: parsed.lastCompleteByte, sliceHash, messages: parsed.messages },
+    { projectId: session.projectId, policyVersion: POLICY_VERSION });
+    if (last.kind !== 'queued' && last.kind !== 'acked') return last;
+    queuedEnd = parsed.lastCompleteByte;
+  }
+  return last;
 }

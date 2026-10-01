@@ -14,7 +14,7 @@ test('remote write before local ACK is reconciled without another SDK add', asyn
   const result = await reconcileStore(operation, {
     findRemote: async () => remote,
     addViaSdk: async () => { adds++; throw new Error('duplicate write'); },
-    ackLocal: async (externalId, proof) => { acks.push({ externalId, proof }); },
+    ackLocal: async (externalId, proof) => { acks.push({ externalId, proof }); return { kind: 'acked', operationId: externalId }; },
   });
   assert.deepEqual(result, { kind: 'stored', externalId: operation.externalId, sdkId: 'sdk-7', qdrantId: 'q-7', verified: true });
   assert.equal(adds, 0);
@@ -32,7 +32,14 @@ test('verified remote state remains pending without a successful local ACK', asy
     assert.notEqual((await ledger.read(operation.externalId)).status, 'acked');
     assert.equal((await reconcileStore(operation, { ...deps, ackLocal: async () => { throw new Error('disk full'); } })).kind, 'pending');
     assert.notEqual((await ledger.read(operation.externalId)).status, 'acked');
-    assert.equal((await reconcileStore(operation, { ...deps, ackLocal: async () => {} })).kind, 'stored');
+    assert.deepEqual(await reconcileStore(operation, { ...deps, ackLocal: async () => ({ kind: 'blocked', reason: 'missing_operation' }) }),
+      { kind: 'pending', reason: 'local_ack_unconfirmed' });
+    assert.notEqual((await ledger.read(operation.externalId)).status, 'acked');
+    assert.equal((await reconcileStore(operation, { ...deps, ackLocal: async () => ({ kind: 'acked', operationId: 'other' }) })).kind,
+      'pending');
+    assert.equal((await reconcileStore(operation, { ...deps, ackLocal: async () => undefined })).kind,
+      'pending');
+    assert.equal((await reconcileStore(operation, { ...deps, ackLocal: async () => ({ kind: 'acked', operationId: operation.externalId }) })).kind, 'stored');
     assert.equal((await ledger.read(operation.externalId)).status, 'acked');
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
@@ -50,7 +57,7 @@ test('canonical persists before activation and a late pending never replaces it'
     addViaSdk: async () => { rows.push({ sdkId: 'uuid-b', qdrantId: 'uuid-b', externalId: op.externalId, projectId: 'p', sessionId: 's', metadata: op.metadata, status: 'pending', text: op.text }); },
     activateViaSdk: async (id) => { activates++; assert.equal((await ledger.read(op.externalId)).canonicalId, id); rows.find(r => r.sdkId === id).status = 'active'; },
     readRemote: async (id) => rows.find(r => r.sdkId === id),
-    ackLocal: async () => {},
+    ackLocal: async id => ({ kind: 'acked', operationId: id }),
   };
   assert.equal((await reconcileStore(op, deps)).kind, 'stored');
   rows.push({ sdkId: 'uuid-a', qdrantId: 'uuid-a', externalId: op.externalId, projectId: 'p', sessionId: 's', metadata: op.metadata, status: 'pending', text: op.text });
@@ -154,6 +161,9 @@ test('external ID depends on source slice and policy', () => {
   assert.equal(externalIdFor(source), externalIdFor({ ...source }));
   assert.notEqual(externalIdFor(source), externalIdFor({ ...source, start: 1 }));
   assert.notEqual(externalIdFor(source), externalIdFor({ ...source, policyVersion: 'v2' }));
+  assert.notEqual(externalIdFor({ ...source, candidateKey: 'fact-0' }), externalIdFor({ ...source, candidateKey: 'fact-1' }));
+  assert.equal(externalIdFor({ ...source, candidateKey: 'fact-0' }), externalIdFor({ ...source, candidateKey: 'fact-0' }));
+  assert.throws(() => externalIdFor({ ...source, candidateKey: '' }), /invalid_source_identity/);
 });
 
 test('project lock serializes independent writer processes', async (t) => {

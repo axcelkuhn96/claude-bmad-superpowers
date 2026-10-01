@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { constants } from 'node:fs';
 
 export const POLICY_VERSION = 'native-v1';
 const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -60,18 +61,24 @@ function codexMessage(row, directUser) {
     timestamp: row.timestamp, nativeSessionId: null };
 }
 
-export async function parsePersistedSlice({ cli, transcriptPath, start = 0, end, sessionId }) {
+export async function parsePersistedSlice({ cli, transcriptPath, start = 0, end, sessionId, expectedFile }) {
   if (!['claude', 'codex'].includes(cli) || typeof transcriptPath !== 'string' ||
       !Number.isSafeInteger(start) || start < 0 || (end !== undefined &&
       (!Number.isSafeInteger(end) || end < start)) || typeof sessionId !== 'string' || !sessionId) {
     throw new Error('invalid_transcript_request');
   }
-  const handle = await fs.open(transcriptPath, 'r');
+  const before = await fs.lstat(transcriptPath);
+  if (!before.isFile() || (process.getuid && before.uid !== process.getuid()) ||
+      (expectedFile && (before.dev !== expectedFile.dev || before.ino !== expectedFile.ino))) {
+    throw new Error('unsafe_transcript');
+  }
+  const handle = await fs.open(transcriptPath, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = await handle.stat();
-    if (!stat.isFile() || (process.getuid && stat.uid !== process.getuid())) throw new Error('unsafe_transcript');
-    const limit = Math.min(end ?? stat.size, stat.size);
-    if (limit - start > 4 * 1024 * 1024) throw new Error('transcript_slice_too_large');
+    if (!stat.isFile() || (process.getuid && stat.uid !== process.getuid()) ||
+        stat.dev !== before.dev || stat.ino !== before.ino) throw new Error('unsafe_transcript');
+    const maxWindow = 4 * 1024 * 1024;
+    const limit = Math.min(end ?? stat.size, stat.size, start + maxWindow);
     const bytes = Buffer.alloc(Math.max(0, limit - start));
     let read = 0;
     while (read < bytes.length) {
@@ -80,6 +87,9 @@ export async function parsePersistedSlice({ cli, transcriptPath, start = 0, end,
       read += result.bytesRead;
     }
     const parsed = readCompleteJsonl(bytes.subarray(0, read), start);
+    if (parsed.lastCompleteByte === start && stat.size > start + maxWindow - 1) {
+      throw new Error('oversized_transcript_record');
+    }
     let directUser = false;
     if (cli === 'codex') {
       let first = parsed.records[0]?.value;
@@ -93,8 +103,10 @@ export async function parsePersistedSlice({ cli, transcriptPath, start = 0, end,
         }
       }
       const meta = first?.type === 'session_meta' ? first.payload : null;
-      directUser = meta?.source === 'exec' && meta?.thread_source === 'user' &&
-        (meta.session_id === sessionId || meta.id === sessionId);
+      if (meta && ((meta.session_id && meta.session_id !== sessionId) ||
+          (meta.id && meta.id !== sessionId))) throw new Error('transcript_session_mismatch');
+      directUser = ['exec', 'vscode'].includes(meta?.source) && meta?.thread_source === 'user' &&
+        meta?.session_id === sessionId && meta?.id === sessionId;
     }
     const messages = [];
     for (const record of parsed.records) {
@@ -105,6 +117,9 @@ export async function parsePersistedSlice({ cli, transcriptPath, start = 0, end,
       messages.push({ ...mapped, cli, sessionId, start: record.start, end: record.end,
         policyVersion: POLICY_VERSION });
     }
-    return { messages, lastCompleteByte: parsed.lastCompleteByte, completeBytes: bytes.subarray(0, parsed.lastCompleteByte - start) };
+    const after = await fs.lstat(transcriptPath);
+    if (!after.isFile() || after.dev !== stat.dev || after.ino !== stat.ino) throw new Error('unsafe_transcript');
+    return { messages, lastCompleteByte: parsed.lastCompleteByte,
+      completeBytes: bytes.subarray(0, parsed.lastCompleteByte - start) };
   } finally { await handle.close(); }
 }

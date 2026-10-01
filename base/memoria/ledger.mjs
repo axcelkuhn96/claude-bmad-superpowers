@@ -13,8 +13,14 @@ export function externalIdFor(source) {
       source.start < 0 || source.end <= source.start || !/^[a-f0-9]{64}$/.test(source.sliceHash ?? '')) {
     throw new Error('invalid_source_identity');
   }
-  return `src-${hash(JSON.stringify([source.projectId, source.originCli, source.sessionId,
-    source.start, source.end, source.sliceHash, source.policyVersion]))}`;
+  if (source.candidateKey !== undefined &&
+      (typeof source.candidateKey !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(source.candidateKey))) {
+    throw new Error('invalid_source_identity');
+  }
+  const identity = [source.projectId, source.originCli, source.sessionId,
+    source.start, source.end, source.sliceHash, source.policyVersion];
+  if (source.candidateKey !== undefined) identity.push(source.candidateKey);
+  return `src-${hash(JSON.stringify(identity))}`;
 }
 
 export function createLedger(stateDir, writerId) {
@@ -177,7 +183,8 @@ export async function reconcileStore(operation, deps) {
     }
     if (!valid(proof, operation, 'active')) return pending('remote_unverified');
     if (typeof deps.ackLocal !== 'function') return pending('ack_required');
-    await deps.ackLocal(operation.externalId, proof);
+    const ack = await deps.ackLocal(operation.externalId, proof);
+    if (ack?.kind !== 'acked' || ack.operationId !== operation.externalId) return pending('local_ack_unconfirmed');
     if (ledger) { local.status = 'acked'; local.lastError = null; await ledger.save(local); }
     return { kind: 'stored', externalId: operation.externalId, sdkId: proof.sdkId,
       qdrantId: proof.qdrantId, verified: true };
