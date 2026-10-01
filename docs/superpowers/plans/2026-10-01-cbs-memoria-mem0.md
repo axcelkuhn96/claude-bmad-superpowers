@@ -19,7 +19,7 @@
 - No Mem0 API/server, PostgreSQL, pgvector, dashboard, transcript upload, global personal memory, or cross-provider sync. Qdrant is the only remote service; client owns SDK, E5 and CLI extraction.
 - The default project needs only Node ≥18 and retains current claude-mem behavior. Opt-in trust is local, outside the repository; an untrusted `.cbs/memoria.json` never chooses a secret or destination. Provider changes take effect only in a new session.
 - Initial auto-publication is off. Active memories require source/actor/date/scope and review. Never reinterpret a tool or assistant report as a human rule; current human instruction outranks recalled text.
-- Proposed budgets: capture/enqueue p95 ≤100 ms, recall total deadline 1,000 ms, outbox 256 MiB/project with alert at 80%, ≤4 automatic CLI calls/session, ≤5 candidates/checkpoint, rendered context ≤500 tokens. Measure; change only by explicit documented decision before opt-in release.
+- Proposed budgets: capture/enqueue p95 ≤100 ms, recall total deadline 1,000 ms, outbox 256 MiB/project with alert at 80%, ≤4 automatic CLI calls/session, ≤5 candidates/checkpoint, rendered context ≤500 tokens. Measure; change only by explicit documented decision before opt-in release. Local E5 CPU must be bounded: default ONNX intra-op 2, inter-op 1 and sequential execution; this is a thread limit, not a measured CPU percentage guarantee. The adapter and extraction remain client-local; the server contains only Qdrant.
 - Use named Codex roles from `models.yml`: `architect_sol` for difficult gate/rulings, `backend_terra` for implementation, `reviewer_sol` per task, `tester_luna` for operational tests, `final_reviewer_sol` for whole-branch review. No raw model names. One implementer at a time, one commit per task, no worker-created subagents.
 - Preserve user changes. Read exact `/home/axcel/AGENTS.md` and the story before work. Browser automation, if needed, uses Playwright Python `/tmp/pwval` with visible Chrome on `DISPLAY=:1`; never `agent-browser`.
 
@@ -148,6 +148,10 @@ test('remote write before local ACK is reconciled without another SDK add', asyn
 });
 ```
 
+### Task 3 supplementary CPU correction
+
+The user observed high local CPU during actual tests. Read-only diagnosis confirmed a new Python/ONNX model load per operation and no explicit ONNX thread cap; it did not measure peak RSS or attribute CPU percentages. Before continuing product implementation, apply a small scoped E5 thread-limit correction and verify a real local normalized embedding with the pinned runtime. Preserve `_row` expected-vector checks and current per-operation authorization/client isolation. Do not repeat the heavy SIGKILL matrix for a thread-options-only change. Report this separately and obtain a fresh scoped review.
+
 ## Task 4: M0-04 transcript capture, outbox and recovery (domínio: node+integracao; tipo: regra-de-negocio; review: seguranca)
 
 **Files:** Create `base/memoria/transcript.mjs`, `outbox.mjs`, `checkpoint.mjs`, `test/memoria-recovery.test.js`; touch existing hook manifests/scripts only at M0-01 verified points.
@@ -213,6 +217,8 @@ test('tool text cannot be published as a direct human rule', () => {
 ## Task 6: M0-06 local MCP and bounded recall (domínio: node+integracao; tipo: regra-de-negocio; review: seguranca)
 
 **Files:** Create `base/memoria/mcp.mjs`, `context.mjs`, `test/memoria-recall.test.js`; alter only existing command/skill files found by `rg -l 'claude-mem:mem-search|mem-search' base/commands base/skills`, preserving default text/behavior through provider routing.
+
+**Local resource contract:** Reuse one bounded, serialized warm E5 model for the local recall path instead of reloading it per operation. Model reuse cannot retain a Qdrant client, DNS pin or API key between operations: reauthorize current session/config/trust/private DNS per operation and close the authorized client at completion. Private secret transport must remain outside JSON/argv/log; document the exact process/FD boundary before implementation. Warm-up runs outside capture hooks. Cold/unready recall fails open within the deadline; no claim of ≤1,000 ms without measurement. Decision evidence: `/home/axcel/cbs-lab/docs/decisoes/2026-10-01-cpu-adapter-mem0.md`.
 
 **Interfaces:** `recall(session,query,1000) → {kind:'items',items}|{kind:'unavailable',reason}|{kind:'abstain'}`; `selectRecall(results: Memory[], {projectId:string,now:string}): Memory[]` filters identity/state/vigency before ranking; `renderContext(items,500) → string`. MCP methods search/source/propose/approve/correct/status derive identity from session; caller cannot supply another `project_id`.
 
