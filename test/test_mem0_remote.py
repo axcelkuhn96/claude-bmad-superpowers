@@ -8,6 +8,7 @@ import secrets
 import sys
 import tempfile
 import unittest
+import uuid
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -84,6 +85,13 @@ class RemoteSDKTest(unittest.TestCase):
                              'superseded')
             self.assertEqual(adapter.execute({**revised, 'op': 'read', 'sdkId': correction['sdkId']}, client, state)['item']['status'],
                              'active')
+            point = client.retrieve(collection, ids=[correction['sdkId']], with_payload=True, with_vectors=True)[0]
+            client.update_vectors(collection, points=[models.PointVectors(id=correction['sdkId'], vector=[0.0] * 384)])
+            with self.assertRaisesRegex(ValueError, 'remote_vector'):
+                adapter.execute({**revised, 'op': 'read', 'sdkId': correction['sdkId']}, client, state)
+            client.update_vectors(collection, points=[models.PointVectors(id=correction['sdkId'], vector=point.vector)])
+            self.assertEqual(adapter.execute({**revised, 'op': 'read', 'sdkId': correction['sdkId']}, client, state)['item']['status'],
+                             'active')
             personal = {**base, 'externalId': 'source-personal-s3-policy1'}
             private = adapter.execute({**personal, 'op': 'add', 'sessionId': 's3',
                                        'text': 'My private release note',
@@ -97,6 +105,17 @@ class RemoteSDKTest(unittest.TestCase):
             client.delete_payload(collection_name=collection, keys=['owner_id'], points=[private['sdkId']])
             self.assertNotIn(private['sdkId'], [row['sdkId'] for row in adapter.execute(
                 {**personal, 'op': 'search', 'query': 'private release note'}, client, state)['items']])
+            crowd_text = 'release review'
+            crowd_vector = adapter.E5Embedder().embed(crowd_text, 'add')
+            crowd = []
+            for index in range(25):
+                payload = {**point.payload, 'data': crowd_text, 'status': 'active',
+                           'source_record_id': f'crowd-{index}', 'scope': 'personal', 'owner_id': 'other-owner'}
+                crowd.append(models.PointStruct(id=str(uuid.uuid4()), vector=crowd_vector, payload=payload))
+            client.upsert(collection, points=crowd)
+            visible = adapter.execute({**base, 'op': 'search', 'query': crowd_text}, client, state)['items']
+            self.assertIn(correction['sdkId'], [row['sdkId'] for row in visible])
+            self.assertTrue(all(row['metadata']['scope'] == 'project' for row in visible))
             self.assertEqual(adapter.NoGenerateLLM.calls, 0)
             self.assertFalse((home / '.mem0').exists())
         finally:

@@ -176,7 +176,8 @@ export async function reconcileStore(operation, deps) {
       proof = await deps.readRemote(canonicalId);
     }
     if (!valid(proof, operation, 'active')) return pending('remote_unverified');
-    if (deps.ackLocal) await deps.ackLocal(operation.externalId, proof);
+    if (typeof deps.ackLocal !== 'function') return pending('ack_required');
+    await deps.ackLocal(operation.externalId, proof);
     if (ledger) { local.status = 'acked'; local.lastError = null; await ledger.save(local); }
     return { kind: 'stored', externalId: operation.externalId, sdkId: proof.sdkId,
       qdrantId: proof.qdrantId, verified: true };

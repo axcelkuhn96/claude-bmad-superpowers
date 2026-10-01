@@ -156,16 +156,23 @@ def _memory(client, collection: str, state: Path, connection: dict):
     return Memory(config)
 
 
-def _row(raw: dict | None, client, collection: str) -> dict | None:
+def _row(raw: dict | None, client, collection: str, embedder) -> dict | None:
     if raw is None:
         return None
     metadata = raw.get('metadata') or {}
     identifier = raw['id']
     points = client.retrieve(collection, ids=[identifier], with_payload=True, with_vectors=True)
+    if 'expiration_date' in raw or 'expiration_date' in metadata or \
+            (points and 'expiration_date' in (points[0].payload or {})):
+        raise ValueError('remote_expiration_unsupported')
     if len(points) != 1 or points[0].id != identifier or not isinstance(points[0].vector, list) or len(points[0].vector) != 384:
         raise ValueError('remote_vector_unverified')
     if not all(math.isfinite(value) for value in points[0].vector):
         raise ValueError('remote_vector_invalid')
+    expected = embedder.embed(raw.get('memory', ''), 'add')
+    if len(expected) != 384 or not all(math.isclose(actual, wanted, rel_tol=1e-4, abs_tol=1e-4)
+                                      for actual, wanted in zip(points[0].vector, expected)):
+        raise ValueError('remote_vector_unverified')
     payload = points[0].payload or {}
     if payload.get('data') != raw.get('memory') or payload.get('user_id') != raw.get('user_id') or \
             payload.get('project_id') != raw.get('user_id') or payload.get('status') != metadata.get('status') or \
@@ -179,9 +186,10 @@ def _row(raw: dict | None, client, collection: str) -> dict | None:
 def _find(memory, client, collection: str, project: str, external: str) -> list[dict]:
     limit = 64
     while limit <= 2048:
-        rows = memory.get_all(filters={'user_id': project, 'source_record_id': external}, top_k=limit)['results']
+        rows = memory.get_all(filters={'user_id': project, 'source_record_id': external},
+                              top_k=limit, show_expired=True)['results']
         if len(rows) < limit:
-            return [_row(row, client, collection) for row in rows]
+            return [_row(row, client, collection, memory.embedding_model) for row in rows]
         limit *= 2
     raise ValueError('remote_inventory_saturated')
 
@@ -198,13 +206,13 @@ def execute(request: dict, client, state: Path) -> dict:
     if op == 'find':
         return {'kind': 'items', 'items': _find(memory, client, collection, project, external)}
     if op == 'read':
-        row = _row(memory.get(request['sdkId']), client, collection)
+        row = _row(memory.get(request['sdkId']), client, collection, memory.embedding_model)
         if row is not None and row['projectId'] != project:
             raise ValueError('project_mismatch')
         return {'kind': 'item', 'item': row}
     if op == 'add':
         metadata = request['metadata']
-        if metadata.get('status') or metadata.get('source_record_id') or metadata.get('project_id'):
+        if any(key in metadata for key in ('status', 'source_record_id', 'project_id', 'expiration_date')):
             raise ValueError('reserved_metadata')
         if metadata.get('scope') not in ('project', 'personal') or \
                 (metadata.get('scope') == 'personal' and not metadata.get('owner_id')):
@@ -222,33 +230,39 @@ def execute(request: dict, client, state: Path) -> dict:
         return {'kind': 'pending', 'sdkId': result['results'][0]['id']}
     if op == 'activate':
         identifier = request['sdkId']
-        row = _row(memory.get(identifier), client, collection)
+        row = _row(memory.get(identifier), client, collection, memory.embedding_model)
         if row is None or row['projectId'] != project or row['externalId'] != external:
             raise ValueError('canonical_mismatch')
         if row['status'] == 'pending':
             supersedes = row['metadata'].get('supersedes_id')
             if supersedes:
-                old = _row(memory.get(supersedes), client, collection)
+                old = _row(memory.get(supersedes), client, collection, memory.embedding_model)
                 if old is None or old['projectId'] != project or old['status'] not in ('active', 'superseded'):
                     raise ValueError('superseded_target_invalid')
                 if old['status'] == 'active':
                     memory.update(supersedes, metadata={'status': 'superseded'})
-                    old = _row(memory.get(supersedes), client, collection)
+                    old = _row(memory.get(supersedes), client, collection, memory.embedding_model)
                     if old['status'] != 'superseded':
                         raise ValueError('supersede_unverified')
             memory.update(identifier, metadata={'status': 'active'})
-        return {'kind': 'item', 'item': _row(memory.get(identifier), client, collection)}
+        return {'kind': 'item', 'item': _row(memory.get(identifier), client, collection, memory.embedding_model)}
     if op == 'search':
-        result = memory.search(request['query'], filters={'user_id': project, 'status': 'active'}, top_k=20)
-        items = [_row(row, client, collection) for row in result['results']]
         now = datetime.now(timezone.utc)
-        return {'kind': 'items', 'items': [row for row in items if row['projectId'] == project and
+        limit = 20
+        while limit <= 2048:
+            result = memory.search(request['query'], filters={'user_id': project, 'status': 'active'}, top_k=limit)
+            items = [_row(row, client, collection, memory.embedding_model) for row in result['results']]
+            eligible = [row for row in items if row['projectId'] == project and
                 row['status'] == 'active' and row['metadata'].get('source') and row['metadata'].get('actor') and
                 row['metadata'].get('scope') in ('project', 'personal') and
                 (row['metadata']['scope'] == 'project' or (request.get('ownerId') and
                     row['metadata'].get('owner_id') == request['ownerId'])) and
                 (not row['metadata'].get('valid_from') or _time(row['metadata']['valid_from']) <= now) and
-                (not row['metadata'].get('valid_to') or now < _time(row['metadata']['valid_to']))]}
+                (not row['metadata'].get('valid_to') or now < _time(row['metadata']['valid_to']))]
+            if len(eligible) >= 20 or len(result['results']) < limit:
+                return {'kind': 'items', 'items': eligible[:20]}
+            limit *= 2
+        raise ValueError('remote_search_saturated')
     raise ValueError('unknown_operation')
 
 

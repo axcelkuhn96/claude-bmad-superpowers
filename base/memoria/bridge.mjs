@@ -92,8 +92,10 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
   return response;
 }
 
-export async function searchProject(cwd, sessionId, projectId, query, readSecret, options = {}) {
+export async function searchProject({ cwd, sessionId, query, projectId }, readSecret, options = {}) {
   if (typeof query !== 'string' || !query.trim()) return blocked('invalid_query');
-  return runBridgeOperation(cwd, sessionId, { op: 'search', projectId, query,
+  const resolution = await (options.resolve ?? resolveProject)(cwd, sessionId, options);
+  if (resolution.provider !== 'mem0' || (projectId && projectId !== resolution.projectId)) return blocked('project_mismatch');
+  return runBridgeOperation(cwd, sessionId, { op: 'search', projectId: resolution.projectId, query,
     ownerId: options.ownerId }, readSecret, options);
 }

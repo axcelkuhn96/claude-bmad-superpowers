@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createLedger, externalIdFor, reconcileStore, transferWriter, withProjectLock } from '../base/memoria/ledger.mjs';
-import { runBridgeOperation } from '../base/memoria/bridge.mjs';
+import { runBridgeOperation, searchProject } from '../base/memoria/bridge.mjs';
 
 test('remote write before local ACK is reconciled without another SDK add', async () => {
   const operation = { externalId: 'src-claude-s1-0-84-v1', projectId: 'p' };
@@ -19,6 +19,22 @@ test('remote write before local ACK is reconciled without another SDK add', asyn
   assert.deepEqual(result, { kind: 'stored', externalId: operation.externalId, sdkId: 'sdk-7', qdrantId: 'q-7', verified: true });
   assert.equal(adds, 0);
   assert.equal(acks.length, 1);
+});
+
+test('verified remote state remains pending without a successful local ACK', async () => {
+  const operation = { externalId: 'source-no-ack', projectId: 'p' };
+  const remote = { ...operation, sdkId: 'uuid-1', qdrantId: 'uuid-1', status: 'active' };
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-ledger-'));
+  try {
+    const ledger = createLedger(root, 'writer-a');
+    const deps = { ledger, findRemote: async () => [remote], readRemote: async () => remote };
+    assert.deepEqual(await reconcileStore(operation, deps), { kind: 'pending', reason: 'ack_required' });
+    assert.notEqual((await ledger.read(operation.externalId)).status, 'acked');
+    assert.equal((await reconcileStore(operation, { ...deps, ackLocal: async () => { throw new Error('disk full'); } })).kind, 'pending');
+    assert.notEqual((await ledger.read(operation.externalId)).status, 'acked');
+    assert.equal((await reconcileStore(operation, { ...deps, ackLocal: async () => {} })).kind, 'stored');
+    assert.equal((await ledger.read(operation.externalId)).status, 'acked');
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
 test('canonical persists before activation and a late pending never replaces it', async (t) => {
@@ -69,6 +85,33 @@ test('bridge reauthorizes every operation and never serializes the key', async (
   assert.equal(authorizations, 2);
   assert.equal(requests.length, 2);
   assert.equal(JSON.stringify(requests).includes('private-secret'), false);
+});
+
+test('search derives project identity from frozen session', async () => {
+  const requests = [];
+  const options = {
+    resolve: async () => ({ provider: 'mem0', projectId: 'frozen-project', stateDir: '/tmp/state', destination: { collection: 'c' } }),
+    authorize: async () => ({ kind: 'authorized', key: 'private-secret', connection: { url: 'http://localhost:6333/' } }),
+    run: async (_python, _script, request) => { requests.push(request); return { kind: 'items', items: [] }; },
+  };
+  assert.equal((await searchProject({ cwd: 'cwd', sessionId: 's', query: 'release' }, () => '', options)).kind, 'items');
+  assert.equal(requests[0].projectId, 'frozen-project');
+  assert.equal(requests[0].query, 'release');
+  assert.equal((await searchProject({ cwd: 'cwd', sessionId: 's', query: 'release', projectId: 'other' }, () => '', options)).kind, 'blocked');
+  assert.equal(requests.length, 1);
+});
+
+test('search blocks when session project changes between resolution and bridge', async () => {
+  let resolutions = 0;
+  let runs = 0;
+  const options = {
+    resolve: async () => ({ provider: 'mem0', projectId: ++resolutions === 1 ? 'initial' : 'changed',
+      stateDir: '/tmp/state', destination: { collection: 'c' } }),
+    authorize: async () => ({ kind: 'authorized', key: 'secret', connection: {} }),
+    run: async () => { runs++; return { kind: 'items', items: [] }; },
+  };
+  assert.equal((await searchProject({ cwd: 'cwd', sessionId: 's', query: 'fact' }, () => '', options)).kind, 'blocked');
+  assert.equal(runs, 0);
 });
 
 test('two corrections of the same version become a conflict', async (t) => {
