@@ -47,8 +47,12 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   }
   let stat;
   try { stat = await fs.lstat(transcriptPath); }
-  catch { return blocked('missing_transcript'); }
-  if (!stat.isFile() || stat.uid !== process.getuid()) return blocked('unsafe_transcript');
+  catch (error) {
+    if (error.code !== 'ENOENT' || event !== 'SessionStart') {
+      return blocked(error.code === 'ENOENT' ? 'missing_transcript' : 'unsafe_transcript');
+    }
+  }
+  if (stat && (!stat.isFile() || stat.uid !== process.getuid())) return blocked('unsafe_transcript');
   const checkout = event === 'SessionStart'
     ? await recordSessionCheckout(session, cli, payload.session_id, scope.activeRoot)
     : await readSessionCheckout(session.stateDir, cli, payload.session_id);
@@ -63,7 +67,7 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   const outbox = createOutbox(session.stateDir);
   let { queuedEnd } = await outbox.cursor(cli, payload.session_id);
   let last = { kind: 'no_complete_bytes', queuedEnd };
-  while (queuedEnd < stat.size) {
+  while (stat && queuedEnd < stat.size) {
     let parsed;
     try {
       parsed = await parsePersistedSlice({ cli, transcriptPath, start: queuedEnd,

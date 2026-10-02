@@ -341,6 +341,55 @@ test('two explicit launches bind interleaved native sessions once', async t => {
   assert.equal((await resolveBoundLaunch('forged', 'claude', { stateRoot })).reason, 'unbound');
 });
 
+test('native SessionStart binds before Claude creates its transcript, then Stop captures verified bytes', async t => {
+  const { dir, root, stateRoot } = await fixture(t);
+  await fs.mkdir(path.join(root, '.cbs'));
+  await fs.writeFile(path.join(root, '.cbs', 'memoria.json'), JSON.stringify({
+    provider: 'mem0', project_id: 'p',
+    qdrant: { url: 'https://qdrant.internal', collection: 'cbs-p', api_key_env: 'CBS_TEST_KEY' },
+    embedding: { model: 'multilingual-e5-small', dimension: 384,
+      fingerprint: `${RUNTIME_PINS.modelSha256}:${RUNTIME_PINS.tokenizerSha256}` },
+  }));
+  assert.equal((await applyNativeExclusion(root, { cli: 'claude', stateRoot })).kind, 'applied');
+  const current = await inspectConfiguration(root, { stateRoot });
+  await writeLocalTrust(current.stateDir, trustTuple(current));
+  const launch = await createLaunch(root, 'claude', { stateRoot });
+  assert.equal(launch.kind, 'created');
+  const transcriptPath = path.join(dir, 'native-session.jsonl');
+  const payload = { cwd: root, session_id: 'native-session', transcript_path: transcriptPath,
+    hook_event_name: 'SessionStart' };
+  const moduleUrl = new URL('../base/memoria/checkpoint.mjs', import.meta.url).href;
+  const script = `import { captureEvent } from ${JSON.stringify(moduleUrl)};
+process.stdout.write(JSON.stringify(await captureEvent(JSON.parse(process.argv[1]))));`;
+  const invoke = (event, token, sessionId = 'native-session', file = transcriptPath) => {
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script,
+      JSON.stringify({ cli: 'claude', event, payload: { ...payload, session_id: sessionId,
+        transcript_path: file, hook_event_name: event }, stateRoot })],
+    { encoding: 'utf8', env: { ...process.env, CBS_MEMORIA_LAUNCH_ID: token } });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout);
+  };
+  const first = invoke('SessionStart', launch.token);
+  assert.equal(first.kind, 'no_complete_bytes', JSON.stringify(first));
+  assert.equal((await resolveBoundLaunch(launch.token, 'claude', { stateRoot })).nativeSessionId, 'native-session');
+  await fs.copyFile(new URL('./fixtures/memoria-native-claude.jsonl', import.meta.url), transcriptPath);
+  assert.equal(invoke('Stop', launch.token).kind, 'queued');
+  assert.equal((await createOutbox(current.stateDir).pending()).length, 1);
+
+  const unsafe = await createLaunch(root, 'claude', { stateRoot });
+  const link = path.join(dir, 'unsafe-session.jsonl');
+  await fs.symlink(transcriptPath, link);
+  assert.equal(invoke('SessionStart', unsafe.token, 'unsafe-session', link).reason, 'unsafe_transcript');
+  assert.equal((await resolveBoundLaunch(unsafe.token, 'claude', { stateRoot })).reason, 'unbound');
+
+  const deferred = await createLaunch(root, 'claude', { stateRoot });
+  const lateLink = path.join(dir, 'deferred-session.jsonl');
+  assert.equal(invoke('SessionStart', deferred.token, 'deferred-session', lateLink).kind, 'no_complete_bytes');
+  await fs.symlink(transcriptPath, lateLink);
+  assert.equal(invoke('Stop', deferred.token, 'deferred-session', lateLink).reason, 'unsafe_transcript');
+  assert.equal((await createOutbox(current.stateDir).pending()).length, 1);
+});
+
 test('Codex worktrees own native config independently and share exclude safely', async t => {
   const { dir, root, stateRoot } = await fixture(t);
   const worktree = path.join(dir, 'worktree');
