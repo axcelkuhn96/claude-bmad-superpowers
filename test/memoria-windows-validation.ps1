@@ -7,17 +7,24 @@ param(
   [switch]$CheckDirectML
 )
 
-# Native Windows diagnostic only. It never activates Mem0 or changes user CLI configuration.
+# Native Windows fixture only. It never activates Mem0 or changes user CLI configuration.
 $ErrorActionPreference = 'Stop'
 if (Test-Path -LiteralPath $ReportPath) { throw 'ReportPath must be a new file' }
 $report = [ordered]@{
-  schema = 'cbs-mem0-windows-diagnostic-v1'
+  schema = 'cbs-mem0-windows-fixture-v2'
   status = 'BLOCKED_UNSUPPORTED'
   platform = [System.Environment]::OSVersion.Platform.ToString()
   controls = [ordered]@{}
 }
 function Record([string]$name, [string]$status, $evidence) {
-  $report.controls[$name] = [ordered]@{ status = $status; evidence = $evidence }
+  $normalized = switch ($status) {
+    'observed' { 'passed' }
+    'unproved' { 'missing_prerequisite' }
+    'unsupported' { 'blocked_missing_implementation' }
+    default { $status }
+  }
+  $report.controls[$name] = [ordered]@{ status = $normalized;
+    executed = ($normalized -in @('passed', 'failed')); evidence = $evidence }
 }
 function Save-Report {
   $parent = Split-Path -Parent $ReportPath
@@ -35,6 +42,13 @@ if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
 }
 
 Record 'native_platform' 'observed' @{ os = [System.Environment]::OSVersion.VersionString; powershell = $PSVersionTable.PSVersion.ToString() }
+Record 'toolchain' 'observed' @{
+  product_revision = (& git -C $ProductRoot rev-parse HEAD).Trim()
+  node = (& node --version).Trim()
+  git = (& git --version).Trim()
+  native_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $ProductRoot 'base/memoria/native.mjs')).Hash.ToLowerInvariant()
+  security_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $ProductRoot 'base/memoria/windows-security.mjs')).Hash.ToLowerInvariant()
+}
 $fixture = Join-Path $env:TEMP ('cbs-memoria-diagnostic-' + [guid]::NewGuid().ToString('N'))
 $child = $null
 $second = $null
@@ -111,11 +125,13 @@ const root = process.env.CBS_MEMORIA_WINDOWS_REPO;
 const local = name => import(pathToFileURL(path.join(root, 'base', 'memoria', name)).href);
 const { runtimePython, RUNTIME_PINS } = await local('runtime.mjs');
 const { activateProject, authorizeCurrentDestination } = await local('setup.mjs');
-const { applyNativeExclusion, verifyNativeCapture } = await local('native.mjs');
+const { applyNativeExclusion, verifyNativeCapture, restoreNativeExclusion } = await local('native.mjs');
 const { requestBroker } = await local('broker.mjs');
 const { identifyProject } = await local('project-id.mjs');
 const { inspectConfiguration, initializeSession, resolveProject } = await local('provider.mjs');
-const { createLaunch } = await local('launch.mjs');
+const { createLaunch, launchCli } = await local('launch.mjs');
+const { writeLocalTrust, readLocalTrust, trustTuple, authorizeDestination } = await local('trust.mjs');
+const { inspectWindowsPath } = await local('windows-security.mjs');
 const { createOutbox } = await local('outbox.mjs');
 const fixture = process.env.CBS_MEMORIA_WINDOWS_FIXTURE;
 const project = process.env.CBS_MEMORIA_WINDOWS_GIT_ROOT;
@@ -134,13 +150,50 @@ const pinnedSession = await resolveProject(project, 'fixture-optin', { stateRoot
 let secretRead = false;
 const untrustedAuthorization = await authorizeCurrentDestination(project, 'fixture-optin',
   () => { secretRead = true; return 'fixture-key'; }, { stateRoot });
-const nativeCapture = Object.fromEntries(await Promise.all(['claude', 'codex'].map(async cli =>
-  [cli, (await verifyNativeCapture(project, { cli, projectRoot: project })).reason])));
+const tuple = trustTuple(optinSelection);
+await writeLocalTrust(optinSelection.stateDir, tuple);
+const storedTrust = await readLocalTrust(optinSelection.stateDir);
+const trustAuthorization = authorizeDestination(optinSelection, storedTrust, () => 'fixture-only-key');
+const claudeConfig = path.join(project, '.claude', 'settings.local.json');
+await fs.mkdir(path.dirname(claudeConfig));
+await fs.writeFile(claudeConfig, JSON.stringify({ fixtureMarker: 7,
+  enabledPlugins: { 'claude-mem@thedotmack': true } }));
+const codexConfig = path.join(project, '.codex', 'config.toml');
+await fs.mkdir(path.dirname(codexConfig));
+await fs.writeFile(codexConfig, '[features]\nhooks = true\n');
+const native = {};
+for (const cli of ['claude', 'codex']) {
+  const options = { cli, projectRoot: optinSelection.projectRoot, stateRoot };
+  let applied, verified, launch, restored, changed;
+  try {
+    applied = await applyNativeExclusion(project, options);
+    verified = applied.kind === 'applied' ? await verifyNativeCapture(project, options) : null;
+    launch = verified?.kind === 'verified' ? await createLaunch(project, cli, { stateRoot }) : null;
+    if (cli === 'claude' && verified?.kind === 'verified') {
+      const config = JSON.parse(await fs.readFile(claudeConfig, 'utf8'));
+      config.enabledPlugins['claude-mem@thedotmack'] = true;
+      await fs.writeFile(claudeConfig, JSON.stringify(config));
+      changed = await restoreNativeExclusion(project, options);
+      config.enabledPlugins['claude-mem@thedotmack'] = false;
+      await fs.writeFile(claudeConfig, JSON.stringify(config));
+    }
+  } catch { applied ??= { kind: 'blocked', reason: 'fixture_exception' }; }
+  try { restored = await restoreNativeExclusion(project, options); }
+  catch { restored = { kind: 'blocked', reason: 'fixture_restore_exception' }; }
+  const after = cli === 'claude' ? JSON.parse(await fs.readFile(claudeConfig, 'utf8')) : null;
+  const codexAfter = cli === 'codex' ? await fs.readFile(codexConfig, 'utf8') : null;
+  native[cli] = { applied: applied.kind, applyReason: applied.reason,
+    verified: verified?.kind, verifyReason: verified?.reason,
+    launch: launch?.kind, launchReason: launch?.reason,
+    changedReason: changed?.reason, restored: restored?.kind, restoreReason: restored?.reason,
+    priorPreserved: cli === 'claude' ? after.fixtureMarker === 7 &&
+      after.enabledPlugins['claude-mem@thedotmack'] === true : codexAfter === '[features]\nhooks = true\n' };
+}
 let replay;
 try { await createOutbox(path.join(fixture, 'outbox-state')).pending(); replay = 'unexpected_success'; }
 catch (error) { replay = error.message; }
-const launch = Object.fromEntries(await Promise.all(['claude', 'codex'].map(async cli =>
-  [cli, (await createLaunch(project, cli, { stateRoot })).reason])));
+const operationalLaunch = (await launchCli(project, 'claude')).reason;
+const trustState = await inspectWindowsPath(path.join(optinSelection.stateDir, 'trust.json'));
 const gitInputs = Object.fromEntries(['ROOT', 'SUB', 'CASE', 'WORKTREE', 'JUNCTION']
   .map(name => [name, process.env['CBS_MEMORIA_WINDOWS_GIT_' + name]]).filter(([, value]) => value));
 const git = Object.fromEntries(await Promise.all(Object.entries(gitInputs)
@@ -148,52 +201,78 @@ const git = Object.fromEntries(await Promise.all(Object.entries(gitInputs)
 process.stdout.write(JSON.stringify({ platform: process.platform,
   runtime_path: runtimePython(fixture),
   activation: (await activateProject(fixture)).reason,
-  native_exclusion: (await applyNativeExclusion(fixture, { cli: 'codex' })).reason,
   broker: (await requestBroker({}, '')).reason, git,
   selection: { default: defaultSelection.provider, optin: optinSelection.provider,
     session: optinSession.provider, pinned: pinnedSession.provider,
     untrusted_authorization: untrustedAuthorization.reason, secret_read: secretRead },
-  native_capture: nativeCapture, replay, launch }));
+  trust: { stored: !!storedTrust, authorized: trustAuthorization.kind, acl: trustState.ok },
+  native, replay, operationalLaunch }));
 '@
   $guardJson = $guardCode | & node --input-type=module -
   if ($LASTEXITCODE -ne 0) { throw 'guard check failed' }
   $guard = $guardJson | ConvertFrom-Json
   $expectedPath = Join-Path $fixture 'runtime\Scripts\python.exe'
   $guardsHold = $guard.platform -eq 'win32' -and $guard.runtime_path -eq $expectedPath -and
-    $guard.activation -eq 'native_windows_unproved' -and $guard.native_exclusion -eq 'native_windows_unproved' -and
-    $guard.broker -eq 'native_windows_unproved'
-  Record 'production_windows_guards' $(if ($guardsHold) { 'unsupported' } else { 'unproved' }) @{
+    $guard.activation -eq 'native_windows_unproved' -and $guard.broker -eq 'native_windows_unproved' -and
+    $guard.operationalLaunch -eq 'native_windows_unproved'
+  Record 'production_windows_guards' $(if ($guardsHold) { 'blocked_missing_implementation' } else { 'failed' }) @{
     runtime_path_matches_windows = ($guard.runtime_path -eq $expectedPath)
-    activation = $guard.activation; native_exclusion = $guard.native_exclusion; broker = $guard.broker
+    activation = $guard.activation; operational_launch = $guard.operationalLaunch; broker = $guard.broker
   }
   $selectionOkay = $guard.selection.default -eq 'claude-mem' -and $guard.selection.optin -eq 'mem0' -and
     $guard.selection.session -eq 'mem0' -and $guard.selection.pinned -eq 'mem0' -and
     $guard.selection.untrusted_authorization -eq 'trust_changed' -and !$guard.selection.secret_read
-  Record 'production_default_optin_selection_fixture' $(if ($selectionOkay) { 'observed' } else { 'unproved' }) @{
+  Record 'production_default_optin_selection_fixture' $(if ($selectionOkay) { 'passed' } else { 'failed' }) @{
     default = $guard.selection.default; optin = $guard.selection.optin
     fresh_session = $guard.selection.session; pinned_session = $guard.selection.pinned
     untrusted_authorization = $guard.selection.untrusted_authorization
     untrusted_config_read_secret = $guard.selection.secret_read
-    production_activation = $guard.activation; trust_written = $false
+    production_activation = $guard.activation; trust_written = $guard.trust.stored
   }
-  $nativeGuardsHold = $guard.native_capture.claude -eq 'native_windows_unproved' -and
-    $guard.native_capture.codex -eq 'native_windows_unproved' -and
-    $guard.native_exclusion -eq 'native_windows_unproved' -and
-    $guard.activation -eq 'native_windows_unproved'
-  Record 'native_claude_codex_hooks_exclusion_trust' $(if ($nativeGuardsHold) { 'unsupported' } else { 'unproved' }) @{
-    claude_capture = $guard.native_capture.claude; codex_capture = $guard.native_capture.codex
-    exclusion = $guard.native_exclusion; activation = $guard.activation
-    claude_cli_available = [bool](Get-Command claude -ErrorAction SilentlyContinue)
-    codex_cli_available = [bool](Get-Command codex -ErrorAction SilentlyContinue)
-    native_cli_fixture_executed = $false; trust_authorized = $false
+  $trustOkay = $guard.trust.stored -and $guard.trust.acl -and $guard.trust.authorized -eq 'authorized'
+  Record 'production_private_trust_fixture' $(if ($trustOkay) { 'passed' } else { 'failed' }) @{
+    stored = $guard.trust.stored; acl_checked = $guard.trust.acl
+    exact_tuple_authorized_with_fixture_key = ($guard.trust.authorized -eq 'authorized')
+    remote_secret_or_network_used = $false
   }
-  $replayGuardsHold = $guard.replay -eq 'native_windows_unproved' -and
-    $guard.broker -eq 'native_windows_unproved' -and
-    $guard.launch.claude -eq 'native_windows_unproved' -and
-    $guard.launch.codex -eq 'native_windows_unproved'
-  Record 'native_outbox_replay_two_machines' $(if ($replayGuardsHold) { 'unsupported' } else { 'unproved' }) @{
+  foreach ($cli in 'claude','codex') {
+    $item = $guard.native.$cli
+    $okay = $item.applied -eq 'applied' -and $item.verified -eq 'verified' -and
+      $item.launch -eq 'created' -and $item.restored -eq 'restored' -and $item.priorPreserved
+    if ($cli -eq 'claude') { $okay = $okay -and $item.changedReason -eq 'native_config_changed' -and $item.priorPreserved }
+    $status = if ($okay) { 'passed' } elseif ($item.applyReason -eq 'unsupported_plugin') { 'missing_prerequisite' } else { 'failed' }
+    Record "native_${cli}_apply_verify_launch_restore" $status @{
+      applied = $item.applied; apply_reason = $item.applyReason; verified = $item.verified
+      verify_reason = $item.verifyReason; launch = $item.launch; launch_reason = $item.launchReason
+      changed_config_refusal = $item.changedReason; restored = $item.restored
+      restore_reason = $item.restoreReason; prior_value_preserved = $item.priorPreserved
+    }
+  }
+  foreach ($cli in 'claude','codex') {
+    $command = Get-Command $cli -ErrorAction SilentlyContinue
+    if (!$command) {
+      Record "native_${cli}_startup" 'missing_prerequisite' @{ reason = 'CLI not installed' }
+    } elseif ([string]$command.Source -like "$ProductRoot*") {
+      Record "native_${cli}_startup" 'failed' @{ reason = 'repository selected executable refused' }
+    } else {
+      try {
+        $versionText = (& $command.Source --version 2>&1 | Out-String).Trim()
+        $cleanVersion = $versionText -replace '[^A-Za-z0-9 ._+/-]', ''
+        Record "native_${cli}_startup" $(if ($LASTEXITCODE -eq 0) { 'passed' } else { 'failed' }) @{
+          version = $cleanVersion.Substring(0, [Math]::Min(120, $cleanVersion.Length))
+          executable_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $command.Source).Hash.ToLowerInvariant()
+          event_executed = $false
+        }
+      } catch { Record "native_${cli}_startup" 'failed' @{ error_type = $_.Exception.GetType().Name } }
+    }
+  }
+  Record 'native_cli_events' 'missing_prerequisite' @{
+    reason = 'Dedicated authenticated profile and interactive project trust required; no model/account call in unattended fixture'
+  }
+  $replayGuardsHold = $guard.replay -eq 'native_windows_unproved' -and $guard.broker -eq 'native_windows_unproved'
+  Record 'native_outbox_replay_two_machines' $(if ($replayGuardsHold) { 'blocked_missing_implementation' } else { 'failed' }) @{
     outbox_replay_precondition = $guard.replay; broker = $guard.broker
-    claude_launch = $guard.launch.claude; codex_launch = $guard.launch.codex
+    operational_launch = $guard.operationalLaunch
     durable_replay_executed = $false; second_machine_executed = $false
   }
   $git = $guard.git
@@ -201,16 +280,36 @@ process.stdout.write(JSON.stringify({ platform: process.platform,
     $git.WORKTREE.kind -eq 'git' -and $git.ROOT.projectRoot -eq $git.SUB.projectRoot -and
     $git.ROOT.projectRoot -eq $git.CASE.projectRoot -and $git.ROOT.projectRoot -eq $git.WORKTREE.projectRoot -and
     $git.ROOT.activeRoot -ne $git.WORKTREE.activeRoot
-  if ($junction) { $identityGood = $identityGood -and $git.JUNCTION.kind -eq 'git' -and $git.ROOT.projectRoot -eq $git.JUNCTION.projectRoot }
-  Record 'production_git_identity_fixture' $(if ($identityGood) { 'observed' } else { 'unproved' }) @{
+  if ($junction) { $identityGood = $identityGood -and $git.JUNCTION.kind -ne 'git' }
+  Record 'production_git_identity_fixture' $(if ($identityGood) { 'passed' } else { 'failed' }) @{
     root = $git.ROOT.kind; subdir = $git.SUB.kind; case_alias = $git.CASE.kind
-    junction = if ($junction) { $git.JUNCTION.kind } else { 'unproved' }
+    junction = if ($junction) { $git.JUNCTION.kind } else { 'missing_prerequisite' }
     worktree = $git.WORKTREE.kind; shared_project_root = $identityGood
     cross_drive = 'unproved'
   }
 } catch {
   Record 'production_windows_guards' 'unproved' @{ error_type = $_.Exception.GetType().Name }
 }
+
+try {
+  $unsafeAcl = Join-Path $fixture 'unsafe-acl'
+  New-Item -ItemType Directory -Path $unsafeAcl | Out-Null
+  & icacls $unsafeAcl /grant '*S-1-1-0:(OI)(CI)M' > $null
+  if ($LASTEXITCODE -ne 0) { throw 'unsafe ACL fixture setup failed' }
+  $env:CBS_MEMORIA_WINDOWS_BAD_ACL = $unsafeAcl
+  $aclCode = @'
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+const modulePath = path.join(process.env.CBS_MEMORIA_WINDOWS_REPO, 'base/memoria/windows-security.mjs');
+const { inspectWindowsPath } = await import(pathToFileURL(modulePath).href);
+process.stdout.write(JSON.stringify(await inspectWindowsPath(process.env.CBS_MEMORIA_WINDOWS_BAD_ACL, 'directory')));
+'@
+  $aclResult = ($aclCode | & node --input-type=module -) | ConvertFrom-Json
+  if ($LASTEXITCODE -ne 0) { throw 'unsafe ACL production probe failed' }
+  Record 'production_rejects_permissive_acl' $(if (!$aclResult.ok -and $aclResult.code -eq 'dacl') { 'passed' } else { 'failed' }) @{
+    production_verdict = $aclResult.code; unexpected_acl_introduced_only_in_fixture = $true
+  }
+} catch { Record 'production_rejects_permissive_acl' 'failed' @{ error_type = $_.Exception.GetType().Name } }
 
 try {
   $lockCode = @'
@@ -360,15 +459,17 @@ print(json.dumps(result))
   Record 'existing_directml' 'unproved' @{ reason = 'requires existing runtime/model/tokenizer and explicit CheckDirectML' }
 }
 
-if (!$report.controls.Contains('native_claude_codex_hooks_exclusion_trust')) {
-  Record 'native_claude_codex_hooks_exclusion_trust' 'unproved' @{ reason = 'production fixture probe failed before reaching native controls' }
+foreach ($cli in 'claude','codex') {
+  if (!$report.controls.Contains("native_${cli}_apply_verify_launch_restore")) {
+    Record "native_${cli}_apply_verify_launch_restore" 'failed' @{ reason = 'production fixture probe failed before reaching native controls' }
+  }
 }
 if (!$report.controls.Contains('native_outbox_replay_two_machines')) {
   Record 'native_outbox_replay_two_machines' 'unproved' @{ reason = 'production fixture probe failed before reaching replay controls' }
 }
 Record 'windows_activation_release' 'unsupported' @{ reason = 'diagnostic cannot authorize opt-in; native implementation and user-machine E2E gates remain' }
 
-foreach ($name in 'CBS_MEMORIA_WINDOWS_REPO','CBS_MEMORIA_WINDOWS_FIXTURE','CBS_MEMORIA_MODEL','CBS_MEMORIA_TOKENIZER','CBS_MEMORIA_WINDOWS_DML','CBS_MEMORIA_WINDOWS_GIT_ROOT','CBS_MEMORIA_WINDOWS_GIT_SUB','CBS_MEMORIA_WINDOWS_GIT_CASE','CBS_MEMORIA_WINDOWS_GIT_WORKTREE','CBS_MEMORIA_WINDOWS_GIT_JUNCTION') {
+foreach ($name in 'CBS_MEMORIA_WINDOWS_REPO','CBS_MEMORIA_WINDOWS_FIXTURE','CBS_MEMORIA_MODEL','CBS_MEMORIA_TOKENIZER','CBS_MEMORIA_WINDOWS_DML','CBS_MEMORIA_WINDOWS_GIT_ROOT','CBS_MEMORIA_WINDOWS_GIT_SUB','CBS_MEMORIA_WINDOWS_GIT_CASE','CBS_MEMORIA_WINDOWS_GIT_WORKTREE','CBS_MEMORIA_WINDOWS_GIT_JUNCTION','CBS_MEMORIA_WINDOWS_BAD_ACL') {
   Remove-Item "Env:$name" -ErrorAction SilentlyContinue
 }
 try { Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction Stop } catch {

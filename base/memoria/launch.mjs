@@ -9,6 +9,9 @@ import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
 import { readLocalTrust, trustTuple } from './trust.mjs';
 import { brokerEndpointStatus } from './broker.mjs';
+import { verifyNativeCapture } from './native.mjs';
+import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
+  writeWindowsPrivateFile } from './windows-security.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const rootDefault = () => path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
@@ -29,6 +32,11 @@ async function sameBinding(root, token, cli, sessionId) {
 }
 
 async function safeRead(file) {
+  if (process.platform === 'win32') {
+    const result = await readWindowsPrivateFile(file);
+    if (!result.ok) return null;
+    try { return JSON.parse(result.text); } catch { return null; }
+  }
   try {
     const dir = await fs.lstat(path.dirname(file));
     const stat = await fs.lstat(file);
@@ -46,27 +54,41 @@ function same(current, saved) {
 }
 
 export async function createLaunch(cwd, cli, { stateRoot } = {}) {
-  if (!['claude', 'codex'].includes(cli) || process.platform === 'win32' || !process.getuid) return blocked('native_windows_unproved');
+  if (!['claude', 'codex'].includes(cli) || (process.platform !== 'win32' && !process.getuid)) return blocked('native_windows_unproved');
   const current = await inspectConfiguration(cwd, { stateRoot });
   if (current.provider !== 'mem0') return blocked(current.reason ?? 'not_mem0');
   const scope = await identifyProject(cwd);
+  if (scope.kind !== 'git') return blocked('unsupported_git');
   const nativeRoot = scope.activeRoot;
   const trust = await readLocalTrust(current.stateDir);
   const expected = trustTuple(current);
   if (!trust || Object.entries(expected).some(([key, value]) => trust[key] !== value)) return blocked('trust_changed');
+  if (process.platform === 'win32') {
+    const verified = await verifyNativeCapture(nativeRoot, { cli, projectRoot: current.projectRoot, stateRoot });
+    if (verified.kind !== 'verified') return blocked(verified.reason);
+  }
   const token = randomBytes(32).toString('hex');
   const dir = launchDir(stateRoot);
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const stat = await fs.lstat(dir);
-  if (stat.uid !== process.getuid() || (stat.mode & 0o077)) return blocked('unsafe_launch_state');
+  if (process.platform === 'win32') {
+    if (!(await ensureWindowsPrivateDirectory(dir)).ok) return blocked('unsafe_launch_state');
+  } else {
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    const stat = await fs.lstat(dir);
+    if (stat.uid !== process.getuid() || (stat.mode & 0o077)) return blocked('unsafe_launch_state');
+  }
   const record = { cli, nativeRoot, projectRoot: current.projectRoot, projectId: current.projectId,
     destination: current.destination, embeddingFingerprint: current.embeddingFingerprint,
     createdAt: Date.now() };
-  await fs.writeFile(launchFile(stateRoot, token), JSON.stringify(record) + '\n', { flag: 'wx', mode: 0o600 });
+  if (process.platform === 'win32') {
+    if (!(await writeWindowsPrivateFile(launchFile(stateRoot, token), JSON.stringify(record) + '\n')).ok) {
+      return blocked('unsafe_launch_state');
+    }
+  } else await fs.writeFile(launchFile(stateRoot, token), JSON.stringify(record) + '\n', { flag: 'wx', mode: 0o600 });
   return { kind: 'created', token, record };
 }
 
 export async function bindLaunch(token, cli, cwd, nativeSessionId, { stateRoot } = {}) {
+  if (process.platform === 'win32') return blocked('native_windows_unproved');
   if (!/^[a-f0-9]{64}$/.test(token ?? '') || !nativeSessionId || nativeSessionId.length > 256) return blocked('unbound');
   const saved = await safeRead(launchFile(stateRoot, token));
   if (!saved || saved.cli !== cli || Date.now() - saved.createdAt > 12 * 60 * 60 * 1000) return blocked('unbound');
@@ -89,6 +111,7 @@ export async function bindLaunch(token, cli, cwd, nativeSessionId, { stateRoot }
 }
 
 export async function resolveBoundLaunch(token, cli, { stateRoot } = {}) {
+  if (process.platform === 'win32') return blocked('native_windows_unproved');
   if (!/^[a-f0-9]{64}$/.test(token ?? '')) return blocked('unbound');
   const saved = await safeRead(launchFile(stateRoot, token));
   const bound = await safeRead(bindingFile(stateRoot, token));
@@ -102,6 +125,7 @@ export async function resolveBoundLaunch(token, cli, { stateRoot } = {}) {
 }
 
 export async function launchCli(cwd, cli, args = [], options = {}) {
+  if (process.platform === 'win32') return blocked('native_windows_unproved');
   const made = await createLaunch(cwd, cli, options);
   if (made.kind !== 'created') return made;
   const root = options.stateRoot ?? rootDefault();

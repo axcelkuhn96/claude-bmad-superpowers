@@ -4,6 +4,8 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { identifyProject } from './project-id.mjs';
 import { RUNTIME_PINS } from './runtime.mjs';
+import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
+  writeWindowsPrivateFile } from './windows-security.mjs';
 
 const blocked = (reason) => ({ provider: 'blocked', reason });
 const stateRootDefault = () => path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
@@ -70,6 +72,12 @@ function sessionFile(stateDir, sessionId) {
   return path.join(stateDir, 'sessions', `${hash(sessionId)}.json`);
 }
 async function readSession(file) {
+  if (process.platform === 'win32') {
+    const result = await readWindowsPrivateFile(file);
+    if (result.code === 'missing') return null;
+    if (!result.ok) return blocked('invalid_session');
+    try { return JSON.parse(result.text); } catch { return blocked('invalid_session'); }
+  }
   try { return JSON.parse(await fs.readFile(file, 'utf8')); }
   catch (error) { return error.code === 'ENOENT' ? null : blocked('invalid_session'); }
 }
@@ -134,6 +142,14 @@ export async function initializeSession(cwd, sessionId, options = {}) {
   const expected = { ...found.current, embeddingFingerprint: found.embeddingFingerprint };
   if (found.saved) return sameSession(found.saved, expected) ? found.current : blocked('session_changed');
   const file = sessionFile(found.stateDir, sessionId);
+  if (process.platform === 'win32') {
+    if (!(await ensureWindowsPrivateDirectory(path.dirname(file))).ok) return blocked('unsafe_session_state');
+    const written = await writeWindowsPrivateFile(file, JSON.stringify(expected) + '\n');
+    if (written.ok) return found.current;
+    if (written.code !== 'exists') return blocked('unsafe_session_state');
+    const raced = await readSession(file);
+    return sameSession(raced, expected) ? found.current : blocked('session_changed');
+  }
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   try { await fs.writeFile(file, JSON.stringify(expected) + '\n', { flag: 'wx', mode: 0o600 }); }
   catch (error) {

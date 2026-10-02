@@ -1,5 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { ensureWindowsPrivateDirectory, inspectWindowsPath, readWindowsPrivateFile,
+  writeWindowsPrivateFile } from './windows-security.mjs';
 
 export const TRUST_VERSION = 1;
 
@@ -24,6 +26,13 @@ export function authorizeDestination(resolution, localTrust, readSecret) {
 }
 
 export async function readLocalTrust(stateDir) {
+  if (process.platform === 'win32') {
+    const directory = await inspectWindowsPath(stateDir, 'directory');
+    if (!directory.ok) return null;
+    const file = await readWindowsPrivateFile(path.join(stateDir, 'trust.json'));
+    if (!file.ok) return null;
+    try { return JSON.parse(file.text); } catch { return null; }
+  }
   try {
     const directory = await fs.lstat(stateDir);
     if (!directory.isDirectory() || (process.getuid && directory.uid !== process.getuid()) ||
@@ -36,6 +45,17 @@ export async function readLocalTrust(stateDir) {
 }
 
 export async function writeLocalTrust(stateDir, tuple) {
+  if (process.platform === 'win32') {
+    const directory = await ensureWindowsPrivateDirectory(stateDir);
+    if (!directory.ok) throw new Error('unsafe trust directory');
+    const file = path.join(stateDir, 'trust.json');
+    const existing = await readWindowsPrivateFile(file);
+    if (!existing.ok && existing.code !== 'missing') throw new Error('unsafe trust file');
+    const written = await writeWindowsPrivateFile(file, JSON.stringify(tuple) + '\n',
+      { replace: existing.ok, expectedText: existing.ok ? existing.text : null });
+    if (!written.ok) throw new Error('unsafe trust file');
+    return;
+  }
   await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
   const directory = await fs.lstat(stateDir);
   if (!directory.isDirectory() || (process.getuid && directory.uid !== process.getuid()) ||
