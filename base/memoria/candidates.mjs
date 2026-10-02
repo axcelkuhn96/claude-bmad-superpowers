@@ -8,20 +8,36 @@ import { isDeepStrictEqual } from 'node:util';
 const blocked = reason => ({ kind: 'blocked', reason });
 const pending = reason => ({ kind: 'pending', reason });
 const localGrants = new WeakSet();
-const secret = /(?:\b(?:api[_ -]?key|token|password|secret|bearer)\s*[:= ]\s*\S+|\bsk-[a-z0-9-]{16,}|\bgh[opusr]_[A-Za-z0-9_]{16,}|\bAKIA[A-Z0-9]{16}\b|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b|-----BEGIN [A-Z ]*PRIVATE KEY-----)/gi;
+const secretLabel = String.raw`\b(?:api[_ -]?key|token|password|secret|bearer)\s*[:= ]\s*`;
+const secret = new RegExp(`(?:${secretLabel}\\S+|\\bsk-[a-z0-9-]{16,}|\\bgh[opusr]_[A-Za-z0-9_]{16,}|\\bAKIA[A-Z0-9]{16}\\b|\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\b|-----BEGIN [A-Z ]*PRIVATE KEY-----)`, 'gi');
 const sensitive = text => typeof text === 'string' && new RegExp(secret.source, 'i').test(text);
 function redact(text) {
   let safe = text.replace(/-----BEGIN ([A-Z ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g, '[REDACTED]');
   if (/-----BEGIN [A-Z ]*PRIVATE KEY-----|-----END [A-Z ]*PRIVATE KEY-----/i.test(safe)) return null;
-  const quoted = /\b(?:api[_ -]?key|token|password|secret|bearer)\s*[:=]\s*(["'])/gi;
-  for (const match of safe.matchAll(quoted)) {
-    const tail = safe.slice(match.index + match[0].length);
-    if (tail.includes('\\') || !tail.includes(match[1])) return null;
+  let result = '';
+  let cursor = 0;
+  for (const match of safe.matchAll(new RegExp(secretLabel, 'gi'))) {
+    if (match.index < cursor) continue;
+    const start = match.index + match[0].length;
+    const quote = safe[start];
+    if (!quote || quote === '|' || quote === '>') return null;
+    let end;
+    if (quote === '"' || quote === "'") {
+      end = start + 1;
+      while (end < safe.length && safe[end] !== quote) {
+        if (safe[end] === '\\') return null;
+        end++;
+      }
+      if (end === safe.length) return null;
+      end++;
+    } else {
+      end = start;
+      while (end < safe.length && !/\s/.test(safe[end])) end++;
+    }
+    result += safe.slice(cursor, match.index) + '[REDACTED]';
+    cursor = end;
   }
-  if (/\b(?:api[_ -]?key|token|password|secret|bearer)\s*[:=]\s*(?:[|>]|$)/im.test(safe)) return null;
-  const labeled = /\b(?:api[_ -]?key|token|password|secret|bearer)\s*[:=]\s*(?:"[\s\S]*?"|'[\s\S]*?'|[^\r\n]+)/gi;
-  safe = safe.replace(labeled, '[REDACTED]');
-  if (/\b(?:api[_ -]?key|token|password|secret|bearer)\s*[:=]\s*(?:["']|[|>]|$)/im.test(safe)) return null;
+  safe = result + safe.slice(cursor);
   return safe.replace(secret, '[REDACTED]');
 }
 const validTime = text => typeof text === 'string' && Number.isFinite(Date.parse(text)) &&
