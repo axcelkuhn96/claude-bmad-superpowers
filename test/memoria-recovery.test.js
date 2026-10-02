@@ -271,6 +271,111 @@ test('repeated no-facts compact to source-bound processed highwater and replay s
   assert.match(summary.processedAudit, /^[a-f0-9]{64}$/);
 });
 
+test('terminal candidate receipt stays auditable while later no-facts compact', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const limit = 98304;
+  const outbox = createOutbox(dir, { maxBytes: limit });
+  const identity = { projectId: 'p', policyVersion: 'native-v1' };
+  const first = { cli: 'codex', sessionId: 'mixed', start: 0, end: 1,
+    sliceHash: 'a'.repeat(64), messages: [{ messageId: 'm', start: 0, end: 1 }] };
+  const parent = await outbox.enqueueCheckpoint(first, identity);
+  assert.equal(parent.kind, 'queued');
+  const children = ['rejected', 'duplicate', 'remote_acked'].map(candidateKey => ({
+    candidateKey, evidence: { messageId: 'm', start: 0, end: 1 },
+    externalId: externalIdFor({ projectId: 'p', originCli: 'codex', sessionId: 'mixed',
+      start: 0, end: 1, sliceHash: first.sliceHash, policyVersion: 'native-v1', candidateKey }) }));
+  for (const child of children) {
+    const { file, ...ref } = await writeCandidateRef(dir, parent.operationId, 'p', child);
+    child.payloadRef = ref;
+  }
+  assert.equal((await outbox.recordManifest(parent.operationId, children)).kind, 'manifested');
+  assert.equal((await outbox.disposeCandidate(parent.operationId, 'rejected', 'rejected', 'unsupported_claim')).kind, 'disposed');
+  assert.equal((await outbox.disposeCandidate(parent.operationId, 'duplicate', 'duplicate', 'existing_fact')).kind, 'disposed');
+  const proof = { externalId: children[2].externalId, projectId: 'p', status: 'active', sdkId: 'sdk-1', qdrantId: 'q-1' };
+  assert.equal((await outbox.ackCandidate(parent.operationId, 'remote_acked', proof)).kind, 'acked');
+  assert.equal((await outbox.completeCheckpoint(parent.operationId)).kind, 'processed');
+  const receiptFile = path.join(dir, 'outbox', 'processed', `${parent.operationId}.json`);
+  const receipt = await fs.readFile(receiptFile);
+  const audited = [[parent.operationId, first.sliceHash, 0, 1]];
+  for (let n = 1; n <= 30; n++) {
+    const queued = await outbox.enqueueCheckpoint({ cli: 'codex', sessionId: 'mixed', start: n, end: n + 1,
+      sliceHash: n.toString(16).padStart(64, '0'), messages: [] }, identity);
+    assert.equal(queued.kind, 'queued', `enqueue ${n}: ${JSON.stringify(queued)}`);
+    assert.equal((await outbox.recordManifest(queued.operationId, [])).kind, 'manifested');
+    assert.equal((await outbox.completeCheckpoint(queued.operationId)).kind, 'processed');
+    audited.push([queued.operationId, n.toString(16).padStart(64, '0'), n, n + 1]);
+  }
+  const restarted = createOutbox(dir, { maxBytes: limit });
+  assert.deepEqual(await restarted.cursor('codex', 'mixed'), { queuedEnd: 31, ackedEnd: 0, processedEnd: 31 });
+  assert.deepEqual(await fs.readFile(receiptFile), receipt);
+  assert.deepEqual((await restarted.readDisposition(parent.operationId)).candidates.map(c => c.status),
+    ['rejected', 'duplicate', 'remote_acked']);
+  const cursors = (await fs.readdir(path.join(dir, 'outbox'))).filter(name => name.startsWith('cursor-'));
+  assert.equal(cursors.length, 1);
+  const summary = JSON.parse(await fs.readFile(path.join(dir, 'outbox', cursors[0])));
+  assert.equal(summary.projectId, 'p');
+  assert.equal(summary.policyVersion, 'native-v1');
+  assert.ok(summary.processedEnd > 1);
+  assert.equal(summary.processedCount, summary.processedEnd - 1);
+  assert.equal(summary.processedCount + (await fs.readdir(path.join(dir, 'outbox', 'processed'))).length, 31);
+  const expectedAudit = audited.slice(0, summary.processedEnd).reduce((digest, [id, sliceHash, start, end]) =>
+    createHash('sha256').update(JSON.stringify([digest, id, sliceHash, start, end])).digest('hex'), '0'.repeat(64));
+  assert.equal(summary.processedAudit, expectedAudit);
+  assert.equal((await restarted.enqueueCheckpoint(first, identity)).kind, 'processed');
+  assert.equal((await restarted.enqueueCheckpoint({ ...first, start: 1, end: 2,
+    sliceHash: 'f'.repeat(64), messages: [] }, identity)).kind, 'blocked');
+  assert.equal((await restarted.ackVerified(parent.operationId, proof)).kind, 'blocked');
+  assert.equal((await restarted.enqueueCheckpoint({ cli: 'codex', sessionId: 'mixed', start: 31, end: 32,
+    sliceHash: '1'.repeat(64), messages: [] }, { projectId: 'foreign', policyVersion: 'native-v1' })).reason,
+    'cursor_source_mismatch');
+  assert.ok((await restarted.usage()) <= limit);
+});
+
+test('pending candidate and cursor gap stop no-facts highwater', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const outbox = createOutbox(dir, { maxBytes: 98304 });
+  const identity = { projectId: 'p', policyVersion: 'native-v1' };
+  const first = await outbox.enqueueCheckpoint({ cli: 'codex', sessionId: 'pending', start: 0, end: 1,
+    sliceHash: 'a'.repeat(64), messages: [{ messageId: 'm', start: 0, end: 1 }] }, identity);
+  const candidate = { candidateKey: 'fact', evidence: { messageId: 'm', start: 0, end: 1 },
+    externalId: externalIdFor({ projectId: 'p', originCli: 'codex', sessionId: 'pending', start: 0, end: 1,
+      sliceHash: 'a'.repeat(64), policyVersion: 'native-v1', candidateKey: 'fact' }) };
+  const { file, ...ref } = await writeCandidateRef(dir, first.operationId, 'p', candidate);
+  candidate.payloadRef = ref;
+  assert.equal((await outbox.recordManifest(first.operationId, [candidate])).kind, 'manifested');
+  assert.equal((await outbox.disposeCandidate(first.operationId, 'fact', 'rejected', 'unsupported_claim')).kind, 'disposed');
+  assert.equal((await outbox.completeCheckpoint(first.operationId)).kind, 'processed');
+  assert.equal((await outbox.enqueueCheckpoint({ cli: 'codex', sessionId: 'pending', start: 2, end: 3,
+    sliceHash: 'b'.repeat(64), messages: [] }, identity)).reason, 'cursor_gap');
+  const second = await outbox.enqueueCheckpoint({ cli: 'codex', sessionId: 'pending', start: 1, end: 2,
+    sliceHash: 'c'.repeat(64), messages: [{ messageId: 'm2', start: 1, end: 2 }] }, identity);
+  assert.equal(second.kind, 'queued');
+  const pending = { candidateKey: 'fact', evidence: { messageId: 'm2', start: 1, end: 2 },
+    externalId: externalIdFor({ projectId: 'p', originCli: 'codex', sessionId: 'pending', start: 1, end: 2,
+      sliceHash: 'c'.repeat(64), policyVersion: 'native-v1', candidateKey: 'fact' }) };
+  const { file: pendingFile, ...pendingRef } = await writeCandidateRef(dir, second.operationId, 'p', pending);
+  pending.payloadRef = pendingRef;
+  assert.equal((await outbox.recordManifest(second.operationId, [pending])).kind, 'manifested');
+  assert.equal((await outbox.completeCheckpoint(second.operationId)).reason, 'unresolved_candidates');
+  let processed = 0;
+  for (let n = 2; n < 20; n++) {
+    const next = await outbox.enqueueCheckpoint({ cli: 'codex', sessionId: 'pending', start: n, end: n + 1,
+      sliceHash: n.toString(16).padStart(64, '0'), messages: [] }, identity);
+    if (next.kind === 'full') break;
+    assert.equal(next.kind, 'queued');
+    if ((await outbox.recordManifest(next.operationId, [])).kind === 'full') break;
+    if ((await outbox.completeCheckpoint(next.operationId)).kind === 'full') break;
+    processed++;
+  }
+  assert.ok(processed > 0);
+  const cursor = await createOutbox(dir).cursor('codex', 'pending');
+  assert.ok(cursor.queuedEnd >= 2 + processed);
+  assert.equal(cursor.ackedEnd, 0);
+  assert.equal(cursor.processedEnd, 1);
+  assert.equal((await fs.readdir(path.join(dir, 'outbox'))).some(name => name.startsWith('cursor-')), false);
+  assert.equal((await createOutbox(dir).readManifest(second.operationId)).candidates[0].status, 'pending');
+});
+
 test('tiny files consume allocated blocks in quota and stop before physical limit', async t => {
   const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const outbox = createOutbox(dir, { maxBytes: 32768 });
@@ -440,6 +545,60 @@ await outbox.enqueueCheckpoint(JSON.parse(process.argv[3]), { projectId: 'p', po
     const replay = await createOutbox(dir, { maxBytes: 48000 }).enqueueCheckpoint(next, identity);
     assert.equal(replay.kind, 'queued', JSON.stringify(replay));
     assert.equal((await outbox.cursor('codex', 's')).queuedEnd, 4);
+  }
+});
+
+test('ENOSPC and SIGKILL before lock owner write never strand the canonical lock', async t => {
+  const moduleUrl = new URL('../base/memoria/outbox.mjs', import.meta.url).href;
+  for (const failure of ['ENOSPC', 'SIGKILL']) {
+    const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+const source = `import fs from 'node:fs/promises';
+import { createOutbox } from ${JSON.stringify(moduleUrl)};
+const open = fs.open;
+fs.open = async (file, ...args) => {
+  const handle = await open(file, ...args);
+  if (String(file).endsWith('/pid') || String(file).endsWith('.pid')) {
+    handle.writeFile = async () => {
+      if (process.argv[2] === 'SIGKILL') process.kill(process.pid, 'SIGKILL');
+      throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+    };
+  }
+  return handle;
+};
+try {
+  await createOutbox(process.argv[1]).enqueueCheckpoint({ cli: 'codex', sessionId: 'lock', start: 0,
+    end: 1, sliceHash: 'a'.repeat(64), messages: [] }, { projectId: 'p', policyVersion: 'native-v1' });
+  process.exitCode = 2;
+} catch (error) { if (error.code !== 'ENOSPC') process.exitCode = 3; }`;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', source, dir, failure], { stdio: 'ignore' });
+    const result = await new Promise((resolve, reject) => {
+      child.once('error', reject); child.once('exit', (code, signal) => resolve({ code, signal }));
+    });
+    assert.deepEqual(result, failure === 'SIGKILL' ? { code: null, signal: 'SIGKILL' } : { code: 0, signal: null });
+    const root = path.join(dir, 'outbox');
+    assert.equal((await fs.readdir(root)).includes('lock'), false, failure);
+    if (failure === 'ENOSPC') assert.equal((await fs.readdir(root)).some(name => name.startsWith('.lock-')), false);
+    const replay = await createOutbox(dir).enqueueCheckpoint({ cli: 'codex', sessionId: 'lock', start: 0,
+      end: 1, sliceHash: 'a'.repeat(64), messages: [] }, { projectId: 'p', policyVersion: 'native-v1' });
+    assert.equal(replay.kind, 'queued', failure);
+    assert.deepEqual(await createOutbox(dir).cursor('codex', 'lock'),
+      { queuedEnd: 1, ackedEnd: 0, processedEnd: 0 });
+  }
+});
+
+test('unknown or live lock owner is never reclaimed by age alone', async t => {
+  for (const owner of ['missing', 'live']) {
+    const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    const outbox = createOutbox(dir);
+    await outbox.usage();
+    const lock = path.join(dir, 'outbox', 'lock');
+    await fs.mkdir(lock, { mode: 0o700 });
+    if (owner === 'live') await fs.writeFile(path.join(lock, 'pid'), String(process.pid));
+    const old = new Date(Date.now() - 60000);
+    await fs.utimes(lock, old, old);
+    const inode = (await fs.lstat(lock)).ino;
+    await assert.rejects(outbox.usage(), /outbox_lock_timeout/);
+    assert.equal((await fs.lstat(lock)).ino, inode);
   }
 });
 

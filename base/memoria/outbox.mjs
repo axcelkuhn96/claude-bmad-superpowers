@@ -65,72 +65,93 @@ export function createOutbox(stateDir, options = {}) {
   }
   async function withLock(callback) {
     await ensure();
-    for (let attempt = 0; attempt < 100; attempt++) {
+    const sameInode = async (file, expected) => {
       try {
-        await fs.mkdir(lock, { mode: 0o700 });
-        await fs.writeFile(path.join(lock, 'pid'), String(process.pid), { flag: 'wx', mode: 0o600 });
-        try {
-          for (const dir of [items, acks, processed, root]) {
-            let removed = false;
-            for (const name of await fs.readdir(dir)) if (/^\.[a-f0-9-]+\.tmp$/.test(name)) {
-              await fs.rm(path.join(dir, name));
-              removed = true;
-            }
-            if (removed) await syncDir(dir);
+        const current = await fs.lstat(file);
+        return current.dev === expected.dev && current.ino === expected.ino;
+      } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    };
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const temporaryLock = path.join(root, `.lock-${randomUUID()}.pid`);
+      let prepared;
+      let acquired = false;
+      let handle;
+      try {
+        handle = await fs.open(temporaryLock, 'wx', 0o600);
+        prepared = await handle.stat();
+        await handle.writeFile(String(process.pid));
+        await handle.sync();
+        await handle.close();
+        handle = null;
+        await fs.link(temporaryLock, lock);
+        acquired = true;
+        await fs.unlink(temporaryLock);
+        for (const dir of [items, acks, processed, root]) {
+          let removed = false;
+          for (const name of await fs.readdir(dir)) if (/^\.[a-f0-9-]+\.tmp$/.test(name)) {
+            await fs.rm(path.join(dir, name));
+            removed = true;
           }
-          let reclaimed = false;
-          for (const name of await fs.readdir(acks)) if (/^src-[a-f0-9]{64}\.json$/.test(name)) {
-            const retry = retryFile(name.slice(0, -5));
-            const present = await Promise.all([fs.stat(path.join(items, name)).then(() => true, error => {
-              if (error.code === 'ENOENT') return false; throw error;
-            }), fs.stat(retry).then(() => true, error => {
-              if (error.code === 'ENOENT') return false; throw error;
-            })]);
-            if (present.some(Boolean)) {
-              await syncDir(acks);
-              if (present[0]) await fs.rm(path.join(items, name));
-              if (present[1]) await fs.rm(retry);
-              reclaimed = true;
-            }
-          }
-          if (reclaimed) await syncDir(items);
-          for (const name of await fs.readdir(processed)) if (/^src-[a-f0-9]{64}\.json$/.test(name)) {
-            const id = name.slice(0, -5);
-            await fs.rm(itemFile(id), { force: true });
-            await fs.rm(manifestFile(id), { force: true });
-            await fs.rm(retryFile(id), { force: true });
-          }
-          let cleanedProcessed = false;
-          for (const name of await fs.readdir(root)) if (/^cursor-[a-f0-9]{64}\.json$/.test(name)) {
-            const summary = await read(path.join(root, name));
-            if (!summary?.processedAudit) continue;
-            for (const receiptName of await fs.readdir(processed)) {
-              if (!/^src-[a-f0-9]{64}\.json$/.test(receiptName)) continue;
-              const receipt = await read(path.join(processed, receiptName));
-              if (receipt?.disposition === 'no_facts' && receipt.cli === summary.cli &&
-                  receipt.sessionId === summary.sessionId && receipt.projectId === summary.projectId &&
-                  receipt.policyVersion === summary.policyVersion && receipt.end <= summary.processedEnd) {
-                await fs.rm(path.join(processed, receiptName));
-                cleanedProcessed = true;
-              }
-            }
-          }
-          if (cleanedProcessed) await syncDir(processed);
-          return await callback();
+          if (removed) await syncDir(dir);
         }
-        finally { await fs.rm(lock, { recursive: true, force: true }); }
+        let reclaimed = false;
+        for (const name of await fs.readdir(acks)) if (/^src-[a-f0-9]{64}\.json$/.test(name)) {
+          const retry = retryFile(name.slice(0, -5));
+          const present = await Promise.all([fs.stat(path.join(items, name)).then(() => true, error => {
+            if (error.code === 'ENOENT') return false; throw error;
+          }), fs.stat(retry).then(() => true, error => {
+            if (error.code === 'ENOENT') return false; throw error;
+          })]);
+          if (present.some(Boolean)) {
+            await syncDir(acks);
+            if (present[0]) await fs.rm(path.join(items, name));
+            if (present[1]) await fs.rm(retry);
+            reclaimed = true;
+          }
+        }
+        if (reclaimed) await syncDir(items);
+        for (const name of await fs.readdir(processed)) if (/^src-[a-f0-9]{64}\.json$/.test(name)) {
+          const id = name.slice(0, -5);
+          await fs.rm(itemFile(id), { force: true });
+          await fs.rm(manifestFile(id), { force: true });
+          await fs.rm(retryFile(id), { force: true });
+        }
+        let cleanedProcessed = false;
+        for (const name of await fs.readdir(root)) if (/^cursor-[a-f0-9]{64}\.json$/.test(name)) {
+          const summary = await read(path.join(root, name));
+          if (!summary?.processedAudit) continue;
+          for (const receiptName of await fs.readdir(processed)) {
+            if (!/^src-[a-f0-9]{64}\.json$/.test(receiptName)) continue;
+            const receipt = await read(path.join(processed, receiptName));
+            if (receipt?.disposition === 'no_facts' && receipt.cli === summary.cli &&
+                receipt.sessionId === summary.sessionId && receipt.projectId === summary.projectId &&
+                receipt.policyVersion === summary.policyVersion && receipt.end <= summary.processedEnd) {
+              await fs.rm(path.join(processed, receiptName));
+              cleanedProcessed = true;
+            }
+          }
+        }
+        if (cleanedProcessed) await syncDir(processed);
+        return await callback();
       } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-        const owner = Number(await fs.readFile(path.join(lock, 'pid'), 'utf8').catch(() => '0'));
+        if (acquired || error.code !== 'EEXIST') throw error;
+        const holder = await fs.lstat(lock).catch(e => { if (e.code === 'ENOENT') return null; throw e; });
+        if (!holder) continue;
+        const owner = Number(await fs.readFile(holder.isDirectory() ? path.join(lock, 'pid') : lock,
+          'utf8').catch(e => { if (e.code === 'ENOENT') return '0'; throw e; }));
         if (owner && owner !== process.pid) {
           try { process.kill(owner, 0); }
-          catch (e) { if (e.code === 'ESRCH') { await fs.rm(lock, { recursive: true, force: true }); continue; } }
-        }
-        if (!owner && Date.now() - (await fs.stat(lock)).mtimeMs > 1000) {
-          await fs.rm(lock, { recursive: true, force: true });
-          continue;
+          catch (e) { if (e.code === 'ESRCH' && await sameInode(lock, holder)) {
+            if (holder.isDirectory()) await fs.rm(lock, { recursive: true, force: true });
+            else await fs.unlink(lock);
+            continue;
+          } }
         }
         await new Promise(resolve => setTimeout(resolve, 2));
+      } finally {
+        await handle?.close();
+        if (prepared && await sameInode(temporaryLock, prepared)) await fs.unlink(temporaryLock);
+        if (acquired && prepared && await sameInode(lock, prepared)) await fs.unlink(lock);
       }
     }
     throw new Error('outbox_lock_timeout');
@@ -227,15 +248,21 @@ export function createOutbox(stateDir, options = {}) {
     let end = prior?.processedEnd ?? 0;
     let digest = prior?.processedAudit ?? '0'.repeat(64);
     const removable = [];
+    let source = prior;
     for (const row of rows) {
       if (row.end <= end) continue;
-      if (row.start !== end || row.disposition !== 'no_facts' || row.candidates?.length) break;
-      if (prior && (row.projectId !== prior.projectId || row.policyVersion !== prior.policyVersion)) {
+      if (row.start !== end || !row.terminal || !row.disposition) break;
+      if (source && (row.projectId !== source.projectId || row.policyVersion !== source.policyVersion)) {
         throw new Error('cursor_source_mismatch');
       }
+      source ??= row;
+      const noFacts = row.disposition === 'no_facts' && !row.candidates?.length;
+      const terminalCandidates = row.disposition === 'candidates' && row.candidates?.length > 0 &&
+        row.candidates.every(candidate => ['rejected', 'duplicate', 'remote_acked'].includes(candidate.status));
+      if (!noFacts && !terminalCandidates) break;
       digest = hash(JSON.stringify([digest, row.operationId, row.sliceHash, row.start, row.end]));
       end = row.end;
-      removable.push(row);
+      if (noFacts) removable.push(row);
     }
     if (!removable.length) return;
     const last = removable.at(-1);
@@ -291,6 +318,7 @@ export function createOutbox(stateDir, options = {}) {
     for (const dir of [items, acks, processed, root, lock, path.dirname(payloads), payloads]) {
       try { await fs.lstat(dir); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
       const directory = await fs.lstat(dir);
+      if (dir === lock && !directory.isDirectory()) continue;
       bytes += Math.max(directory.size, (directory.blocks ?? 0) * 512);
       for (const name of await fs.readdir(dir)) {
         const stat = await fs.lstat(path.join(dir, name));
