@@ -481,7 +481,8 @@ test('trusted linked Codex launch carries only its verified hooks as session con
   assert.equal(seen.cwd, linked);
   assert.match(seen.launchId, /^[a-f0-9]{64}$/);
   for (const [event, groups] of Object.entries(expected)) {
-    assert.ok(seen.args.includes(`hooks.${event}=${JSON.stringify(groups)}`), event);
+    const command = groups[0].hooks[0].command;
+    assert.ok(seen.args.includes(`hooks.${event}=[{hooks=[{type="command",command=${JSON.stringify(command)},timeout=10}]}]`), event);
   }
   assert.equal(seen.args.filter(arg => arg.startsWith('hooks.')).length, Object.keys(expected).length);
   assert.ok(seen.args.some(arg => arg.startsWith('mcp_servers.cbs_memoria.command=')));

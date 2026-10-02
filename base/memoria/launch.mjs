@@ -10,6 +10,7 @@ import { identifyProject } from './project-id.mjs';
 import { readLocalTrust, trustTuple } from './trust.mjs';
 import { brokerEndpointStatus } from './broker.mjs';
 import { inspectCodexMainHooks, verifyNativeCapture } from './native.mjs';
+import { codexHookOverride, codexTomlString } from './codex-config-toml.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
   writeWindowsPrivateFile } from './windows-security.mjs';
 
@@ -160,12 +161,21 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
     }
   }
   const mcp = { mcpServers: { cbs_memoria: { command: process.execPath, args: [mcpScript] } } };
-  const mcpArgs = cli === 'claude' ? ['--mcp-config', JSON.stringify(mcp)] :
-    ['-c', `mcp_servers.cbs_memoria.command=${JSON.stringify(process.execPath)}`,
-      '-c', `mcp_servers.cbs_memoria.args=${JSON.stringify([mcpScript])}`];
-  const hookArgs = cli === 'codex' && made.captureSource.source === 'session'
-    ? Object.entries(made.captureSource.hooks).flatMap(([event, groups]) =>
-    ['-c', `hooks.${event}=${JSON.stringify(groups)}`]) : [];
+  let mcpArgs;
+  if (cli === 'claude') mcpArgs = ['--mcp-config', JSON.stringify(mcp)];
+  else {
+    try {
+      mcpArgs = ['-c', `mcp_servers.cbs_memoria.command=${codexTomlString(process.execPath)}`,
+        '-c', `mcp_servers.cbs_memoria.args=[${codexTomlString(mcpScript)}]`];
+    } catch { return blocked('unsafe_mcp_command'); }
+  }
+  let hookArgs = [];
+  if (cli === 'codex' && made.captureSource.source === 'session') {
+    try {
+      hookArgs = Object.entries(made.captureSource.hooks).flatMap(([event, groups]) =>
+        ['-c', codexHookOverride(event, groups)]);
+    } catch { return blocked('unsafe_capture_hooks'); }
+  }
   if (cli === 'codex') {
     const currentSource = await codexCaptureSource(made.record.nativeRoot,
       made.record.projectRoot, options.stateRoot);
