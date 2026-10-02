@@ -7,12 +7,10 @@ const schema = JSON.stringify({ type: 'object', additionalProperties: false,
   required: ['candidates', 'no_facts'], properties: {
     no_facts: { type: 'boolean' }, candidates: { type: 'array', maxItems: 5, items: {
       type: 'object', additionalProperties: false,
-      required: ['candidate_key', 'source_message_id', 'text', 'type', 'actor', 'speaker_role',
-        'origin', 'evidence_at', 'scope'], properties: {
+      required: ['candidate_key', 'source_message_id', 'text', 'type', 'scope'], properties: {
         candidate_key: { type: 'string' }, source_message_id: { type: 'string' },
         logical_key: { type: 'string' }, text: { type: 'string' }, type: { type: 'string' },
-        actor: { type: 'string' }, speaker_role: { type: 'string' }, origin: { type: 'string' },
-        evidence_at: { type: 'string' }, scope: { type: 'string' }, owner_id: { type: 'string' },
+        scope: { type: 'string' }, owner_id: { type: 'string' },
         condition: { type: 'string' }, valid_from: { type: 'string' }, valid_to: { type: 'string' },
         supersedes_id: { type: 'string' },
       },

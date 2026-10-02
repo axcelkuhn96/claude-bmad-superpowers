@@ -4,11 +4,13 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { createOutbox } from '../base/memoria/outbox.mjs';
 import { validateCandidate, extractCheckpoint, approveCandidate, rejectCandidate,
   markDuplicateCandidate } from '../base/memoria/candidates.mjs';
 import { storeMemory } from '../base/memoria/bridge.mjs';
 import { runSonnetExtraction } from '../base/memoria/extract-cli.mjs';
+import { parsePersistedSlice } from '../base/memoria/transcript.mjs';
 
 const source = { origin: 'human', actor: 'user', speakerRole: 'user', text: 'Fable faz só revisão final; Mira implementa.',
   messageId: 'm1', timestamp: '2024-02-03T10:00:00Z', start: 0, end: 80, sessionId: 's', cli: 'claude' };
@@ -17,6 +19,9 @@ const candidate = { candidate_key: 'fable_review', project_id: 'p', text: 'Fable
   evidence_at: source.timestamp, scope: 'project', source_message_id: 'm1',
   source_offsets: { start: 0, end: 80 }, status: 'candidate', condition: 'revisão final' };
 const slice = { cli: 'claude', sessionId: 's', start: 0, end: 80, sliceHash: 'a'.repeat(64), messages: [source] };
+const syntheticToken = ['sk', 'synthetic12345678901234567890'].join('-');
+const syntheticKeyBody = ['abcPRIVATE', 'KEYbody123'].join('');
+const beginPrivateKey = ['-----BEGIN', 'PRIVATE KEY-----'].join(' ');
 
 async function fixture(t, messages = [source]) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-candidates-'));
@@ -27,6 +32,29 @@ async function fixture(t, messages = [source]) {
   assert.equal(queued.kind, 'queued');
   return { dir, box, checkpoint: { ...item, operationId: queued.operationId,
     projectId: 'p', policyVersion: 'native-v1' } };
+}
+
+async function sealFixture(box, operationId, candidateKey, decision, extra = {}) {
+  const entry = (await box.readManifest(operationId)).candidates.find(item => item.candidateKey === candidateKey);
+  const payload = await box.readCandidatePayload(operationId, candidateKey);
+  const operation = decision === 'approve' ? {
+    externalId: payload.external_id, projectId: payload.project_id, sessionId: payload.session_id,
+    text: extra.text ?? payload.text,
+    sourceIdentity: { projectId: payload.project_id, originCli: payload.origin_cli,
+      sessionId: payload.session_id, start: payload.slice_start, end: payload.slice_end,
+      sliceHash: payload.slice_hash, policyVersion: payload.policy_version, candidateKey },
+    metadata: { source: payload.source_message_id, source_offsets: payload.source_offsets,
+      checkpoint_id: payload.checkpoint_id, actor: payload.actor, speaker_role: payload.speaker_role,
+      origin: payload.origin, scope: payload.scope, owner_id: payload.owner_id,
+      evidence_at: payload.evidence_at, ingested_at: payload.ingested_at,
+      valid_from: payload.valid_from, valid_to: payload.valid_to, condition: payload.condition,
+      logical_key: payload.logical_key, type: payload.type, supersedes_id: payload.supersedes_id,
+      policy_version: payload.policy_version, extractor_model: payload.extractor_model,
+      embedding_fingerprint: payload.embedding_fingerprint }, approval: { kind: 'approved' },
+  } : undefined;
+  return box.sealReview(operationId, candidateKey, { decision, actor: 'test_fixture',
+    reviewedAt: '2026-10-01T00:00:00.000Z', payloadSha256: entry.payloadRef.sha256,
+    ...(operation ? { operation } : {}), ...extra });
 }
 
 test('tool text cannot be published as a direct human rule', () => {
@@ -42,7 +70,7 @@ test('assistant report without observation stays assistant report', () => {
     text: 'Corrigi a integração' };
   assert.ok(validateCandidate({ ...candidate, text: assistant.text }, assistant).reasons.includes('origin_mismatch'));
   assert.equal(validateCandidate({ ...candidate, text: assistant.text, actor: 'assistant',
-    speaker_role: 'assistant', origin: 'assistant_report', type: 'report' }, assistant).eligible, true);
+    speaker_role: 'assistant', origin: 'assistant_report', type: 'report', condition: null }, assistant).eligible, true);
 });
 
 test('historical evidence and condition are required, transient episodes stay inactive', () => {
@@ -93,6 +121,332 @@ test('AWS key and JWT are absent from CLI input and cannot become candidates', a
   assert.equal(prompt.includes(jwt), false);
   assert.equal(result.reason, 'sensitive_content');
   assert.equal((await box.readManifest(checkpoint.operationId)).kind, 'blocked');
+});
+
+test('complete private keys and quoted or multiline passwords never reach CLI', async t => {
+  const privateKey = '-----BEGIN OPENSSH PRIVATE KEY-----\nabcPRIVATEKEYbody123\n-----END OPENSSH PRIVATE KEY-----';
+  const password = 'alpha beta gamma';
+  const multiline = 'first line\nsecond secret line';
+  const message = { ...source, text: `${source.text}\n${privateKey}\npassword: "${password}"\nsecret: "${multiline}"` };
+  const { box, checkpoint } = await fixture(t, [message]);
+  let prompt;
+  const result = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async input => { prompt = input; return { kind: 'error', reason: 'cli_failed' }; },
+  });
+  assert.equal(result.kind, 'pending');
+  assert.ok(prompt);
+  for (const value of ['abcPRIVATEKEYbody123', password, multiline]) assert.equal(prompt.includes(value), false);
+  assert.equal(prompt.includes('Fable faz só revisão final'), true);
+});
+
+test('safe fact beside source secrets reaches remote payload without secret bytes', async t => {
+  const privateKey = '-----BEGIN PRIVATE KEY-----\nprivate-material-123\n-----END PRIVATE KEY-----';
+  const password = 'alpha beta gamma';
+  const { box, checkpoint } = await fixture(t, [{ ...source,
+    text: `${source.text}\npassword: "${password}"\n${privateKey}` }]);
+  let prompt, operation;
+  assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async input => { prompt = input; return { kind: 'success',
+      candidates: [candidate] }; },
+  })).kind, 'manifested');
+  assert.equal((await sealFixture(box, checkpoint.operationId, 'fable_review', 'approve')).kind, 'sealed');
+  assert.equal((await approveCandidate(checkpoint.operationId, 'fable_review', {
+    outbox: box, store: async op => { operation = op; return box.ackCandidate(checkpoint.operationId,
+      'fable_review', { externalId: op.externalId, projectId: 'p', status: 'active',
+        sdkId: 'uuid-1', qdrantId: 'uuid-1' }); },
+  })).kind, 'processed');
+  const exposed = prompt + JSON.stringify(operation);
+  assert.equal(exposed.includes(privateKey), false);
+  assert.equal(exposed.includes('private-material-123'), false);
+  assert.equal(exposed.includes(password), false);
+  assert.equal(operation.text, candidate.text);
+});
+
+test('incomplete private key blocks CLI before any call', async t => {
+  const { box, checkpoint } = await fixture(t, [{ ...source,
+    text: `${source.text}\n${beginPrivateKey}\n${syntheticKeyBody}` }]);
+  const result = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => { throw new Error('called'); },
+  });
+  assert.equal(result.reason, 'unsafe_source_secret');
+});
+
+test('model-controlled metadata with secret cannot be persisted or published', async t => {
+  const { box, checkpoint } = await fixture(t);
+  const result = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', candidates: [{ ...candidate,
+      logical_key: syntheticToken }] }),
+  });
+  assert.equal(result.reason, 'sensitive_content');
+  assert.equal((await box.readManifest(checkpoint.operationId)).kind, 'blocked');
+  assert.equal(validateCandidate({ ...candidate, logical_key: syntheticToken },
+    source).reasons.includes('sensitive_content'), true);
+});
+
+test('private-key body substring is rejected even without PEM markers in candidate', () => {
+  const pemSource = { ...source, text: `${source.text}\n-----BEGIN OPENSSH PRIVATE KEY-----\n` +
+    `${syntheticKeyBody}\n-----END OPENSSH PRIVATE KEY-----` };
+  assert.ok(validateCandidate({ ...candidate, text: syntheticKeyBody, type: 'fact' }, pemSource)
+    .reasons.includes('sensitive_content'));
+});
+
+test('model metadata uses bounded type and cannot invent supersession', () => {
+  assert.ok(validateCandidate({ ...candidate, type: 'arbitrary_model_label' }, source)
+    .reasons.includes('invalid_metadata'));
+  assert.ok(validateCandidate({ ...candidate, supersedes_id: `src-${'a'.repeat(64)}` }, source)
+    .reasons.includes('invalid_metadata'));
+});
+
+test('extraction derives actor, origin and evidence date from native human source', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-native-source-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const row = { type: 'user', uuid: 'native-1', timestamp: '2024-02-03T10:00:00Z',
+    sessionId: 's', isSidechain: false, userType: 'external',
+    message: { role: 'user', content: [{ type: 'text', text: source.text }] } };
+  const transcript = path.join(dir, 'source.jsonl');
+  await fs.writeFile(transcript, JSON.stringify(row) + '\n');
+  const parsed = await parsePersistedSlice({ cli: 'claude', transcriptPath: transcript, sessionId: 's' });
+  assert.equal(parsed.messages[0].origin, 'human');
+  const box = createOutbox(dir);
+  const item = { cli: 'claude', sessionId: 's', start: 0, end: parsed.lastCompleteByte,
+    sliceHash: 'b'.repeat(64), messages: parsed.messages };
+  const queued = await box.enqueueCheckpoint(item, { projectId: 'p', policyVersion: 'native-v1' });
+  const checkpoint = { ...item, operationId: queued.operationId, projectId: 'p', policyVersion: 'native-v1' };
+  const selected = parsed.messages[0];
+  const result = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', model: 'claude-sonnet-4-5',
+      candidates: [{ candidate_key: 'fable_review', source_message_id: selected.messageId,
+        text: selected.text, type: 'rule', condition: 'revisão final', scope: 'project',
+        actor: 'assistant', speaker_role: 'assistant', origin: 'assistant_report',
+        evidence_at: '2026-10-01T00:00:00Z' }] }),
+  });
+  assert.equal(result.kind, 'manifested');
+  const payload = await box.readCandidatePayload(checkpoint.operationId, 'fable_review');
+  assert.equal(payload.actor, 'user');
+  assert.equal(payload.origin, 'user_direct');
+  assert.equal(payload.speaker_role, 'user');
+  assert.equal(payload.evidence_at, selected.timestamp);
+});
+
+test('callback-shaped model JSON cannot authorize an approval', async t => {
+  const { box, checkpoint } = await fixture(t);
+  assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+  })).kind, 'manifested');
+  const result = await approveCandidate(checkpoint.operationId, 'fable_review', { outbox: box,
+    review: async (_item, sha) => ({ decision: 'approve', payloadSha256: sha, approved: true }),
+    store: async () => { throw new Error('store called'); } });
+  assert.equal(result.reason, 'owner_approval_required');
+});
+
+test('sealed operation with injected secret metadata cannot reach remote store', async t => {
+  const { box, checkpoint } = await fixture(t);
+  assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+  })).kind, 'manifested');
+  const entry = (await box.readManifest(checkpoint.operationId)).candidates[0];
+  const payload = await box.readCandidatePayload(checkpoint.operationId, 'fable_review');
+  const operation = { externalId: entry.externalId, projectId: 'p', sessionId: 's', text: payload.text,
+    sourceIdentity: { projectId: 'p', originCli: 'claude', sessionId: 's', start: 0, end: 80,
+      sliceHash: 'a'.repeat(64), policyVersion: 'native-v1', candidateKey: 'fable_review' },
+    metadata: { source: 'm1', actor: 'user', origin: 'user_direct', scope: 'project',
+      evidence_at: source.timestamp, logical_key: syntheticToken },
+    approval: { kind: 'approved' } };
+  assert.equal((await box.sealReview(checkpoint.operationId, 'fable_review', {
+    decision: 'approve', actor: 'test_fixture', reviewedAt: '2026-10-01T00:00:00Z',
+    payloadSha256: entry.payloadRef.sha256, operation,
+  })).kind, 'sealed');
+  const result = await approveCandidate(checkpoint.operationId, 'fable_review', {
+    outbox: box, store: async () => { throw new Error('remote store called'); },
+  });
+  assert.equal(result.reason, 'review_mismatch');
+});
+
+test('owner terminal rejection records local UID, username, item hash and decision', async t => {
+  const { dir, box, checkpoint } = await fixture(t);
+  assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+  })).kind, 'manifested');
+  const entry = (await box.readManifest(checkpoint.operationId)).candidates[0];
+  const runner = path.join(dir, 'owner-review.mjs');
+  await fs.writeFile(runner, `import { createOutbox } from ${JSON.stringify(new URL('../base/memoria/outbox.mjs', import.meta.url).href)};\n` +
+    `import { reviewCandidateOnTerminal } from ${JSON.stringify(new URL('../base/memoria/candidates.mjs', import.meta.url).href)};\n` +
+    `const result = await reviewCandidateOnTerminal(${JSON.stringify(checkpoint.operationId)}, 'fable_review', ` +
+    `{ outbox: createOutbox(${JSON.stringify(dir)}) });\nconsole.log('RESULT=' + JSON.stringify(result));\n`);
+  const child = spawn('/usr/bin/script', ['-q', '-e', '-c', `${process.execPath} ${runner}`, '/dev/null'],
+    { stdio: ['pipe', 'pipe', 'pipe'] });
+  let output = '';
+  let step = 0;
+  child.stdout.on('data', chunk => {
+    output += chunk;
+    if (step === 0 && output.includes('Action (accept/reject/duplicate/edit): ')) {
+      step++; child.stdin.write('reject\n');
+    } else if (step === 1 && output.includes('Reason code: ')) {
+      step++; child.stdin.write('unsupported_claim\n');
+    } else if (step === 2 && output.includes('Confirm reject for ')) {
+      step++; child.stdin.write('yes\n');
+    }
+  });
+  const code = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
+  assert.equal(code, 0, output);
+  assert.match(output, /RESULT=\{"kind":"processed"/);
+  assert.ok(output.includes(entry.payloadRef.sha256));
+  assert.ok(output.includes(candidate.text));
+  const audit = JSON.parse(await fs.readFile(path.join(dir, 'candidates', 'reviews', `${entry.externalId}.json`)));
+  assert.equal(audit.review.actor, `uid:${process.getuid()}:${os.userInfo().username}`);
+  assert.equal(audit.review.decision, 'reject');
+  assert.equal(audit.review.payloadSha256, entry.payloadRef.sha256);
+});
+
+test('owner terminal acceptance seals review before one verified child ACK', async t => {
+  const { dir, box, checkpoint } = await fixture(t);
+  assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+  })).kind, 'manifested');
+  const runner = path.join(dir, 'owner-accept.mjs');
+  await fs.writeFile(runner, `import { createOutbox } from ${JSON.stringify(new URL('../base/memoria/outbox.mjs', import.meta.url).href)};\n` +
+    `import { reviewCandidateOnTerminal } from ${JSON.stringify(new URL('../base/memoria/candidates.mjs', import.meta.url).href)};\n` +
+    `const box = createOutbox(${JSON.stringify(dir)});\n` +
+    `const result = await reviewCandidateOnTerminal(${JSON.stringify(checkpoint.operationId)}, 'fable_review', ` +
+    `{ outbox: box, store: op => box.ackCandidate(${JSON.stringify(checkpoint.operationId)}, 'fable_review', ` +
+    `{ externalId: op.externalId, projectId: op.projectId, status: 'active', sdkId: 'uuid-1', qdrantId: 'uuid-1' }) });\n` +
+    `console.log('RESULT=' + JSON.stringify(result));\n`);
+  const child = spawn('/usr/bin/script', ['-q', '-e', '-c', `${process.execPath} ${runner}`, '/dev/null'],
+    { stdio: ['pipe', 'pipe', 'pipe'] });
+  let output = '';
+  let step = 0;
+  child.stdout.on('data', chunk => {
+    output += chunk;
+    if (step === 0 && output.includes('Action (accept/reject/duplicate/edit): ')) {
+      step++; child.stdin.write('accept\n');
+    } else if (step === 1 && output.includes('Confirm accept for ')) {
+      step++; child.stdin.write('yes\n');
+    }
+  });
+  const code = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
+  assert.equal(code, 0, output);
+  assert.match(output, /RESULT=\{"kind":"processed"/);
+  const receipt = await box.readDisposition(checkpoint.operationId);
+  assert.equal(receipt.candidates[0].status, 'remote_acked');
+  const review = JSON.parse(await fs.readFile(path.join(dir, 'candidates', 'reviews',
+    `${receipt.candidates[0].externalId}.json`)));
+  assert.equal(review.review.actor, `uid:${process.getuid()}:${os.userInfo().username}`);
+  assert.equal(review.review.operation.text, candidate.text);
+});
+
+test('first child ACK returns success while sibling remains pending', async t => {
+  const { box, checkpoint } = await fixture(t);
+  const second = { ...candidate, candidate_key: 'mira_implement', text: 'Mira implementa.' };
+  assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate, second] }),
+  })).kind, 'manifested');
+  const manifest = await box.readManifest(checkpoint.operationId);
+  let adds = 0;
+  for (const child of manifest.candidates) assert.equal((await sealFixture(box, checkpoint.operationId,
+    child.candidateKey, 'approve')).kind, 'sealed');
+  const options = { outbox: box,
+    store: async op => { adds++; return box.ackCandidate(checkpoint.operationId, op.sourceIdentity.candidateKey,
+      { externalId: op.externalId, projectId: 'p', status: 'active', sdkId: `sdk-${adds}`, qdrantId: `sdk-${adds}` }); } };
+  const first = await approveCandidate(checkpoint.operationId, manifest.candidates[0].candidateKey, options);
+  assert.equal(first.kind, 'acked');
+  assert.equal((await box.readManifest(checkpoint.operationId)).candidates[1].status, 'pending');
+  assert.equal((await approveCandidate(checkpoint.operationId, manifest.candidates[1].candidateKey, options)).kind, 'processed');
+  assert.equal(adds, 2);
+});
+
+test('claimed store success without durable child ACK remains pending', async t => {
+  const { box, checkpoint } = await fixture(t);
+  assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+  })).kind, 'manifested');
+  assert.equal((await sealFixture(box, checkpoint.operationId, 'fable_review', 'approve')).kind, 'sealed');
+  const entry = (await box.readManifest(checkpoint.operationId)).candidates[0];
+  const result = await approveCandidate(checkpoint.operationId, 'fable_review', {
+    outbox: box, store: async () => ({ kind: 'stored', externalId: entry.externalId }),
+  });
+  assert.equal(result.reason, 'store_unconfirmed');
+  assert.equal((await box.readManifest(checkpoint.operationId)).candidates[0].status, 'pending');
+});
+
+test('terminal child replay completes parent after receipt ENOSPC without another add', async t => {
+  const { dir, box, checkpoint } = await fixture(t);
+  assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+  })).kind, 'manifested');
+  const child = (await box.readManifest(checkpoint.operationId)).candidates[0];
+  assert.equal((await sealFixture(box, checkpoint.operationId, child.candidateKey, 'approve')).kind, 'sealed');
+  let adds = 0;
+  let failReceipt = true;
+  const firstBox = { ...box, completeCheckpoint: async id => failReceipt ? { kind: 'full', operationId: id } : box.completeCheckpoint(id) };
+  const options = { outbox: firstBox,
+    store: async op => { adds++; return box.ackCandidate(checkpoint.operationId, child.candidateKey,
+      { externalId: op.externalId, projectId: 'p', status: 'active', sdkId: 'uuid-1', qdrantId: 'uuid-1' }); } };
+  assert.equal((await approveCandidate(checkpoint.operationId, child.candidateKey, options)).kind, 'full');
+  failReceipt = false;
+  const replay = await approveCandidate(checkpoint.operationId, child.candidateKey,
+    { ...options, outbox: createOutbox(dir), store: async () => { throw new Error('second add'); } });
+  assert.equal(replay.kind, 'processed');
+  assert.equal(adds, 1);
+});
+
+test('two-child final ACK survives parent receipt ENOSPC and restart without reextraction', async t => {
+  const { dir, box, checkpoint } = await fixture(t);
+  const second = { ...candidate, candidate_key: 'mira_implement', text: 'Mira implementa.' };
+  let extracts = 0;
+  assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => { extracts++; return { kind: 'success', candidates: [candidate, second] }; },
+  })).kind, 'manifested');
+  const children = (await box.readManifest(checkpoint.operationId)).candidates;
+  for (const child of children) assert.equal((await sealFixture(box, checkpoint.operationId,
+    child.candidateKey, 'approve')).kind, 'sealed');
+  let adds = 0;
+  let failReceipt = true;
+  const fullAfterFinal = { ...box, completeCheckpoint: async id => {
+    const manifest = await box.readManifest(id);
+    return failReceipt && manifest.candidates.every(item => item.status !== 'pending')
+      ? { kind: 'full', operationId: id } : box.completeCheckpoint(id);
+  } };
+  const options = { outbox: fullAfterFinal, store: async op => {
+    adds++;
+    return box.ackCandidate(checkpoint.operationId, op.sourceIdentity.candidateKey,
+      { externalId: op.externalId, projectId: 'p', status: 'active', sdkId: `uuid-${adds}`,
+        qdrantId: `uuid-${adds}` });
+  } };
+  assert.equal((await approveCandidate(checkpoint.operationId, children[0].candidateKey, options)).kind, 'acked');
+  assert.equal((await approveCandidate(checkpoint.operationId, children[1].candidateKey, options)).kind, 'full');
+  failReceipt = false;
+  const replay = await approveCandidate(checkpoint.operationId, children[1].candidateKey,
+    { outbox: createOutbox(dir), store: async () => { throw new Error('repeat add'); } });
+  assert.equal(replay.kind, 'processed');
+  assert.equal(adds, 2);
+  assert.equal(extracts, 1);
+});
+
+test('rejected and duplicate terminal children replay parent receipt without renewed review', async t => {
+  for (const disposition of ['rejected', 'duplicate']) {
+    const { dir, box, checkpoint } = await fixture(t);
+    assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+      outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    })).kind, 'manifested');
+    const key = 'fable_review';
+    assert.equal((await sealFixture(box, checkpoint.operationId, key,
+      disposition === 'rejected' ? 'reject' : 'duplicate', disposition === 'rejected'
+        ? { reason: 'unsupported_claim' } : { duplicateRef: 'older-source' })).kind, 'sealed');
+    const fullBox = { ...box, completeCheckpoint: async id => ({ kind: 'full', operationId: id }) };
+    const call = disposition === 'rejected'
+      ? options => rejectCandidate(checkpoint.operationId, key, 'unsupported_claim', options)
+      : options => markDuplicateCandidate(checkpoint.operationId, key, 'older-source', options);
+    const firstOptions = { outbox: fullBox, verifyDuplicate: async () =>
+      ({ externalId: 'older-source', projectId: 'p', status: 'active' }) };
+    assert.equal((await call(firstOptions)).kind, 'full');
+    assert.equal((await call({ outbox: createOutbox(dir) })).kind, 'processed');
+  }
 });
 
 test('two complementary facts persist separate payloads and reload after restart', async t => {
@@ -187,10 +541,10 @@ test('approved item seals exact operation, stores through canonical facade and A
   })).kind, 'manifested');
   const manifest = await box.readManifest(checkpoint.operationId);
   const child = manifest.candidates[0];
+  assert.equal((await sealFixture(box, checkpoint.operationId, child.candidateKey, 'approve')).kind, 'sealed');
   let operation;
   const result = await approveCandidate(checkpoint.operationId, child.candidateKey, {
-    outbox: box, review: async item => ({ decision: 'approve', payloadSha256: child.payloadRef.sha256,
-      text: item.text }),
+    outbox: box,
     store: async op => { operation = op; return box.ackCandidate(checkpoint.operationId, child.candidateKey,
       { externalId: op.externalId, projectId: 'p', status: 'active', sdkId: 'uuid-1', qdrantId: 'uuid-1' }); },
   });
@@ -199,7 +553,7 @@ test('approved item seals exact operation, stores through canonical facade and A
   assert.equal(operation.externalId, child.externalId);
   assert.equal(operation.approval.kind, 'approved');
   const audit = JSON.parse(await fs.readFile(path.join(dir, 'candidates', 'reviews', `${child.externalId}.json`)));
-  assert.equal(audit.review.actor, 'local_owner');
+  assert.equal(audit.review.actor, 'test_fixture');
   assert.ok(Number.isFinite(Date.parse(audit.review.reviewedAt)));
   assert.equal(audit.review.operation.text, candidate.text);
   assert.equal((await createOutbox(dir).cursor('claude', 's')).processedEnd, 80);
@@ -227,8 +581,10 @@ test('review rejection is auditable local disposition and never calls remote sto
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
     outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
   })).kind, 'manifested');
+  assert.equal((await sealFixture(box, checkpoint.operationId, 'fable_review', 'reject',
+    { reason: 'unsupported_claim' })).kind, 'sealed');
   const result = await rejectCandidate(checkpoint.operationId, 'fable_review', 'unsupported_claim', {
-    outbox: box, review: async (_item, sha) => ({ decision: 'reject', payloadSha256: sha }),
+    outbox: box,
   });
   assert.equal(result.kind, 'processed');
   assert.equal((await box.readDisposition(checkpoint.operationId)).candidates[0].status, 'rejected');
@@ -239,7 +595,9 @@ test('duplicate disposition requires verified active reference and keeps separat
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
     outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
   })).kind, 'manifested');
-  const duplicate = { outbox: box, review: async (_item, sha) => ({ decision: 'duplicate', payloadSha256: sha }),
+  assert.equal((await sealFixture(box, checkpoint.operationId, 'fable_review', 'duplicate',
+    { duplicateRef: 'older-source' })).kind, 'sealed');
+  const duplicate = { outbox: box,
     verifyDuplicate: async () => ({ externalId: 'older-source', projectId: 'p', status: 'active' }) };
   assert.equal((await markDuplicateCandidate(checkpoint.operationId, 'fable_review',
     'older-source', duplicate)).kind, 'processed');
@@ -258,7 +616,7 @@ test('canonical store reuses remote commit after failed local child ACK', async 
   const remote = [];
   let adds = 0;
   let ackFails = true;
-  let reviews = 0;
+  assert.equal((await sealFixture(box, checkpoint.operationId, child.candidateKey, 'approve')).kind, 'sealed');
   const bridge = { writerId: 'writer-a', resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir: dir,
       destination: { collection: 'private' } }), authorize: async () => ({ kind: 'authorized', key: 'fixture-key',
       connection: { url: 'http://127.0.0.1:6333/' } }),
@@ -277,8 +635,7 @@ test('canonical store reuses remote commit after failed local child ACK', async 
         return { kind: 'item', item: remote[0] }; }
       throw new Error('unexpected operation');
     } };
-  const options = { outbox: box, review: async () => { reviews++; return { decision: 'approve',
-    payloadSha256: child.payloadRef.sha256 }; },
+  const options = { outbox: box,
     store: op => storeMemory('project', 's', op, () => '', { ...bridge,
       ackLocal: (id, proof) => ackFails ? { kind: 'blocked', reason: 'disk_full' } :
         box.ackCandidate(checkpoint.operationId, child.candidateKey, proof) }),
@@ -289,7 +646,6 @@ test('canonical store reuses remote commit after failed local child ACK', async 
   assert.equal((await approveCandidate(checkpoint.operationId, child.candidateKey, options)).kind, 'processed');
   assert.equal((await box.cursor('claude', 's')).processedEnd, 80);
   assert.equal(adds, 1);
-  assert.equal(reviews, 1);
 });
 
 test('CLI route excludes inherited API secrets and rejects an unexpected model', async t => {
