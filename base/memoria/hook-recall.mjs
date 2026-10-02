@@ -35,9 +35,48 @@ async function saveSeen(file, seen) {
   } finally { await fs.rm(temporary, { force: true }); }
 }
 
+export async function recordRecallWindow({ stateDir, cli, sessionId, eligible, remaining,
+  writeSeen = saveSeen }) {
+  const file = stateFile(stateDir, cli, sessionId);
+  return withProjectLock(stateDir, async () => {
+    if (remaining() <= 0) return { kind: 'unavailable', reason: 'deadline' };
+    const seen = await readSeen(file);
+    if (!seen) return { kind: 'unavailable', reason: 'unsafe_window' };
+    if (seen.size >= 2048) return { kind: 'unavailable', reason: 'window_full' };
+    const keyed = eligible.map(row => ({ row,
+      key: digest(`${row.sdkId ?? row.memory_id ?? row.id}:${row.text ?? row.memory}`) }));
+    const rendered = renderRecall(keyed.filter(item => !seen.has(item.key)).map(item => item.row), 500);
+    if (!rendered.used.length) return { kind: 'abstain' };
+    const additions = keyed.filter(item => rendered.used.includes(item.row)).map(item => item.key);
+    if (seen.size + additions.length > 2048) return { kind: 'unavailable', reason: 'window_full' };
+    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+    const dir = await fs.lstat(path.dirname(file));
+    if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o077)) {
+      return { kind: 'unavailable', reason: 'unsafe_window' };
+    }
+    const previous = new Set(seen);
+    for (const key of additions) seen.add(key);
+    if (remaining() <= 0) return { kind: 'unavailable', reason: 'deadline' };
+    await writeSeen(file, seen);
+    if (remaining() <= 0) {
+      await saveSeen(file, previous);
+      return { kind: 'unavailable', reason: 'deadline' };
+    }
+    const rollback = () => withProjectLock(stateDir, async () => {
+      const current = await readSeen(file);
+      if (!current) return false;
+      for (const key of additions) current.delete(key);
+      await saveSeen(file, current);
+      return true;
+    }, 'recall.lock', 1000);
+    return { kind: 'items', items: rendered.used, text: rendered.text, rollback };
+  }, 'recall.lock', Math.max(1, Math.min(remaining(), 100)));
+}
+
 export async function recallForPrompt({ cli, event = 'UserPromptSubmit', payload, result, stateRoot,
   began = performance.now(), resolve = resolveProject, search = searchProject,
-  readSecret = name => process.env[name], now = () => new Date().toISOString() } = {}) {
+  readSecret = name => process.env[name], now = () => new Date().toISOString(),
+  recordWindow = recordRecallWindow } = {}) {
   if (!validCapture(result) || !['claude', 'codex'].includes(cli) ||
       typeof payload?.cwd !== 'string' || typeof payload.session_id !== 'string') return null;
   if (event !== 'UserPromptSubmit' && event !== 'PreCompact') return null;
@@ -64,25 +103,10 @@ export async function recallForPrompt({ cli, event = 'UserPromptSubmit', payload
     if (answer?.kind !== 'items' || remaining() <= 0) return null;
     const eligible = selectRecall(answer.items, { projectId: current.projectId, now: now() });
     if (!eligible.length) return null;
-    return await withProjectLock(current.stateDir, async () => {
-      if (remaining() <= 0) return null;
-      const seen = await readSeen(file);
-      if (!seen) return null;
-      if (seen.size >= 2048) return null;
-      const keyed = eligible.map(row => ({ row, key: digest(`${row.sdkId ?? row.memory_id ?? row.id}:${row.text ?? row.memory}`) }));
-      const unseen = keyed.filter(item => !seen.has(item.key));
-      const rendered = renderRecall(unseen.map(item => item.row), 500);
-      if (!rendered.used.length || seen.size + rendered.used.length > 2048 || remaining() <= 0) return null;
-      for (const row of rendered.used) {
-        const item = keyed.find(item => item.row === row);
-        seen.add(item.key);
-      }
-      await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-      const dir = await fs.lstat(path.dirname(file));
-      if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o077)) return null;
-      await saveSeen(file, seen);
-      if (remaining() <= 0) return null;
-      return { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: rendered.text } };
-    }, 'recall.lock', Math.max(1, Math.min(remaining(), 100)));
+    const selected = await recordWindow({ stateDir: current.stateDir, cli,
+      sessionId: payload.session_id, eligible, remaining });
+    if (selected.kind !== 'items') return null;
+    if (remaining() <= 0) { await selected.rollback(); return null; }
+    return { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: selected.text } };
   } catch { return null; }
 }

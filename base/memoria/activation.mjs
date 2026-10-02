@@ -1,7 +1,7 @@
-import dns from 'node:dns/promises';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
+import { spawn } from 'node:child_process';
 import { authorizeDestination, trustTuple } from './trust.mjs';
 
 const blocked = (reason) => ({ kind: 'blocked', reason });
@@ -17,8 +17,36 @@ function privateAddress(address) {
     (a === 192 && b === 168) || a === 127;
 }
 
-async function addressesFor(host) {
-  return (await dns.lookup(host, { all: true })).map(({ address }) => address);
+async function addressesFor(host, deps) {
+  const remaining = (deps.deadlineAt ?? Date.now() + 5000) - Date.now();
+  if (remaining <= 0 || deps.signal?.aborted) return blocked('deadline');
+  const child = (deps.spawnLookup ?? spawn)(process.execPath, ['-e',
+    'require("node:dns").lookup(process.argv[1],{all:true},(error,rows)=>{if(error)process.exitCode=1;else process.stdout.write(JSON.stringify(rows.map(row=>row.address)))})', host],
+  { stdio: ['ignore', 'pipe', 'ignore'], env: {} });
+  return new Promise(resolve => {
+    let output = '';
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      deps.signal?.removeEventListener('abort', abort);
+      if (value?.kind === 'blocked') child.kill('SIGKILL');
+      resolve(value);
+    };
+    const abort = () => finish(blocked('deadline'));
+    const timer = setTimeout(abort, remaining);
+    deps.signal?.addEventListener('abort', abort, { once: true });
+    child.stdout.on('data', chunk => {
+      output += chunk;
+      if (output.length > 16384) finish(blocked('destination_unavailable'));
+    });
+    child.once('error', () => finish(blocked('destination_unavailable')));
+    child.once('close', code => {
+      try { finish(code === 0 ? JSON.parse(output) : blocked('destination_unavailable')); }
+      catch { finish(blocked('destination_unavailable')); }
+    });
+  });
 }
 
 async function probeCollection(url, collection, key, address) {
@@ -51,8 +79,10 @@ export async function pinDestination(url, deps = {}) {
   if (!['https:', 'http:'].includes(target.protocol) || target.username || target.password ||
       target.pathname !== '/' || target.search || target.hash) return blocked('invalid_destination');
   let addresses;
-  try { addresses = await (deps.lookup ?? addressesFor)(target.hostname); }
+  try { addresses = deps.lookup ? await deps.lookup(target.hostname) : await addressesFor(target.hostname, deps); }
   catch { return blocked('destination_unavailable'); }
+  if (addresses?.kind === 'blocked') return addresses;
+  if (deps.deadlineAt !== undefined && Date.now() >= deps.deadlineAt || deps.signal?.aborted) return blocked('deadline');
   if (!Array.isArray(addresses)) return blocked('destination_unavailable');
   addresses = addresses.map((item) => typeof item === 'string' ? item : item.address);
   if (!addresses.length || addresses.some((address) => !privateAddress(address)) ||

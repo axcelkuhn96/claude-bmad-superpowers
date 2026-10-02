@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { FrameReader, encodeFrame } from '../base/memoria/frame.mjs';
 import { EventEmitter } from 'node:events';
 import { createMcp } from '../base/memoria/mcp.mjs';
@@ -16,6 +16,9 @@ import { inspectConfiguration, initializeSession } from '../base/memoria/provide
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { applyNativeExclusion, restoreNativeExclusion, verifyNativeCapture } from '../base/memoria/native.mjs';
 import { RUNTIME_PINS, runtimePython, openArtifactIdentity } from '../base/memoria/runtime.mjs';
+import { pinDestination } from '../base/memoria/activation.mjs';
+import net from 'node:net';
+import { readBrokerRequest, brokerEndpointStatus, prepareBrokerEndpoint } from '../base/memoria/broker.mjs';
 
 function git(cwd, ...args) {
   const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
@@ -55,6 +58,120 @@ test('binary frames handle fragments and keep the secret out of JSON', () => {
   assert.throws(() => partial.end(), /frame_partial_eof/);
 });
 
+test('broker accepts one request split across real Unix socket writes', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-broker-frame-'));
+  const file = path.join(dir, 'sock');
+  const server = net.createServer(socket => readBrokerRequest(socket, frame =>
+    socket.end(encodeFrame({ kind: 'items', query: frame.value.query }, undefined, true))));
+  t.after(async () => { server.close(); await fs.rm(dir, { recursive: true, force: true }); });
+  await new Promise(resolve => server.listen(file, resolve));
+  const client = net.createConnection(file);
+  const response = new FrameReader({ response: true });
+  const result = new Promise((resolve, reject) => {
+    client.on('data', chunk => {
+      const frames = response.push(chunk);
+      if (frames.length) resolve(frames[0].value);
+    });
+    client.on('error', reject);
+    client.on('close', () => reject(new Error('fragmented_request_rejected')));
+  });
+  await new Promise(resolve => client.once('connect', resolve));
+  const frame = encodeFrame({ query: 'split' }, Buffer.from('key'));
+  client.write(frame.subarray(0, 6));
+  await new Promise(resolve => setTimeout(resolve, 10));
+  client.write(frame.subarray(6));
+  assert.deepEqual(await result, { kind: 'items', query: 'split' });
+  client.destroy();
+});
+
+test('broker rejects trailing partial bytes without processing the request', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-broker-trailing-'));
+  const file = path.join(dir, 'sock');
+  let processed = 0;
+  const server = net.createServer(socket => readBrokerRequest(socket, () => { processed++; }));
+  t.after(async () => { server.close(); await fs.rm(dir, { recursive: true, force: true }); });
+  await new Promise(resolve => server.listen(file, resolve));
+  const client = net.createConnection(file);
+  await new Promise(resolve => client.once('connect', resolve));
+  client.write(Buffer.concat([encodeFrame({ query: 'fact' }, Buffer.from('key')), Buffer.from('M0')]));
+  await new Promise(resolve => client.once('close', resolve));
+  assert.equal(processed, 0);
+});
+
+test('broker recovers a verified orphan socket after its own listener crashes', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-broker-orphan-'));
+  const file = path.join(dir, 'encoder.sock');
+  const child = spawn(process.execPath, ['-e',
+    'require("node:net").createServer().listen(process.argv[1],()=>{require("node:fs").chmodSync(process.argv[1],0o600);process.stdout.write("ready\\n")})', file],
+  { stdio: ['ignore', 'pipe', 'pipe'] });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+      await new Promise(resolve => child.once('exit', resolve));
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await new Promise((resolve, reject) => {
+    child.stdout.once('data', resolve);
+    child.once('error', reject);
+  });
+  assert.equal(await brokerEndpointStatus(dir), 'live');
+  assert.equal(await prepareBrokerEndpoint(dir), 'live');
+  child.kill('SIGKILL');
+  await new Promise(resolve => child.once('exit', resolve));
+  assert.equal(await brokerEndpointStatus(dir), 'orphan');
+  assert.equal(await prepareBrokerEndpoint(dir), 'ready');
+  assert.equal(await brokerEndpointStatus(dir), 'missing');
+});
+
+test('DNS lookup is killed at recall deadline and next destination is serviced', async t => {
+  let lookupChild;
+  const started = performance.now();
+  const pending = await pinDestination('https://qdrant.internal/', {
+    deadlineAt: Date.now() + 130,
+    spawnLookup: () => {
+      lookupChild = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'],
+        { stdio: ['ignore', 'pipe', 'ignore'] });
+      return lookupChild;
+    },
+  });
+  assert.deepEqual(pending, { kind: 'blocked', reason: 'deadline' });
+  assert.ok(performance.now() - started < 450);
+  await new Promise(resolve => lookupChild.once('exit', resolve));
+  assert.equal(lookupChild.signalCode, 'SIGKILL');
+  const next = await pinDestination('http://localhost/', { deadlineAt: Date.now() + 300,
+    lookup: async () => ['127.0.0.1'] });
+  assert.equal(next.kind, 'pinned');
+  t.after(() => { if (lookupChild.exitCode === null && lookupChild.signalCode === null) lookupChild.kill('SIGKILL'); });
+});
+
+test('hook child exits despite a host DNS implementation that never answers', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-dns-hook-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const preload = path.join(dir, 'hang-dns.cjs');
+  await fs.writeFile(preload,
+    'require("node:dns/promises").lookup=()=>new Promise(()=>setInterval(()=>{},1000));\n');
+  const script = `import { recallForPrompt } from './base/memoria/hook-recall.mjs';
+import { pinDestination } from './base/memoria/activation.mjs';
+await recallForPrompt({ cli:'claude', result:{kind:'queued'},
+  payload:{cwd:'/fixture',session_id:'s',prompt:'rule'}, began:performance.now(),
+  resolve:async()=>({provider:'mem0',projectId:'p',stateDir:process.argv[1]}),
+  search:(_query,_secret,options)=>pinDestination('https://qdrant.invalid/',
+    {deadlineAt:Date.now()+options.deadlineMs}) });`;
+  const started = performance.now();
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script, dir],
+    { cwd: path.resolve('.'), stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, NODE_OPTIONS: `--require ${preload}` } });
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  const outcome = await new Promise(resolve => {
+    const timer = setTimeout(() => { child.kill('SIGKILL'); resolve({ timedOut: true }); }, 1300);
+    child.once('exit', (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
+  });
+  assert.deepEqual(outcome, { code: 0, signal: null }, stderr);
+  assert.ok(performance.now() - started < 1300);
+});
+
 test('warm artifact identity rejects replacement or mutation between operations', async t => {
   const { dir } = await fixture(t);
   const file = path.join(dir, 'model');
@@ -81,11 +198,11 @@ test('MCP refuses unbound calls before search and never accepts JSON approval', 
     resolve: async () => ({ kind: 'bound', projectId: 'p', cwd: '/fixture', nativeSessionId: 'session', stateDir: '/fixture/state' }),
     search: async (args) => { calls++; assert.equal(args.projectId, undefined); return { kind: 'items', items: [] }; } });
   assert.deepEqual(await bound.call('approve', { approved: true, actor: 'owner' }),
-    { kind: 'blocked', reason: 'trusted_review_required',
-      route: 'Run review.mjs <caller-cli> <caller-checkout> <current-native-session-id> <checkpoint-id> <candidate-key> in the owner terminal.' });
+    { kind: 'unavailable', reason: 'invalid_arguments' });
   assert.equal(calls, 0);
-  assert.deepEqual(await bound.call('search', { query: 'negative', project_id: 'other' }), { kind: 'abstain' });
-  assert.equal(calls, 1);
+  assert.deepEqual(await bound.call('search', { query: 'negative', project_id: 'other' }),
+    { kind: 'unavailable', reason: 'invalid_arguments' });
+  assert.equal(calls, 0);
 });
 
 test('MCP recall deadline includes native binding time', async () => {
@@ -102,6 +219,14 @@ test('MCP recall deadline includes native binding time', async () => {
   const result = await instance.call('search', { query: 'fact' });
   assert.equal(result.kind, 'unavailable');
   assert.ok(performance.now() - began < 1150);
+});
+
+test('MCP search failure is typed and does not escape the tool call', async () => {
+  const mcp = createMcp({ launchId: 'bound', cli: 'claude',
+    resolve: async () => ({ kind: 'bound', projectId: 'p', cwd: '/fixture', nativeSessionId: 's' }),
+    search: async () => { throw new Error('synthetic_search_failure'); } });
+  assert.deepEqual(await mcp.call('search', { query: 'rule' }),
+    { kind: 'unavailable', reason: 'search_failed' });
 });
 
 test('bound caller may propose protected historical checkpoints from the same project', async t => {
@@ -174,6 +299,27 @@ test('Codex worktrees own native config independently and share exclude safely',
   assert.ok((await fs.readFile(path.resolve(root, excludePath), 'utf8')).includes('/.codex/config.toml'));
   assert.equal((await restoreNativeExclusion(worktree, options)).kind, 'restored');
   assert.equal((await fs.readFile(path.resolve(root, excludePath), 'utf8')).includes('# cbs-memoria codex'), false);
+});
+
+test('native rollback retries after Git exclude write failure on final shared lease', async t => {
+  const { dir, root, stateRoot } = await fixture(t);
+  const worktree = path.join(dir, 'worktree');
+  git(root, 'worktree', 'add', '-q', '-b', 'rollback-worktree', worktree);
+  const options = { cli: 'codex', stateRoot, installedPlugin: true, projectRoot: root };
+  assert.equal((await applyNativeExclusion(root, options)).kind, 'applied');
+  assert.equal((await applyNativeExclusion(worktree, options)).kind, 'applied');
+  assert.equal((await restoreNativeExclusion(root, options)).kind, 'restored');
+  const exclude = path.resolve(root, git(root, 'rev-parse', '--git-path', 'info/exclude'));
+  const info = path.dirname(exclude);
+  await fs.chmod(info, 0o500);
+  let failed;
+  try { failed = await restoreNativeExclusion(worktree, options); }
+  finally { await fs.chmod(info, 0o700); }
+  assert.deepEqual(failed, { kind: 'blocked', reason: 'git_exclude_changed' });
+  await assert.rejects(fs.readFile(path.join(worktree, '.codex', 'config.toml'), 'utf8'), { code: 'ENOENT' });
+  assert.ok((await fs.readFile(exclude, 'utf8')).includes('/.codex/config.toml'));
+  assert.equal((await restoreNativeExclusion(worktree, options)).kind, 'restored');
+  assert.equal((await fs.readFile(exclude, 'utf8')).includes('/.codex/config.toml'), false);
 });
 
 test('Windows venv uses Scripts/python.exe without changing POSIX path', () => {

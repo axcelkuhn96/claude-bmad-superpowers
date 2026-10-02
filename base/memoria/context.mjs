@@ -28,6 +28,10 @@ export function selectRecall(results, { projectId, now, ownerId } = {}) {
       Number.isFinite(row.score) && row.score >= MIN_RECALL_SCORE && row.score <= 1 &&
       typeof item.text === 'string' && item.text.length > 0 && item.id &&
       typeof m.source === 'string' && m.source && typeof m.actor === 'string' && m.actor &&
+      ((m.origin === 'user_direct' && m.speaker_role === 'user') ||
+        (m.origin === 'assistant_report' && m.speaker_role === 'assistant') ||
+        (m.origin === 'tool_observation' && m.speaker_role === 'tool') ||
+        (m.origin === 'external_reference' && m.speaker_role === 'external')) &&
       Number.isFinite(date(m.evidence_at)) &&
       (m.scope === 'project' || m.scope === 'personal' && ownerId && m.owner_id === ownerId ||
         m.scope === 'episode' && Number.isFinite(to)) &&
@@ -52,7 +56,9 @@ function renderWithItems(items, maxTokens) {
   append('Current human instruction takes precedence over recalled memory.');
   for (const row of items) {
     const item = fields(row);
-    const line = `[${item.id}; source ${item.metadata.source}; date ${item.metadata.evidence_at}; actor ${item.metadata.actor}] ${item.text}`;
+    const m = item.metadata;
+    const condition = typeof m.condition === 'string' && m.condition ? `; condition ${m.condition}` : '';
+    const line = `[${item.id}; source ${m.source}; date ${m.evidence_at}; actor ${m.actor}; origin ${m.origin}; role ${m.speaker_role}${condition}] ${item.text}`;
     if (!append(line)) continue;
     used.push(row);
   }

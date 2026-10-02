@@ -3,7 +3,8 @@ import readline from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { resolveBoundLaunch } from './launch.mjs';
 import { searchProject, runBridgeOperation } from './bridge.mjs';
-import { createRecall, renderContext } from './context.mjs';
+import { selectRecall } from './context.mjs';
+import { recordRecallWindow } from './hook-recall.mjs';
 import { createOutbox } from './outbox.mjs';
 import { POLICY_VERSION } from './transcript.mjs';
 
@@ -22,12 +23,9 @@ const definitions = [
 
 export function createMcp({ launchId = process.env.CBS_MEMORIA_LAUNCH_ID,
   cli = process.env.CBS_MEMORIA_CLI, stateRoot = process.env.CBS_MEMORIA_STATE_ROOT,
-  resolve = resolveBoundLaunch, search = searchProject, read = runBridgeOperation } = {}) {
+  resolve = resolveBoundLaunch, search = searchProject, read = runBridgeOperation,
+  recordWindow = recordRecallWindow } = {}) {
   const mcpLifecycleId = randomUUID();
-  const recall = createRecall({ search: async (session, query, { deadlineMs }) =>
-    search({ cwd: session.cwd, sessionId: session.nativeSessionId, query }, secret,
-      { stateRoot, deadlineMs }) });
-
   async function call(name, args = {}) {
     // This check precedes every secret access, network operation and outbox read.
     const began = performance.now();
@@ -38,16 +36,39 @@ export function createMcp({ launchId = process.env.CBS_MEMORIA_LAUNCH_ID,
     ]) : await resolve(launchId, cli, { stateRoot });
     clearTimeout(timer);
     if (bound.kind !== 'bound') return blocked(bound.reason ?? 'unbound');
+    const definition = definitions.find(item => item.name === name);
+    if (!definition || !args || typeof args !== 'object' || Array.isArray(args) ||
+        Object.keys(args).some(key => !Object.hasOwn(definition.inputSchema.properties, key))) {
+      return blocked('invalid_arguments');
+    }
     if (name === 'status') return { kind: 'bound', provider: 'mem0', projectId: bound.projectId,
       mcpLifecycleId, nativeSessionId: bound.nativeSessionId };
     if (name === 'search') {
       if (typeof args.query !== 'string' || !args.query.trim() || args.query.length > 4096) return blocked('invalid_query');
-      const remaining = Math.floor(1000 - (performance.now() - began));
-      if (remaining <= 0) return blocked('deadline');
-      const result = await recall(bound, args.query, remaining);
-      if (performance.now() - began >= 1000) return blocked('deadline');
-      return result.kind === 'items' ? { kind: 'items', context: renderContext(result.items, 500),
-        count: result.items.length } : result;
+      const remaining = () => Math.floor(1000 - (performance.now() - began));
+      if (remaining() <= 0) return blocked('deadline');
+      let searchTimer;
+      let answer;
+      try {
+        answer = await Promise.race([
+          search({ cwd: bound.cwd, sessionId: bound.nativeSessionId, query: args.query }, secret,
+            { stateRoot, deadlineMs: remaining() }),
+          new Promise(resolveDeadline => { searchTimer = setTimeout(() => resolveDeadline(blocked('deadline')), remaining()); }),
+        ]);
+      } catch { return blocked('search_failed'); }
+      finally { clearTimeout(searchTimer); }
+      if (answer?.kind !== 'items') return answer?.kind === 'unavailable' || answer?.kind === 'blocked'
+        ? blocked(answer.reason) : blocked('search_failed');
+      const eligible = selectRecall(answer.items, { projectId: bound.projectId,
+        ownerId: bound.ownerId, now: new Date().toISOString() });
+      if (!eligible.length) return { kind: 'abstain' };
+      let selected;
+      try { selected = await recordWindow({ stateDir: bound.stateDir, cli,
+        sessionId: bound.nativeSessionId, eligible, remaining }); }
+      catch { return blocked(remaining() <= 0 ? 'deadline' : 'window_unavailable'); }
+      if (selected.kind !== 'items') return selected;
+      if (remaining() <= 0) { await selected.rollback(); return blocked('deadline'); }
+      return { kind: 'items', context: selected.text, count: selected.items.length };
     }
     if (name === 'source') {
       if (typeof args.memory_id !== 'string' || args.memory_id.length > 256) return blocked('invalid_memory_id');
@@ -84,7 +105,7 @@ export function createMcp({ launchId = process.env.CBS_MEMORIA_LAUNCH_ID,
       route: 'Run review.mjs <caller-cli> <caller-checkout> <current-native-session-id> <checkpoint-id> <candidate-key> in the owner terminal.' };
     return blocked('unknown_method');
   }
-  return { mcpLifecycleId, call, compact: recall.compact };
+  return { mcpLifecycleId, call };
 }
 
 export async function serveMcp(instance = createMcp()) {

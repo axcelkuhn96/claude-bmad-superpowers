@@ -60,6 +60,23 @@ test('Mem0 só inicia em SessionStart; sessão desconhecida exige sessão nova',
   assert.ok(Object.isFrozen(started.destination));
 });
 
+test('config permits explicit HTTP 127.0.0.1 only, while rejecting other plaintext URLs', async t => {
+  const { root, stateRoot } = await fixture(t);
+  for (const [url, allowed] of [
+    ['http://127.0.0.1:6333', true],
+    ['http://localhost:6333', false],
+    ['http://10.0.0.1:6333', false],
+    ['http://127.0.0.1.evil:6333', false],
+    ['http://user:password@127.0.0.1:6333', false],
+    ['http://127.0.0.1:6333/path', false],
+  ]) {
+    await putConfig(root, { ...config(), qdrant: { ...config().qdrant, url } });
+    const result = await initializeSession(root, `url-${url}`, options(stateRoot));
+    assert.equal(result.provider, allowed ? 'mem0' : 'blocked', url);
+    if (!allowed) assert.equal(result.reason, 'invalid_config', url);
+  }
+});
+
 test('identidade explícita é igual na raiz, subdir, symlink e worktree mapeada', async (t) => {
   const { dir, root, stateRoot } = await fixture(t);
   await putConfig(root);

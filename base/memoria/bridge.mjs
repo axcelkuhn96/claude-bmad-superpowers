@@ -16,7 +16,8 @@ export async function runBridgeOperation(cwd, sessionId, operation, readSecret, 
   if (resolution.provider !== 'mem0' || operation.projectId !== resolution.projectId) {
     return blocked('project_mismatch');
   }
-  const auth = await (options.authorize ?? authorizeCurrentDestination)(cwd, sessionId, readSecret, options);
+  const auth = await (options.authorize ?? authorizeCurrentDestination)(cwd, sessionId, readSecret,
+    { ...options, deadlineAt });
   if (auth.kind !== 'authorized') return auth;
   const remaining = deadlineAt === null ? options.deadlineMs : Math.floor(deadlineAt - Date.now());
   if (deadlineAt !== null && remaining <= 0) return blocked('deadline');

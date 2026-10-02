@@ -15,9 +15,59 @@ import { withProjectLock } from './ledger.mjs';
 const blocked = reason => ({ kind: 'unavailable', reason });
 export const brokerPath = (root = path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria')) =>
   path.join(root, 'encoder.sock');
+export async function brokerEndpointStatus(root) {
+  if (!process.getuid) return 'unsafe';
+  const file = brokerPath(root);
+  let stat;
+  try { stat = await fs.lstat(file); }
+  catch (error) { return error.code === 'ENOENT' ? 'missing' : 'unsafe'; }
+  if (!stat.isSocket() || stat.uid !== process.getuid() || (stat.mode & 0o077)) return 'unsafe';
+  return new Promise(resolve => {
+    const socket = net.createConnection(file);
+    const finish = value => { clearTimeout(timer); socket.destroy(); resolve(value); };
+    const timer = setTimeout(() => finish('unknown'), 150);
+    socket.once('connect', () => finish('live'));
+    socket.once('error', error => finish(error.code === 'ECONNREFUSED' ? 'orphan' : 'unknown'));
+  });
+}
+
+// Called only while encoder.lock is held by the prospective owner.
+export async function prepareBrokerEndpoint(root) {
+  const file = brokerPath(root);
+  let before;
+  try { before = await fs.lstat(file); }
+  catch (error) { return error.code === 'ENOENT' ? 'ready' : 'unsafe'; }
+  if (await brokerEndpointStatus(root) !== 'orphan') return 'live';
+  const after = await fs.lstat(file).catch(() => null);
+  if (!after || !after.isSocket() || after.uid !== process.getuid() ||
+      (after.mode & 0o077) || after.dev !== before.dev || after.ino !== before.ino) return 'unsafe';
+  await fs.unlink(file);
+  return 'ready';
+}
 const script = fileURLToPath(new URL('./python/worker.py', import.meta.url));
 const envAllow = () => Object.fromEntries(['PATH', 'HOME', 'SYSTEMROOT', 'WINDIR', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'CBS_MEMORIA_CA_FILE']
   .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
+
+export function readBrokerRequest(socket, accept) {
+  const input = new FrameReader();
+  let received = false;
+  socket.on('data', chunk => {
+    let frames;
+    try { frames = input.push(chunk); }
+    catch { socket.destroy(); return; }
+    if (received || frames.length > 1 || frames.length && input.buffer.length) {
+      for (const frame of frames) frame.secret.fill(0);
+      socket.destroy();
+      return;
+    }
+    if (!frames.length) return;
+    received = true;
+    accept(frames[0]);
+  });
+  socket.on('end', () => {
+    try { input.end(); } catch { socket.destroy(); }
+  });
+}
 
 export async function requestBroker(request, secret, { stateRoot, deadlineMs = 120000 } = {}) {
   if (process.platform === 'win32') return blocked('native_windows_unproved');
@@ -63,11 +113,12 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
   const dir = await fs.lstat(root);
   if (dir.uid !== process.getuid() || (dir.mode & 0o077)) return blocked('unsafe_broker');
   const file = brokerPath(root);
-  try { await fs.lstat(file); return blocked('stale_broker_endpoint'); }
-  catch (error) { if (error.code !== 'ENOENT') return blocked('unsafe_broker'); }
+  const endpoint = await brokerEndpointStatus(root);
+  if (endpoint === 'live' || endpoint === 'unknown') return blocked('broker_owned');
+  if (endpoint === 'unsafe') return blocked('unsafe_broker');
   try { return await withProjectLock(root, async () => {
-  try { await fs.lstat(file); return blocked('stale_broker_endpoint'); }
-  catch (error) { if (error.code !== 'ENOENT') return blocked('unsafe_broker'); }
+  const prepared = await prepareBrokerEndpoint(root);
+  if (prepared !== 'ready') return blocked(prepared === 'unsafe' ? 'unsafe_broker' : 'broker_owned');
   const artifacts = await openArtifactIdentity([model, tokenizer]);
   if (artifacts.kind !== 'opened') return blocked(artifacts.reason);
   const child = spawn(runtimePython(resolution.stateDir), [script], {
@@ -113,44 +164,47 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
   const server = net.createServer(socket => {
     active++;
     clearTimeout(idle);
-    const input = new FrameReader();
-    let received = false;
-    socket.on('data', chunk => {
-      let frames;
-      try { frames = input.push(chunk); }
-      catch { socket.destroy(); return; }
-      if (received || frames.length !== 1) { socket.destroy(); return; }
-      received = true;
-      if (queued >= 2) { socket.end(encodeFrame(blocked('queue_full'), undefined, true)); return; }
+    const controller = new AbortController();
+    readBrokerRequest(socket, frame => {
+      if (queued >= 2) {
+        frame.secret.fill(0);
+        socket.end(encodeFrame(blocked('queue_full'), undefined, true));
+        return;
+      }
       const enqueuedAt = Date.now();
       queued++;
       chain = chain.then(async () => {
         queued--;
-        const { value, secret } = frames[0];
+        const { value, secret } = frame;
         if (socket.destroyed) { secret.fill(0); return; }
         try {
-          const result = Date.now() - enqueuedAt > 100 ? blocked('queue_timeout') : await handle(value, secret);
+          const result = Date.now() - enqueuedAt > 100 ? blocked('queue_timeout') :
+            await handle(value, secret, controller.signal);
           if (!socket.destroyed) socket.end(encodeFrame(result, undefined, true));
         } finally { secret.fill(0); }
       }).catch(() => { if (!socket.destroyed) socket.end(encodeFrame(blocked('broker_failed'), undefined, true)); });
     });
     socket.once('close', () => {
+      controller.abort();
       active--;
       if (!active) idle = setTimeout(() => server.close(), idleMs);
     });
   });
-  async function handle(value, secret) {
+  async function handle(value, secret, signal) {
     if (dead || !value || typeof value !== 'object' || secret.length === 0) return blocked('worker_unavailable');
     if (!await artifacts.unchanged()) { dead = true; child.kill(); return blocked('artifact_changed'); }
     const { cwd, sessionId, operation } = value;
     if (!cwd || !sessionId || !operation || typeof operation !== 'object') return blocked('invalid_request');
     const current = await resolveProject(cwd, sessionId, { stateRoot });
     if (current.provider !== 'mem0' || current.embeddingFingerprint !== resolution.embeddingFingerprint) return blocked('project_mismatch');
-    const authorized = await authorizeCurrentDestination(cwd, sessionId, () => secret.toString('utf8'), { stateRoot });
+    const deadlineAt = Math.min(Number(value.deadlineAt), Date.now() + 120000);
+    if (!Number.isFinite(deadlineAt) || deadlineAt <= Date.now() || signal.aborted) return blocked('deadline');
+    const authorized = await authorizeCurrentDestination(cwd, sessionId, () => secret.toString('utf8'),
+      { stateRoot, deadlineAt, signal });
     if (authorized.kind !== 'authorized') return blocked(authorized.reason);
     const request = { ...operation, projectId: current.projectId, state: current.stateDir,
       collection: current.destination.collection, connection: authorized.connection };
-    const deadline = Math.min(Number(value.deadlineAt) - Date.now(), 120000);
+    const deadline = deadlineAt - Date.now();
     if (!Number.isFinite(deadline) || deadline <= 0) return blocked('deadline');
     return await new Promise(resolve => {
       if (dead) { resolve(blocked('worker_unavailable')); return; }

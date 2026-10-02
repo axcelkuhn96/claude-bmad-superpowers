@@ -1,16 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { selectRecall, renderContext, createRecall } from '../base/memoria/context.mjs';
-import { recallForPrompt } from '../base/memoria/hook-recall.mjs';
+import { recallForPrompt, recordRecallWindow } from '../base/memoria/hook-recall.mjs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createMcp } from '../base/memoria/mcp.mjs';
 
 const now = '2026-10-01T00:00:00Z';
 const base = { projectId: 'p', status: 'active', score: 0.9, scoreSource: 'mem0_sdk_search',
   text: 'The approved convention is X.',
   metadata: { source: 'message-1', actor: 'owner', evidence_at: '2026-09-01T00:00:00Z',
-    origin: 'user_direct', scope: 'project', valid_from: '2026-09-01T00:00:00Z' } };
+    origin: 'user_direct', speaker_role: 'user', scope: 'project', valid_from: '2026-09-01T00:00:00Z' } };
 
 test('identity, state, validity and provenance filter before rank', () => {
   const hits = [
@@ -26,6 +27,21 @@ test('identity, state, validity and provenance filter before rank', () => {
     { ...base, sdkId: 'current', score: 0.85 },
   ];
   assert.deepEqual(selectRecall(hits, { projectId: 'p', now }).map(x => x.sdkId), ['current']);
+});
+
+test('recall requires trusted origin and role and cites report provenance and condition', () => {
+  const human = { ...base, sdkId: 'human', metadata: { ...base.metadata, speaker_role: 'user',
+    condition: 'only on Fridays' } };
+  const report = { ...base, sdkId: 'report', text: 'The assistant reported a passing test.',
+    metadata: { ...base.metadata, actor: 'assistant', origin: 'assistant_report', speaker_role: 'assistant' } };
+  const missing = { ...base, sdkId: 'missing', metadata: { ...base.metadata, origin: undefined } };
+  const forged = { ...base, sdkId: 'forged', metadata: { ...base.metadata, speaker_role: 'assistant' } };
+  const picked = selectRecall([human, report, missing, forged], { projectId: 'p', now });
+  assert.deepEqual(picked.map(row => row.sdkId), ['human', 'report']);
+  const text = renderContext(picked);
+  assert.match(text, /origin user_direct; role user; condition only on Fridays/);
+  assert.match(text, /origin assistant_report; role assistant/);
+  assert.match(text, /Current human instruction takes precedence/);
 });
 
 test('episode remains scoped to its project and expires at valid_to', () => {
@@ -97,4 +113,70 @@ test('prompt hook injects approved context once per session and resets at compac
   assert.equal(await recallForPrompt(input) !== null, true);
   assert.equal(await recallForPrompt({ ...input, result: { kind: 'pass_through' } }), null);
   assert.equal(await recallForPrompt({ ...input, began: performance.now() - 1001 }), null);
+});
+
+test('native PreCompact opens a new window for a live MCP process', async t => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-recall-shared-'));
+  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  const current = { provider: 'mem0', projectId: 'p', stateDir };
+  const mcp = createMcp({ launchId: 'bound', cli: 'claude',
+    resolve: async () => ({ kind: 'bound', cwd: '/checkout', nativeSessionId: 's',
+      projectId: 'p', stateDir }),
+    search: async () => ({ kind: 'items', items: [{ ...base, sdkId: 'shared' }] }) });
+  assert.equal((await mcp.call('search', { query: 'rule' })).kind, 'items');
+  assert.equal((await mcp.call('search', { query: 'rule' })).kind, 'abstain');
+  await recallForPrompt({ cli: 'claude', event: 'PreCompact', payload: { cwd: '/checkout', session_id: 's' },
+    result: { kind: 'queued' }, resolve: async () => current });
+  assert.equal((await mcp.call('search', { query: 'rule' })).kind, 'items');
+});
+
+test('window write crossing deadline rolls back before the following turn', async t => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-recall-late-'));
+  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  const eligible = [{ ...base, sdkId: 'late' }];
+  let deadline = performance.now() + 1000;
+  const timed = await recordRecallWindow({ stateDir, cli: 'claude', sessionId: 's', eligible,
+    remaining: () => deadline - performance.now(),
+    writeSeen: async (file, seen) => {
+      deadline = performance.now() + 10;
+      await new Promise(resolve => setTimeout(resolve, 30));
+      await fs.writeFile(file, JSON.stringify([...seen]));
+    } });
+  assert.deepEqual(timed, { kind: 'unavailable', reason: 'deadline' });
+  const next = await recordRecallWindow({ stateDir, cli: 'claude', sessionId: 's', eligible,
+    remaining: () => 1000 });
+  assert.equal(next.kind, 'items');
+});
+
+test('MCP deadline after selection does not suppress the next search', async t => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-recall-mcp-late-'));
+  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  let first = true;
+  const mcp = createMcp({ launchId: 'bound', cli: 'claude',
+    resolve: async () => ({ kind: 'bound', cwd: '/checkout', nativeSessionId: 's',
+      projectId: 'p', stateDir }),
+    search: async () => ({ kind: 'items', items: [{ ...base, sdkId: 'late' }] }),
+    recordWindow: async options => {
+      const selected = await recordRecallWindow(options);
+      if (first) { first = false; await new Promise(resolve => setTimeout(resolve, 1020)); }
+      return selected;
+    } });
+  assert.deepEqual(await mcp.call('search', { query: 'rule' }), { kind: 'unavailable', reason: 'deadline' });
+  assert.equal((await mcp.call('search', { query: 'rule' })).kind, 'items');
+});
+
+test('native hook deadline after selection does not suppress the next prompt', async t => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-recall-hook-late-'));
+  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  let first = true;
+  const input = { cli: 'claude', payload: { cwd: '/checkout', session_id: 's', prompt: 'rule' },
+    result: { kind: 'queued' }, resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir }),
+    search: async () => ({ kind: 'items', items: [{ ...base, sdkId: 'late' }] }), now: () => now,
+    recordWindow: async options => {
+      const selected = await recordRecallWindow(options);
+      if (first) { first = false; await new Promise(resolve => setTimeout(resolve, 1020)); }
+      return selected;
+    } };
+  assert.equal(await recallForPrompt({ ...input, began: performance.now() }), null);
+  assert.ok((await recallForPrompt({ ...input, began: performance.now() }))?.hookSpecificOutput);
 });

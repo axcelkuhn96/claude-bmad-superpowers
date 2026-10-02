@@ -120,10 +120,17 @@ async function leaseExclude(plan, root, options, remove = false) {
       }
       return true;
     }
-    if (!lease || !lease.owners.includes(root)) return false;
-    lease.owners = lease.owners.filter(owner => owner !== root);
-    if (lease.owners.length) { await writeAtomic(leaseFile, JSON.stringify(lease) + '\n'); return true; }
-    if (lease.createdByCBS && !await removeExclude({ ...plan, added: true })) return false;
+    if (!lease) return !(plan.added && (await readOptional(plan.file))?.includes(plan.block));
+    if (!lease.owners.includes(root) && lease.releasing !== root) return lease.owners.length > 0;
+    if (lease.owners.includes(root)) {
+      lease.owners = lease.owners.filter(owner => owner !== root);
+      if (lease.owners.length) { await writeAtomic(leaseFile, JSON.stringify(lease) + '\n'); return true; }
+      if (lease.createdByCBS && !(await readOptional(plan.file))?.includes(plan.block)) return false;
+      lease.releasing = root;
+      await writeAtomic(leaseFile, JSON.stringify(lease) + '\n');
+    }
+    if (lease.createdByCBS && (await readOptional(plan.file))?.includes(plan.block) &&
+        !await removeExclude({ ...plan, added: true })) return false;
     await fs.rm(leaseFile);
     return true;
   });
@@ -286,40 +293,70 @@ export async function restoreNativeExclusion(root, options = {}) {
       (saved.projectRoot && saved.projectRoot !== scope.projectRoot) ||
       (saved.nativeRoot && saved.nativeRoot !== root) ||
       saved.cli !== cli || saved.file !== file || !await safeFile(file) || await tracked(root, file)) return blocked('unsafe_native_config');
-  const raw = await readOptional(file);
-  if (raw === null) return blocked('native_config_changed');
-  const edit = (cli === 'claude' ? claudeEdit : codexEdit)(raw, saved);
-  if (!edit) return blocked('native_config_changed');
   const hasCapture = Object.hasOwn(saved, 'capturePath');
   const capturePath = saved.capturePath;
   if (hasCapture && (capturePath !== (cli === 'claude' ? file : hookFile(root)) ||
       !await safeFile(capturePath))) return blocked('unsafe_capture_hooks');
+  const raw = await readOptional(file);
   const captureRaw = hasCapture ? await readOptional(capturePath) : null;
-  const captureEdit = hasCapture ? editCaptureHooks(cli === 'claude' ? edit.raw : captureRaw, cli, true) : edit.raw;
-  if (!captureEdit || (hasCapture && cli === 'codex' && captureRaw === null)) return blocked('capture_hooks_changed');
-  if (saved.exclude?.added && !(await readOptional(saved.exclude.file))?.includes(saved.exclude.block)) {
+  let plan = saved.rollback;
+  if (!plan) {
+    if (raw === null) return blocked('native_config_changed');
+    const edit = (cli === 'claude' ? claudeEdit : codexEdit)(raw, saved);
+    if (!edit) return blocked('native_config_changed');
+    const captureEdit = hasCapture ? editCaptureHooks(cli === 'claude' ? edit.raw : captureRaw, cli, true) : edit.raw;
+    if (!captureEdit || (hasCapture && cli === 'codex' && captureRaw === null)) return blocked('capture_hooks_changed');
+    const configText = cli === 'claude' ? captureEdit : edit.raw;
+    plan = { config: !saved.existed && (cli === 'claude' ? Object.keys(JSON.parse(configText)).length === 0 :
+      !configText.trim()) ? null : configText,
+    capture: cli === 'codex' && hasCapture ?
+      !saved.captureExisted && Object.keys(JSON.parse(captureEdit)).length === 0 ? null : captureEdit : null };
+  } else if (!Object.hasOwn(plan, 'config') || !Object.hasOwn(plan, 'capture') ||
+      ![plan.config, plan.capture].every(value => value === null || typeof value === 'string')) {
+    return blocked('unsafe_snapshot');
+  }
+  if (raw !== plan.config) {
+    if (raw === null) return blocked('native_config_changed');
+    const edit = (cli === 'claude' ? claudeEdit : codexEdit)(raw, saved);
+    const restored = edit && (cli === 'claude' ? editCaptureHooks(edit.raw, cli, true) : edit.raw);
+    if (!restored) return blocked('native_config_changed');
+    const target = !saved.existed && (cli === 'claude' ? Object.keys(JSON.parse(restored)).length === 0 :
+      !restored.trim()) ? null : restored;
+    if (plan.config !== target) return blocked('native_config_changed');
+  }
+  if (cli === 'codex' && hasCapture && captureRaw !== plan.capture) {
+    const restored = captureRaw && editCaptureHooks(captureRaw, cli, true);
+    if (!restored) return blocked('capture_hooks_changed');
+    const target = !saved.captureExisted && Object.keys(JSON.parse(restored)).length === 0 ? null : restored;
+    if (plan.capture !== target) return blocked('capture_hooks_changed');
+  }
+  if (!saved.rollback && saved.exclude?.added && !(await readOptional(saved.exclude.file))?.includes(saved.exclude.block)) {
     return blocked('git_exclude_changed');
   }
-  if (saved.captureExclude?.added && !(await readOptional(saved.captureExclude.file))?.includes(saved.captureExclude.block)) {
+  if (!saved.rollback && saved.captureExclude?.added && !(await readOptional(saved.captureExclude.file))?.includes(saved.captureExclude.block)) {
     return blocked('git_exclude_changed');
   }
-  if (saved.existed) await writeAtomic(file, cli === 'claude' ? captureEdit : edit.raw);
-  else if (cli === 'claude' && Object.keys(JSON.parse(captureEdit)).length === 0) await fs.rm(file);
-  else if (cli === 'codex' && !edit.raw.trim()) await fs.rm(file);
-  else await writeAtomic(file, cli === 'claude' ? captureEdit : edit.raw);
-  if (cli === 'codex' && hasCapture) {
-    if (!saved.captureExisted && Object.keys(JSON.parse(captureEdit)).length === 0) await fs.rm(capturePath);
-    else await writeAtomic(capturePath, captureEdit);
-  }
-  if (saved.leased) {
-    if (!await leaseExclude(saved.exclude, root, { ...options, projectRoot: scope.projectRoot }, true) ||
-        !await leaseExclude(saved.captureExclude, root, { ...options, projectRoot: scope.projectRoot }, true)) {
-      return blocked('git_exclude_changed');
+  try {
+    if (!saved.rollback) await writeAtomic(snapshot, JSON.stringify({ ...saved, rollback: plan }) + '\n');
+    if (raw !== plan.config) {
+      if (plan.config === null) await fs.rm(file, { force: true });
+      else await writeAtomic(file, plan.config);
     }
-  } else {
-    if (!await removeExclude(saved.exclude)) return blocked('git_exclude_changed');
-    if (!await removeExclude(saved.captureExclude)) return blocked('git_exclude_changed');
-  }
+    if (cli === 'codex' && hasCapture && captureRaw !== plan.capture) {
+      if (plan.capture === null) await fs.rm(capturePath, { force: true });
+      else await writeAtomic(capturePath, plan.capture);
+    }
+    if (saved.leased) {
+      if (!await leaseExclude(saved.exclude, root, { ...options, projectRoot: scope.projectRoot }, true) ||
+          !await leaseExclude(saved.captureExclude, root, { ...options, projectRoot: scope.projectRoot }, true)) {
+        return blocked('git_exclude_changed');
+      }
+    } else {
+      if (!await removeExclude(saved.exclude) || !await removeExclude(saved.captureExclude)) {
+        return blocked('git_exclude_changed');
+      }
+    }
+  } catch { return blocked('git_exclude_changed'); }
   await fs.rm(snapshot);
   return { kind: 'restored' };
 }

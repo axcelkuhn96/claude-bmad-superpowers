@@ -10,6 +10,16 @@ const stateRootDefault = () => path.join(os.homedir(), '.local', 'state', 'cbs',
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const isObject = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
 const idValid = (x) => typeof x === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(x);
+function destinationUrlValid(value) {
+  if (typeof value !== 'string') return false;
+  let url;
+  try { url = new URL(value); } catch { return false; }
+  const tls = value.startsWith('https://') && url.protocol === 'https:';
+  const loopback = /^http:\/\/127\.0\.0\.1(?::[1-9]\d{0,4})?\/?$/.test(value) &&
+    url.protocol === 'http:' && url.hostname === '127.0.0.1';
+  return (tls || loopback) && !!url.hostname && !url.username && !url.password &&
+    url.pathname === '/' && !url.search && !url.hash;
+}
 
 async function configFor(scope) {
   async function read(root) {
@@ -40,7 +50,7 @@ function parseConfig(data) {
   if (!isObject(c) || !['mem0', 'claude-mem'].includes(c.provider)) return blocked('invalid_config');
   if (c.provider === 'claude-mem') return { provider: 'claude-mem' };
   if (!idValid(c.project_id) || !isObject(c.qdrant) || !isObject(c.embedding) ||
-      typeof c.qdrant.url !== 'string' || !/^https:\/\//.test(c.qdrant.url) ||
+      !destinationUrlValid(c.qdrant.url) ||
       !idValid(c.qdrant.collection) || typeof c.qdrant.api_key_env !== 'string' ||
       !/^[A-Z][A-Z0-9_]*$/.test(c.qdrant.api_key_env) ||
       c.embedding.model !== 'multilingual-e5-small' || c.embedding.dimension !== 384 ||

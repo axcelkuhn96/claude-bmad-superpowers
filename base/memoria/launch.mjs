@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
 import { readLocalTrust, trustTuple } from './trust.mjs';
-import { brokerPath } from './broker.mjs';
+import { brokerEndpointStatus } from './broker.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const rootDefault = () => path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
@@ -108,8 +108,9 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
   const mcpScript = fileURLToPath(new URL('./mcp.mjs', import.meta.url));
   const brokerScript = fileURLToPath(new URL('./broker.mjs', import.meta.url));
   if (process.platform !== 'win32') {
-    try { await fs.access(brokerPath(root)); }
-    catch {
+    const endpoint = await brokerEndpointStatus(root);
+    if (endpoint === 'unsafe') return blocked('unsafe_broker');
+    if (endpoint === 'missing' || endpoint === 'orphan') {
       const broker = spawn(process.execPath, [brokerScript, root, cwd], { detached: true,
         stdio: 'ignore', env: { PATH: process.env.PATH, HOME: process.env.HOME,
           ...(process.env.CBS_MEMORIA_CA_FILE ? { CBS_MEMORIA_CA_FILE: process.env.CBS_MEMORIA_CA_FILE } : {}) } });
