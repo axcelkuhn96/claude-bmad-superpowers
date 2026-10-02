@@ -11,6 +11,7 @@ const runFile = promisify(execFile);
 const blocked = (reason) => ({ kind: 'blocked', reason });
 
 export async function provisionRuntime(cwd, model, tokenizer, options = {}) {
+  if (process.platform === 'win32' || !process.getuid) return blocked('native_windows_unproved');
   const resolution = await inspectConfiguration(cwd, options);
   if (resolution.provider !== 'mem0') return blocked(resolution.reason);
   const localTrust = await readLocalTrust(resolution.stateDir);

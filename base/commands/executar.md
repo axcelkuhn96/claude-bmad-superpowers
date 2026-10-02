@@ -9,6 +9,8 @@ description: "Executa um prompt refinado (ou PRD/caminho de docs/prompts/) — B
 
 **ORDEM OBRIGATÓRIA:**
 
+**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+
 1. **PRIMEIRO**: invoque `Skill` com `skill: "claude-mem:mem-search"` (fallback `mem-search`) passando o tema/intent extraído do prompt como query. Se nenhuma existir, registre "Memória: não disponível".
 2. **SÓ DEPOIS**: invoque `Skill` com `skill: "executor-bmad-superpowers"`, passando o prompt (ou o caminho do arquivo) + resumo curto da memória + modo + models.
 

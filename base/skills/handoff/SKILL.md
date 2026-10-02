@@ -20,6 +20,8 @@ Se o usuário passou argumentos, trate-os como **descrição do foco da próxima
 
 1. **Referencie, não duplique.** Specs, planos, ADRs, issues, PRDs, commits e diffs que já existem entram como **link/caminho**, não copiados no corpo. O handoff aponta; não reescreve.
 2. **Redija segredos.** Nunca inclua API keys, senhas, tokens, connection strings ou PII. Substitua por `[REDIGIDO]` e diga onde o segredo vive (ex.: "token em `.env` → `STRIPE_KEY`").
+**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+
 3. **Inclua "Skills sugeridas".** Uma seção dizendo quais skills/comandos o próximo agente deve invocar (`/refinar`, `/executar`, `/piloto`, `/revisar`, `/grelhar`, `/mapear`, `mem-search`, etc.) e por quê.
 4. **Consulte a memória** (se disponível) pra referenciar decisões já registradas em vez de reexplicá-las.
 

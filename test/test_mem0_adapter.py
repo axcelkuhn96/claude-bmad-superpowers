@@ -4,6 +4,7 @@ import math
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -133,20 +134,23 @@ class AdapterTest(unittest.TestCase):
             adapter._row({**raw, 'expiration_date': '2025-01-01T00:00:00Z'}, client, 'collection', Embedder())
 
     def test_search_fetches_past_ineligible_items_before_limiting(self):
-        bad = {'projectId': 'p', 'status': 'active', 'sdkId': 'bad', 'metadata':
+        bad = {'projectId': 'p', 'status': 'active', 'score': .9, 'sdkId': 'bad', 'metadata':
                {'source': 's', 'actor': 'a', 'scope': 'personal', 'owner_id': 'other'}}
-        good = {'projectId': 'p', 'status': 'active', 'sdkId': 'good', 'metadata':
+        good = {'projectId': 'p', 'status': 'active', 'score': .9, 'sdkId': 'good', 'metadata':
                 {'source': 's', 'actor': 'a', 'scope': 'project'}}
         rows = [bad] * 25 + [good]
+        self_test = self
         class Memory:
             embedding_model = object()
-            def search(self, query, *, filters, top_k):
+            def search(self, query, *, filters, top_k, threshold):
+                self_test.assertEqual(threshold, .85)
                 return {'results': rows[:top_k]}
         with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_memory', return_value=Memory()), \
              patch.object(adapter, '_row', side_effect=lambda row, *args: row):
             result = adapter.execute({'op': 'search', 'collection': 'c', 'projectId': 'p',
                                       'connection': {}, 'query': 'fact'}, None, Path('/tmp'))
         self.assertEqual([row['sdkId'] for row in result['items']], ['good'])
+        self.assertEqual(result['items'][0]['scoreSource'], 'mem0_sdk_search')
 
     def test_reconciliation_includes_expired_sdk_rows_and_rejects_expiration_on_add(self):
         class Memory:
@@ -163,6 +167,38 @@ class AdapterTest(unittest.TestCase):
                 adapter.execute({'op': 'add', 'collection': 'c', 'projectId': 'p', 'externalId': 'e',
                                  'connection': {}, 'sessionId': 's', 'text': 'fact',
                                  'metadata': {'expiration_date': '2025-01-01T00:00:00Z'}}, None, Path('/tmp'))
+
+    def test_episode_requires_explicit_expiry_and_search_filters_project_and_time(self):
+        expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        expired = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        metadata = {'source': 'message', 'actor': 'owner', 'origin': 'user_direct',
+                    'scope': 'episode', 'evidence_at': '2026-09-30T12:00:00Z'}
+        class Memory:
+            embedding_model = object()
+            def add(self, *args, **kwargs):
+                self_test.assertEqual(kwargs['metadata']['scope'], 'episode')
+                return {'results': [{'id': 'episode-id'}]}
+            def search(self, query, *, filters, top_k, threshold):
+                self_test.assertEqual(filters, {'user_id': 'p', 'status': 'active'})
+                self_test.assertEqual(threshold, .85)
+                return {'results': rows}
+        self_test = self
+        rows = [
+            {'projectId': 'other', 'status': 'active', 'score': .9, 'metadata': {**metadata, 'valid_to': expires}},
+            {'projectId': 'p', 'status': 'active', 'score': .9, 'metadata': {**metadata, 'valid_to': expired}},
+            {'projectId': 'p', 'status': 'active', 'score': .9, 'metadata': {**metadata, 'valid_to': expires}},
+        ]
+        with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_memory', return_value=Memory()), \
+             patch.object(adapter, '_row', side_effect=lambda row, *args: row):
+            request = {'op': 'add', 'collection': 'c', 'projectId': 'p', 'externalId': 'e',
+                       'connection': {}, 'sessionId': 's', 'text': 'fact', 'metadata': metadata}
+            with self.assertRaisesRegex(ValueError, 'scope_invalid'):
+                adapter.execute(request, None, Path('/tmp'))
+            self.assertEqual(adapter.execute({**request, 'metadata': {**metadata, 'valid_to': expires}},
+                                             None, Path('/tmp'))['kind'], 'pending')
+            result = adapter.execute({'op': 'search', 'collection': 'c', 'projectId': 'p',
+                                      'connection': {}, 'query': 'fact'}, None, Path('/tmp'))
+            self.assertEqual(result['items'], [{**rows[2], 'scoreSource': 'mem0_sdk_search'}])
 
 
 if __name__ == '__main__':

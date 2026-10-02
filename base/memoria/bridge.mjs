@@ -1,56 +1,30 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
 import { authorizeCurrentDestination } from './setup.mjs';
 import { resolveProject } from './provider.mjs';
-import { runtimeEnvironment, verifyRuntimeArtifacts } from './runtime.mjs';
+import { runtimePython } from './runtime.mjs';
+import { requestBroker } from './broker.mjs';
 import { createLedger, externalIdFor, reconcileStore, withProjectLock } from './ledger.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'python', 'mem0_adapter.py');
 
-async function runPython(python, program, request, env) {
-  return new Promise((resolve) => {
-    const child = spawn(python, [program], { env, stdio: ['pipe', 'pipe', 'ignore'] });
-    let output = '';
-    const timer = setTimeout(() => child.kill('SIGKILL'), 120000);
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', chunk => {
-      output += chunk;
-      if (output.length > 2 * 1024 * 1024) child.kill('SIGKILL');
-    });
-    child.on('error', () => { clearTimeout(timer); resolve(blocked('python_unavailable')); });
-    child.on('close', code => {
-      clearTimeout(timer);
-      if (code !== 0) { resolve(blocked('bridge_failed')); return; }
-      try { resolve(JSON.parse(output)); } catch { resolve(blocked('bridge_invalid_response')); }
-    });
-    child.stdin.on('error', error => {
-      if (error.code !== 'EPIPE') resolve(blocked('bridge_input_failed'));
-    });
-    child.stdin.end(JSON.stringify(request) + '\n');
-  });
-}
-
 export async function runBridgeOperation(cwd, sessionId, operation, readSecret, options = {}) {
+  const deadlineAt = options.deadlineAt ?? (options.deadlineMs ? Date.now() + options.deadlineMs : null);
+  if (deadlineAt !== null && deadlineAt <= Date.now()) return blocked('deadline');
   const resolution = await (options.resolve ?? resolveProject)(cwd, sessionId, options);
   if (resolution.provider !== 'mem0' || operation.projectId !== resolution.projectId) {
     return blocked('project_mismatch');
   }
-  const state = resolution.stateDir;
-  const model = path.join(state, 'artifacts', 'model.onnx');
-  const tokenizer = path.join(state, 'artifacts', 'tokenizer.json');
-  if (!options.run) {
-    const artifacts = await verifyRuntimeArtifacts(model, tokenizer);
-    if (artifacts.kind !== 'verified') return artifacts;
-  }
   const auth = await (options.authorize ?? authorizeCurrentDestination)(cwd, sessionId, readSecret, options);
   if (auth.kind !== 'authorized') return auth;
+  const remaining = deadlineAt === null ? options.deadlineMs : Math.floor(deadlineAt - Date.now());
+  if (deadlineAt !== null && remaining <= 0) return blocked('deadline');
   const request = { ...operation, collection: resolution.destination.collection, connection: auth.connection };
-  const env = { ...runtimeEnvironment(state), CBS_MEMORIA_STATE: state,
-    CBS_MEMORIA_MODEL: model, CBS_MEMORIA_TOKENIZER: tokenizer, CBS_MEMORIA_API_KEY: auth.key,
-    OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1', MKL_NUM_THREADS: '1' };
-  return (options.run ?? runPython)(path.join(state, 'runtime', 'bin', 'python'), script, request, env);
+  const env = { OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1', MKL_NUM_THREADS: '1' };
+  if (options.run) return options.run(runtimePython(resolution.stateDir), script, request, env, Buffer.from(auth.key));
+  return requestBroker({ cwd, sessionId, operation }, auth.key,
+    { stateRoot: options.stateRoot, deadlineMs: remaining });
 }
 
 export async function storeMemory(cwd, sessionId, operation, readSecret, options = {}) {
@@ -95,8 +69,9 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
 
 export async function searchProject({ cwd, sessionId, query, projectId }, readSecret, options = {}) {
   if (typeof query !== 'string' || !query.trim()) return blocked('invalid_query');
+  const deadlineAt = options.deadlineMs ? Date.now() + options.deadlineMs : null;
   const resolution = await (options.resolve ?? resolveProject)(cwd, sessionId, options);
   if (resolution.provider !== 'mem0' || (projectId && projectId !== resolution.projectId)) return blocked('project_mismatch');
   return runBridgeOperation(cwd, sessionId, { op: 'search', projectId: resolution.projectId, query,
-    ownerId: options.ownerId }, readSecret, options);
+    ownerId: options.ownerId }, readSecret, { ...options, deadlineAt });
 }

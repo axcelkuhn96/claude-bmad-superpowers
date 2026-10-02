@@ -1,4 +1,5 @@
-import { createReadStream } from 'node:fs';
+import { createReadStream, constants } from 'node:fs';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -16,6 +17,38 @@ export const RUNTIME_PINS = Object.freeze({
   ].join(''),
   dimensions: 384, pooling: 'masked-mean-l2', queryPrefix: 'query: ', passagePrefix: 'passage: ',
 });
+
+export function runtimePython(stateDir, platform = process.platform) {
+  return path.join(stateDir, 'runtime', ...(platform === 'win32' ? ['Scripts', 'python.exe'] : ['bin', 'python']));
+}
+
+export async function openArtifactIdentity(paths) {
+  const handles = [];
+  const baseline = [];
+  const fields = ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'];
+  async function same(file, handle, expected) {
+    const [name, opened] = await Promise.all([fs.lstat(file, { bigint: true }), handle.stat({ bigint: true })]);
+    return name.isFile() && opened.isFile() && fields.every(field =>
+      name[field] === expected[field] && opened[field] === expected[field]);
+  }
+  try {
+    for (const file of paths) {
+      const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+      handles.push(handle);
+      const stat = await handle.stat({ bigint: true });
+      if (!stat.isFile() || !await same(file, handle, stat)) throw new Error('artifact_changed');
+      baseline.push(stat);
+    }
+    return { kind: 'opened', unchanged: async () => {
+      try { return (await Promise.all(paths.map((file, index) => same(file, handles[index], baseline[index]))))
+        .every(Boolean); }
+      catch { return false; }
+    }, close: async () => Promise.all(handles.map(handle => handle.close())) };
+  } catch {
+    await Promise.all(handles.map(handle => handle.close()));
+    return { kind: 'blocked', reason: 'artifact_changed' };
+  }
+}
 
 async function sha256(file) {
   const digest = createHash('sha256');

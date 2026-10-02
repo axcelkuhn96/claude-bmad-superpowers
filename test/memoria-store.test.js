@@ -85,7 +85,7 @@ test('bridge reauthorizes every operation and never serializes the key', async (
     resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir: '/tmp/state', destination: { collection: 'c' } }),
     authorize: async () => { authorizations++; return { kind: 'authorized', key: 'private-secret',
       connection: { url: 'http://localhost:6333/', hostname: 'localhost', address: '127.0.0.1', port: 6333 } }; },
-    run: async (_python, _script, request, env) => { requests.push(request); assert.equal(env.CBS_MEMORIA_API_KEY, 'private-secret'); return { kind: 'items', items: [] }; },
+    run: async (_python, _script, request, env, secret) => { requests.push(request); assert.equal(env.CBS_MEMORIA_API_KEY, undefined); assert.equal(secret.toString(), 'private-secret'); return { kind: 'items', items: [] }; },
   };
   await runBridgeOperation('cwd', 's', { op: 'find', projectId: 'p', externalId: 'x' }, () => '', options);
   await runBridgeOperation('cwd', 's', { op: 'find', projectId: 'p', externalId: 'y' }, () => '', options);

@@ -80,15 +80,19 @@ export function createLedger(stateDir, writerId) {
   return { read, save, begin };
 }
 
-export async function withProjectLock(stateDir, callback) {
+export async function withProjectLock(stateDir, callback, lockName = 'writer.lock', timeoutMs = 5000) {
+  if (!/^[a-z][a-z0-9-]{0,63}\.lock$/.test(lockName)) throw new Error('invalid_lock_name');
   const directory = path.join(stateDir, 'ledger');
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-  const program = 'import fcntl,sys; f=open(sys.argv[1],"a+"); fcntl.flock(f,fcntl.LOCK_EX); print("ready",flush=True); sys.stdin.read()';
-  const child = spawn('python3', ['-c', program, path.join(directory, 'writer.lock')],
+  const program = process.platform === 'win32'
+    ? 'import msvcrt,sys,time; f=open(sys.argv[1],"a+b"); f.seek(0); f.write(b"0"); f.flush(); f.seek(0); deadline=time.monotonic()+5\nwhile True:\n try: msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1); break\n except OSError:\n  if time.monotonic()>deadline: sys.exit(2)\n  time.sleep(.05)\nprint("ready",flush=True); sys.stdin.read(); f.seek(0); msvcrt.locking(f.fileno(),msvcrt.LK_UNLCK,1)'
+    : 'import fcntl,sys; f=open(sys.argv[1],"a+"); fcntl.flock(f,fcntl.LOCK_EX); print("ready",flush=True); sys.stdin.read()';
+  const child = spawn(process.platform === 'win32' ? 'python' : 'python3',
+    ['-c', program, path.join(directory, lockName)],
     { stdio: ['pipe', 'pipe', 'ignore'] });
   try {
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('writer_lock_timeout')); }, 5000);
+      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('writer_lock_timeout')); }, timeoutMs);
       child.once('error', error => { clearTimeout(timer); reject(error); });
       child.once('exit', code => { clearTimeout(timer); reject(new Error(`writer_lock_failed:${code}`)); });
       child.stdout.once('data', chunk => {

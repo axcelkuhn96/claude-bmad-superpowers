@@ -12,6 +12,8 @@ Chat enxuto: 1 linha por etapa. O detalhe vai pros arquivos (`docs/prompts/`, pl
 
 ## Etapa 0 — Memória (primeiro de tudo)
 
+**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+
 Invoque `Skill` com `skill: "claude-mem:mem-search"` (fallback `mem-search`) passando a entrada do usuário como query. Sem exceção. Se nenhuma existir, registre "Memória: não disponível" e siga.
 
 ## Etapa 1 — Grelhar

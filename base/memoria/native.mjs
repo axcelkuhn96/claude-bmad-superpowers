@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { identifyProject } from './project-id.mjs';
+import { withProjectLock } from './ledger.mjs';
 
 const run = promisify(execFile);
 const gitEnv = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
@@ -13,7 +14,8 @@ const plugins = { claude: 'claude-mem@thedotmack', codex: 'claude-mem@claude-mem
 const blocked = (reason) => ({ kind: 'blocked', reason });
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const stateRoot = (options) => options.stateRoot ?? path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
-const snapshotFile = (root, cli, options) => path.join(stateRoot(options), hash(root), `native-${cli}.json`);
+const snapshotFile = (root, cli, options) => path.join(stateRoot(options), hash(options.projectRoot ?? root),
+  (options.projectRoot && options.projectRoot !== root ? `native-${cli}-${hash(root)}.json` : `native-${cli}.json`));
 const configFile = (root, cli) => path.join(root, cli === 'claude' ? '.claude/settings.local.json' : '.codex/config.toml');
 const captureEvents = { claude: ['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'SessionEnd'],
   codex: ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'] };
@@ -66,9 +68,11 @@ async function tracked(root, file) {
 }
 async function excludePlan(root, cli, target = configFile(root, cli)) {
   const relative = path.relative(root, target);
+  const block = `# cbs-memoria ${cli}\n/${relative}\n`;
+  let ignored = false;
   try {
     await run('git', ['-C', root, 'check-ignore', '-q', '--', relative], { env: gitEnv(), timeout: 5000 });
-    return { added: false };
+    ignored = true;
   } catch (error) {
     if (error.code !== 1) return null;
   }
@@ -76,7 +80,7 @@ async function excludePlan(root, cli, target = configFile(root, cli)) {
     const { stdout } = await run('git', ['-C', root, 'rev-parse', '--git-path', 'info/exclude'], { env: gitEnv(), timeout: 5000 });
     const file = path.resolve(root, stdout.trim());
     if (!await safeParent(file) || !await safeFile(file)) return null;
-    return { added: true, file, block: `# cbs-memoria ${cli}\n/${relative}\n` };
+    return { added: !ignored, file, block };
   } catch { return null; }
 }
 async function addExclude(plan) {
@@ -93,6 +97,36 @@ async function removeExclude(plan) {
   if (current === null || !current.includes(plan.block)) return false;
   await writeAtomic(plan.file, current.replace(plan.block, ''));
   return true;
+}
+async function leaseExclude(plan, root, options, remove = false) {
+  if (!plan?.file || !plan.block) return true;
+  const canonical = options.projectRoot ?? root;
+  const state = path.join(stateRoot(options), hash(canonical));
+  const leaseFile = path.join(state, `exclude-${hash(`${plan.file}:${plan.block}`)}.json`);
+  return withProjectLock(state, async () => {
+    let lease;
+    try { lease = JSON.parse(await fs.readFile(leaseFile, 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT') return false; }
+    if (lease && (lease.file !== plan.file || lease.block !== plan.block || !Array.isArray(lease.owners))) return false;
+    if (!remove) {
+      const first = !lease;
+      lease ??= { file: plan.file, block: plan.block, createdByCBS: plan.added, owners: [] };
+      if (!lease.owners.includes(root)) lease.owners.push(root);
+      if (first && plan.added) await addExclude(plan);
+      try { await writeAtomic(leaseFile, JSON.stringify(lease) + '\n'); }
+      catch (error) {
+        if (first && plan.added) await removeExclude(plan);
+        throw error;
+      }
+      return true;
+    }
+    if (!lease || !lease.owners.includes(root)) return false;
+    lease.owners = lease.owners.filter(owner => owner !== root);
+    if (lease.owners.length) { await writeAtomic(leaseFile, JSON.stringify(lease) + '\n'); return true; }
+    if (lease.createdByCBS && !await removeExclude({ ...plan, added: true })) return false;
+    await fs.rm(leaseFile);
+    return true;
+  });
 }
 async function readOptional(file) {
   try { return await fs.readFile(file, 'utf8'); }
@@ -167,9 +201,11 @@ async function supportedCodex(root, options) {
 
 export async function applyNativeExclusion(root, options = {}) {
   const { cli } = options;
+  if (process.platform === 'win32' || !process.getuid) return blocked('native_windows_unproved');
   if (!plugins[cli]) return blocked('unsupported_cli');
   const scope = await identifyProject(root);
-  if (scope.kind !== 'git' || scope.projectRoot !== await fs.realpath(root).catch(() => null)) return blocked('unsupported_git');
+  if (scope.kind !== 'git' || scope.projectRoot !== (options.projectRoot ?? await fs.realpath(root).catch(() => null)) ||
+      scope.activeRoot !== await fs.realpath(root).catch(() => null)) return blocked('unsupported_git');
   if (cli === 'codex' && !await supportedCodex(root, options)) return blocked('unsupported_plugin');
   const file = configFile(root, cli);
   if (!await safeParent(file) || !await safeFile(file)) return blocked('unsafe_native_config');
@@ -181,11 +217,13 @@ export async function applyNativeExclusion(root, options = {}) {
     let saved;
     try { saved = JSON.parse(priorSnapshot); } catch { return blocked('unsafe_snapshot'); }
     const raw = await readOptional(file);
-    if (saved.cli !== cli || saved.file !== file || raw === null ||
+    if (saved.cli !== cli || saved.file !== file || (saved.nativeRoot && saved.nativeRoot !== root) ||
+        (saved.projectRoot && saved.projectRoot !== scope.projectRoot) || raw === null ||
         !(cli === 'claude' ? claudeEdit(raw, saved) : codexEdit(raw, saved))) {
       return blocked('native_config_changed');
     }
-    return { kind: 'applied', existing: true };
+    const verification = await verifyNativeCapture(root, { ...options, projectRoot: scope.projectRoot });
+    return verification.kind === 'verified' ? { kind: 'applied', existing: true } : blocked(verification.reason);
   }
   const raw = await readOptional(file);
   const edit = (cli === 'claude' ? claudeEdit : codexEdit)(raw);
@@ -199,19 +237,29 @@ export async function applyNativeExclusion(root, options = {}) {
   const exclude = await excludePlan(root, cli);
   const captureExclude = cli === 'codex' ? await excludePlan(root, cli, capturePath) : { added: false };
   if (!exclude || !captureExclude) return blocked('unsafe_git_exclude');
-  const save = { cli, file, existed: raw !== null, had: edit.had, previous: edit.previous,
+  const save = { cli, file, projectRoot: scope.projectRoot, nativeRoot: root, leased: true,
+    existed: raw !== null, had: edit.had, previous: edit.previous,
     hadEnabledPlugins: cli === 'claude' && raw !== null && Object.hasOwn(JSON.parse(raw), 'enabledPlugins'),
     hadSection: edit.hadSection, old: edit.old, exclude,
     capturePath, captureExisted: cli === 'codex' && captureRaw !== null, captureExclude,
     pluginChecked: cli === 'codex' };
   await writeAtomic(snapshot, JSON.stringify(save) + '\n');
+  let leasedExclude = false;
+  let leasedCapture = false;
   try {
     await writeAtomic(file, cli === 'claude' ? captureEdit : edit.raw);
     if (cli === 'codex') await writeAtomic(capturePath, captureEdit);
-    await addExclude(exclude);
-    await addExclude(captureExclude);
+    leasedExclude = await leaseExclude(exclude, root, { ...options, projectRoot: scope.projectRoot });
+    if (!leasedExclude) throw new Error('exclude_lease_failed');
+    leasedCapture = await leaseExclude(captureExclude, root, { ...options, projectRoot: scope.projectRoot });
+    if (!leasedCapture) throw new Error('exclude_lease_failed');
   }
   catch (error) {
+    const captureReleased = !leasedCapture || await leaseExclude(captureExclude, root,
+      { ...options, projectRoot: scope.projectRoot }, true).catch(() => false);
+    const excludeReleased = !leasedExclude || await leaseExclude(exclude, root,
+      { ...options, projectRoot: scope.projectRoot }, true).catch(() => false);
+    if (!captureReleased || !excludeReleased) return blocked('native_rollback_failed');
     if (raw === null) await fs.rm(file, { force: true }); else await writeAtomic(file, raw);
     if (cli === 'codex') {
       if (captureRaw === null) await fs.rm(capturePath, { force: true });
@@ -225,6 +273,7 @@ export async function applyNativeExclusion(root, options = {}) {
 
 export async function restoreNativeExclusion(root, options = {}) {
   const { cli } = options;
+  if (process.platform === 'win32' || !process.getuid) return blocked('native_windows_unproved');
   if (!plugins[cli]) return blocked('unsupported_cli');
   const snapshot = snapshotFile(root, cli, options);
   let saved;
@@ -232,7 +281,11 @@ export async function restoreNativeExclusion(root, options = {}) {
   try { saved = JSON.parse(await fs.readFile(snapshot, 'utf8')); }
   catch { return blocked('missing_snapshot'); }
   const file = configFile(root, cli);
-  if (saved.cli !== cli || saved.file !== file || !await safeFile(file) || await tracked(root, file)) return blocked('unsafe_native_config');
+  const scope = await identifyProject(root);
+  if (scope.kind !== 'git' || scope.projectRoot !== (options.projectRoot ?? scope.projectRoot) ||
+      (saved.projectRoot && saved.projectRoot !== scope.projectRoot) ||
+      (saved.nativeRoot && saved.nativeRoot !== root) ||
+      saved.cli !== cli || saved.file !== file || !await safeFile(file) || await tracked(root, file)) return blocked('unsafe_native_config');
   const raw = await readOptional(file);
   if (raw === null) return blocked('native_config_changed');
   const edit = (cli === 'claude' ? claudeEdit : codexEdit)(raw, saved);
@@ -258,8 +311,15 @@ export async function restoreNativeExclusion(root, options = {}) {
     if (!saved.captureExisted && Object.keys(JSON.parse(captureEdit)).length === 0) await fs.rm(capturePath);
     else await writeAtomic(capturePath, captureEdit);
   }
-  if (!await removeExclude(saved.exclude)) return blocked('git_exclude_changed');
-  if (!await removeExclude(saved.captureExclude)) return blocked('git_exclude_changed');
+  if (saved.leased) {
+    if (!await leaseExclude(saved.exclude, root, { ...options, projectRoot: scope.projectRoot }, true) ||
+        !await leaseExclude(saved.captureExclude, root, { ...options, projectRoot: scope.projectRoot }, true)) {
+      return blocked('git_exclude_changed');
+    }
+  } else {
+    if (!await removeExclude(saved.exclude)) return blocked('git_exclude_changed');
+    if (!await removeExclude(saved.captureExclude)) return blocked('git_exclude_changed');
+  }
   await fs.rm(snapshot);
   return { kind: 'restored' };
 }
@@ -267,7 +327,9 @@ export async function restoreNativeExclusion(root, options = {}) {
 export async function verifyNativeCapture(root, options = {}) {
   const { cli } = options;
   if (!captureEvents[cli] || process.platform === 'win32' || !process.getuid) return blocked('native_windows_unproved');
-  if (root !== await fs.realpath(root).catch(() => null)) return blocked('unsupported_git');
+  const scope = await identifyProject(root);
+  if (root !== await fs.realpath(root).catch(() => null) || scope.kind !== 'git' ||
+      scope.projectRoot !== (options.projectRoot ?? scope.projectRoot) || scope.activeRoot !== root) return blocked('unsupported_git');
   const file = configFile(root, cli);
   const capturePath = cli === 'claude' ? file : hookFile(root);
   if (!await safeFile(file) || !await safeFile(capturePath) || await tracked(root, file) ||
@@ -276,6 +338,8 @@ export async function verifyNativeCapture(root, options = {}) {
   try { saved = JSON.parse(await fs.readFile(snapshotFile(root, cli, options), 'utf8')); }
   catch { return blocked('missing_native_snapshot'); }
   if (saved.cli !== cli || saved.file !== file || saved.capturePath !== capturePath ||
+      (saved.projectRoot && saved.projectRoot !== scope.projectRoot) ||
+      (saved.nativeRoot && saved.nativeRoot !== root) ||
       (cli === 'codex' && saved.pluginChecked !== true)) return blocked('native_snapshot_changed');
   const raw = await readOptional(file);
   const captureRaw = await readOptional(capturePath);

@@ -13,6 +13,8 @@ Chega-se aqui por `/grelhar` direto, pela Etapa 1 do `/piloto` (que `/refinar` e
 
 ## ⚠️ PRIMEIRA AÇÃO — consultar memória (se disponível)
 
+**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+
 Use o resumo que o comando passou. Se não veio, chame `claude-mem:mem-search` (fallback `mem-search`) com o tema como query. Decisões anteriores e padrões já estabelecidos mudam quais perguntas ainda fazem sentido. Se nenhuma skill de memória existir, registre "Memória: não disponível" e siga.
 
 ## Modo auto (sem interlocutor)

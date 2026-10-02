@@ -34,6 +34,8 @@ Extraia da ideia crua: objetivo de negócio, usuário final, comportamento esper
 
 ### Fase 2 — Coleta de contexto (obrigatória)
 
+**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+
 1. **Memória**: use o resumo que o comando passou. Se não veio, chame `claude-mem:mem-search` (fallback `mem-search`) com o tema; extraia stack, arquitetura, decisões anteriores, regras de negócio, preferências, bugs relacionados. Sem skill de memória → `NÃO ENCONTRADO: memória`.
 2. **CLAUDE.md** (raiz e ancestrais).
 3. **Configuração**: README, `package.json` / `composer.json` / `pyproject.toml`, `prisma/schema.prisma`, migrations, `.env.example`, `.mcp.json` (Laravel Boost → anote `Boost: sim`).

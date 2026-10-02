@@ -18,6 +18,9 @@ MODEL_SHA256 = ('ca456c06b3a9505ddfd9131408916d'
 TOKENIZER_SHA256 = ('0b44a9d7b51c3c62626640cda0e2c'
                     '2f70fdacdc25bbbd68038369d14ebdf4c39')
 FINGERPRINT = f'{MODEL_SHA256}:{TOKENIZER_SHA256}'
+_WARM_EMBEDDER = None
+# Conservative interim floor; Task7 calibrates it on frozen negative queries.
+MIN_RECALL_SCORE = 0.85
 
 
 class PinnedTransport(httpx.BaseTransport):
@@ -118,6 +121,15 @@ class E5Embedder:
         return (pooled / norm)[0].astype('float32').tolist()
 
 
+class WarmE5Embedder:
+    def __init__(self, config=None):
+        if _WARM_EMBEDDER is None:
+            raise RuntimeError('encoder_unready')
+
+    def embed(self, text: str, memory_action: str = 'add') -> list[float]:
+        return _WARM_EMBEDDER.embed(text, memory_action)
+
+
 def verify_collection(client, collection: str, fingerprint: str) -> None:
     info = client.get_collection(collection)
     vectors = info.config.params.vectors
@@ -147,7 +159,8 @@ def _memory(client, collection: str, state: Path, connection: dict):
             verify_collection(self.client, self.collection_name, FINGERPRINT)
             self._has_bm25_slot = False
 
-    EmbedderFactory.provider_to_class['ollama'] = 'mem0_adapter.E5Embedder'
+    EmbedderFactory.provider_to_class['ollama'] = ('mem0_adapter.WarmE5Embedder'
+        if _WARM_EMBEDDER is not None else 'mem0_adapter.E5Embedder')
     sys.modules['mem0_adapter'] = sys.modules[__name__]
     LlmFactory.provider_to_class['ollama'] = ('mem0_adapter.NoGenerateLLM', BaseLlmConfig)
     VectorStoreFactory.provider_to_class['qdrant'] = 'mem0_adapter.ExistingQdrant'
@@ -186,7 +199,9 @@ def _row(raw: dict | None, client, collection: str, embedder) -> dict | None:
         raise ValueError('remote_payload_unverified')
     return {'sdkId': identifier, 'qdrantId': str(points[0].id), 'externalId': metadata.get('source_record_id'),
             'projectId': raw.get('user_id'), 'status': metadata.get('status'), 'text': raw.get('memory'),
-            'metadata': metadata, 'sessionId': raw.get('run_id')}
+            'metadata': metadata, 'sessionId': raw.get('run_id'),
+            **({'score': raw['score']} if isinstance(raw.get('score'), (int, float)) and
+               math.isfinite(raw['score']) and 0 <= raw['score'] <= 1 else {})}
 
 
 def _find(memory, client, collection: str, project: str, external: str) -> list[dict]:
@@ -220,8 +235,9 @@ def execute(request: dict, client, state: Path) -> dict:
         metadata = request['metadata']
         if any(key in metadata for key in ('status', 'source_record_id', 'project_id', 'expiration_date')):
             raise ValueError('reserved_metadata')
-        if metadata.get('scope') not in ('project', 'personal') or \
-                (metadata.get('scope') == 'personal' and not metadata.get('owner_id')):
+        if metadata.get('scope') not in ('project', 'personal', 'episode') or \
+                (metadata.get('scope') == 'personal' and not metadata.get('owner_id')) or \
+                (metadata.get('scope') == 'episode' and not metadata.get('valid_to')):
             raise ValueError('scope_invalid')
         if not all(metadata.get(field) for field in ('source', 'actor', 'origin', 'evidence_at')):
             raise ValueError('provenance_incomplete')
@@ -256,12 +272,17 @@ def execute(request: dict, client, state: Path) -> dict:
         now = datetime.now(timezone.utc)
         limit = 20
         while limit <= 2048:
-            result = memory.search(request['query'], filters={'user_id': project, 'status': 'active'}, top_k=limit)
-            items = [_row(row, client, collection, memory.embedding_model) for row in result['results']]
+            result = memory.search(request['query'], filters={'user_id': project, 'status': 'active'},
+                                   top_k=limit, threshold=MIN_RECALL_SCORE)
+            items = [{**_row(row, client, collection, memory.embedding_model),
+                      'scoreSource': 'mem0_sdk_search'} for row in result['results']]
             eligible = [row for row in items if row['projectId'] == project and
+                isinstance(row.get('score'), (int, float)) and math.isfinite(row['score']) and
+                MIN_RECALL_SCORE <= row['score'] <= 1 and
                 row['status'] == 'active' and row['metadata'].get('source') and row['metadata'].get('actor') and
-                row['metadata'].get('scope') in ('project', 'personal') and
-                (row['metadata']['scope'] == 'project' or (request.get('ownerId') and
+                row['metadata'].get('scope') in ('project', 'personal', 'episode') and
+                (row['metadata'].get('scope') != 'episode' or row['metadata'].get('valid_to')) and
+                (row['metadata']['scope'] in ('project', 'episode') or (request.get('ownerId') and
                     row['metadata'].get('owner_id') == request['ownerId'])) and
                 (not row['metadata'].get('valid_from') or _time(row['metadata']['valid_from']) <= now) and
                 (not row['metadata'].get('valid_to') or now < _time(row['metadata']['valid_to']))]

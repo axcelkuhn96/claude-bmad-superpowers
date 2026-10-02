@@ -88,6 +88,8 @@ A névoa só se junta **em direção ao destino**. O destino fixa o escopo, ent�
 
 ## Invocação
 
+**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+
 Chega-se aqui por `/mapear` direto, ou encaminhado pelo `/investigar` e pela grelha do `/piloto` quando o escopo não cabe numa sessão. Memória: use o resumo que o comando passou; se não veio, `claude-mem:mem-search` (fallback `mem-search`). Subagents de pesquisa usam o papel `explorer` de `~/.claude/cbs-overrides/models.yml` (Claude Code: coluna `claude:`, agente `cbs-explorer` se existir, senão `sonnet`; Codex (`~/.codex/agents/*.toml`, `CODEX_HOME`/`CODEX_CLI_PATH`): só a coluna `codex:`, `explorer_luna`, nunca modelo; sinônimo antigo `investigar`), nomeados `name: explore-<ticket>` (regra em `~/.claude/skills/executor-bmad-superpowers/referencia/dispatch.md` §2).
 
 Dois modos. Em qualquer um: **nunca resolva mais de um ticket por sessão** — exceto tickets de pesquisa.

@@ -77,7 +77,7 @@ def main() -> int:
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     runtime = state / "runtime"
     venv.EnvBuilder(with_pip=True).create(runtime)
-    python = runtime / "bin" / "python"
+    python = runtime / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     env = os.environ.copy()
     subprocess.run([str(python), "-m", "pip", "install", "--disable-pip-version-check", *PINS],
                    check=True, env=env)

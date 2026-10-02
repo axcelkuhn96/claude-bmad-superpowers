@@ -14,6 +14,8 @@ Chat enxuto: 1 linha por etapa; o detalhe vai pro relatório.
 
 ## Fluxo
 
+**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+
 1. **Memória**: use o resumo recebido; se não veio, `claude-mem:mem-search` (fallback `mem-search`) com o tema das mudanças.
 2. **Escopo (sem editar nada)**: argumentos → escopo. Senão: `git status` + `git diff` (não commitado) e, em branch de feature, `git diff <base>...HEAD`. Escreva o diff num arquivo — `.superpowers/revisao/<data>-<slug>/diff.txt` (garanta que `.superpowers/` está ignorado; senão adicione a `.git/info/exclude`) — e passe **o caminho** aos subagents, nunca o conteúdo.
 3. **Domínios**: detecte no diff com a tabela de `~/.claude/skills/executor-bmad-superpowers/referencia/roteamento.md` §1 (até 2 por área tocada).

@@ -2,6 +2,7 @@ import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { authorizeDestination, readLocalTrust, trustTuple, writeLocalTrust } from './trust.mjs';
 import { pinDestination, validateDestination } from './activation.mjs';
 import { applyNativeExclusion, restoreNativeExclusion } from './native.mjs';
+import { identifyProject } from './project-id.mjs';
 
 const blocked = (reason) => ({ kind: 'blocked', reason });
 const same = (a, b) => a?.provider === 'mem0' && b?.provider === 'mem0' &&
@@ -10,6 +11,7 @@ const same = (a, b) => a?.provider === 'mem0' && b?.provider === 'mem0' &&
   JSON.stringify(a.destination) === JSON.stringify(b.destination);
 
 export async function activateProject(cwd, deps = {}) {
+  if (process.platform === 'win32' || !process.getuid) return blocked('native_windows_unproved');
   const resolution = await inspectConfiguration(cwd, deps);
   if (resolution.provider !== 'mem0') return blocked(resolution.reason);
   const current = async () => same(resolution, await inspectConfiguration(cwd, deps));
@@ -18,17 +20,21 @@ export async function activateProject(cwd, deps = {}) {
   });
   if (validated.kind !== 'authorized') return validated;
   if (!await current()) return blocked('config_changed');
-  const applyNative = deps.applyNative ?? ((root) => applyNativeExclusion(root, deps));
-  const native = await applyNative(resolution.projectRoot);
+  const scope = await identifyProject(cwd);
+  if (scope.kind !== 'git' || scope.projectRoot !== resolution.projectRoot) return blocked('unsupported_git');
+  const nativeRoot = deps.cli === 'codex' ? scope.activeRoot : resolution.projectRoot;
+  const nativeOptions = { ...deps, projectRoot: resolution.projectRoot };
+  const applyNative = deps.applyNative ?? ((root) => applyNativeExclusion(root, nativeOptions));
+  const native = await applyNative(nativeRoot);
   if (native && native.kind === 'blocked') return native;
   try {
     if (!await current()) {
-      if (!deps.applyNative && !native?.existing) await restoreNativeExclusion(resolution.projectRoot, deps);
+      if (!deps.applyNative && !native?.existing) await restoreNativeExclusion(nativeRoot, nativeOptions);
       return blocked('config_changed');
     }
     await writeLocalTrust(resolution.stateDir, trustTuple(resolution));
   } catch (error) {
-    if (!deps.applyNative && !native?.existing) await restoreNativeExclusion(resolution.projectRoot, deps);
+    if (!deps.applyNative && !native?.existing) await restoreNativeExclusion(nativeRoot, nativeOptions);
     return blocked('trust_write_failed');
   }
   return { kind: 'activated', projectId: resolution.projectId, stateDir: resolution.stateDir };

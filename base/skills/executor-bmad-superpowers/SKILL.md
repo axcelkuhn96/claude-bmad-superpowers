@@ -79,6 +79,8 @@ Escalonamentos do SDD (não substitutos): **teammate** (subagent persistente, `S
 ### Fase 1 — Intake
 
 1. Leia o prompt/spec inteiro. Se veio do refinador, ele traz `<tipo_de_tarefa>` e `<dominios_previstos>` — use-os na Fase 3.
+**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+
 2. Memória: se o comando já passou o resumo, use-o; senão chame `claude-mem:mem-search` (fallback `mem-search`) com o tema. Sem skill de memória: `Memória: não disponível`.
 3. Ambiguidade bloqueante: normal → pergunte (uma por vez, `AskUserQuestion`); auto → assuma, marque `SUPOSIÇÃO`.
 4. Workspace: `git branch --show-current`. Se for `main`/`master`, crie `feat/<slug>` antes de qualquer edição (o SDD exige consentimento pra trabalhar em main — a branch dedicada é o consentimento; em normal, registre-o no gate da Fase 4). **Sem worktree** — trabalhe na branch.

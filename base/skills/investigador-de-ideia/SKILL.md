@@ -26,6 +26,8 @@ Tudo vai pro arquivo `docs/analises/<AAAA-MM-DD>-investigacao-<slug>.md` (crie `
 Reformule em 3 partes: **Problema** (o que dói / oportunidade), **Quem sente**, **Como saberíamos que resolvemos** (critério observável). Separe **Sabemos** (fato, com fonte) / **Assumimos** (precisa validar) / **Não sabemos** (precisa pesquisar — e como).
 
 ### 2. Investigação
+**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+
 - **Memória**: use o resumo que o comando passou; se não veio, `claude-mem:mem-search` (fallback `mem-search`) com o tema. Sem skill → "Memória: não disponível".
 - **Código atual** via subagent `Explore` (papel `explorer` de `~/.claude/cbs-overrides/models.yml` — Claude Code: coluna `claude:`, agente `cbs-explorer` se existir em `~/.claude/agents/`, senão `sonnet`; Codex — dispatch por nome de `~/.codex/agents/*.toml` ou `CODEX_HOME`/`CODEX_CLI_PATH` no ambiente: **só** a coluna `codex:`, `explorer_luna`, nunca modelo nem effort; sinônimo antigo `investigar`; nomeado `name: explore-<tema>`, regra em `~/.claude/skills/executor-bmad-superpowers/referencia/dispatch.md` §2): como funciona hoje a área; componentes/serviços/tabelas que tocam o tema; algo parecido já existe; integrações no caminho; **quem depende do que seria alterado** (callers, jobs, telas, relatórios, integrações). Receba síntese com `arquivo:linha`, nunca dump.
 

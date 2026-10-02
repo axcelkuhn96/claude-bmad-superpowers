@@ -6,6 +6,9 @@ import { verifyNativeCapture } from './native.mjs';
 import { createOutbox } from './outbox.mjs';
 import { parsePersistedSlice, POLICY_VERSION } from './transcript.mjs';
 import { readLocalTrust, trustTuple } from './trust.mjs';
+import { identifyProject } from './project-id.mjs';
+import { bindLaunch } from './launch.mjs';
+import { recordSessionCheckout, readSessionCheckout } from './session-checkout.mjs';
 
 const events = { claude: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'SessionEnd']),
   codex: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd']) };
@@ -24,7 +27,10 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   if (resolution.provider !== 'mem0' && resolution.reason !== 'fresh_session') return blocked(resolution.reason ?? 'unresolved_session');
   const current = resolution.provider === 'mem0' ? resolution : await inspectConfiguration(payload.cwd, options);
   if (current.provider !== 'mem0') return blocked(current.reason ?? 'unresolved_session');
-  const native = await verifyNativeCapture(current.projectRoot, { cli, stateRoot, installedPlugin });
+  const scope = await identifyProject(payload.cwd);
+  if (scope.kind !== 'git' || scope.projectRoot !== current.projectRoot) return blocked('unsupported_git');
+  const native = await verifyNativeCapture(cli === 'codex' ? scope.activeRoot : current.projectRoot,
+    { cli, stateRoot, installedPlugin, projectRoot: current.projectRoot });
   if (native.kind !== 'verified') return blocked(native.reason);
   const trust = await readLocalTrust(current.stateDir);
   if (!trust || Object.entries(trustTuple(current)).some(([key, value]) => trust[key] !== value)) {
@@ -43,6 +49,17 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   try { stat = await fs.lstat(transcriptPath); }
   catch { return blocked('missing_transcript'); }
   if (!stat.isFile() || stat.uid !== process.getuid()) return blocked('unsafe_transcript');
+  const checkout = event === 'SessionStart'
+    ? await recordSessionCheckout(session, cli, payload.session_id, scope.activeRoot)
+    : await readSessionCheckout(session.stateDir, cli, payload.session_id);
+  if (checkout.kind !== 'bound' || checkout.nativeRoot !== scope.activeRoot ||
+      checkout.projectRoot !== session.projectRoot || checkout.projectId !== session.projectId) {
+    return blocked(checkout.reason ?? 'session_checkout_changed');
+  }
+  if (event === 'SessionStart' && process.env.CBS_MEMORIA_LAUNCH_ID) {
+    const binding = await bindLaunch(process.env.CBS_MEMORIA_LAUNCH_ID, cli, payload.cwd, payload.session_id, { stateRoot });
+    if (binding.kind !== 'bound') return blocked(binding.reason);
+  }
   const outbox = createOutbox(session.stateDir);
   let { queuedEnd } = await outbox.cursor(cli, payload.session_id);
   let last = { kind: 'no_complete_bytes', queuedEnd };
