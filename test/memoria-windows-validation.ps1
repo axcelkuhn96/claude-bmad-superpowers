@@ -4,7 +4,13 @@ param(
   [string]$RuntimeStateDir,
   [string]$ModelPath,
   [string]$TokenizerPath,
-  [switch]$CheckDirectML
+  [switch]$CheckDirectML,
+  [ValidateSet('claude','codex')][string]$NativeEventCli,
+  [string]$NativeEventExecutable,
+  [string]$NativeEventExecutableSha256,
+  [string]$NativeEventProfileDir,
+  [string]$NativeEventProjectRoot,
+  [ValidateRange(10,600)][int]$NativeEventWaitSeconds = 180
 )
 
 # Native Windows fixture only. It never activates Mem0 or changes user CLI configuration.
@@ -67,8 +73,12 @@ try {
   $actualReadWrite = [System.IO.File]::ReadAllText($probe) -eq 'fixture-only'
   $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($fixture))
   $isNtfs = $drive.DriveFormat -eq 'NTFS'
-  Record 'fixture_ntfs_sid_dacl' $(if ($ownerSid -eq $sid -and !$unexpected.Count -and $actualReadWrite -and $isNtfs) { 'observed' } else { 'failed' }) @{
+  $volumeAcl = Get-Acl -LiteralPath $drive.RootDirectory.FullName
+  $volumeOwnerSid = ([System.Security.Principal.NTAccount]::new($volumeAcl.Owner)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+  Record 'fixture_ntfs_sid_dacl' $(if ($ownerSid -eq $sid -and $volumeOwnerSid -ne $sid -and
+      !$unexpected.Count -and $actualReadWrite -and $isNtfs) { 'observed' } else { 'failed' }) @{
     filesystem = $drive.DriveFormat; owner_matches_current_sid = ($ownerSid -eq $sid)
+    volume_root_owned_by_different_sid = ($volumeOwnerSid -ne $sid)
     unexpected_allow_aces = @($unexpected | ForEach-Object { $_.IdentityReference.Value })
     actual_owner_read_write = $actualReadWrite; inherited_aces = @($rules | Where-Object IsInherited).Count
   }
@@ -266,8 +276,91 @@ process.stdout.write(JSON.stringify({ platform: process.platform,
       } catch { Record "native_${cli}_startup" 'failed' @{ error_type = $_.Exception.GetType().Name } }
     }
   }
-  Record 'native_cli_events' 'missing_prerequisite' @{
-    reason = 'Dedicated authenticated profile and interactive project trust required; no model/account call in unattended fixture'
+  $eventArgs = @($NativeEventCli, $NativeEventExecutable, $NativeEventExecutableSha256,
+    $NativeEventProfileDir, $NativeEventProjectRoot)
+  if (@($eventArgs | Where-Object { !$_ }).Count -eq $eventArgs.Count) {
+    Record 'native_cli_events' 'missing_prerequisite' @{
+      reason = 'Supply a private authenticated profile, an already trusted private fixture project with the reviewed SessionStart recorder hook, and an absolute executable plus SHA-256'
+    }
+  } elseif (@($eventArgs | Where-Object { !$_ }).Count -ne 0) {
+    Record 'native_cli_events' 'failed' @{ reason = 'Incomplete explicit native event prerequisites' }
+  } else {
+    $ownCli = $null
+    $oldProfile = $null
+    $oldMarker = $env:CBS_MEMORIA_EVENT_MARKER
+    $oldNonce = $env:CBS_MEMORIA_EVENT_NONCE
+    try {
+      $fullExe = [System.IO.Path]::GetFullPath($NativeEventExecutable)
+      if ($fullExe -ne $NativeEventExecutable -or
+          [System.IO.Path]::GetExtension($fullExe) -ine '.exe' -or
+          !(Test-Path -LiteralPath $fullExe -PathType Leaf) -or
+          (Get-FileHash -Algorithm SHA256 -LiteralPath $fullExe).Hash -ine $NativeEventExecutableSha256) {
+        throw 'Untrusted event executable'
+      }
+      $profilePath = (Resolve-Path -LiteralPath $NativeEventProfileDir).Path
+      $projectPath = (Resolve-Path -LiteralPath $NativeEventProjectRoot).Path
+      $eventScope = (& git -C $projectPath rev-parse --show-toplevel).Trim()
+      if (![string]::Equals($eventScope, $projectPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Event project must be the exact private Git root'
+      }
+      $env:CBS_MEMORIA_WINDOWS_EVENT_PROFILE = $profilePath
+      $eventAclCode = @'
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+const { inspectWindowsPath } = await import(pathToFileURL(path.join(
+  process.env.CBS_MEMORIA_WINDOWS_REPO, 'base/memoria/windows-security.mjs')).href);
+process.stdout.write(JSON.stringify(await inspectWindowsPath(process.env.CBS_MEMORIA_WINDOWS_EVENT_PROFILE,
+  'directory')));
+'@
+      $profileAudit = ($eventAclCode | & node --input-type=module -) | ConvertFrom-Json
+      if ($LASTEXITCODE -ne 0 -or !$profileAudit.ok) { throw 'Event profile is not private' }
+      $env:CBS_MEMORIA_WINDOWS_EVENT_PROFILE = $projectPath
+      $projectAudit = ($eventAclCode | & node --input-type=module -) | ConvertFrom-Json
+      if ($LASTEXITCODE -ne 0 -or !$projectAudit.ok) { throw 'Event project is not private' }
+      $nonce = [guid]::NewGuid().ToString('N')
+      $marker = Join-Path $profilePath ('cbs-event-' + $nonce + '.json')
+      if (Test-Path -LiteralPath $marker) { throw 'Event marker already exists' }
+      $profileVariable = if ($NativeEventCli -eq 'claude') { 'CLAUDE_CONFIG_DIR' } else { 'CODEX_HOME' }
+      $oldProfile = [System.Environment]::GetEnvironmentVariable($profileVariable, 'Process')
+      [System.Environment]::SetEnvironmentVariable($profileVariable, $profilePath, 'Process')
+      $env:CBS_MEMORIA_EVENT_NONCE = $nonce
+      $env:CBS_MEMORIA_EVENT_MARKER = $marker
+      $ownCli = Start-Process -FilePath $fullExe -WorkingDirectory $projectPath -PassThru -NoNewWindow
+      [System.Environment]::SetEnvironmentVariable($profileVariable, $oldProfile, 'Process')
+      # Codex may require a human-initiated first turn before SessionStart.
+      # This harness sends no prompt and never bypasses hook trust.
+      $deadline = [DateTime]::UtcNow.AddSeconds($NativeEventWaitSeconds)
+      while (!(Test-Path -LiteralPath $marker) -and !$ownCli.HasExited -and
+          [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+      $observed = if (Test-Path -LiteralPath $marker) {
+        Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
+      } else { $null }
+      $matched = $observed -and $observed.nonce -eq $nonce -and
+        $observed.cli -eq $NativeEventCli -and $observed.event -eq 'SessionStart' -and
+        $observed.hasSessionId -and
+        [string]::Equals($observed.cwd, $projectPath, [System.StringComparison]::OrdinalIgnoreCase) -and
+        $observed.payloadSha256 -match '^[a-f0-9]{64}$'
+      Record 'native_cli_events' $(if ($matched) { 'passed' } else { 'failed' }) @{
+        cli = $NativeEventCli; session_start_observed = [bool]$matched
+        exact_trusted_fixture_project = $true
+        isolated_profile_acl_checked = [bool]$profileAudit.ok
+        private_project_acl_checked = [bool]$projectAudit.ok
+        model_prompt_sent = $false; production_capture_claim = $false
+      }
+    } catch {
+      Record 'native_cli_events' 'failed' @{ error_type = $_.Exception.GetType().Name }
+    } finally {
+      if ($ownCli -and !$ownCli.HasExited) { Stop-Process -Id $ownCli.Id -Force -ErrorAction SilentlyContinue }
+      if ($profileVariable) {
+        [System.Environment]::SetEnvironmentVariable($profileVariable, $oldProfile, 'Process')
+      }
+      $env:CBS_MEMORIA_EVENT_MARKER = $oldMarker
+      $env:CBS_MEMORIA_EVENT_NONCE = $oldNonce
+      if ($marker -and (Test-Path -LiteralPath $marker)) {
+        Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+      }
+      Remove-Item Env:CBS_MEMORIA_WINDOWS_EVENT_PROFILE -ErrorAction SilentlyContinue
+    }
   }
   $replayGuardsHold = $guard.replay -eq 'native_windows_unproved' -and $guard.broker -eq 'native_windows_unproved'
   Record 'native_outbox_replay_two_machines' $(if ($replayGuardsHold) { 'blocked_missing_implementation' } else { 'failed' }) @{
@@ -312,6 +405,73 @@ process.stdout.write(JSON.stringify(await inspectWindowsPath(process.env.CBS_MEM
 } catch { Record 'production_rejects_permissive_acl' 'failed' @{ error_type = $_.Exception.GetType().Name } }
 
 try {
+  $securityCode = @'
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+const { inspectWindowsPath, resolveWindowsExecutable, writeWindowsPrivateFile,
+  readWindowsPrivateFile, removeWindowsPrivateFile, withWindowsLock } = await import(pathToFileURL(path.join(
+  process.env.CBS_MEMORIA_WINDOWS_REPO, 'base/memoria/windows-security.mjs')).href);
+const target = path.join(process.env.CBS_MEMORIA_WINDOWS_FIXTURE, 'conditional-remove.txt');
+const originalRoot = process.env.SystemRoot;
+process.env.SystemRoot = path.join(process.env.CBS_MEMORIA_WINDOWS_FIXTURE, 'fake', 'Windows');
+const osRootIndependent = (await inspectWindowsPath(process.env.CBS_MEMORIA_WINDOWS_FIXTURE,
+  'directory')).ok;
+process.env.SystemRoot = originalRoot;
+const unsafeTools = path.join(process.env.CBS_MEMORIA_WINDOWS_FIXTURE, 'unsafe-tools');
+await fs.mkdir(unsafeTools);
+await fs.copyFile(path.join(process.env.CBS_MEMORIA_WINDOWS_REPO,
+  'base/memoria/bin/windows-native-x64.node'), path.join(unsafeTools, 'git.exe'));
+const originalPath = process.env.PATH;
+process.env.PATH = unsafeTools;
+let writablePathRejected = false;
+try { await resolveWindowsExecutable('git.exe'); }
+catch { writablePathRejected = true; }
+process.env.PATH = originalPath;
+const written = await writeWindowsPrivateFile(target, 'before');
+const wrong = await removeWindowsPrivateFile(target, 'other');
+const preserved = await readWindowsPrivateFile(target);
+const removed = await removeWindowsPrivateFile(target, 'before');
+let active = 0;
+let maximum = 0;
+await Promise.all([1, 2].map(() => withWindowsLock('fixture-concurrent', async held => {
+  held();
+  active++;
+  maximum = Math.max(maximum, active);
+  await new Promise(resolve => setTimeout(resolve, 150));
+  held();
+  active--;
+})));
+let priorGuard;
+await withWindowsLock('fixture-release', async held => { priorGuard = held; held(); });
+let releaseConfirmed = false;
+try { priorGuard(); }
+catch (error) { releaseConfirmed = error.message === 'windows_lock_lost'; }
+process.stdout.write(JSON.stringify({ osRootIndependent, writablePathRejected,
+  written: written.ok, wrong: wrong.code,
+  preserved: preserved.text === 'before', removed: removed.ok,
+  concurrentMaximum: maximum, releaseConfirmed }));
+'@
+  $securityResult = ($securityCode | & node --input-type=module -) | ConvertFrom-Json
+  if ($LASTEXITCODE -ne 0) { throw 'Native security helper probe failed' }
+  $securityOkay = $securityResult.osRootIndependent -and $securityResult.writablePathRejected -and
+    $securityResult.written -and $securityResult.wrong -eq 'changed' -and
+    $securityResult.preserved -and $securityResult.removed -and
+    $securityResult.concurrentMaximum -eq 1 -and $securityResult.releaseConfirmed
+  Record 'production_conditional_remove_and_mutex' $(if ($securityOkay) { 'passed' } else { 'failed' }) @{
+    inherited_systemroot_ignored = $securityResult.osRootIndependent
+    writable_path_tool_rejected = $securityResult.writablePathRejected
+    wrong_bytes_refused = $securityResult.wrong
+    original_bytes_preserved = $securityResult.preserved
+    matching_remove_succeeded = $securityResult.removed
+    maximum_concurrent_callbacks = $securityResult.concurrentMaximum
+    native_release_acknowledged = $securityResult.releaseConfirmed
+  }
+} catch {
+  Record 'production_conditional_remove_and_mutex' 'failed' @{ error_type = $_.Exception.GetType().Name }
+}
+
+try {
   $lockCode = @'
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -319,8 +479,9 @@ import { pathToFileURL } from 'node:url';
 const root = process.env.CBS_MEMORIA_WINDOWS_REPO;
 const fixture = process.env.CBS_MEMORIA_WINDOWS_FIXTURE;
 const mode = process.env.CBS_MEMORIA_WINDOWS_LOCK_MODE;
-const { withProjectLock } = await import(pathToFileURL(path.join(root, 'base', 'memoria', 'ledger.mjs')).href);
-await withProjectLock(fixture, async () => {
+const { withWindowsLock } = await import(pathToFileURL(path.join(root, 'base', 'memoria', 'windows-security.mjs')).href);
+await withWindowsLock('fixture-process-crash', async held => {
+  held();
   const temp = path.join(fixture, 'crash-record.tmp');
   const target = path.join(fixture, 'crash-record.json');
   if (mode === 'hold') {
@@ -330,7 +491,8 @@ await withProjectLock(fixture, async () => {
   }
   await fs.writeFile(path.join(fixture, mode + '.ready'), 'ready');
   if (mode === 'hold') await new Promise(resolve => setTimeout(resolve, 60000));
-}, 'diagnostic.lock', 2000);
+  held();
+});
 '@
   function Start-OwnNode([string]$mode) {
     $info = [System.Diagnostics.ProcessStartInfo]::new()
@@ -463,6 +625,9 @@ foreach ($cli in 'claude','codex') {
   if (!$report.controls.Contains("native_${cli}_apply_verify_launch_restore")) {
     Record "native_${cli}_apply_verify_launch_restore" 'failed' @{ reason = 'production fixture probe failed before reaching native controls' }
   }
+}
+if (!$report.controls.Contains('native_cli_events')) {
+  Record 'native_cli_events' 'failed' @{ reason = 'fixture failed before native event probe' }
 }
 if (!$report.controls.Contains('native_outbox_replay_two_machines')) {
   Record 'native_outbox_replay_two_machines' 'unproved' @{ reason = 'production fixture probe failed before reaching replay controls' }

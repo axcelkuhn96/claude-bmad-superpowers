@@ -8,14 +8,17 @@ import { fileURLToPath } from 'node:url';
 import { identifyProject } from './project-id.mjs';
 import { withProjectLock } from './ledger.mjs';
 import { canonicalWindowsPath, ensureWindowsPrivateDirectory, inspectWindowsPath,
-  probeWindowsCodexPlugin, readWindowsPrivateFile, resolveWindowsExecutable, windowsPathKey, withWindowsLock,
-  writeWindowsPrivateFile } from './windows-security.mjs';
+  probeWindowsCodexPlugin, readWindowsPrivateFile, removeWindowsPrivateFile,
+  resolveWindowsExecutable, windowsPathKey, withWindowsLock,
+  writeWindowsPrivateFile, windowsGitPattern } from './windows-security.mjs';
 
 const run = promisify(execFile);
 const gitEnv = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
 const gitCommand = root => process.platform === 'win32'
   ? resolveWindowsExecutable('git.exe', [root, path.resolve(path.dirname(captureScript), '..', '..')])
   : 'git';
+const gitArgs = (root, ...args) => process.platform === 'win32'
+  ? ['-c', 'core.fsmonitor=false', '-C', root, ...args] : ['-C', root, ...args];
 const plugins = { claude: 'claude-mem@thedotmack', codex: 'claude-mem@claude-mem-local' };
 const blocked = (reason) => ({ kind: 'blocked', reason });
 const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -77,28 +80,35 @@ async function safeParent(file, privateState = false) {
   } catch (error) { return error.code === 'ENOENT'; }
 }
 async function tracked(root, file) {
-  const relative = path.relative(root, file);
+  const relative = process.platform === 'win32' ? windowsGitPattern(root, file).slice(1) : path.relative(root, file);
   try {
-    const { stdout } = await run(await gitCommand(root), ['-C', root, 'ls-files', '--cached', '--', relative], { env: gitEnv(), timeout: 5000 });
+    const { stdout } = await run(await gitCommand(root), gitArgs(root, 'ls-files', '--cached', '--', relative), { env: gitEnv(), timeout: 5000 });
     return !!stdout.trim();
   } catch { return true; }
 }
 async function excludePlan(root, cli, target = configFile(root, cli)) {
-  const relative = path.relative(root, target);
+  const relative = process.platform === 'win32' ? windowsGitPattern(root, target).slice(1) : path.relative(root, target);
   const block = `# cbs-memoria ${cli}\n/${relative}\n`;
   let ignored = false;
   try {
-    await run(await gitCommand(root), ['-C', root, 'check-ignore', '-q', '--', relative], { env: gitEnv(), timeout: 5000 });
+    await run(await gitCommand(root), gitArgs(root, 'check-ignore', '-q', '--', relative), { env: gitEnv(), timeout: 5000 });
     ignored = true;
   } catch (error) {
     if (error.code !== 1) return null;
   }
   try {
-    const { stdout } = await run(await gitCommand(root), ['-C', root, 'rev-parse', '--git-path', 'info/exclude'], { env: gitEnv(), timeout: 5000 });
+    const { stdout } = await run(await gitCommand(root), gitArgs(root, 'rev-parse', '--git-path', 'info/exclude'), { env: gitEnv(), timeout: 5000 });
     const file = path.resolve(root, stdout.trim());
     if (!await safeParent(file) || !await safeFile(file)) return null;
-    return { added: !ignored, file, block };
+    return { added: !ignored, file, block, target: relative };
   } catch { return null; }
+}
+async function actuallyIgnored(root, relative) {
+  try {
+    await run(await gitCommand(root), gitArgs(root, 'check-ignore', '-q', '--', relative),
+      { env: gitEnv(), timeout: 5000 });
+    return true;
+  } catch { return false; }
 }
 async function addExclude(plan) {
   if (!plan.added) return;
@@ -121,7 +131,13 @@ async function leaseExclude(plan, root, options, remove = false) {
   const state = path.join(stateRoot(options), hash(canonical));
   const leaseFile = path.join(state, `exclude-${hash(`${plan.file}:${plan.block}`)}.json`);
   const lock = process.platform === 'win32' ? withWindowsLock : withProjectLock;
-  return lock(state, async () => {
+  return lock(state, async (assertHeld = () => {}) => {
+    const mutate = async operation => {
+      assertHeld();
+      const result = await operation();
+      assertHeld();
+      return result;
+    };
     let lease;
     try {
       const raw = await readOptional(leaseFile, true);
@@ -132,14 +148,14 @@ async function leaseExclude(plan, root, options, remove = false) {
       const first = !lease;
       lease ??= { file: plan.file, block: plan.block, createdByCBS: plan.added, owners: [] };
       if (lease.releasing && lease.createdByCBS && !(await readOptional(plan.file))?.includes(plan.block)) {
-        await addExclude({ ...plan, added: true });
+        await mutate(() => addExclude({ ...plan, added: true }));
       }
       if (!lease.owners.includes(root)) lease.owners.push(root);
       delete lease.releasing;
-      if (first && plan.added) await addExclude(plan);
-      try { await writeAtomic(leaseFile, JSON.stringify(lease) + '\n'); }
+      if (first && plan.added) await mutate(() => addExclude(plan));
+      try { await mutate(() => writeAtomic(leaseFile, JSON.stringify(lease) + '\n')); }
       catch (error) {
-        if (first && plan.added) await removeExclude(plan);
+        if (first && plan.added) await mutate(() => removeExclude(plan));
         throw error;
       }
       return true;
@@ -149,20 +165,24 @@ async function leaseExclude(plan, root, options, remove = false) {
       if (lease.releasing !== root) return lease.owners.length > 0;
       if (lease.owners.length) {
         delete lease.releasing;
-        await writeAtomic(leaseFile, JSON.stringify(lease) + '\n');
+        await mutate(() => writeAtomic(leaseFile, JSON.stringify(lease) + '\n'));
         return true;
       }
     }
     if (lease.owners.includes(root)) {
       lease.owners = lease.owners.filter(owner => owner !== root);
-      if (lease.owners.length) { await writeAtomic(leaseFile, JSON.stringify(lease) + '\n'); return true; }
+      if (lease.owners.length) {
+        await mutate(() => writeAtomic(leaseFile, JSON.stringify(lease) + '\n'));
+        return true;
+      }
       if (lease.createdByCBS && !(await readOptional(plan.file))?.includes(plan.block)) return false;
       lease.releasing = root;
-      await writeAtomic(leaseFile, JSON.stringify(lease) + '\n');
+      await mutate(() => writeAtomic(leaseFile, JSON.stringify(lease) + '\n'));
     }
     if (lease.createdByCBS && (await readOptional(plan.file))?.includes(plan.block) &&
-        !await removeExclude({ ...plan, added: true })) return false;
-    await fs.rm(leaseFile);
+        !await mutate(() => removeExclude({ ...plan, added: true }))) return false;
+    const currentLease = await readOptional(leaseFile, true);
+    await mutate(() => removeIfCurrent(leaseFile, currentLease, true));
     return true;
   });
 }
@@ -176,6 +196,14 @@ async function readOptional(file, privateState = false) {
   try { return await fs.readFile(file, 'utf8'); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
+async function removeIfCurrent(file, expectedText, privateState = false) {
+  if (process.platform === 'win32') {
+    const removed = await removeWindowsPrivateFile(file, expectedText, { privateState });
+    if (!removed.ok) throw new Error(removed.code);
+    return;
+  }
+  await fs.rm(file, { force: true });
+}
 async function writeAtomic(file, contents, privateState = true, expectedText) {
   if (process.platform === 'win32') {
     const directory = await ensureWindowsPrivateDirectory(path.dirname(file), { privateState });
@@ -183,10 +211,7 @@ async function writeAtomic(file, contents, privateState = true, expectedText) {
     const existing = await readWindowsPrivateFile(file, { privateState });
     if (!existing.ok && existing.code !== 'missing') throw new Error('unsafe_native_file');
     if (expectedText !== undefined && (existing.ok ? existing.text : '') !== expectedText) {
-      const backup = await readWindowsPrivateFile(`${file}.cbs-replace-backup`, { privateState });
-      if (!existing.ok || existing.text !== contents || !backup.ok || backup.text !== expectedText) {
-        throw new Error('native_config_changed');
-      }
+      throw new Error('native_config_changed');
     }
     const written = await writeWindowsPrivateFile(file, contents,
       { replace: existing.ok, privateState, expectedText: existing.ok ? existing.text : null });
@@ -321,7 +346,8 @@ export async function applyNativeExclusion(root, options = {}) {
     hadSection: edit.hadSection, old: edit.old, exclude,
     capturePath, captureExisted: cli === 'codex' && captureRaw !== null, captureExclude,
     pluginChecked: cli === 'codex' };
-  await writeAtomic(snapshot, JSON.stringify(save) + '\n');
+  const snapshotText = JSON.stringify(save) + '\n';
+  await writeAtomic(snapshot, snapshotText);
   let leasedExclude = false;
   let leasedCapture = false;
   try {
@@ -331,20 +357,36 @@ export async function applyNativeExclusion(root, options = {}) {
     if (!leasedExclude) throw new Error('exclude_lease_failed');
     leasedCapture = await leaseExclude(captureExclude, root, { ...options, projectRoot: scope.projectRoot });
     if (!leasedCapture) throw new Error('exclude_lease_failed');
+    if (process.platform === 'win32' && (!await actuallyIgnored(root, exclude.target) ||
+        (cli === 'codex' && !await actuallyIgnored(root, captureExclude.target)))) {
+      throw new Error('git_exclude_unverified');
+    }
   }
   catch (error) {
-    const captureReleased = !leasedCapture || await leaseExclude(captureExclude, root,
-      { ...options, projectRoot: scope.projectRoot }, true).catch(() => false);
-    const excludeReleased = !leasedExclude || await leaseExclude(exclude, root,
-      { ...options, projectRoot: scope.projectRoot }, true).catch(() => false);
-    if (!captureReleased || !excludeReleased) return blocked('native_rollback_failed');
-    if (raw === null) await fs.rm(file, { force: true }); else await writeAtomic(file, raw, false);
-    if (cli === 'codex') {
-      if (captureRaw === null) await fs.rm(capturePath, { force: true });
-      else await writeAtomic(capturePath, captureRaw, false);
-    }
-    await fs.rm(snapshot, { force: true });
-    return blocked('native_write_failed');
+    try {
+      const current = await readOptional(file);
+      const installed = cli === 'claude' ? captureEdit : edit.raw;
+      const currentCapture = cli === 'codex' ? await readOptional(capturePath) : null;
+      if ((current !== raw && current !== installed) ||
+          (cli === 'codex' && currentCapture !== captureRaw && currentCapture !== captureEdit)) {
+        return blocked('native_rollback_failed');
+      }
+      const captureReleased = !leasedCapture || await leaseExclude(captureExclude, root,
+        { ...options, projectRoot: scope.projectRoot }, true).catch(() => false);
+      const excludeReleased = !leasedExclude || await leaseExclude(exclude, root,
+        { ...options, projectRoot: scope.projectRoot }, true).catch(() => false);
+      if (!captureReleased || !excludeReleased) return blocked('native_rollback_failed');
+      if (current !== raw) {
+        if (raw === null) await removeIfCurrent(file, installed);
+        else await writeAtomic(file, raw, false, installed);
+      }
+      if (cli === 'codex' && currentCapture !== captureRaw) {
+        if (captureRaw === null) await removeIfCurrent(capturePath, captureEdit);
+        else await writeAtomic(capturePath, captureRaw, false, captureEdit);
+      }
+      await removeIfCurrent(snapshot, snapshotText, true);
+      return blocked('native_write_failed');
+    } catch { return blocked('native_rollback_failed'); }
   }
   return { kind: 'applied' };
 }
@@ -419,11 +461,11 @@ export async function restoreNativeExclusion(root, options = {}) {
   try {
     if (!saved.rollback) await writeAtomic(snapshot, JSON.stringify({ ...saved, rollback: plan }) + '\n');
     if (raw !== plan.config) {
-      if (plan.config === null) await fs.rm(file, { force: true });
+      if (plan.config === null) await removeIfCurrent(file, raw);
       else await writeAtomic(file, plan.config, false, raw ?? '');
     }
     if (cli === 'codex' && hasCapture && captureRaw !== plan.capture) {
-      if (plan.capture === null) await fs.rm(capturePath, { force: true });
+      if (plan.capture === null) await removeIfCurrent(capturePath, captureRaw);
       else await writeAtomic(capturePath, plan.capture, false, captureRaw ?? '');
     }
     if (saved.leased) {
@@ -437,7 +479,7 @@ export async function restoreNativeExclusion(root, options = {}) {
       }
     }
   } catch { return blocked('git_exclude_changed'); }
-  await fs.rm(snapshot);
+  await removeIfCurrent(snapshot, await readOptional(snapshot, true), true);
   return { kind: 'restored' };
 }
 
@@ -465,6 +507,10 @@ export async function verifyNativeCapture(root, options = {}) {
       (saved.projectRoot && saved.projectRoot !== scope.projectRoot) ||
       (saved.nativeRoot && saved.nativeRoot !== root) ||
       (cli === 'codex' && saved.pluginChecked !== true)) return blocked('native_snapshot_changed');
+  if (process.platform === 'win32' && (!await actuallyIgnored(root, windowsGitPattern(root, file).slice(1)) ||
+      (cli === 'codex' && !await actuallyIgnored(root, windowsGitPattern(root, capturePath).slice(1))))) {
+    return blocked('git_exclude_unverified');
+  }
   const raw = await readOptional(file);
   const captureRaw = await readOptional(capturePath);
   if (!raw || !captureRaw || !(cli === 'claude' ? claudeEdit(raw, saved) : codexEdit(raw, saved))) {

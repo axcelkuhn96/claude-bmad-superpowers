@@ -13,15 +13,32 @@ async function git(cwd, ...args) {
   let executable = 'git';
   if (process.platform === 'win32') {
     let boundary = cwd;
+    let gitMarker;
     for (let current = cwd; ; current = path.dirname(current)) {
-      try { await fs.lstat(path.join(current, '.git')); boundary = current; break; }
+      try {
+        gitMarker = await fs.lstat(path.join(current, '.git'));
+        boundary = current;
+        break;
+      }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
       if (path.dirname(current) === current) break;
     }
+    const forbidden = [boundary, fileURLToPath(new URL('../..', import.meta.url))];
+    if (gitMarker?.isFile()) {
+      if (gitMarker.size > 4096) throw new Error('unsupported_git');
+      const marker = await fs.readFile(path.join(boundary, '.git'), 'utf8');
+      const match = /^gitdir:\s*(.+)\s*$/i.exec(marker.trim());
+      if (!match) throw new Error('unsupported_git');
+      const gitdir = path.win32.resolve(boundary, match[1]);
+      const parts = windowsPathKey(gitdir).split('\\.git\\worktrees\\');
+      if (parts.length === 2 && parts[0]) forbidden.push(parts[0]);
+    }
     executable = await resolveWindowsExecutable('git.exe',
-      [boundary, fileURLToPath(new URL('../..', import.meta.url))]);
+      forbidden);
   }
-  const { stdout } = await runFile(executable, ['-C', cwd, ...args], { env, timeout: 5000, maxBuffer: 1024 * 1024 });
+  const commandArgs = process.platform === 'win32'
+    ? ['-c', 'core.fsmonitor=false', '-C', cwd, ...args] : ['-C', cwd, ...args];
+  const { stdout } = await runFile(executable, commandArgs, { env, timeout: 5000, maxBuffer: 1024 * 1024 });
   return stdout.trim();
 }
 

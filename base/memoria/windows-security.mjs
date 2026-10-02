@@ -5,8 +5,21 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const runFile = promisify(execFile);
+const nativeFile = new URL('./bin/windows-native-x64.node', import.meta.url);
+const requireNative = createRequire(import.meta.url);
+export const WINDOWS_NATIVE_SHA256 = '67acff10cfe721fbe8e340759da3d6b5124fe830ed53824af51bd529c25b7cc9';
+
+export function windowsGitPattern(root, target) {
+  const relative = path.win32.relative(windowsPathKey(root), windowsPathKey(target));
+  if (!relative || relative === '..' || relative.startsWith('..\\') || path.win32.isAbsolute(relative)) {
+    throw new Error('unsafe_windows_path');
+  }
+  return '/' + relative.replace(/\\/g, '/');
+}
 
 // The program is fixed in the installed module. Paths and contents travel as JSON on stdin.
 export const WINDOWS_SECURITY_PROGRAM = String.raw`
@@ -23,12 +36,32 @@ function SafePath([string]$value) {
       $value -match '(^|\\)\.\.?($|\\)' -or $value -match '[. ]($|\\)') { throw 'unsafe_path' }
   return [System.IO.Path]::GetFullPath($value)
 }
-function Audit([string]$value, [string]$kind, [bool]$privateState = $true) {
+function AuditAncestor([string]$value, [bool]$toolOnly = $false) {
+  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $acl = [System.IO.Directory]::GetAccessControl($value)
+  $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+  $trusted = @($sid, 'S-1-5-18', 'S-1-5-32-544',
+    'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+  if ($toolOnly) { $trusted = @($trusted | Where-Object { $_ -ne $sid }) }
+  if ($owner -notin $trusted) { throw 'ancestor' }
+  $dangerous = [int64]([System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+    [System.Security.AccessControl.FileSystemRights]::Delete -bor
+    [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+    [System.Security.AccessControl.FileSystemRights]::TakeOwnership)
+  foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+    if (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+    if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+        $rule.IdentityReference.Value -notin $trusted -and
+        (([int64]$rule.FileSystemRights -band $dangerous) -ne 0)) { throw 'ancestor' }
+  }
+}
+function WalkAncestors([string]$value, [bool]$includeFinal = $false, [bool]$toolOnly = $false) {
   $full = SafePath $value
   $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($full))
   if ($drive.DriveType -ne [System.IO.DriveType]::Fixed -or $drive.DriveFormat -ne 'NTFS') { throw 'volume' }
   $root = [System.IO.Path]::GetPathRoot($full)
   $walk = $root
+  AuditAncestor $root $toolOnly
   foreach ($part in $full.Substring($root.Length).Split([char]'\')) {
     if (!$part) { continue }
     $walk = [System.IO.Path]::Combine($walk, $part)
@@ -36,11 +69,18 @@ function Audit([string]$value, [string]$kind, [bool]$privateState = $true) {
     catch [System.IO.FileNotFoundException] { throw 'missing' }
     catch [System.IO.DirectoryNotFoundException] { throw 'missing' }
     if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'reparse' }
+    if ($walk -ne $full -or $includeFinal) { AuditAncestor $walk $toolOnly }
   }
+}
+function Audit([string]$value, [string]$kind, [bool]$privateState = $true,
+    [System.IO.FileStream]$handle = $null) {
+  $full = SafePath $value
+  WalkAncestors $full
   if ($kind -eq 'file' -and ![System.IO.File]::Exists($full)) { throw 'missing' }
   if ($kind -eq 'directory' -and ![System.IO.Directory]::Exists($full)) { throw 'missing' }
   $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-  if ($kind -eq 'file') { $acl = [System.IO.File]::GetAccessControl($full) }
+  if ($kind -eq 'file' -and $handle) { $acl = $handle.GetAccessControl() }
+  elseif ($kind -eq 'file') { $acl = [System.IO.File]::GetAccessControl($full) }
   else { $acl = [System.IO.Directory]::GetAccessControl($full) }
   if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { throw 'owner' }
   if (($privateState -and !$acl.AreAccessRulesProtected) -or !$acl.AreAccessRulesCanonical) { throw 'dacl' }
@@ -58,9 +98,6 @@ function Audit([string]$value, [string]$kind, [bool]$privateState = $true) {
     }
   }
   if (!$ownerRead -or !$ownerWrite) { throw 'dacl' }
-  if ($privateState -and $full -ne $root) {
-    [void](Audit ([System.IO.Path]::GetDirectoryName($full.TrimEnd([char]'\'))) 'directory' $false)
-  }
   return @{ ok = $true; code = 'safe'; ownerMatches = $true; localNtfs = $true;
     noReparse = $true; daclSafe = $true; currentSid = $sid.Value }
 }
@@ -83,6 +120,37 @@ function PrivateSecurity([bool]$directory) {
   }
   return $security
 }
+function AuditTool([string]$value, $roots) {
+  $full = SafePath $value
+  $inside = $false
+  foreach ($rootValue in $roots) {
+    $root = SafePath ([string]$rootValue)
+    if ($full.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $inside = $true }
+  }
+  if (!$inside) { throw 'unsafe_tool' }
+  WalkAncestors $full $false $true
+  if (![System.IO.File]::Exists($full) -or
+      (([System.IO.File]::GetAttributes($full) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+    throw 'unsafe_tool'
+  }
+  $acl = [System.IO.File]::GetAccessControl($full)
+  $trusted = @('S-1-5-18', 'S-1-5-32-544',
+    'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+  if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -notin $trusted) {
+    throw 'unsafe_tool'
+  }
+  $dangerous = [int64]([System.Security.AccessControl.FileSystemRights]::WriteData -bor
+    [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+    [System.Security.AccessControl.FileSystemRights]::Delete -bor
+    [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+    [System.Security.AccessControl.FileSystemRights]::TakeOwnership)
+  foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+    if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+        $rule.IdentityReference.Value -notin $trusted -and
+        (([int64]$rule.FileSystemRights -band $dangerous) -ne 0)) { throw 'unsafe_tool' }
+  }
+  return @{ trustedTool = $true }
+}
 try {
   $inputValue = [Console]::In.ReadToEnd() | ConvertFrom-Json
   $target = SafePath ([string]$inputValue.path)
@@ -96,7 +164,7 @@ try {
         $walk = [System.IO.Path]::Combine($walk, $part)
         if (![System.IO.Directory]::Exists($walk)) {
           if ([System.IO.File]::Exists($walk)) { throw 'not_directory' }
-          [void](Audit ([System.IO.Path]::GetDirectoryName($walk)) 'directory' $false)
+          WalkAncestors ([System.IO.Path]::GetDirectoryName($walk)) $true
           [void][System.IO.Directory]::CreateDirectory($walk, (PrivateSecurity $true))
         }
         if (([System.IO.File]::GetAttributes($walk) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'reparse' }
@@ -106,29 +174,12 @@ try {
     'write-file' {
       $parent = [System.IO.Path]::GetDirectoryName($target)
       [void](Audit $parent 'directory' ([bool]$inputValue.privateState))
-      $backup = $target + '.cbs-replace-backup'
-      if ([System.IO.File]::Exists($backup)) {
-        if (!$inputValue.replace) { throw 'recovery_required' }
-        [void](Audit $backup 'file' ([bool]$inputValue.privateState))
-        $previous = [System.IO.File]::ReadAllText($backup)
-        if ([System.IO.File]::Exists($target)) {
-          [void](Audit $target 'file' ([bool]$inputValue.privateState))
-          $current = [System.IO.File]::ReadAllText($target)
-          if ($current -eq [string]$inputValue.text) {
-            [System.IO.File]::Delete($backup)
-            Result $true 'safe' (Audit $target 'file' ([bool]$inputValue.privateState))
-            break
-          }
-          if ($current -ne $previous) { throw 'recovery_required' }
-          [System.IO.File]::Delete($backup)
-        } else {
-          [System.IO.File]::Move($backup, $target)
-          [void](Audit $target 'file' ([bool]$inputValue.privateState))
-        }
-      }
+      $intent = $target + '.cbs-replace-intent'
+      if ([System.IO.File]::Exists($intent)) { throw 'recovery_required' }
       $exists = [System.IO.File]::Exists($target)
       if ($exists) {
         if (!$inputValue.replace) { throw 'exists' }
+        if ($null -eq $inputValue.expectedText) { throw 'changed' }
         [void](Audit $target 'file' ([bool]$inputValue.privateState))
         if ($null -ne $inputValue.expectedText -and
             [System.IO.File]::ReadAllText($target) -cne [string]$inputValue.expectedText) { throw 'changed' }
@@ -144,26 +195,50 @@ try {
         $stream.Flush($true)
       } finally { $stream.Dispose() }
       [void](Audit $temp 'file')
-      if ($exists) { [System.IO.File]::Replace($temp, $target, $backup) }
-      else { [System.IO.File]::Move($temp, $target) }
-        $verified = Audit $target 'file' ([bool]$inputValue.privateState)
+      if ($exists) {
+        $backup = $target + '.cbs-' + [guid]::NewGuid().ToString('N') + '.bak'
+        $hasher = [System.Security.Cryptography.SHA256]::Create()
+        try {
+          $oldHash = [BitConverter]::ToString($hasher.ComputeHash(
+            [System.Text.UTF8Encoding]::new($false).GetBytes([string]$inputValue.expectedText))).Replace('-', '')
+          $newHash = [BitConverter]::ToString($hasher.ComputeHash($bytes)).Replace('-', '')
+        } finally { $hasher.Dispose() }
+        $manifest = @{ backup = $backup; temp = $temp; expectedTextHash =
+          $oldHash; nextTextHash = $newHash } |
+          ConvertTo-Json -Compress
+        $intentStream = [System.IO.FileStream]::new($intent, [System.IO.FileMode]::CreateNew,
+          [System.Security.AccessControl.FileSystemRights]::Write,
+          [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::WriteThrough,
+          (PrivateSecurity $false))
+        try {
+          $intentBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($manifest)
+          $intentStream.Write($intentBytes, 0, $intentBytes.Length)
+          $intentStream.Flush($true)
+        } finally { $intentStream.Dispose() }
+        [void](Audit $intent 'file')
+        [System.IO.File]::Replace($temp, $target, $backup)
+      } else { [System.IO.File]::Move($temp, $target) }
+      $verified = Audit $target 'file' ([bool]$inputValue.privateState)
       if ([System.IO.File]::ReadAllText($target) -ne [string]$inputValue.text) { throw 'recovery_required' }
-      if ($exists) { [System.IO.File]::Delete($backup) }
+      if ($exists) {
+        [void](Audit $backup 'file' ([bool]$inputValue.privateState))
+        if ([System.IO.File]::ReadAllText($backup) -cne [string]$inputValue.expectedText) {
+          throw 'recovery_required'
+        }
+        [System.IO.File]::Delete($backup)
+        [System.IO.File]::Delete($intent)
+      }
       Result $true 'safe' $verified
       break
     }
     'read-file' {
       [void](Audit ([System.IO.Path]::GetDirectoryName($target)) 'directory' ([bool]$inputValue.privateState))
-      $backup = $target + '.cbs-replace-backup'
-      if (![System.IO.File]::Exists($target) -and [System.IO.File]::Exists($backup)) {
-        [void](Audit $backup 'file' ([bool]$inputValue.privateState))
-        [System.IO.File]::Move($backup, $target)
-      }
+      if ([System.IO.File]::Exists($target + '.cbs-replace-intent')) { throw 'recovery_required' }
       if (![System.IO.File]::Exists($target)) { throw 'missing' }
       $stream = [System.IO.FileStream]::new($target, [System.IO.FileMode]::Open,
-        [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
       try {
-        $result = Audit $target 'file' ([bool]$inputValue.privateState)
+        $result = Audit $target 'file' ([bool]$inputValue.privateState) $stream
         if ($stream.Length -gt 1048576) { throw 'oversize' }
         $reader = [System.IO.StreamReader]::new($stream, [System.Text.UTF8Encoding]::new($false), $true, 4096, $true)
         try { $result['text'] = $reader.ReadToEnd() } finally { $reader.Dispose() }
@@ -171,62 +246,51 @@ try {
       } finally { $stream.Dispose() }
       break
     }
-    'codex-plugin' {
-      $scope = Audit $target 'directory' $false
-      $command = Get-Command codex -CommandType Application -ErrorAction Stop
-      $source = SafePath ([string]$command.Source)
-      $product = SafePath ([string]$inputValue.productRoot)
-      if ($source.StartsWith($target + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
-          $source.StartsWith($product + '\', [System.StringComparison]::OrdinalIgnoreCase)) { throw 'unsafe_tool' }
-      $walk = [System.IO.Path]::GetPathRoot($source)
-      foreach ($part in $source.Substring($walk.Length).Split([char]'\')) {
-        if (!$part) { continue }
-        $walk = [System.IO.Path]::Combine($walk, $part)
-        if (([System.IO.File]::GetAttributes($walk) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'unsafe_tool' }
-      }
-      $listing = (& $source plugin list 2>$null | Out-String)
-      if ($LASTEXITCODE -ne 0) { throw 'cli_failed' }
-      $scope['installed'] = @($listing -split '\r?\n' | Where-Object {
-        $_ -like '*claude-mem@claude-mem-local*' -and $_ -match 'installed' -and $_ -notmatch 'workspace.managed'
-      }).Count -gt 0
-      Result $true 'safe' $scope
+    'remove-file' {
+      if ($null -eq $inputValue.expectedText) { throw 'changed' }
+      [void](Audit ([System.IO.Path]::GetDirectoryName($target)) 'directory' ([bool]$inputValue.privateState))
+      $rights = [System.Security.AccessControl.FileSystemRights]::ReadData -bor
+        [System.Security.AccessControl.FileSystemRights]::ReadPermissions -bor
+        [System.Security.AccessControl.FileSystemRights]::Delete
+      $stream = [System.IO.FileStream]::new($target, [System.IO.FileMode]::Open,
+        $rights, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::None)
+      try {
+        [void](Audit $target 'file' ([bool]$inputValue.privateState) $stream)
+        if ($stream.Length -gt 1048576) { throw 'oversize' }
+        $reader = [System.IO.StreamReader]::new($stream, [System.Text.UTF8Encoding]::new($false), $true, 4096, $true)
+        try { $actual = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        if ($actual -cne [string]$inputValue.expectedText) { throw 'changed' }
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class CbsDeleteByHandle {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct Disposition { [MarshalAs(UnmanagedType.Bool)] public bool DeleteFile; }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass,
+    ref Disposition value, uint size);
+}
+'@
+        $disposition = [CbsDeleteByHandle+Disposition]::new()
+        $disposition.DeleteFile = $true
+        if (![CbsDeleteByHandle]::SetFileInformationByHandle($stream.SafeFileHandle, 4,
+          [ref]$disposition, [uint32][Runtime.InteropServices.Marshal]::SizeOf($disposition))) {
+          throw 'security_error'
+        }
+      } finally { $stream.Dispose() }
+      Result $true 'safe' @{ ownerMatches = $true; localNtfs = $true; noReparse = $true;
+        daclSafe = $true; currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
       break
     }
+    'trusted-tool' { Result $true 'safe' (AuditTool $target $inputValue.programFiles); break }
     default { throw 'action' }
   }
 } catch {
   $code = if ($_.Exception.Message -in @('unsafe_path','volume','reparse','missing','owner','dacl',
-      'not_directory','exists','oversize','action','recovery_required','unsafe_tool','cli_failed','changed')) { $_.Exception.Message } else { 'security_error' }
+      'not_directory','exists','oversize','action','recovery_required','unsafe_tool','changed','ancestor')) { $_.Exception.Message } else { 'security_error' }
   Result $false $code
 }
-`;
-
-const WINDOWS_LOCK_PROGRAM = String.raw`
-$ErrorActionPreference = 'Stop'
-try {
-  $request = [Console]::In.ReadLine() | ConvertFrom-Json
-  if ($request.key -notmatch '^[a-f0-9]{64}$') { throw 'key' }
-  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-  $security = New-Object System.Security.AccessControl.MutexSecurity
-  $rule = [System.Security.AccessControl.MutexAccessRule]::new($sid,
-    [System.Security.AccessControl.MutexRights]::FullControl,
-    [System.Security.AccessControl.AccessControlType]::Allow)
-  $security.AddAccessRule($rule)
-  $created = $false
-  $mutex = [System.Threading.Mutex]::new($false, ('Global\CBS-Mem0-' + $sid.Value + '-' + $request.key),
-    [ref]$created, $security)
-  try {
-    $held = $false
-    try { $held = $mutex.WaitOne(5000) }
-    catch [System.Threading.AbandonedMutexException] { $held = $true }
-    if (!$held) { throw 'timeout' }
-    try {
-      [Console]::Out.WriteLine('LOCKED')
-      [Console]::Out.Flush()
-      [void][Console]::In.ReadToEnd()
-    } finally { $mutex.ReleaseMutex() }
-  } finally { $mutex.Dispose() }
-} catch { [Console]::Out.WriteLine('BLOCKED') }
 `;
 
 export function windowsPathKey(value) {
@@ -250,11 +314,39 @@ export function parseWindowsSecurityResult(raw) {
   return result;
 }
 
-function powershellExe() {
-  const root = process.env.SystemRoot;
-  windowsPathKey(root);
-  if (!/^windows$/i.test(path.win32.basename(root))) throw new Error('unsafe_system_root');
-  return path.win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+let nativePromise;
+async function nativeWindows() {
+  if (process.platform !== 'win32') throw new Error('native_windows_unproved');
+  if (process.arch !== 'x64') throw new Error('unsupported_windows_arch');
+  nativePromise ??= (async () => {
+    const file = fileURLToPath(nativeFile);
+    const bytes = await fs.readFile(file);
+    if (createHash('sha256').update(bytes).digest('hex') !== WINDOWS_NATIVE_SHA256 ||
+        windowsPathKey(file) !== windowsPathKey(await fs.realpath(file))) {
+      throw new Error('unsafe_windows_native');
+    }
+    const native = requireNative(file);
+    if (typeof native.locations !== 'function' || typeof native.acquire !== 'function' ||
+        typeof native.release !== 'function') throw new Error('unsafe_windows_native');
+    return native;
+  })();
+  return nativePromise;
+}
+
+let systemLocationsPromise;
+async function systemLocations() {
+  systemLocationsPromise ??= (async () => {
+    const { windows, programFiles, programFilesX86 } = (await nativeWindows()).locations();
+    const values = [windows, programFiles, programFilesX86].map(windowsPathKey);
+    if (new Set(values).size !== 3) throw new Error('unsafe_windows_native');
+    return { windows: values[0], programFiles: values[1], programFilesX86: values[2] };
+  })();
+  return systemLocationsPromise;
+}
+
+async function powershellExe() {
+  const { windows } = await systemLocations();
+  return path.win32.join(windows, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 }
 
 function powershellArgs(program) {
@@ -265,21 +357,30 @@ function powershellArgs(program) {
 async function invoke(action, file, extra = {}) {
   if (process.platform !== 'win32') return { ok: false, code: 'native_windows_unproved' };
   windowsPathKey(file);
-  const command = powershellExe();
+  const command = await powershellExe();
+  const { windows } = await systemLocations();
   const args = powershellArgs(WINDOWS_SECURITY_PROGRAM);
   return await new Promise((resolve) => {
     const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true,
-      env: { SystemRoot: process.env.SystemRoot, TEMP: os.tmpdir(),
-        ...(action === 'codex-plugin' ? { PATH: process.env.PATH,
-          APPDATA: process.env.APPDATA, LOCALAPPDATA: process.env.LOCALAPPDATA,
-          USERPROFILE: process.env.USERPROFILE } : {}) } });
+      env: { SystemRoot: windows, WINDIR: windows, TEMP: os.tmpdir(), PATH: '' } });
+    const timer = setTimeout(() => child.kill(), 7000);
     child.stdin.once('error', () => resolve({ ok: false, code: 'security_helper_failed' }));
     let output = '';
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', chunk => { output += chunk; if (output.length > 2 * 1024 * 1024) child.kill(); });
     child.once('error', () => resolve({ ok: false, code: 'security_helper_failed' }));
-    child.once('close', code => resolve(code === 0 ? parseWindowsSecurityResult(output.trim()) :
-      { ok: false, code: 'security_helper_failed' }));
+    child.once('close', code => {
+      clearTimeout(timer);
+      if (code !== 0) return resolve({ ok: false, code: 'security_helper_failed' });
+      if (action === 'trusted-tool') {
+        try {
+          const result = JSON.parse(output.trim());
+          return resolve(result?.ok === true && result?.code === 'safe' && result?.trustedTool === true
+            ? result : { ok: false, code: result?.code ?? 'invalid_response' });
+        } catch { return resolve({ ok: false, code: 'invalid_response' }); }
+      }
+      resolve(parseWindowsSecurityResult(output.trim()));
+    });
     child.stdin.end(JSON.stringify({ action, path: file, ...extra }));
   });
 }
@@ -318,45 +419,82 @@ export async function readWindowsPrivateFile(file, { privateState = true } = {})
   return invoke('read-file', file, { privateState });
 }
 
+export function windowsCodexPluginInstalled(output) {
+  return typeof output === 'string' && output.split(/\r?\n/).some(line => {
+    const fields = line.trim().split(/\s+/);
+    return fields.includes('claude-mem@claude-mem-local') &&
+      fields.some(field => field.toLowerCase() === 'installed') &&
+      !fields.some(field => /workspace[.-]managed/i.test(field));
+  });
+}
+
+export async function removeWindowsPrivateFile(file, expectedText, { privateState = true } = {}) {
+  if (typeof expectedText !== 'string' || Buffer.byteLength(expectedText, 'utf8') > 1024 * 1024) {
+    return { ok: false, code: 'changed' };
+  }
+  return invoke('remove-file', file, { expectedText, privateState });
+}
+
 export async function probeWindowsCodexPlugin(root, productRoot) {
-  return invoke('codex-plugin', root, { productRoot });
+  try {
+    const executable = await resolveWindowsExecutable('codex.exe', [root, productRoot]);
+    const { windows } = await systemLocations();
+    const { stdout } = await runFile(executable, ['plugin', 'list'], { cwd: root, timeout: 5000,
+      maxBuffer: 1024 * 1024, windowsHide: true,
+      env: { ...process.env, SystemRoot: windows, WINDIR: windows, PATH: path.win32.dirname(executable) } });
+    return { ok: true, installed: windowsCodexPluginInstalled(stdout) };
+  } catch { return { ok: false, code: 'unsafe_tool' }; }
 }
 
 export async function resolveWindowsExecutable(name, forbiddenRoots = []) {
-  if (process.platform !== 'win32' || name !== 'git.exe') throw new Error('unsafe_windows_tool');
-  const where = path.win32.join(process.env.SystemRoot, 'System32', 'where.exe');
-  windowsPathKey(where);
-  const { stdout } = await runFile(where, [name], { timeout: 5000, windowsHide: true,
-    env: { SystemRoot: process.env.SystemRoot, PATH: process.env.PATH } });
-  const candidate = stdout.split(/\r?\n/).find(Boolean);
-  const key = windowsPathKey(candidate);
-  const real = windowsPathKey(await fs.realpath(candidate));
-  if (key !== real || forbiddenRoots.some(root => {
-    const prefix = windowsPathKey(root);
-    return key === prefix || key.startsWith(prefix + '\\');
-  })) throw new Error('unsafe_windows_tool');
-  return candidate;
+  if (process.platform !== 'win32' || !['git.exe', 'codex.exe'].includes(name)) throw new Error('unsafe_windows_tool');
+  const locations = await systemLocations();
+  const where = path.win32.join(locations.windows, 'System32', 'where.exe');
+  const { stdout } = await runFile(where, [name], { timeout: 5000, maxBuffer: 65536,
+    windowsHide: true, env: { SystemRoot: locations.windows, PATH: process.env.PATH ?? '' } });
+  for (const candidate of stdout.split(/\r?\n/).filter(Boolean)) {
+    try {
+      const key = windowsPathKey(candidate);
+      if (key !== windowsPathKey(await fs.realpath(candidate)) || forbiddenRoots.some(root => {
+        const prefix = windowsPathKey(root);
+        return key === prefix || key.startsWith(prefix + '\\');
+      })) continue;
+      const result = await invoke('trusted-tool', candidate,
+        { programFiles: [locations.programFiles, locations.programFilesX86] });
+      if (result.ok) return candidate;
+    } catch { /* Reject this PATH entry and inspect the next one. */ }
+  }
+  throw new Error('unsafe_windows_tool');
 }
 
+const localLocks = new Map();
 export async function withWindowsLock(key, callback) {
   if (process.platform !== 'win32' || typeof callback !== 'function') throw new Error('native_windows_unproved');
-  const child = spawn(powershellExe(), powershellArgs(WINDOWS_LOCK_PROGRAM),
-    { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true,
-      env: { SystemRoot: process.env.SystemRoot, TEMP: os.tmpdir() } });
-  const ready = await new Promise((resolve) => {
-    let output = '';
-    const timer = setTimeout(() => { child.kill(); resolve(false); }, 7000);
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', chunk => {
-      output += chunk;
-      if (output.includes('\n')) { clearTimeout(timer); resolve(output.trim() === 'LOCKED'); }
-    });
-    child.once('error', () => { clearTimeout(timer); resolve(false); });
-    child.once('close', () => { clearTimeout(timer); resolve(false); });
-    child.stdin.once('error', () => { clearTimeout(timer); resolve(false); });
-    child.stdin.write(JSON.stringify({ key: createHash('sha256').update(key).digest('hex') }) + '\n');
-  });
-  if (!ready) { child.stdin.end(); throw new Error('windows_lock_failed'); }
-  try { return await callback(); }
-  finally { child.stdin.end(); }
+  const native = await nativeWindows();
+  const digest = createHash('sha256').update(key).digest('hex');
+  const previous = localLocks.get(digest) ?? Promise.resolve();
+  let next;
+  const pending = new Promise(resolve => { next = resolve; });
+  localLocks.set(digest, pending);
+  await previous;
+  let lease;
+  let held = false;
+  try {
+    lease = native.acquire(digest);
+    held = true;
+    const assertHeld = () => { if (!held) throw new Error('windows_lock_lost'); };
+    const result = await callback(assertHeld);
+    assertHeld();
+    return result;
+  } finally {
+    try {
+      if (held) {
+        held = false;
+        if (native.release(lease) !== true) throw new Error('windows_lock_release_failed');
+      }
+    } finally {
+      next();
+      if (localLocks.get(digest) === pending) localLocks.delete(digest);
+    }
+  }
 }
