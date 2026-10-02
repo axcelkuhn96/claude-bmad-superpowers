@@ -111,7 +111,11 @@ async function leaseExclude(plan, root, options, remove = false) {
     if (!remove) {
       const first = !lease;
       lease ??= { file: plan.file, block: plan.block, createdByCBS: plan.added, owners: [] };
+      if (lease.releasing && lease.createdByCBS && !(await readOptional(plan.file))?.includes(plan.block)) {
+        await addExclude({ ...plan, added: true });
+      }
       if (!lease.owners.includes(root)) lease.owners.push(root);
+      delete lease.releasing;
       if (first && plan.added) await addExclude(plan);
       try { await writeAtomic(leaseFile, JSON.stringify(lease) + '\n'); }
       catch (error) {
@@ -121,7 +125,14 @@ async function leaseExclude(plan, root, options, remove = false) {
       return true;
     }
     if (!lease) return !(plan.added && (await readOptional(plan.file))?.includes(plan.block));
-    if (!lease.owners.includes(root) && lease.releasing !== root) return lease.owners.length > 0;
+    if (!lease.owners.includes(root)) {
+      if (lease.releasing !== root) return lease.owners.length > 0;
+      if (lease.owners.length) {
+        delete lease.releasing;
+        await writeAtomic(leaseFile, JSON.stringify(lease) + '\n');
+        return true;
+      }
+    }
     if (lease.owners.includes(root)) {
       lease.owners = lease.owners.filter(owner => owner !== root);
       if (lease.owners.length) { await writeAtomic(leaseFile, JSON.stringify(lease) + '\n'); return true; }

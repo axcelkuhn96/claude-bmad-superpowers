@@ -84,6 +84,63 @@ test('broker accepts one request split across real Unix socket writes', async t 
   client.destroy();
 });
 
+test('broker closes an incomplete frame at an absolute reception deadline and becomes idle', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-broker-incomplete-'));
+  const file = path.join(dir, 'sock');
+  let accepted = 0;
+  let active = 0;
+  let idle;
+  const server = net.createServer(socket => {
+    active++;
+    clearTimeout(idle);
+    readBrokerRequest(socket, () => { accepted++; }, { receptionMs: 80 });
+    socket.once('close', () => {
+      active--;
+      if (!active) idle = setTimeout(() => server.close(), 20);
+    });
+  });
+  t.after(async () => {
+    clearTimeout(idle);
+    server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await new Promise(resolve => server.listen(file, resolve));
+  const closed = new Promise(resolve => server.once('close', resolve));
+  const client = net.createConnection(file);
+  let clientError;
+  client.on('error', error => { if (error.code !== 'EPIPE') clientError = error; });
+  await new Promise(resolve => client.once('connect', resolve));
+  const began = performance.now();
+  const frame = encodeFrame({ query: 'incomplete' }, Buffer.from('key'));
+  client.write(frame.subarray(0, 13));
+  const drip = setInterval(() => client.write(frame.subarray(13, 14)), 20);
+  client.once('close', () => clearInterval(drip));
+  t.after(() => { clearInterval(drip); client.destroy(); });
+  await Promise.race([closed, new Promise((_, reject) => setTimeout(() => reject(new Error('broker_not_idle')), 350))]);
+  clearInterval(drip);
+  assert.ok(performance.now() - began < 300);
+  assert.equal(active, 0);
+  assert.equal(accepted, 0);
+  assert.ifError(clientError);
+});
+
+test('broker closes a client holding only a partial header', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-broker-header-'));
+  const file = path.join(dir, 'sock');
+  let accepted = 0;
+  const server = net.createServer(socket => readBrokerRequest(socket, () => { accepted++; }, { receptionMs: 50 }));
+  t.after(async () => { server.close(); await fs.rm(dir, { recursive: true, force: true }); });
+  await new Promise(resolve => server.listen(file, resolve));
+  const client = net.createConnection(file);
+  await new Promise(resolve => client.once('connect', resolve));
+  client.write(Buffer.from('M0BW'));
+  await Promise.race([
+    new Promise(resolve => client.once('close', resolve)),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('partial_header_left_open')), 250)),
+  ]);
+  assert.equal(accepted, 0);
+});
+
 test('broker rejects trailing partial bytes without processing the request', async t => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-broker-trailing-'));
   const file = path.join(dir, 'sock');
@@ -320,6 +377,40 @@ test('native rollback retries after Git exclude write failure on final shared le
   assert.ok((await fs.readFile(exclude, 'utf8')).includes('/.codex/config.toml'));
   assert.equal((await restoreNativeExclusion(worktree, options)).kind, 'restored');
   assert.equal((await fs.readFile(exclude, 'utf8')).includes('/.codex/config.toml'), false);
+});
+
+test('native rollback retry preserves a checkout acquired after final lease release failed', async t => {
+  const { dir, root, stateRoot } = await fixture(t);
+  const worktree = path.join(dir, 'new-owner');
+  git(root, 'worktree', 'add', '-q', '-b', 'new-owner', worktree);
+  const options = { cli: 'codex', stateRoot, installedPlugin: true, projectRoot: root };
+  assert.equal((await applyNativeExclusion(root, options)).kind, 'applied');
+  const exclude = path.resolve(root, git(root, 'rev-parse', '--git-path', 'info/exclude'));
+  const info = path.dirname(exclude);
+  await fs.chmod(info, 0o500);
+  let failed;
+  try { failed = await restoreNativeExclusion(root, options); }
+  finally { await fs.chmod(info, 0o700); }
+  assert.deepEqual(failed, { kind: 'blocked', reason: 'git_exclude_changed' });
+  await assert.rejects(fs.readFile(path.join(root, '.codex', 'config.toml'), 'utf8'), { code: 'ENOENT' });
+
+  assert.equal((await applyNativeExclusion(worktree, options)).kind, 'applied');
+  assert.equal((await restoreNativeExclusion(root, options)).kind, 'restored');
+  assert.equal((await verifyNativeCapture(worktree, options)).kind, 'verified');
+  const text = await fs.readFile(exclude, 'utf8');
+  assert.ok(text.includes('/.codex/config.toml'));
+  assert.ok(text.includes('/.codex/hooks.json'));
+  const state = path.join(stateRoot, (await fs.readdir(stateRoot))[0]);
+  const leases = (await fs.readdir(state)).filter(name => name.startsWith('exclude-'));
+  assert.equal(leases.length, 2);
+  for (const lease of leases) {
+    const saved = JSON.parse(await fs.readFile(path.join(state, lease), 'utf8'));
+    assert.deepEqual(saved.owners, [worktree]);
+    assert.equal(Object.hasOwn(saved, 'releasing'), false);
+  }
+  assert.equal((await restoreNativeExclusion(worktree, options)).kind, 'restored');
+  assert.equal((await fs.readFile(exclude, 'utf8')).includes('# cbs-memoria codex'), false);
+  assert.equal((await fs.readdir(state)).some(name => name.startsWith('exclude-')), false);
 });
 
 test('Windows venv uses Scripts/python.exe without changing POSIX path', () => {

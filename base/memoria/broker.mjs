@@ -48,13 +48,21 @@ const script = fileURLToPath(new URL('./python/worker.py', import.meta.url));
 const envAllow = () => Object.fromEntries(['PATH', 'HOME', 'SYSTEMROOT', 'WINDIR', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'CBS_MEMORIA_CA_FILE']
   .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
 
-export function readBrokerRequest(socket, accept) {
+export function readBrokerRequest(socket, accept, { receptionMs = 1000 } = {}) {
   const input = new FrameReader();
   let received = false;
+  const deadline = performance.now() + receptionMs;
+  const timer = setTimeout(() => { if (!received) socket.destroy(); }, receptionMs);
+  socket.once('close', () => clearTimeout(timer));
   socket.on('data', chunk => {
     let frames;
     try { frames = input.push(chunk); }
     catch { socket.destroy(); return; }
+    if (performance.now() >= deadline) {
+      for (const frame of frames) frame.secret.fill(0);
+      socket.destroy();
+      return;
+    }
     if (received || frames.length > 1 || frames.length && input.buffer.length) {
       for (const frame of frames) frame.secret.fill(0);
       socket.destroy();
@@ -62,6 +70,7 @@ export function readBrokerRequest(socket, accept) {
     }
     if (!frames.length) return;
     received = true;
+    clearTimeout(timer);
     accept(frames[0]);
   });
   socket.on('end', () => {
