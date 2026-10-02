@@ -18,15 +18,23 @@ case "${1-} ${2-}" in
     test -f "$FAKE_DOCKER_STATE" || exit 1
     cat "$FAKE_DOCKER_STATE" ;;
   'run -d')
+    if test -f "$FAKE_DOCKER_FAIL_RUN"; then rm "$FAKE_DOCKER_FAIL_RUN"; exit 97; fi
     cp "$FAKE_DOCKER_OWNED" "$FAKE_DOCKER_STATE"
     printf 'fake-container-id\n' ;;
-  'start cbs-mem0-qdrant'|'stop cbs-mem0-qdrant'|'restart cbs-mem0-qdrant') exit 0 ;;
+  'start cbs-mem0-qdrant')
+    if test -f "$FAKE_DOCKER_FAIL_START"; then
+      remaining="$(cat "$FAKE_DOCKER_FAIL_START")"
+      if test "$remaining" -gt 0; then printf '%s\n' "$((remaining - 1))" > "$FAKE_DOCKER_FAIL_START"; exit 96; fi
+    fi
+    exit 0 ;;
+  'stop cbs-mem0-qdrant'|'restart cbs-mem0-qdrant') exit 0 ;;
   *) exit 98 ;;
 esac
 DOCKER
 chmod 700 "$scratch/bin/docker"
 export PATH="$scratch/bin:$PATH"
 export FAKE_DOCKER_LOG="$scratch/docker.log" FAKE_DOCKER_STATE="$scratch/state.json" FAKE_DOCKER_OWNED="$scratch/owned.json"
+export FAKE_DOCKER_FAIL_RUN="$scratch/fail-run" FAKE_DOCKER_FAIL_START="$scratch/fail-start"
 export QDRANT_API_KEY_FILE="$scratch/key" QDRANT_DATA_DIR="$scratch/data" QDRANT_BIND_IP=127.0.0.1
 : > "$FAKE_DOCKER_LOG"
 
@@ -105,12 +113,35 @@ test "$status" -ne 0
 ! rg -q '^run ' "$FAKE_DOCKER_LOG"
 rm "$scratch/state.json"
 
+: > "$FAKE_DOCKER_FAIL_RUN"
+set +e
+output="$(bash "$script" 2>&1)"
+status=$?
+set -e
+test "$status" -ne 0
+test ! -f "$scratch/state.json"
+printf 'marker\n' > "$scratch/data/storage/marker"
+printf 'foreign\n' > "$scratch/data/unknown"
+set +e
+output="$(bash "$script" 2>&1)"
+status=$?
+set -e
+test "$status" -ne 0
+[[ "$output" == *'unknown data'* ]]
+rm "$scratch/data/unknown"
+printf 'wrong-synthetic-key\n' > "$scratch/key"
+set +e
+output="$(bash "$script" 2>&1)"
+status=$?
+set -e
+test "$status" -ne 0
+[[ "$output" == *'bootstrap identity drift'* ]]
+printf 'synthetic-test-key\n' > "$scratch/key"
 bash "$script" > "$scratch/output"
 test -f "$scratch/state.json"
-printf 'marker\n' > "$scratch/data/storage/marker"
 bash "$script" >> "$scratch/output"
 test "$(cat "$scratch/data/storage/marker")" = marker
-test "$(rg -c '^run ' "$FAKE_DOCKER_LOG")" = 1
+test "$(rg -c '^run ' "$FAKE_DOCKER_LOG")" = 2
 ! rg -q '^start |^stop |^restart ' "$FAKE_DOCKER_LOG"
 ! rg -q 'synthetic-test-key' "$scratch/docker.log" "$scratch/output"
 test "$(stat -c %a "$scratch/data/.cbs-qdrant.yaml")" = 600
@@ -130,6 +161,30 @@ test "$(rg -c '^stop ' "$FAKE_DOCKER_LOG")" = 1
 test "$(rg -c '^start ' "$FAKE_DOCKER_LOG")" = 1
 ! rg -q 'synthetic-test-key|rotated-synthetic-key' "$scratch/docker.log" "$scratch/output"
 
+printf 'third-synthetic-key\n' > "$scratch/key"
+config_inode="$(stat -c %i "$scratch/data/.cbs-qdrant.yaml")"
+printf '2\n' > "$FAKE_DOCKER_FAIL_START"
+set +e
+output="$(QDRANT_ROTATE_KEY=1 bash "$script" 2>&1)"
+status=$?
+set -e
+test "$status" -ne 0
+rg -q 'rotated-synthetic-key' "$scratch/data/.cbs-qdrant.yaml"
+test -f "$scratch/data/.cbs-qdrant.rotation.json"
+test "$(cat "$scratch/data/storage/marker")" = marker
+test "$(rg -c '^start ' "$FAKE_DOCKER_LOG")" = 3
+! rg -q 'third-synthetic-key' "$scratch/docker.log" "$scratch/output" "$scratch/data/.cbs-qdrant.yaml"
+printf 'rotated-synthetic-key\n' > "$scratch/key"
+set +e
+output="$(bash "$script" 2>&1)"
+status=$?
+set -e
+test "$status" -ne 0
+[[ "$output" == *'prior config restored'* ]]
+test ! -e "$scratch/data/.cbs-qdrant.rotation.json"
+test "$(stat -c %i "$scratch/data/.cbs-qdrant.yaml")" = "$config_inode"
+bash "$script" >> "$scratch/output"
+
 python3 - "$scratch/state.json" <<'PY'
 import json, pathlib, sys
 p = pathlib.Path(sys.argv[1]); state = json.loads(p.read_text())
@@ -142,7 +197,7 @@ status=$?
 set -e
 test "$status" -ne 0
 [[ "$output" == *'drift'* ]]
-test "$(rg -c '^run ' "$FAKE_DOCKER_LOG")" = 1
+test "$(rg -c '^run ' "$FAKE_DOCKER_LOG")" = 2
 
 mkdir -m 700 "$scratch/tlsdata"
 printf 'fixture cert\n' > "$scratch/cert.pem"

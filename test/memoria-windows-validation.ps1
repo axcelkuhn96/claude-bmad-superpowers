@@ -105,15 +105,42 @@ try {
   $env:CBS_MEMORIA_WINDOWS_GIT_JUNCTION = if ($junction) { $alias } else { '' }
   $guardCode = @'
 import path from 'node:path';
+import fs from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 const root = process.env.CBS_MEMORIA_WINDOWS_REPO;
 const local = name => import(pathToFileURL(path.join(root, 'base', 'memoria', name)).href);
-const { runtimePython } = await local('runtime.mjs');
-const { activateProject } = await local('setup.mjs');
-const { applyNativeExclusion } = await local('native.mjs');
+const { runtimePython, RUNTIME_PINS } = await local('runtime.mjs');
+const { activateProject, authorizeCurrentDestination } = await local('setup.mjs');
+const { applyNativeExclusion, verifyNativeCapture } = await local('native.mjs');
 const { requestBroker } = await local('broker.mjs');
 const { identifyProject } = await local('project-id.mjs');
+const { inspectConfiguration, initializeSession, resolveProject } = await local('provider.mjs');
+const { createLaunch } = await local('launch.mjs');
+const { createOutbox } = await local('outbox.mjs');
 const fixture = process.env.CBS_MEMORIA_WINDOWS_FIXTURE;
+const project = process.env.CBS_MEMORIA_WINDOWS_GIT_ROOT;
+const stateRoot = path.join(fixture, 'state');
+const defaultSelection = await initializeSession(project, 'fixture-default', { event: 'SessionStart', stateRoot });
+await fs.mkdir(path.join(project, '.cbs'));
+await fs.writeFile(path.join(project, '.cbs', 'memoria.json'), JSON.stringify({
+  provider: 'mem0', project_id: 'fixture',
+  qdrant: { url: 'http://127.0.0.1:6333', collection: 'fixture', api_key_env: 'CBS_FIXTURE_KEY' },
+  embedding: { model: 'multilingual-e5-small', dimension: 384,
+    fingerprint: `${RUNTIME_PINS.modelSha256}:${RUNTIME_PINS.tokenizerSha256}` },
+}));
+const optinSelection = await inspectConfiguration(project, { stateRoot });
+const optinSession = await initializeSession(project, 'fixture-optin', { event: 'SessionStart', stateRoot });
+const pinnedSession = await resolveProject(project, 'fixture-optin', { stateRoot });
+let secretRead = false;
+const untrustedAuthorization = await authorizeCurrentDestination(project, 'fixture-optin',
+  () => { secretRead = true; return 'fixture-key'; }, { stateRoot });
+const nativeCapture = Object.fromEntries(await Promise.all(['claude', 'codex'].map(async cli =>
+  [cli, (await verifyNativeCapture(project, { cli, projectRoot: project })).reason])));
+let replay;
+try { await createOutbox(path.join(fixture, 'outbox-state')).pending(); replay = 'unexpected_success'; }
+catch (error) { replay = error.message; }
+const launch = Object.fromEntries(await Promise.all(['claude', 'codex'].map(async cli =>
+  [cli, (await createLaunch(project, cli, { stateRoot })).reason])));
 const gitInputs = Object.fromEntries(['ROOT', 'SUB', 'CASE', 'WORKTREE', 'JUNCTION']
   .map(name => [name, process.env['CBS_MEMORIA_WINDOWS_GIT_' + name]]).filter(([, value]) => value));
 const git = Object.fromEntries(await Promise.all(Object.entries(gitInputs)
@@ -122,7 +149,11 @@ process.stdout.write(JSON.stringify({ platform: process.platform,
   runtime_path: runtimePython(fixture),
   activation: (await activateProject(fixture)).reason,
   native_exclusion: (await applyNativeExclusion(fixture, { cli: 'codex' })).reason,
-  broker: (await requestBroker({}, '')).reason, git }));
+  broker: (await requestBroker({}, '')).reason, git,
+  selection: { default: defaultSelection.provider, optin: optinSelection.provider,
+    session: optinSession.provider, pinned: pinnedSession.provider,
+    untrusted_authorization: untrustedAuthorization.reason, secret_read: secretRead },
+  native_capture: nativeCapture, replay, launch }));
 '@
   $guardJson = $guardCode | & node --input-type=module -
   if ($LASTEXITCODE -ne 0) { throw 'guard check failed' }
@@ -134,6 +165,36 @@ process.stdout.write(JSON.stringify({ platform: process.platform,
   Record 'production_windows_guards' $(if ($guardsHold) { 'unsupported' } else { 'unproved' }) @{
     runtime_path_matches_windows = ($guard.runtime_path -eq $expectedPath)
     activation = $guard.activation; native_exclusion = $guard.native_exclusion; broker = $guard.broker
+  }
+  $selectionOkay = $guard.selection.default -eq 'claude-mem' -and $guard.selection.optin -eq 'mem0' -and
+    $guard.selection.session -eq 'mem0' -and $guard.selection.pinned -eq 'mem0' -and
+    $guard.selection.untrusted_authorization -eq 'trust_changed' -and !$guard.selection.secret_read
+  Record 'production_default_optin_selection_fixture' $(if ($selectionOkay) { 'observed' } else { 'unproved' }) @{
+    default = $guard.selection.default; optin = $guard.selection.optin
+    fresh_session = $guard.selection.session; pinned_session = $guard.selection.pinned
+    untrusted_authorization = $guard.selection.untrusted_authorization
+    untrusted_config_read_secret = $guard.selection.secret_read
+    production_activation = $guard.activation; trust_written = $false
+  }
+  $nativeGuardsHold = $guard.native_capture.claude -eq 'native_windows_unproved' -and
+    $guard.native_capture.codex -eq 'native_windows_unproved' -and
+    $guard.native_exclusion -eq 'native_windows_unproved' -and
+    $guard.activation -eq 'native_windows_unproved'
+  Record 'native_claude_codex_hooks_exclusion_trust' $(if ($nativeGuardsHold) { 'unsupported' } else { 'unproved' }) @{
+    claude_capture = $guard.native_capture.claude; codex_capture = $guard.native_capture.codex
+    exclusion = $guard.native_exclusion; activation = $guard.activation
+    claude_cli_available = [bool](Get-Command claude -ErrorAction SilentlyContinue)
+    codex_cli_available = [bool](Get-Command codex -ErrorAction SilentlyContinue)
+    native_cli_fixture_executed = $false; trust_authorized = $false
+  }
+  $replayGuardsHold = $guard.replay -eq 'native_windows_unproved' -and
+    $guard.broker -eq 'native_windows_unproved' -and
+    $guard.launch.claude -eq 'native_windows_unproved' -and
+    $guard.launch.codex -eq 'native_windows_unproved'
+  Record 'native_outbox_replay_two_machines' $(if ($replayGuardsHold) { 'unsupported' } else { 'unproved' }) @{
+    outbox_replay_precondition = $guard.replay; broker = $guard.broker
+    claude_launch = $guard.launch.claude; codex_launch = $guard.launch.codex
+    durable_replay_executed = $false; second_machine_executed = $false
   }
   $git = $guard.git
   $identityGood = $git.ROOT.kind -eq 'git' -and $git.SUB.kind -eq 'git' -and $git.CASE.kind -eq 'git' -and
@@ -275,12 +336,20 @@ print(json.dumps(result))
     if ($LASTEXITCODE -ne 0) { throw 'existing model/runtime probe failed' }
     $embedding = $embeddingJson | ConvertFrom-Json
     $cpuOkay = $embedding.cpu_dimensions -eq 384 -and [Math]::Abs($embedding.cpu_norm - 1) -lt 0.0001
-    Record 'existing_e5_cpu' $(if ($cpuOkay) { 'observed' } else { 'failed' }) $embedding
+    Record 'existing_e5_cpu' 'unproved' @{
+      diagnostic = $embedding; one_vector_dimensions_and_norm_ok = $cpuOkay
+      missing_proof = @('representative corpus', 'stored-row vectors', 'CPU/RAM p95 and peak measurements')
+    }
     if ($CheckDirectML) {
       $dml = $embedding.directml
       $dmlOkay = $dml -and $dml.actual_providers -contains 'DmlExecutionProvider' -and
         $dml.dimensions -eq 384 -and $dml.max_abs_diff_cpu -le 0.0001
-      Record 'existing_directml' $(if ($dmlOkay) { 'observed' } else { 'unproved' }) $dml
+      Record 'existing_directml' 'unproved' @{
+        one_vector_diagnostic = $dml; provider_listed_and_one_vector_within_tolerance = $dmlOkay
+        device_execution_proved = $false
+        missing_proof = @('representative corpus with max absolute difference <= 1e-4',
+          'stored-row comparison and new fingerprint if drift', 'CPU/RAM/VRAM and p95 measurements')
+      }
     } else { Record 'existing_directml' 'unproved' @{ reason = 'optional CheckDirectML not requested' } }
   } catch {
     Record 'existing_e5_cpu' 'unproved' @{ error_type = $_.Exception.GetType().Name }
@@ -291,8 +360,12 @@ print(json.dumps(result))
   Record 'existing_directml' 'unproved' @{ reason = 'requires existing runtime/model/tokenizer and explicit CheckDirectML' }
 }
 
-Record 'native_claude_codex_hooks_exclusion_trust' 'unsupported' @{ reason = 'production native guard; no user CLI configuration changed' }
-Record 'native_outbox_replay_two_machines' 'unsupported' @{ reason = 'fixture primitives do not prove production Windows capture/replay or cross-machine writer handoff' }
+if (!$report.controls.Contains('native_claude_codex_hooks_exclusion_trust')) {
+  Record 'native_claude_codex_hooks_exclusion_trust' 'unproved' @{ reason = 'production fixture probe failed before reaching native controls' }
+}
+if (!$report.controls.Contains('native_outbox_replay_two_machines')) {
+  Record 'native_outbox_replay_two_machines' 'unproved' @{ reason = 'production fixture probe failed before reaching replay controls' }
+}
 Record 'windows_activation_release' 'unsupported' @{ reason = 'diagnostic cannot authorize opt-in; native implementation and user-machine E2E gates remain' }
 
 foreach ($name in 'CBS_MEMORIA_WINDOWS_REPO','CBS_MEMORIA_WINDOWS_FIXTURE','CBS_MEMORIA_MODEL','CBS_MEMORIA_TOKENIZER','CBS_MEMORIA_WINDOWS_DML','CBS_MEMORIA_WINDOWS_GIT_ROOT','CBS_MEMORIA_WINDOWS_GIT_SUB','CBS_MEMORIA_WINDOWS_GIT_CASE','CBS_MEMORIA_WINDOWS_GIT_WORKTREE','CBS_MEMORIA_WINDOWS_GIT_JUNCTION') {
