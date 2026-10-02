@@ -540,6 +540,9 @@ export async function restoreNativeExclusion(root, options = {}) {
     saved = JSON.parse(savedVersion?.text);
   }
   catch { return blocked('missing_snapshot'); }
+  // A later call cannot prove the original .versions file ID or which missing-sidecar phase occurred.
+  // Retain every Windows artifact for manual recovery until an independent ownership receipt exists.
+  if (process.platform === 'win32') return blocked('native_recovery_required');
   if (process.platform === 'win32' && !saved.rollback) return blocked('unsupported_windows_replace');
   let manifest;
   if (process.platform === 'win32') {

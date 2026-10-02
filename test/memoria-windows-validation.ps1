@@ -105,6 +105,12 @@ try {
   & git -C $createOnlyRepo -c user.name=cbs-diagnostic -c user.email=diagnostic@invalid.example commit --allow-empty -q -m fixture
   if ($LASTEXITCODE -ne 0) { throw 'create-only fixture commit failed' }
   Add-Content -LiteralPath (Join-Path $createOnlyRepo '.git/info/exclude') -Value '/.claude/settings.local.json'
+  $missingPhaseRepo = Join-Path $fixture 'missing-phase-repo'
+  & git init -q $missingPhaseRepo
+  if ($LASTEXITCODE -ne 0) { throw 'missing-phase fixture git init failed' }
+  & git -C $missingPhaseRepo -c user.name=cbs-diagnostic -c user.email=diagnostic@invalid.example commit --allow-empty -q -m fixture
+  if ($LASTEXITCODE -ne 0) { throw 'missing-phase fixture commit failed' }
+  Add-Content -LiteralPath (Join-Path $missingPhaseRepo '.git/info/exclude') -Value '/.claude/settings.local.json'
   $sub = Join-Path $repo 'subdir'
   New-Item -ItemType Directory -Path $sub | Out-Null
   $worktree = Join-Path $fixture 'worktree'
@@ -136,6 +142,7 @@ try {
   $env:CBS_MEMORIA_WINDOWS_FIXTURE = $fixture
   $env:CBS_MEMORIA_WINDOWS_GIT_ROOT = $repo
   $env:CBS_MEMORIA_WINDOWS_CREATE_ONLY_ROOT = $createOnlyRepo
+  $env:CBS_MEMORIA_WINDOWS_MISSING_PHASE_ROOT = $missingPhaseRepo
   $env:CBS_MEMORIA_WINDOWS_GIT_SUB = $sub
   $env:CBS_MEMORIA_WINDOWS_GIT_CASE = $caseAlias
   $env:CBS_MEMORIA_WINDOWS_GIT_WORKTREE = $worktree
@@ -143,6 +150,7 @@ try {
   $guardCode = @'
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 const root = process.env.CBS_MEMORIA_WINDOWS_REPO;
 const local = name => import(pathToFileURL(path.join(root, 'base', 'memoria', name)).href);
@@ -224,7 +232,7 @@ try {
   const applied = await applyNativeExclusion(createRoot, createOptions);
   const verified = applied.kind === 'applied'
     ? await verifyNativeCapture(createRoot, createOptions) : null;
-  let refused, preserved = false, restored;
+  let refused, preserved = false, sidecarSwap, missingAfterCleanup;
   if (verified?.kind === 'verified') {
     const oldName = config + '.fixture-prior';
     await fs.rename(config, oldName);
@@ -237,13 +245,62 @@ try {
       const removedReplacement = await removeWindowsPrivateFile(config, replacementVersion,
         { privateState: false });
       if (removedReplacement.ok) await fs.rename(oldName, config);
-      restored = removedReplacement.ok ? await restoreNativeExclusion(createRoot, createOptions) : null;
+      if (removedReplacement.ok) {
+        const digest = value => createHash('sha256').update(value).digest('hex');
+        const snapshot = path.join(stateRoot, digest(createScope.projectRoot), 'native-claude.json');
+        const sidecar = snapshot + '.versions';
+        const original = await readWindowsPrivateFile(sidecar, { privateState: true });
+        await fs.rename(sidecar, sidecar + '.fixture-prior');
+        const recreated = await writeWindowsPrivateFile(sidecar, original.text, { privateState: true });
+        const saved = JSON.parse(await fs.readFile(snapshot, 'utf8'));
+        const lease = path.join(path.dirname(snapshot),
+          `exclude-${digest(`${saved.exclude.file}:${saved.exclude.block}`)}.json`);
+        const configBefore = await readWindowsPrivateFile(config, { privateState: false });
+        const leaseBefore = await readWindowsPrivateFile(lease, { privateState: true });
+        const restored = recreated.ok ? await restoreNativeExclusion(createRoot, createOptions) : null;
+        const configAfter = await readWindowsPrivateFile(config, { privateState: false });
+        const leaseAfter = await readWindowsPrivateFile(lease, { privateState: true });
+        sidecarSwap = { distinctId: recreated.ok && recreated.fileId !== original.fileId,
+          reason: restored?.reason, sidecarPreserved: (await fs.readFile(sidecar, 'utf8')) === original.text,
+          snapshotPreserved: !!(await fs.stat(snapshot).catch(() => null)),
+          configLeasePreserved: configBefore.ok && leaseBefore.ok && configAfter.ok && leaseAfter.ok &&
+            configBefore.fileId === configAfter.fileId && leaseBefore.fileId === leaseAfter.fileId };
+        if (sidecarSwap.sidecarPreserved) await fs.rm(sidecar);
+        await fs.rm(sidecar + '.fixture-prior');
+        await fs.rm(config);
+        await fs.rm(lease);
+        const configAbsent = !(await fs.stat(config).catch(() => null));
+        const leaseAbsent = !(await fs.stat(lease).catch(() => null));
+        const repeated = await restoreNativeExclusion(createRoot, createOptions);
+        missingAfterCleanup = { phaseAbsent: configAbsent && leaseAbsent,
+          reason: repeated.reason, snapshotPreserved: !!(await fs.stat(snapshot).catch(() => null)) };
+      }
     }
   }
   createOnly = { applied: applied.kind, applyReason: applied.reason,
     verified: verified?.kind, refusal: refused?.reason, preserved,
-    restored: restored?.kind };
+    sidecarSwap, missingAfterCleanup };
 } catch { createOnly = { error: 'fixture_exception' }; }
+let missingBeforeCreation;
+try {
+  const root = process.env.CBS_MEMORIA_WINDOWS_MISSING_PHASE_ROOT;
+  const scope = await identifyProject(root);
+  const options = { cli: 'claude', projectRoot: scope.projectRoot, stateRoot };
+  const applied = await applyNativeExclusion(root, options);
+  if (applied.kind === 'applied') {
+    const digest = value => createHash('sha256').update(value).digest('hex');
+    const snapshot = path.join(stateRoot, digest(scope.projectRoot), 'native-claude.json');
+    const saved = JSON.parse(await fs.readFile(snapshot, 'utf8'));
+    const lease = path.join(path.dirname(snapshot),
+      `exclude-${digest(`${saved.exclude.file}:${saved.exclude.block}`)}.json`);
+    await fs.rm(snapshot + '.versions');
+    await fs.rm(saved.file);
+    await fs.rm(lease);
+    const restored = await restoreNativeExclusion(root, options);
+    missingBeforeCreation = { applied: applied.kind, reason: restored.reason,
+      snapshotPreserved: !!(await fs.stat(snapshot).catch(() => null)) };
+  } else missingBeforeCreation = { applied: applied.kind, reason: applied.reason };
+} catch { missingBeforeCreation = { error: 'fixture_exception' }; }
 let replay;
 try { await createOutbox(path.join(fixture, 'outbox-state')).pending(); replay = 'unexpected_success'; }
 catch (error) { replay = error.message; }
@@ -261,7 +318,7 @@ process.stdout.write(JSON.stringify({ platform: process.platform,
     session: optinSession.provider, pinned: pinnedSession.provider,
     untrusted_authorization: untrustedAuthorization.reason, secret_read: secretRead },
   trust: { stored: !!storedTrust, authorized: trustAuthorization.kind, acl: trustState.ok },
-  native, createOnly, replay, operationalLaunch }));
+  native, createOnly, missingBeforeCreation, replay, operationalLaunch }));
 '@
   $guardJson = $guardCode | & node --input-type=module -
   if ($LASTEXITCODE -ne 0) { throw 'guard check failed' }
@@ -310,12 +367,28 @@ process.stdout.write(JSON.stringify({ platform: process.platform,
   $createOnlyOkay = $createOnly.applied -eq 'applied' -and
     $createOnly.verified -eq 'verified' -and
     $createOnly.refusal -eq 'native_config_changed' -and
-    $createOnly.preserved -and $createOnly.restored -eq 'restored'
+    $createOnly.preserved -and $createOnly.sidecarSwap.distinctId -and
+    $createOnly.sidecarSwap.reason -eq 'native_recovery_required' -and
+    $createOnly.sidecarSwap.sidecarPreserved -and $createOnly.sidecarSwap.snapshotPreserved -and
+    $createOnly.sidecarSwap.configLeasePreserved
   Record 'native_claude_create_only_version_fixture' $(if ($createOnlyOkay) { 'passed' } else { 'failed' }) @{
     applied = $createOnly.applied; apply_reason = $createOnly.applyReason
     verified = $createOnly.verified; substituted_identity_refused = $createOnly.refusal
-    external_same_text_preserved = $createOnly.preserved; restored_after_repair = $createOnly.restored
+    external_same_text_preserved = $createOnly.preserved
+    sidecar_recreated_distinct_id = $createOnly.sidecarSwap.distinctId
+    sidecar_recreated_restore_reason = $createOnly.sidecarSwap.reason
+    foreign_sidecar_preserved = $createOnly.sidecarSwap.sidecarPreserved
+    snapshot_preserved = $createOnly.sidecarSwap.snapshotPreserved
+    config_and_lease_preserved = $createOnly.sidecarSwap.configLeasePreserved
     error = $createOnly.error
+  }
+  $after = $createOnly.missingAfterCleanup
+  $before = $guard.missingBeforeCreation
+  $phaseOkay = $before.applied -eq 'applied' -and $before.reason -eq 'native_recovery_required' -and
+    $before.snapshotPreserved -and $after.phaseAbsent -and
+    $after.reason -eq 'native_recovery_required' -and $after.snapshotPreserved
+  Record 'native_missing_sidecar_phase_fixture' $(if ($phaseOkay) { 'passed' } else { 'failed' }) @{
+    before_creation = $before; after_cleanup = $after
   }
   foreach ($cli in 'claude','codex') {
     $command = Get-Command $cli -ErrorAction SilentlyContinue
@@ -752,12 +825,15 @@ foreach ($cli in 'claude','codex') {
 if (!$report.controls.Contains('native_cli_events')) {
   Record 'native_cli_events' 'failed' @{ reason = 'fixture failed before native event probe' }
 }
+if (!$report.controls.Contains('native_missing_sidecar_phase_fixture')) {
+  Record 'native_missing_sidecar_phase_fixture' 'failed' @{ reason = 'fixture failed before phase probe' }
+}
 if (!$report.controls.Contains('native_outbox_replay_two_machines')) {
   Record 'native_outbox_replay_two_machines' 'unproved' @{ reason = 'production fixture probe failed before reaching replay controls' }
 }
 Record 'windows_activation_release' 'unsupported' @{ reason = 'diagnostic cannot authorize opt-in; native implementation and user-machine E2E gates remain' }
 
-foreach ($name in 'CBS_MEMORIA_WINDOWS_REPO','CBS_MEMORIA_WINDOWS_FIXTURE','CBS_MEMORIA_MODEL','CBS_MEMORIA_TOKENIZER','CBS_MEMORIA_WINDOWS_DML','CBS_MEMORIA_WINDOWS_GIT_ROOT','CBS_MEMORIA_WINDOWS_GIT_SUB','CBS_MEMORIA_WINDOWS_GIT_CASE','CBS_MEMORIA_WINDOWS_GIT_WORKTREE','CBS_MEMORIA_WINDOWS_GIT_JUNCTION','CBS_MEMORIA_WINDOWS_BAD_ACL') {
+foreach ($name in 'CBS_MEMORIA_WINDOWS_REPO','CBS_MEMORIA_WINDOWS_FIXTURE','CBS_MEMORIA_MODEL','CBS_MEMORIA_TOKENIZER','CBS_MEMORIA_WINDOWS_DML','CBS_MEMORIA_WINDOWS_GIT_ROOT','CBS_MEMORIA_WINDOWS_CREATE_ONLY_ROOT','CBS_MEMORIA_WINDOWS_MISSING_PHASE_ROOT','CBS_MEMORIA_WINDOWS_GIT_SUB','CBS_MEMORIA_WINDOWS_GIT_CASE','CBS_MEMORIA_WINDOWS_GIT_WORKTREE','CBS_MEMORIA_WINDOWS_GIT_JUNCTION','CBS_MEMORIA_WINDOWS_BAD_ACL') {
   Remove-Item "Env:$name" -ErrorAction SilentlyContinue
 }
 try { Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction Stop } catch {
