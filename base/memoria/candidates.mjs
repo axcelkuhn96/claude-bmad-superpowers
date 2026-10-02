@@ -32,7 +32,7 @@ function redact(text) {
       end++;
     } else {
       end = start;
-      while (end < safe.length && !/\s/.test(safe[end])) end++;
+      while (end < safe.length && safe[end] !== '\r' && safe[end] !== '\n') end++;
     }
     result += safe.slice(cursor, match.index) + '[REDACTED]';
     cursor = end;

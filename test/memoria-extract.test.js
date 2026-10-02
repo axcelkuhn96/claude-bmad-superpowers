@@ -205,6 +205,69 @@ test('space-separated quoted password cannot reach prompt, candidate or sealed s
   assert.equal(sealed.review.operation.text, fact);
 });
 
+test('unquoted password with spaces cannot reach prompt, candidate, review seal or store', async t => {
+  const fact = 'Fable faz revisão.';
+  const value = ['alpha', 'beta', 'gamma'].join(' ');
+  const tail = 'beta gamma';
+  const message = { ...source, text: `${fact} password: ${value}\nMira implementa.` };
+  const { dir, box, checkpoint } = await fixture(t, [message]);
+  let prompt;
+  const poisoned = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async input => { prompt = input; return { kind: 'success', candidates: [
+      { ...candidate, text: tail, type: 'fact', condition: null },
+    ] }; },
+  });
+  assert.equal(prompt.includes(tail), false);
+  assert.equal(prompt.includes(value), false);
+  assert.equal(prompt.includes(fact), true);
+  assert.equal(prompt.includes('Mira implementa.'), true);
+  assert.equal(poisoned.reason, 'sensitive_content');
+  assert.equal((await box.readManifest(checkpoint.operationId)).reason, 'missing_manifest');
+
+  const clean = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', candidates: [
+      { ...candidate, text: fact, type: 'fact', condition: null },
+    ] }),
+  });
+  assert.equal(clean.kind, 'manifested');
+  const payload = await box.readCandidatePayload(checkpoint.operationId, 'fable_review');
+  assert.equal(JSON.stringify(payload).includes(tail), false);
+  assert.equal(payload.text, fact);
+  assert.equal((await sealFixture(box, checkpoint.operationId, 'fable_review', 'approve')).kind, 'sealed');
+  let operation;
+  const stored = await approveCandidate(checkpoint.operationId, 'fable_review', {
+    outbox: box, store: async op => { operation = op; return box.ackCandidate(checkpoint.operationId,
+      'fable_review', { externalId: op.externalId, projectId: 'p', status: 'active',
+        sdkId: 'uuid-1', qdrantId: 'uuid-1' }); },
+  });
+  assert.equal(stored.kind, 'processed');
+  assert.equal(JSON.stringify(operation).includes(tail), false);
+  assert.equal(operation.text, fact);
+  const entry = (await box.readDisposition(checkpoint.operationId)).candidates[0];
+  const sealed = JSON.parse(await fs.readFile(path.join(dir, 'candidates', 'reviews',
+    `${entry.externalId}.json`)));
+  assert.equal(JSON.stringify(sealed).includes(tail), false);
+  assert.equal(sealed.review.operation.text, fact);
+});
+
+test('each detected label separator consumes complete unquoted value through line end', async t => {
+  const fact = 'Fable faz revisão.';
+  const value = ['alpha', 'beta', 'gamma'].join(' ');
+  for (const separator of [' ', ': ', '= ']) {
+    const { box, checkpoint } = await fixture(t, [{ ...source,
+      text: `${fact} password${separator}${value}\nMira implementa.` }]);
+    let prompt;
+    const result = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+      outbox: box, runCli: async input => { prompt = input; return { kind: 'error', reason: 'cli_failed' }; },
+    });
+    assert.equal(result.reason, 'cli_failed');
+    assert.equal(prompt.includes(value), false, separator);
+    assert.equal(prompt.includes('beta gamma'), false, separator);
+    assert.equal(prompt.includes(fact), true, separator);
+    assert.equal(prompt.includes('Mira implementa.'), true, separator);
+  }
+});
+
 test('each detected label separator consumes complete single, double and multiline quoted values', async t => {
   const fact = 'Fable faz revisão.';
   const value = ['alpha', 'beta', 'gamma'].join(' ');
