@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { externalIdFor } from './ledger.mjs';
 
 const DEFAULT_MAX = 256 * 1024 * 1024;
@@ -20,6 +21,7 @@ export function createOutbox(stateDir, options = {}) {
   const processed = path.join(root, 'processed');
   const payloads = path.join(stateDir, 'candidates', 'payloads');
   const lock = path.join(root, 'lock');
+  const kernelLock = path.join(root, '.kernel-lock');
   const itemFile = id => path.join(items, `${id}.json`);
   const ackFile = id => path.join(acks, `${id}.json`);
   const processedFile = id => path.join(processed, `${id}.json`);
@@ -65,27 +67,129 @@ export function createOutbox(stateDir, options = {}) {
   }
   async function withLock(callback) {
     await ensure();
-    const sameInode = async (file, expected) => {
+    if (process.platform !== 'linux') throw new Error('outbox_lock_unsupported');
+    const supported = new Set([0xef53, 0x58465342, 0x9123683e, 0x01021994, 0x794c7630]);
+    if (!supported.has((await fs.statfs(root)).type)) throw new Error('outbox_lock_unsupported');
+    const utility = '/usr/bin/flock';
+    let utilityStat, utilityDir, utilityParent, utilityRoot;
+    try {
+      [utilityStat, utilityDir, utilityParent, utilityRoot] = await Promise.all([
+        fs.lstat(utility), fs.lstat('/usr/bin'), fs.lstat('/usr'), fs.lstat('/')]);
+    } catch (error) { throw new Error('outbox_lock_utility_unavailable', { cause: error }); }
+    if (!utilityStat.isFile() || utilityStat.isSymbolicLink() || utilityStat.uid !== 0 ||
+        (utilityStat.mode & 0o022) || !(utilityStat.mode & 0o111) ||
+        !utilityDir.isDirectory() || utilityDir.uid !== 0 || (utilityDir.mode & 0o022) ||
+        !utilityParent.isDirectory() || utilityParent.uid !== 0 || (utilityParent.mode & 0o022) ||
+        !utilityRoot.isDirectory() || utilityRoot.uid !== 0 || (utilityRoot.mode & 0o022)) {
+      throw new Error('outbox_lock_utility_unavailable');
+    }
+    let handle;
+    try {
+      const priorLegacy = await fs.lstat(lock).catch(error => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      let created = false;
       try {
-        const current = await fs.lstat(file);
-        return current.dev === expected.dev && current.ino === expected.ino;
-      } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
-    };
-    for (let attempt = 0; attempt < 100; attempt++) {
-      const temporaryLock = path.join(root, `.lock-${randomUUID()}.pid`);
-      let prepared;
-      let acquired = false;
-      let handle;
+        handle = await fs.open(kernelLock, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW |
+          (priorLegacy ? 0 : fs.constants.O_CREAT | fs.constants.O_EXCL), 0o600);
+        created = !priorLegacy;
+      } catch (error) {
+        if (priorLegacy && error.code === 'ENOENT') {
+          let content = '';
+          if (priorLegacy.isFile() && !priorLegacy.isSymbolicLink() && priorLegacy.size < 128) {
+            const marker = await fs.open(lock, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+            try { content = await marker.readFile('utf8'); } finally { await marker.close(); }
+          }
+          throw new Error(content.startsWith('cbs-kernel-lock-v1 ')
+            ? 'outbox_lock_identity_changed' : 'outbox_legacy_lock', { cause: error });
+        }
+        if (error.code === 'ELOOP' || error.code === 'EISDIR') {
+          throw new Error('outbox_lock_identity_changed', { cause: error });
+        }
+        if (error.code !== 'EEXIST') throw error;
+        handle = await fs.open(kernelLock, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW)
+          .catch(cause => { throw new Error('outbox_lock_identity_changed', { cause }); });
+      }
+      if (created) await syncDir(root);
+      const held = await handle.stat();
+      const legacyMarker = `cbs-kernel-lock-v1 ${held.dev}:${held.ino}\n`;
+      const sameKernelInode = async () => {
+        const current = await fs.lstat(kernelLock).catch(error => {
+          if (error.code === 'ENOENT') return null;
+          throw error;
+        });
+        return current?.isFile() && !current.isSymbolicLink() && current.dev === held.dev &&
+          current.ino === held.ino && current.nlink === 1 && current.uid === process.getuid() &&
+          (current.mode & 0o777) === 0o600;
+      };
+      if (!held.isFile() || held.nlink !== 1 || held.uid !== process.getuid() ||
+          (held.mode & 0o777) !== 0o600 || !await sameKernelInode()) {
+        throw new Error('outbox_lock_identity_changed');
+      }
+      await new Promise((resolve, reject) => {
+        const child = spawn(utility, ['-x', '-E', '75', '-w', '0.2', '3'], {
+          stdio: ['ignore', 'pipe', 'pipe', handle.fd], env: { LC_ALL: 'C' }, windowsHide: true });
+        let output = '';
+        let settled = false;
+        const finish = error => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (error) reject(error); else resolve();
+        };
+        const timer = setTimeout(() => child.kill('SIGKILL'), 1000);
+        const capture = chunk => {
+          output += chunk;
+          if (output.length > 4096) child.kill('SIGKILL');
+        };
+        child.stdout.on('data', capture);
+        child.stderr.on('data', capture);
+        child.once('error', error => finish(Object.assign(new Error('outbox_lock_utility_unavailable', { cause: error }),
+          { code: 'OUTBOX_LOCK_UTILITY' })));
+        child.once('close', code => finish(code === 0 ? null :
+          new Error(code === 75 ? 'outbox_lock_timeout' : 'outbox_lock_utility_unavailable')));
+      });
+      await syncDir(root);
+      if (!await sameKernelInode()) throw new Error('outbox_lock_identity_changed');
+      let legacy;
+      try { legacy = await fs.lstat(lock); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (legacy) {
+        if (!legacy.isFile() || legacy.isSymbolicLink() || legacy.uid !== process.getuid() ||
+            legacy.nlink !== 1 || (legacy.mode & 0o777) !== 0o600 || legacy.size >= 128) {
+          throw new Error('outbox_legacy_lock');
+        }
+        const marker = await fs.open(lock, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        try {
+          const opened = await marker.stat();
+          const current = await fs.lstat(lock);
+          if (opened.dev !== legacy.dev || opened.ino !== legacy.ino ||
+              current.dev !== legacy.dev || current.ino !== legacy.ino) throw new Error('outbox_legacy_lock');
+          const content = await marker.readFile('utf8');
+          if (content !== legacyMarker) throw new Error(content.startsWith('cbs-kernel-lock-v1 ')
+            ? 'outbox_lock_identity_changed' : 'outbox_legacy_lock');
+        } finally { await marker.close(); }
+      } else {
+        const temporary = path.join(root, `.${randomUUID()}.tmp`);
+        let markerHandle;
+        try {
+          markerHandle = await fs.open(temporary, 'wx', 0o600);
+          await markerHandle.writeFile(legacyMarker);
+          await markerHandle.sync();
+          await markerHandle.close(); markerHandle = null;
+          await fs.link(temporary, lock);
+          await syncDir(root);
+        } catch (error) {
+          if (error.code === 'EEXIST') throw new Error('outbox_legacy_lock', { cause: error });
+          throw error;
+        } finally {
+          await markerHandle?.close();
+          await fs.rm(temporary, { force: true });
+        }
+      }
+      if (!await sameKernelInode()) throw new Error('outbox_lock_identity_changed');
       try {
-        handle = await fs.open(temporaryLock, 'wx', 0o600);
-        prepared = await handle.stat();
-        await handle.writeFile(String(process.pid));
-        await handle.sync();
-        await handle.close();
-        handle = null;
-        await fs.link(temporaryLock, lock);
-        acquired = true;
-        await fs.unlink(temporaryLock);
         for (const dir of [items, acks, processed, root]) {
           let removed = false;
           for (const name of await fs.readdir(dir)) if (/^\.[a-f0-9-]+\.tmp$/.test(name)) {
@@ -133,28 +237,8 @@ export function createOutbox(stateDir, options = {}) {
         }
         if (cleanedProcessed) await syncDir(processed);
         return await callback();
-      } catch (error) {
-        if (acquired || error.code !== 'EEXIST') throw error;
-        const holder = await fs.lstat(lock).catch(e => { if (e.code === 'ENOENT') return null; throw e; });
-        if (!holder) continue;
-        const owner = Number(await fs.readFile(holder.isDirectory() ? path.join(lock, 'pid') : lock,
-          'utf8').catch(e => { if (e.code === 'ENOENT') return '0'; throw e; }));
-        if (owner && owner !== process.pid) {
-          try { process.kill(owner, 0); }
-          catch (e) { if (e.code === 'ESRCH' && await sameInode(lock, holder)) {
-            if (holder.isDirectory()) await fs.rm(lock, { recursive: true, force: true });
-            else await fs.unlink(lock);
-            continue;
-          } }
-        }
-        await new Promise(resolve => setTimeout(resolve, 2));
-      } finally {
-        await handle?.close();
-        if (prepared && await sameInode(temporaryLock, prepared)) await fs.unlink(temporaryLock);
-        if (acquired && prepared && await sameInode(lock, prepared)) await fs.unlink(lock);
-      }
-    }
-    throw new Error('outbox_lock_timeout');
+      } finally { await handle.close(); handle = null; }
+    } finally { await handle?.close(); }
   }
   async function records() {
     await ensure();

@@ -548,18 +548,67 @@ await outbox.enqueueCheckpoint(JSON.parse(process.argv[3]), { projectId: 'p', po
   }
 });
 
-test('ENOSPC and SIGKILL before lock owner write never strand the canonical lock', async t => {
+test('two simultaneous reclaimers preserve a stale legacy owner inode', async t => {
   const moduleUrl = new URL('../base/memoria/outbox.mjs', import.meta.url).href;
-  for (const failure of ['ENOSPC', 'SIGKILL']) {
+  for (const kind of ['file', 'directory']) {
+    const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    const root = path.join(dir, 'outbox');
+    await fs.mkdir(root, { mode: 0o700 });
+    const legacy = path.join(root, 'lock');
+    if (kind === 'file') await fs.writeFile(legacy, '999999999', { mode: 0o600 });
+    else {
+      await fs.mkdir(legacy, { mode: 0o700 });
+      await fs.writeFile(path.join(legacy, 'pid'), '999999999', { mode: 0o600 });
+    }
+    const before = await fs.lstat(legacy);
+    const source = `import { createOutbox } from ${JSON.stringify(moduleUrl)};
+process.stdout.write('ready\\n');
+process.stdin.once('data', async () => {
+  try { await createOutbox(process.argv[1]).usage(); process.stdout.write('entered\\n'); }
+  catch (error) { process.stdout.write(error.message + '\\n'); }
+});`;
+    const children = [0, 1].map(() => spawn(process.execPath,
+      ['--input-type=module', '-e', source, dir], { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin' } }));
+    const outputs = children.map(child => new Promise((resolve, reject) => {
+      let output = '';
+      child.stdout.on('data', data => { output += data; if (output.includes('ready\n')) resolve(output); });
+      child.once('error', reject);
+    }));
+    await Promise.all(outputs);
+    const results = children.map(child => new Promise((resolve, reject) => {
+      let output = '';
+      child.stdout.on('data', data => { output += data; });
+      child.once('error', reject);
+      child.once('close', code => resolve({ code, output }));
+    }));
+    for (const child of children) child.stdin.end('go\n');
+    for (const result of await Promise.all(results)) {
+      assert.equal(result.code, 0);
+      assert.match(result.output, /outbox_legacy_lock/);
+      assert.doesNotMatch(result.output, /entered/);
+    }
+    assert.equal((await fs.lstat(legacy)).ino, before.ino);
+    assert.equal((await fs.lstat(legacy)).dev, before.dev);
+  }
+});
+
+test('ENOSPC and SIGKILL during kernel lock preparation leave replay available', async t => {
+  const moduleUrl = new URL('../base/memoria/outbox.mjs', import.meta.url).href;
+  for (const failure of ['ENOSPC', 'MARKER_ENOSPC', 'SIGKILL', 'MARKER_SIGKILL']) {
     const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
 const source = `import fs from 'node:fs/promises';
 import { createOutbox } from ${JSON.stringify(moduleUrl)};
 const open = fs.open;
 fs.open = async (file, ...args) => {
+  if (process.argv[2] === 'ENOSPC' && String(file).endsWith('/.kernel-lock'))
+    throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
   const handle = await open(file, ...args);
-  if (String(file).endsWith('/pid') || String(file).endsWith('.pid')) {
+  if (process.argv[2] === 'SIGKILL' && String(file).endsWith('/.kernel-lock'))
+    process.kill(process.pid, 'SIGKILL');
+  if (['MARKER_ENOSPC', 'MARKER_SIGKILL'].includes(process.argv[2]) &&
+      String(file).includes('/outbox/.') && String(file).endsWith('.tmp')) {
     handle.writeFile = async () => {
-      if (process.argv[2] === 'SIGKILL') process.kill(process.pid, 'SIGKILL');
+      if (process.argv[2] === 'MARKER_SIGKILL') process.kill(process.pid, 'SIGKILL');
       throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
     };
   }
@@ -574,31 +623,197 @@ try {
     const result = await new Promise((resolve, reject) => {
       child.once('error', reject); child.once('exit', (code, signal) => resolve({ code, signal }));
     });
-    assert.deepEqual(result, failure === 'SIGKILL' ? { code: null, signal: 'SIGKILL' } : { code: 0, signal: null });
+    assert.deepEqual(result, failure.includes('SIGKILL') ? { code: null, signal: 'SIGKILL' } : { code: 0, signal: null });
     const root = path.join(dir, 'outbox');
-    assert.equal((await fs.readdir(root)).includes('lock'), false, failure);
-    if (failure === 'ENOSPC') assert.equal((await fs.readdir(root)).some(name => name.startsWith('.lock-')), false);
+    const names = await fs.readdir(root);
+    assert.equal(names.includes('lock'), false, failure);
+    if (failure !== 'MARKER_SIGKILL') assert.equal(names.some(name => name.endsWith('.tmp')), false, failure);
+    assert.equal((await fs.readdir(path.join(root, 'items'))).length, 0);
     const replay = await createOutbox(dir).enqueueCheckpoint({ cli: 'codex', sessionId: 'lock', start: 0,
       end: 1, sliceHash: 'a'.repeat(64), messages: [] }, { projectId: 'p', policyVersion: 'native-v1' });
     assert.equal(replay.kind, 'queued', failure);
+    assert.equal((await fs.readdir(root)).some(name => name.endsWith('.tmp')), false, failure);
     assert.deepEqual(await createOutbox(dir).cursor('codex', 'lock'),
       { queuedEnd: 1, ackedEnd: 0, processedEnd: 0 });
   }
 });
 
-test('unknown or live lock owner is never reclaimed by age alone', async t => {
-  for (const owner of ['missing', 'live']) {
+test('unknown, live and dead legacy owners remain unchanged', async t => {
+  for (const owner of ['missing', 'live', 'dead']) {
     const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
     const outbox = createOutbox(dir);
-    await outbox.usage();
+    await fs.mkdir(path.join(dir, 'outbox'), { mode: 0o700 });
     const lock = path.join(dir, 'outbox', 'lock');
     await fs.mkdir(lock, { mode: 0o700 });
     if (owner === 'live') await fs.writeFile(path.join(lock, 'pid'), String(process.pid));
+    if (owner === 'dead') await fs.writeFile(path.join(lock, 'pid'), '999999999');
     const old = new Date(Date.now() - 60000);
     await fs.utimes(lock, old, old);
     const inode = (await fs.lstat(lock)).ino;
-    await assert.rejects(outbox.usage(), /outbox_lock_timeout/);
+    await assert.rejects(outbox.usage(), /outbox_legacy_lock/);
     assert.equal((await fs.lstat(lock)).ino, inode);
+  }
+});
+
+test('kernel lock survives flock child exit, blocks a second process, and SIGKILL releases it', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const moduleUrl = new URL('../base/memoria/outbox.mjs', import.meta.url).href;
+  const row = { cli: 'codex', sessionId: 'kernel', start: 0, end: 5,
+    sliceHash: 'a'.repeat(64), messages: [{ text: 'held' }] };
+  const identity = { projectId: 'p', policyVersion: 'native-v1' };
+  const source = `import { createOutbox } from ${JSON.stringify(moduleUrl)};
+await createOutbox(process.argv[1], { fault: async stage => {
+  if (stage === 'after_write') {
+    process.stdout.write('held\\n');
+    await new Promise(resolve => process.stdin.once('data', resolve));
+  }
+} }).enqueueCheckpoint(JSON.parse(process.argv[2]), JSON.parse(process.argv[3]));`;
+  const a = spawn(process.execPath, ['--input-type=module', '-e', source, dir,
+    JSON.stringify(row), JSON.stringify(identity)], {
+    stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin' } });
+  t.after(() => a.kill('SIGKILL'));
+  await new Promise((resolve, reject) => {
+    a.stdout.on('data', data => { if (String(data).includes('held\n')) resolve(); });
+    a.once('error', reject);
+    a.once('close', () => reject(new Error('holder exited before mutation barrier')));
+  });
+  const root = path.join(dir, 'outbox');
+  const lock = path.join(root, '.kernel-lock');
+  const before = await fs.lstat(lock);
+  const temporary = (await fs.readdir(path.join(root, 'items'))).find(name => name.endsWith('.tmp'));
+  assert.ok(temporary);
+  const contender = `import { createOutbox } from ${JSON.stringify(moduleUrl)};
+try { await createOutbox(process.argv[1]).usage(); process.stdout.write('entered'); }
+catch (error) { process.stdout.write(error.message); }`;
+  const b = await run(process.execPath, ['--input-type=module', '-e', contender, dir],
+    { env: { PATH: '/usr/bin:/bin' }, timeout: 3000 });
+  assert.equal(b.stdout, 'outbox_lock_timeout');
+  assert.equal((await fs.lstat(lock)).ino, before.ino);
+  assert.ok((await fs.readdir(path.join(root, 'items'))).includes(temporary));
+  assert.equal((await fs.readdir(path.join(root, 'acks'))).length, 0);
+  const closed = new Promise(resolve => a.once('close', resolve));
+  a.kill('SIGKILL');
+  await closed;
+  const fresh = createOutbox(dir);
+  assert.deepEqual(await fresh.cursor('codex', 'kernel'), { queuedEnd: 0, ackedEnd: 0, processedEnd: 0 });
+  const queued = await fresh.enqueueCheckpoint(row, identity);
+  assert.equal(queued.kind, 'queued');
+  assert.equal((await createOutbox(dir).enqueueCheckpoint(row, identity)).operationId, queued.operationId);
+  assert.equal((await fresh.pending()).length, 1);
+  assert.deepEqual(await fresh.cursor('codex', 'kernel'), { queuedEnd: 5, ackedEnd: 0, processedEnd: 0 });
+  assert.equal((await fs.lstat(lock)).ino, before.ino);
+});
+
+test('concurrent callers in one process cannot enter the same protected mutation', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const row = { cli: 'codex', sessionId: 'same-process', start: 0, end: 1,
+    sliceHash: 'b'.repeat(64), messages: [] };
+  const identity = { projectId: 'p', policyVersion: 'native-v1' };
+  let release;
+  let entered;
+  const atWrite = new Promise(resolve => { entered = resolve; });
+  const barrier = new Promise(resolve => { release = resolve; });
+  const first = createOutbox(dir, { fault: async stage => {
+    if (stage === 'after_write') { entered(); await barrier; }
+  } }).enqueueCheckpoint(row, identity);
+  await atWrite;
+  let secondEntered = false;
+  const second = createOutbox(dir).enqueueCheckpoint(row, identity).then(result => {
+    secondEntered = true; return result;
+  });
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(secondEntered, false);
+  release();
+  const [one, two] = await Promise.all([first, second]);
+  assert.equal(one.kind, 'queued');
+  assert.equal(two.operationId, one.operationId);
+  assert.equal((await createOutbox(dir).pending()).length, 1);
+});
+
+test('unsuitable flock utility, filesystem and changed inode fail before mutation', async t => {
+  const moduleUrl = new URL('../base/memoria/outbox.mjs', import.meta.url).href;
+  for (const failure of ['utility', 'filesystem', 'identity']) {
+    const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    const source = `import fs from 'node:fs/promises';
+import { createOutbox } from ${JSON.stringify(moduleUrl)};
+const kind = process.argv[2];
+if (kind === 'filesystem') {
+  const statfs = fs.statfs;
+  fs.statfs = async (...args) => ({ ...await statfs(...args), type: 0x6969 });
+}
+const lstat = fs.lstat;
+let checks = 0;
+fs.lstat = async (file, ...args) => {
+  if (kind === 'identity' && String(file).endsWith('/.kernel-lock') && ++checks === 2) {
+    await fs.rename(file, file + '.retired');
+    await fs.writeFile(file, '', { mode: 0o600 });
+  }
+  const stat = await lstat(file, ...args);
+  if (kind === 'utility' && file === '/usr/bin/flock') stat.mode |= 0o002;
+  return stat;
+};
+try {
+  await createOutbox(process.argv[1]).enqueueCheckpoint({ cli: 'codex', sessionId: 'guard',
+    start: 0, end: 1, sliceHash: 'a'.repeat(64), messages: [] },
+  { projectId: 'p', policyVersion: 'native-v1' });
+  process.stdout.write('entered');
+} catch (error) { process.stdout.write(error.message); }`;
+    const { stdout } = await run(process.execPath, ['--input-type=module', '-e', source, dir, failure],
+      { env: { PATH: '/usr/bin:/bin' }, timeout: 3000 });
+    assert.equal(stdout, failure === 'utility' ? 'outbox_lock_utility_unavailable' :
+      failure === 'filesystem' ? 'outbox_lock_unsupported' : 'outbox_lock_identity_changed');
+    const root = path.join(dir, 'outbox');
+    assert.equal((await fs.readdir(path.join(root, 'items'))).length, 0);
+    assert.equal((await fs.readdir(path.join(root, 'acks'))).length, 0);
+    assert.equal((await fs.readdir(root)).includes('lock'), false);
+    if (failure === 'identity') {
+      assert.equal((await createOutbox(dir).enqueueCheckpoint({ cli: 'codex', sessionId: 'guard', start: 0,
+        end: 1, sliceHash: 'a'.repeat(64), messages: [] },
+      { projectId: 'p', policyVersion: 'native-v1' })).kind, 'queued');
+    }
+  }
+});
+
+test('persistent marker rejects replacement or disappearance of the kernel inode', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const outbox = createOutbox(dir);
+  await outbox.usage();
+  const root = path.join(dir, 'outbox');
+  const kernel = path.join(root, '.kernel-lock');
+  const marker = path.join(root, 'lock');
+  assert.equal((await fs.lstat(kernel)).mode & 0o777, 0o600);
+  assert.equal((await fs.lstat(marker)).mode & 0o777, 0o600);
+  const markerBefore = await fs.readFile(marker, 'utf8');
+  await fs.rename(kernel, `${kernel}.retired`);
+  await assert.rejects(outbox.usage(), /outbox_lock_identity_changed/);
+  assert.equal((await fs.readFile(marker, 'utf8')), markerBefore);
+  assert.equal((await fs.readdir(root)).includes('.kernel-lock'), false);
+  await fs.writeFile(kernel, '', { mode: 0o600 });
+  await assert.rejects(createOutbox(dir).usage(), /outbox_lock_identity_changed/);
+  assert.equal((await fs.readFile(marker, 'utf8')), markerBefore);
+});
+
+test('flock spawn error, nonzero exit and hung child close descriptors without mutation', async t => {
+  const moduleUrl = new URL('../base/memoria/outbox.mjs', import.meta.url).href;
+  for (const failure of ['spawn', 'exit', 'hung']) {
+    const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    const source = `import cp from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+const realSpawn = cp.spawn;
+cp.spawn = (_file, _args, options) => realSpawn(
+  process.argv[2] === 'spawn' ? '/missing/cbs-flock' :
+  process.argv[2] === 'exit' ? '/usr/bin/flock' : '/usr/bin/sleep',
+  process.argv[2] === 'exit' ? ['--invalid-cbs-option'] :
+  process.argv[2] === 'hung' ? ['5'] : [], options);
+syncBuiltinESMExports();
+const { createOutbox } = await import(${JSON.stringify(moduleUrl)});
+try { await createOutbox(process.argv[1]).usage(); process.stdout.write('entered'); }
+catch (error) { process.stdout.write(error.message); }`;
+    const { stdout } = await run(process.execPath, ['--input-type=module', '-e', source, dir, failure],
+      { env: { PATH: '/usr/bin:/bin' }, timeout: 3000 });
+    assert.equal(stdout, 'outbox_lock_utility_unavailable');
+    assert.equal((await fs.readdir(path.join(dir, 'outbox'))).includes('lock'), false);
+    assert.equal((await createOutbox(dir).usage()) >= 0, true);
   }
 });
 
