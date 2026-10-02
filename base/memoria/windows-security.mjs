@@ -30,6 +30,98 @@ function Result($ok, $code, $extra = @{}) {
   foreach ($key in $extra.Keys) { $value[$key] = $extra[$key] }
   [Console]::Out.WriteLine(($value | ConvertTo-Json -Compress -Depth 4))
 }
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class CbsFileHandle {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct FileTime { public uint Low; public uint High; }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct Information {
+    public uint Attributes;
+    public FileTime Creation, Access, Write;
+    public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct Disposition { [MarshalAs(UnmanagedType.Bool)] public bool DeleteFile; }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct RenameInfo {
+    public uint Flags;
+    public IntPtr RootDirectory;
+    public uint FileNameLength;
+    public char FileName;
+  }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Information value);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass,
+    ref Disposition value, uint size);
+  [DllImport("kernel32.dll", EntryPoint="SetFileInformationByHandle", SetLastError=true)]
+  static extern bool SetFileInformationByHandleRaw(SafeFileHandle handle, int informationClass,
+    IntPtr value, uint size);
+  public static string Identity(SafeFileHandle handle) {
+    Information value;
+    if (!GetFileInformationByHandle(handle, out value)) throw new InvalidOperationException("identity");
+    return value.Volume.ToString("x8") + ":" + value.IndexHigh.ToString("x8") + value.IndexLow.ToString("x8");
+  }
+  public static void Delete(SafeFileHandle handle) {
+    Disposition value = new Disposition { DeleteFile = true };
+    if (!SetFileInformationByHandle(handle, 4, ref value, (uint)Marshal.SizeOf(typeof(Disposition))))
+      throw new InvalidOperationException("delete");
+  }
+  public static int RenameNew(SafeFileHandle handle, string target) {
+    byte[] name = Encoding.Unicode.GetBytes(target);
+    int root = Marshal.OffsetOf(typeof(RenameInfo), "RootDirectory").ToInt32();
+    int length = Marshal.OffsetOf(typeof(RenameInfo), "FileNameLength").ToInt32();
+    int offset = Marshal.OffsetOf(typeof(RenameInfo), "FileName").ToInt32();
+    IntPtr value = Marshal.AllocHGlobal(offset + name.Length);
+    try {
+      Marshal.WriteInt32(value, 0, 0);
+      Marshal.WriteIntPtr(value, root, IntPtr.Zero);
+      Marshal.WriteInt32(value, length, name.Length);
+      Marshal.Copy(name, 0, IntPtr.Add(value, offset), name.Length);
+      return SetFileInformationByHandleRaw(handle, 3, value, (uint)(offset + name.Length))
+        ? 0 : Marshal.GetLastWin32Error();
+    } finally { Marshal.FreeHGlobal(value); }
+  }
+}
+'@
+function ExactVersion([System.IO.FileStream]$stream) {
+  if ($stream.Length -gt 1048576) { throw 'oversize' }
+  $stream.Position = 0
+  $bytes = [byte[]]::new([int]$stream.Length)
+  $offset = 0
+  while ($offset -lt $bytes.Length) {
+    $count = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+    if ($count -le 0) { throw 'security_error' }
+    $offset += $count
+  }
+  if ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) {
+    throw 'invalid_text'
+  }
+  try { $decoded = [System.Text.UTF8Encoding]::new($false, $true).GetString($bytes) }
+  catch [System.Text.DecoderFallbackException] { throw 'invalid_text' }
+  $hasher = [System.Security.Cryptography.SHA256]::Create()
+  try { $digest = [BitConverter]::ToString($hasher.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant() }
+  finally { $hasher.Dispose() }
+  return @{ text = $decoded; sha256 = $digest; fileId = [CbsFileHandle]::Identity($stream.SafeFileHandle) }
+}
+function RemoveVersioned([string]$value, [string]$expectedHash, [string]$expectedId,
+    [bool]$privateState = $true) {
+  $rights = [System.Security.AccessControl.FileSystemRights]::ReadData -bor
+    [System.Security.AccessControl.FileSystemRights]::ReadPermissions -bor
+    [System.Security.AccessControl.FileSystemRights]::Delete
+  $stream = [System.IO.FileStream]::new($value, [System.IO.FileMode]::Open,
+    $rights, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::None)
+  try {
+    [void](Audit $value 'file' $privateState $stream)
+    $version = ExactVersion $stream
+    if ($version.sha256 -cne $expectedHash -or $version.fileId -cne $expectedId) { throw 'changed' }
+    [CbsFileHandle]::Delete($stream.SafeFileHandle)
+  } finally { $stream.Dispose() }
+}
 function SafePath([string]$value) {
   if ($value -notmatch '^[A-Za-z]:\\' -or $value -match '[\x00-\x1f]' -or
       $value -match '[<>|"?*]' -or $value.Substring(2).Contains(':') -or
@@ -176,59 +268,39 @@ try {
       [void](Audit $parent 'directory' ([bool]$inputValue.privateState))
       $intent = $target + '.cbs-replace-intent'
       if ([System.IO.File]::Exists($intent)) { throw 'recovery_required' }
-      $exists = [System.IO.File]::Exists($target)
-      if ($exists) {
-        if (!$inputValue.replace) { throw 'exists' }
-        if ($null -eq $inputValue.expectedText) { throw 'changed' }
-        [void](Audit $target 'file' ([bool]$inputValue.privateState))
-        if ($null -ne $inputValue.expectedText -and
-            [System.IO.File]::ReadAllText($target) -cne [string]$inputValue.expectedText) { throw 'changed' }
-      } elseif ($inputValue.replace) { throw 'missing' }
+      if ($inputValue.replace) { throw 'unsupported_windows_replace' }
+      if ([System.IO.File]::Exists($target)) { throw 'exists' }
+      try { $bytes = [System.Text.UTF8Encoding]::new($false, $true).GetBytes([string]$inputValue.text) }
+      catch [System.Text.EncoderFallbackException] { throw 'invalid_text' }
       $temp = [System.IO.Path]::Combine($parent, ([System.IO.Path]::GetFileName($target) + '.' + [guid]::NewGuid().ToString('N') + '.tmp'))
+      $rights = [System.Security.AccessControl.FileSystemRights]::ReadData -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+        [System.Security.AccessControl.FileSystemRights]::ReadPermissions -bor
+        [System.Security.AccessControl.FileSystemRights]::Delete
       $stream = [System.IO.FileStream]::new($temp, [System.IO.FileMode]::CreateNew,
-        [System.Security.AccessControl.FileSystemRights]::Write,
+        $rights,
         [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::WriteThrough,
         (PrivateSecurity $false))
       try {
-        $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes([string]$inputValue.text)
         $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush($true)
-      } finally { $stream.Dispose() }
-      [void](Audit $temp 'file')
-      if ($exists) {
-        $backup = $target + '.cbs-' + [guid]::NewGuid().ToString('N') + '.bak'
-        $hasher = [System.Security.Cryptography.SHA256]::Create()
-        try {
-          $oldHash = [BitConverter]::ToString($hasher.ComputeHash(
-            [System.Text.UTF8Encoding]::new($false).GetBytes([string]$inputValue.expectedText))).Replace('-', '')
-          $newHash = [BitConverter]::ToString($hasher.ComputeHash($bytes)).Replace('-', '')
-        } finally { $hasher.Dispose() }
-        $manifest = @{ backup = $backup; temp = $temp; expectedTextHash =
-          $oldHash; nextTextHash = $newHash } |
-          ConvertTo-Json -Compress
-        $intentStream = [System.IO.FileStream]::new($intent, [System.IO.FileMode]::CreateNew,
-          [System.Security.AccessControl.FileSystemRights]::Write,
-          [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::WriteThrough,
-          (PrivateSecurity $false))
-        try {
-          $intentBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($manifest)
-          $intentStream.Write($intentBytes, 0, $intentBytes.Length)
-          $intentStream.Flush($true)
-        } finally { $intentStream.Dispose() }
-        [void](Audit $intent 'file')
-        [System.IO.File]::Replace($temp, $target, $backup)
-      } else { [System.IO.File]::Move($temp, $target) }
-      $verified = Audit $target 'file' ([bool]$inputValue.privateState)
-      if ([System.IO.File]::ReadAllText($target) -ne [string]$inputValue.text) { throw 'recovery_required' }
-      if ($exists) {
-        [void](Audit $backup 'file' ([bool]$inputValue.privateState))
-        if ([System.IO.File]::ReadAllText($backup) -cne [string]$inputValue.expectedText) {
+        [void](Audit $temp 'file' $true $stream)
+        $tempVersion = ExactVersion $stream
+        if ($tempVersion.text -cne [string]$inputValue.text) { throw 'recovery_required' }
+        $renamed = [CbsFileHandle]::RenameNew($stream.SafeFileHandle, $target)
+        if ($renamed -ne 0) {
+          try { [CbsFileHandle]::Delete($stream.SafeFileHandle) }
+          catch { throw 'recovery_required' }
+          if ([System.IO.File]::Exists($target)) { throw 'exists' }
+          throw 'security_error'
+        }
+        $verified = Audit $target 'file' ([bool]$inputValue.privateState) $stream
+        $version = ExactVersion $stream
+        if ($version.fileId -cne $tempVersion.fileId -or $version.sha256 -cne $tempVersion.sha256) {
           throw 'recovery_required'
         }
-        [System.IO.File]::Delete($backup)
-        [System.IO.File]::Delete($intent)
-      }
-      Result $true 'safe' $verified
+        Result $true 'safe' ($verified + @{ sha256 = $version.sha256; fileId = $version.fileId })
+      } finally { $stream.Dispose() }
       break
     }
     'read-file' {
@@ -239,46 +311,17 @@ try {
         [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
       try {
         $result = Audit $target 'file' ([bool]$inputValue.privateState) $stream
-        if ($stream.Length -gt 1048576) { throw 'oversize' }
-        $reader = [System.IO.StreamReader]::new($stream, [System.Text.UTF8Encoding]::new($false), $true, 4096, $true)
-        try { $result['text'] = $reader.ReadToEnd() } finally { $reader.Dispose() }
-        Result $true 'safe' $result
+        $version = ExactVersion $stream
+        Result $true 'safe' ($result + $version)
       } finally { $stream.Dispose() }
       break
     }
     'remove-file' {
-      if ($null -eq $inputValue.expectedText) { throw 'changed' }
+      if ($inputValue.expectedSha256 -notmatch '^[a-f0-9]{64}$' -or
+          $inputValue.expectedFileId -notmatch '^[a-f0-9]{8}:[a-f0-9]{16}$') { throw 'changed' }
       [void](Audit ([System.IO.Path]::GetDirectoryName($target)) 'directory' ([bool]$inputValue.privateState))
-      $rights = [System.Security.AccessControl.FileSystemRights]::ReadData -bor
-        [System.Security.AccessControl.FileSystemRights]::ReadPermissions -bor
-        [System.Security.AccessControl.FileSystemRights]::Delete
-      $stream = [System.IO.FileStream]::new($target, [System.IO.FileMode]::Open,
-        $rights, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::None)
-      try {
-        [void](Audit $target 'file' ([bool]$inputValue.privateState) $stream)
-        if ($stream.Length -gt 1048576) { throw 'oversize' }
-        $reader = [System.IO.StreamReader]::new($stream, [System.Text.UTF8Encoding]::new($false), $true, 4096, $true)
-        try { $actual = $reader.ReadToEnd() } finally { $reader.Dispose() }
-        if ($actual -cne [string]$inputValue.expectedText) { throw 'changed' }
-        Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-public static class CbsDeleteByHandle {
-  [StructLayout(LayoutKind.Sequential)]
-  public struct Disposition { [MarshalAs(UnmanagedType.Bool)] public bool DeleteFile; }
-  [DllImport("kernel32.dll", SetLastError=true)]
-  public static extern bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass,
-    ref Disposition value, uint size);
-}
-'@
-        $disposition = [CbsDeleteByHandle+Disposition]::new()
-        $disposition.DeleteFile = $true
-        if (![CbsDeleteByHandle]::SetFileInformationByHandle($stream.SafeFileHandle, 4,
-          [ref]$disposition, [uint32][Runtime.InteropServices.Marshal]::SizeOf($disposition))) {
-          throw 'security_error'
-        }
-      } finally { $stream.Dispose() }
+      if ([System.IO.File]::Exists($target + '.cbs-replace-intent')) { throw 'recovery_required' }
+      RemoveVersioned $target ([string]$inputValue.expectedSha256) ([string]$inputValue.expectedFileId) ([bool]$inputValue.privateState)
       Result $true 'safe' @{ ownerMatches = $true; localNtfs = $true; noReparse = $true;
         daclSafe = $true; currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
       break
@@ -288,7 +331,8 @@ public static class CbsDeleteByHandle {
   }
 } catch {
   $code = if ($_.Exception.Message -in @('unsafe_path','volume','reparse','missing','owner','dacl',
-      'not_directory','exists','oversize','action','recovery_required','unsafe_tool','changed','ancestor')) { $_.Exception.Message } else { 'security_error' }
+      'not_directory','exists','oversize','action','recovery_required','unsafe_tool','changed','ancestor',
+      'invalid_text','unsupported_windows_replace')) { $_.Exception.Message } else { 'security_error' }
   Result $false $code
 }
 `;
@@ -303,13 +347,17 @@ export function windowsPathKey(value) {
   return (normalized.length > 3 ? normalized.replace(/\\+$/, '') : normalized).toLowerCase();
 }
 
-export function parseWindowsSecurityResult(raw) {
+export function parseWindowsSecurityResult(raw, { version = false, text = true } = {}) {
   let result;
   try { result = JSON.parse(raw); } catch { return { ok: false, code: 'invalid_response' }; }
   if (result?.ok !== true || result.code !== 'safe' || result.ownerMatches !== true ||
       result.localNtfs !== true || result.noReparse !== true || result.daclSafe !== true ||
       !/^S-\d+(?:-\d+){2,}$/.test(result.currentSid ?? '')) {
     return { ok: false, code: typeof result?.code === 'string' ? result.code : 'invalid_response' };
+  }
+  if (version && ((text && typeof result.text !== 'string') || !/^[a-f0-9]{64}$/.test(result.sha256 ?? '') ||
+      !/^[a-f0-9]{8}:[a-f0-9]{16}$/.test(result.fileId ?? ''))) {
+    return { ok: false, code: 'invalid_response' };
   }
   return result;
 }
@@ -379,7 +427,8 @@ async function invoke(action, file, extra = {}) {
             ? result : { ok: false, code: result?.code ?? 'invalid_response' });
         } catch { return resolve({ ok: false, code: 'invalid_response' }); }
       }
-      resolve(parseWindowsSecurityResult(output.trim()));
+      resolve(parseWindowsSecurityResult(output.trim(), { version: action === 'read-file' || action === 'write-file',
+        text: action === 'read-file' }));
     });
     child.stdin.end(JSON.stringify({ action, path: file, ...extra }));
   });
@@ -407,12 +456,12 @@ export async function ensureWindowsPrivateDirectory(dir, { privateState = true }
   return invoke('ensure-directory', dir, { privateState });
 }
 
-export async function writeWindowsPrivateFile(file, text, { replace = false, privateState = true,
-  expectedText = null } = {}) {
+export async function writeWindowsPrivateFile(file, text, { replace = false, privateState = true } = {}) {
+  if (replace) return { ok: false, code: 'unsupported_windows_replace' };
   if (typeof text !== 'string' || Buffer.byteLength(text, 'utf8') > 1024 * 1024) {
     return { ok: false, code: 'oversize' };
   }
-  return invoke('write-file', file, { text, replace, privateState, expectedText });
+  return invoke('write-file', file, { text, replace: false, privateState });
 }
 
 export async function readWindowsPrivateFile(file, { privateState = true } = {}) {
@@ -428,11 +477,13 @@ export function windowsCodexPluginInstalled(output) {
   });
 }
 
-export async function removeWindowsPrivateFile(file, expectedText, { privateState = true } = {}) {
-  if (typeof expectedText !== 'string' || Buffer.byteLength(expectedText, 'utf8') > 1024 * 1024) {
+export async function removeWindowsPrivateFile(file, expectedVersion, { privateState = true } = {}) {
+  if (!/^[a-f0-9]{64}$/.test(expectedVersion?.sha256 ?? '') ||
+      !/^[a-f0-9]{8}:[a-f0-9]{16}$/.test(expectedVersion?.fileId ?? '')) {
     return { ok: false, code: 'changed' };
   }
-  return invoke('remove-file', file, { expectedText, privateState });
+  return invoke('remove-file', file, { expectedSha256: expectedVersion.sha256,
+    expectedFileId: expectedVersion.fileId, privateState });
 }
 
 export async function probeWindowsCodexPlugin(root, productRoot) {

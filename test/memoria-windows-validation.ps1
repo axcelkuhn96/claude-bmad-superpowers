@@ -32,6 +32,11 @@ function Record([string]$name, [string]$status, $evidence) {
   $report.controls[$name] = [ordered]@{ status = $normalized;
     executed = ($normalized -in @('passed', 'failed')); evidence = $evidence }
 }
+function Record-LockOutcome([bool]$executed, [bool]$success, $evidence) {
+  $status = if (!$executed) { 'missing_prerequisite' }
+    elseif ($success) { 'passed' } else { 'failed' }
+  Record 'own_child_lock_crash_fixture' $status $evidence
+}
 function Save-Report {
   $parent = Split-Path -Parent $ReportPath
   if ($parent -and !(Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
@@ -58,6 +63,7 @@ Record 'toolchain' 'observed' @{
 $fixture = Join-Path $env:TEMP ('cbs-memoria-diagnostic-' + [guid]::NewGuid().ToString('N'))
 $child = $null
 $second = $null
+$lockExecuted = $false
 try {
   New-Item -ItemType Directory -Path $fixture | Out-Null
   $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -93,6 +99,12 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'git init failed' }
   & git -C $repo -c user.name=cbs-diagnostic -c user.email=diagnostic@invalid.example commit --allow-empty -q -m fixture
   if ($LASTEXITCODE -ne 0) { throw 'fixture commit failed' }
+  $createOnlyRepo = Join-Path $fixture 'create-only-repo'
+  & git init -q $createOnlyRepo
+  if ($LASTEXITCODE -ne 0) { throw 'create-only fixture git init failed' }
+  & git -C $createOnlyRepo -c user.name=cbs-diagnostic -c user.email=diagnostic@invalid.example commit --allow-empty -q -m fixture
+  if ($LASTEXITCODE -ne 0) { throw 'create-only fixture commit failed' }
+  Add-Content -LiteralPath (Join-Path $createOnlyRepo '.git/info/exclude') -Value '/.claude/settings.local.json'
   $sub = Join-Path $repo 'subdir'
   New-Item -ItemType Directory -Path $sub | Out-Null
   $worktree = Join-Path $fixture 'worktree'
@@ -123,6 +135,7 @@ try {
   $env:CBS_MEMORIA_WINDOWS_REPO = (Resolve-Path -LiteralPath $ProductRoot).Path
   $env:CBS_MEMORIA_WINDOWS_FIXTURE = $fixture
   $env:CBS_MEMORIA_WINDOWS_GIT_ROOT = $repo
+  $env:CBS_MEMORIA_WINDOWS_CREATE_ONLY_ROOT = $createOnlyRepo
   $env:CBS_MEMORIA_WINDOWS_GIT_SUB = $sub
   $env:CBS_MEMORIA_WINDOWS_GIT_CASE = $caseAlias
   $env:CBS_MEMORIA_WINDOWS_GIT_WORKTREE = $worktree
@@ -141,7 +154,8 @@ const { identifyProject } = await local('project-id.mjs');
 const { inspectConfiguration, initializeSession, resolveProject } = await local('provider.mjs');
 const { createLaunch, launchCli } = await local('launch.mjs');
 const { writeLocalTrust, readLocalTrust, trustTuple, authorizeDestination } = await local('trust.mjs');
-const { inspectWindowsPath } = await local('windows-security.mjs');
+const { inspectWindowsPath, readWindowsPrivateFile, removeWindowsPrivateFile,
+  writeWindowsPrivateFile } = await local('windows-security.mjs');
 const { createOutbox } = await local('outbox.mjs');
 const fixture = process.env.CBS_MEMORIA_WINDOWS_FIXTURE;
 const project = process.env.CBS_MEMORIA_WINDOWS_GIT_ROOT;
@@ -188,8 +202,10 @@ for (const cli of ['claude', 'codex']) {
       await fs.writeFile(claudeConfig, JSON.stringify(config));
     }
   } catch { applied ??= { kind: 'blocked', reason: 'fixture_exception' }; }
-  try { restored = await restoreNativeExclusion(project, options); }
-  catch { restored = { kind: 'blocked', reason: 'fixture_restore_exception' }; }
+  if (applied?.kind === 'applied') {
+    try { restored = await restoreNativeExclusion(project, options); }
+    catch { restored = { kind: 'blocked', reason: 'fixture_restore_exception' }; }
+  } else { restored = { kind: 'blocked', reason: 'apply_not_performed' }; }
   const after = cli === 'claude' ? JSON.parse(await fs.readFile(claudeConfig, 'utf8')) : null;
   const codexAfter = cli === 'codex' ? await fs.readFile(codexConfig, 'utf8') : null;
   native[cli] = { applied: applied.kind, applyReason: applied.reason,
@@ -199,6 +215,35 @@ for (const cli of ['claude', 'codex']) {
     priorPreserved: cli === 'claude' ? after.fixtureMarker === 7 &&
       after.enabledPlugins['claude-mem@thedotmack'] === true : codexAfter === '[features]\nhooks = true\n' };
 }
+let createOnly;
+try {
+  const createRoot = process.env.CBS_MEMORIA_WINDOWS_CREATE_ONLY_ROOT;
+  const createScope = await identifyProject(createRoot);
+  const createOptions = { cli: 'claude', projectRoot: createScope.projectRoot, stateRoot };
+  const config = path.join(createRoot, '.claude', 'settings.local.json');
+  const applied = await applyNativeExclusion(createRoot, createOptions);
+  const verified = applied.kind === 'applied'
+    ? await verifyNativeCapture(createRoot, createOptions) : null;
+  let refused, preserved = false, restored;
+  if (verified?.kind === 'verified') {
+    const oldName = config + '.fixture-prior';
+    await fs.rename(config, oldName);
+    const exactText = await fs.readFile(oldName, 'utf8');
+    const replacement = await writeWindowsPrivateFile(config, exactText, { privateState: false });
+    refused = replacement.ok ? await restoreNativeExclusion(createRoot, createOptions) : null;
+    preserved = replacement.ok && (await fs.readFile(config, 'utf8')) === exactText;
+    if (replacement.ok) {
+      const replacementVersion = await readWindowsPrivateFile(config, { privateState: false });
+      const removedReplacement = await removeWindowsPrivateFile(config, replacementVersion,
+        { privateState: false });
+      if (removedReplacement.ok) await fs.rename(oldName, config);
+      restored = removedReplacement.ok ? await restoreNativeExclusion(createRoot, createOptions) : null;
+    }
+  }
+  createOnly = { applied: applied.kind, applyReason: applied.reason,
+    verified: verified?.kind, refusal: refused?.reason, preserved,
+    restored: restored?.kind };
+} catch { createOnly = { error: 'fixture_exception' }; }
 let replay;
 try { await createOutbox(path.join(fixture, 'outbox-state')).pending(); replay = 'unexpected_success'; }
 catch (error) { replay = error.message; }
@@ -216,7 +261,7 @@ process.stdout.write(JSON.stringify({ platform: process.platform,
     session: optinSession.provider, pinned: pinnedSession.provider,
     untrusted_authorization: untrustedAuthorization.reason, secret_read: secretRead },
   trust: { stored: !!storedTrust, authorized: trustAuthorization.kind, acl: trustState.ok },
-  native, replay, operationalLaunch }));
+  native, createOnly, replay, operationalLaunch }));
 '@
   $guardJson = $guardCode | & node --input-type=module -
   if ($LASTEXITCODE -ne 0) { throw 'guard check failed' }
@@ -250,13 +295,27 @@ process.stdout.write(JSON.stringify({ platform: process.platform,
     $okay = $item.applied -eq 'applied' -and $item.verified -eq 'verified' -and
       $item.launch -eq 'created' -and $item.restored -eq 'restored' -and $item.priorPreserved
     if ($cli -eq 'claude') { $okay = $okay -and $item.changedReason -eq 'native_config_changed' -and $item.priorPreserved }
-    $status = if ($okay) { 'passed' } elseif ($item.applyReason -eq 'unsupported_plugin') { 'missing_prerequisite' } else { 'failed' }
+    $status = if ($okay) { 'passed' }
+      elseif ($item.applyReason -eq 'unsupported_plugin') { 'missing_prerequisite' }
+      elseif ($item.applyReason -eq 'unsupported_windows_replace' -and $item.priorPreserved) { 'blocked_missing_implementation' }
+      else { 'failed' }
     Record "native_${cli}_apply_verify_launch_restore" $status @{
       applied = $item.applied; apply_reason = $item.applyReason; verified = $item.verified
       verify_reason = $item.verifyReason; launch = $item.launch; launch_reason = $item.launchReason
       changed_config_refusal = $item.changedReason; restored = $item.restored
       restore_reason = $item.restoreReason; prior_value_preserved = $item.priorPreserved
     }
+  }
+  $createOnly = $guard.createOnly
+  $createOnlyOkay = $createOnly.applied -eq 'applied' -and
+    $createOnly.verified -eq 'verified' -and
+    $createOnly.refusal -eq 'native_config_changed' -and
+    $createOnly.preserved -and $createOnly.restored -eq 'restored'
+  Record 'native_claude_create_only_version_fixture' $(if ($createOnlyOkay) { 'passed' } else { 'failed' }) @{
+    applied = $createOnly.applied; apply_reason = $createOnly.applyReason
+    verified = $createOnly.verified; substituted_identity_refused = $createOnly.refusal
+    external_same_text_preserved = $createOnly.preserved; restored_after_repair = $createOnly.restored
+    error = $createOnly.error
   }
   foreach ($cli in 'claude','codex') {
     $command = Get-Command $cli -ErrorAction SilentlyContinue
@@ -429,9 +488,50 @@ try { await resolveWindowsExecutable('git.exe'); }
 catch { writablePathRejected = true; }
 process.env.PATH = originalPath;
 const written = await writeWindowsPrivateFile(target, 'before');
-const wrong = await removeWindowsPrivateFile(target, 'other');
 const preserved = await readWindowsPrivateFile(target);
-const removed = await removeWindowsPrivateFile(target, 'before');
+const wrong = await removeWindowsPrivateFile(target, { ...preserved, sha256: '0'.repeat(64) });
+const replaced = await writeWindowsPrivateFile(target, 'ours', { replace: true, expectedText: 'before' });
+const afterRefusal = await fs.readFile(target, 'utf8');
+const expectedVersion = { sha256: preserved.sha256, fileId: preserved.fileId };
+await fs.writeFile(target, Buffer.from([0xef, 0xbb, 0xbf, ...Buffer.from('before')]));
+const bomRead = await readWindowsPrivateFile(target);
+const bomRemove = await removeWindowsPrivateFile(target, expectedVersion);
+const bomPreserved = (await fs.readFile(target)).subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]));
+await fs.writeFile(target, Buffer.from([0xff]));
+const invalidARead = await readWindowsPrivateFile(target);
+const invalidARemove = await removeWindowsPrivateFile(target, expectedVersion);
+const invalidAPreserved = (await fs.readFile(target)).equals(Buffer.from([0xff]));
+await fs.writeFile(target, Buffer.from([0xfe]));
+const invalidBRead = await readWindowsPrivateFile(target);
+const invalidBRemove = await removeWindowsPrivateFile(target, expectedVersion);
+const invalidBPreserved = (await fs.readFile(target)).equals(Buffer.from([0xfe]));
+await fs.writeFile(target, 'after');
+const changed = await removeWindowsPrivateFile(target, expectedVersion);
+const changedPreserved = (await fs.readFile(target, 'utf8')) === 'after';
+await fs.writeFile(target, 'before');
+const alternate = path.join(process.env.CBS_MEMORIA_WINDOWS_FIXTURE, 'alternate.txt');
+const alternateCreated = await writeWindowsPrivateFile(alternate, 'before');
+await fs.rm(target);
+await fs.rename(alternate, target);
+const swapped = await removeWindowsPrivateFile(target, expectedVersion);
+const swappedPreserved = (await fs.readFile(target, 'utf8')) === 'before';
+const current = await readWindowsPrivateFile(target);
+const removed = await removeWindowsPrivateFile(target, current);
+const racedCreatePath = path.join(process.env.CBS_MEMORIA_WINDOWS_FIXTURE, 'raced-create.json');
+const absent = await readWindowsPrivateFile(racedCreatePath);
+await fs.writeFile(racedCreatePath, 'external-create');
+const racedCreate = await writeWindowsPrivateFile(racedCreatePath, 'ours');
+const racedCreatePreserved = (await fs.readFile(racedCreatePath, 'utf8')) === 'external-create';
+const changedVersions = [];
+for (const name of ['snapshot', 'lease']) {
+  const value = path.join(process.env.CBS_MEMORIA_WINDOWS_FIXTURE, name + '.json');
+  const created = await writeWindowsPrivateFile(value, 'before');
+  const observed = await readWindowsPrivateFile(value);
+  await fs.writeFile(value, 'external-edit');
+  const rejected = await removeWindowsPrivateFile(value, observed);
+  changedVersions.push(created.ok && rejected.code === 'changed' &&
+    (await fs.readFile(value, 'utf8')) === 'external-edit');
+}
 let active = 0;
 let maximum = 0;
 await Promise.all([1, 2].map(() => withWindowsLock('fixture-concurrent', async held => {
@@ -449,20 +549,42 @@ try { priorGuard(); }
 catch (error) { releaseConfirmed = error.message === 'windows_lock_lost'; }
 process.stdout.write(JSON.stringify({ osRootIndependent, writablePathRejected,
   written: written.ok, wrong: wrong.code,
-  preserved: preserved.text === 'before', removed: removed.ok,
+  preserved: preserved.text === 'before', replaced: replaced.code,
+  afterRefusal, bomRead: bomRead.code, bomRemove: bomRemove.code, bomPreserved,
+  invalidARead: invalidARead.code, invalidARemove: invalidARemove.code, invalidAPreserved,
+  invalidBRead: invalidBRead.code, invalidBRemove: invalidBRemove.code, invalidBPreserved,
+  changed: changed.code, changedPreserved, alternateCreated: alternateCreated.ok,
+  swapped: swapped.code, swappedPreserved, removed: removed.ok,
+  racedCreate: racedCreate.code, racedCreatePreserved, absent: absent.code,
+  snapshotLeaseVersionPreserved: changedVersions.every(Boolean),
   concurrentMaximum: maximum, releaseConfirmed }));
 '@
   $securityResult = ($securityCode | & node --input-type=module -) | ConvertFrom-Json
   if ($LASTEXITCODE -ne 0) { throw 'Native security helper probe failed' }
   $securityOkay = $securityResult.osRootIndependent -and $securityResult.writablePathRejected -and
     $securityResult.written -and $securityResult.wrong -eq 'changed' -and
-    $securityResult.preserved -and $securityResult.removed -and
+    $securityResult.preserved -and $securityResult.replaced -eq 'unsupported_windows_replace' -and
+    $securityResult.afterRefusal -eq 'before' -and
+    $securityResult.bomRead -eq 'invalid_text' -and $securityResult.bomRemove -eq 'invalid_text' -and $securityResult.bomPreserved -and
+    $securityResult.invalidARead -eq 'invalid_text' -and $securityResult.invalidARemove -eq 'invalid_text' -and $securityResult.invalidAPreserved -and
+    $securityResult.invalidBRead -eq 'invalid_text' -and $securityResult.invalidBRemove -eq 'invalid_text' -and $securityResult.invalidBPreserved -and
+    $securityResult.changed -eq 'changed' -and $securityResult.changedPreserved -and
+    $securityResult.alternateCreated -and $securityResult.swapped -eq 'changed' -and
+    $securityResult.swappedPreserved -and $securityResult.removed -and
+    $securityResult.absent -eq 'missing' -and $securityResult.racedCreate -eq 'exists' -and
+    $securityResult.racedCreatePreserved -and $securityResult.snapshotLeaseVersionPreserved -and
     $securityResult.concurrentMaximum -eq 1 -and $securityResult.releaseConfirmed
   Record 'production_conditional_remove_and_mutex' $(if ($securityOkay) { 'passed' } else { 'failed' }) @{
     inherited_systemroot_ignored = $securityResult.osRootIndependent
     writable_path_tool_rejected = $securityResult.writablePathRejected
     wrong_bytes_refused = $securityResult.wrong
     original_bytes_preserved = $securityResult.preserved
+    existing_replace_refused = $securityResult.replaced
+    bom_invalid_bytes_and_identity_preserved = ($securityResult.bomPreserved -and
+      $securityResult.invalidAPreserved -and $securityResult.invalidBPreserved -and
+      $securityResult.changedPreserved -and $securityResult.swappedPreserved)
+    create_race_and_metadata_edit_preserved = ($securityResult.racedCreatePreserved -and
+      $securityResult.snapshotLeaseVersionPreserved)
     matching_remove_succeeded = $securityResult.removed
     maximum_concurrent_callbacks = $securityResult.concurrentMaximum
     native_release_acknowledged = $securityResult.releaseConfirmed
@@ -514,6 +636,7 @@ await withWindowsLock('fixture-process-crash', async held => {
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $info
     [void]$process.Start()
+    $script:lockExecuted = $true
     $process.StandardInput.Write($lockCode)
     $process.StandardInput.Close()
     return $process
@@ -529,13 +652,13 @@ await withWindowsLock('fixture-process-crash', async held => {
   while (!(Test-Path -LiteralPath (Join-Path $fixture 'reacquire.ready')) -and !$second.HasExited -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
   $reacquired = Test-Path -LiteralPath (Join-Path $fixture 'reacquire.ready')
   $recordPreserved = [System.IO.File]::ReadAllText((Join-Path $fixture 'crash-record.json')).TrimEnd([char[]]"`r`n") -eq '{"fixture":true}'
-  Record 'own_child_lock_crash_fixture' $(if ($reacquired -and $recordPreserved) { 'observed' } else { 'unproved' }) @{
+  Record-LockOutcome $lockExecuted ($reacquired -and $recordPreserved) @{
     lock_reacquired_after_recorded_child_termination = $reacquired
     fsynced_renamed_record_readable_after_child_termination = $recordPreserved
     power_loss_durability = 'unproved'; production_outbox_replay = 'unproved'
   }
 } catch {
-  Record 'own_child_lock_crash_fixture' 'unproved' @{ error_type = $_.Exception.GetType().Name }
+  Record-LockOutcome $lockExecuted $false @{ error_type = $_.Exception.GetType().Name }
 } finally {
   foreach ($process in @($child, $second)) {
     if ($process -and !$process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }

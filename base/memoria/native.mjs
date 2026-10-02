@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +25,13 @@ const hash = (value) => createHash('sha256').update(value).digest('hex');
 const stateRoot = (options) => options.stateRoot ?? path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
 const snapshotFile = (root, cli, options) => path.join(stateRoot(options), hash(options.projectRoot ?? root),
   (options.projectRoot && options.projectRoot !== root ? `native-${cli}-${hash(root)}.json` : `native-${cli}.json`));
+const versionFile = snapshot => `${snapshot}.versions`;
+const validVersion = value => /^[a-f0-9]{64}$/.test(value?.sha256 ?? '') &&
+  /^[a-f0-9]{8}:[a-f0-9]{16}$/.test(value?.fileId ?? '');
+const fileVersion = value => validVersion(value)
+  ? { sha256: value.sha256, fileId: value.fileId } : null;
+const sameVersion = (actual, expected) => validVersion(actual) && validVersion(expected) &&
+  actual.sha256 === expected.sha256 && actual.fileId === expected.fileId;
 const configFile = (root, cli) => path.join(root, cli === 'claude' ? '.claude/settings.local.json' : '.codex/config.toml');
 const captureEvents = { claude: ['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'SessionEnd'],
   codex: ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'] };
@@ -153,11 +160,13 @@ async function removeExclude(plan) {
   await writeAtomic(plan.file, current.replace(plan.block, ''), false, current);
   return true;
 }
-async function leaseExclude(plan, root, options, remove = false) {
+const excludeLeaseFile = (plan, root, options) => path.join(stateRoot(options),
+  hash(options.projectRoot ?? root), `exclude-${hash(`${plan.file}:${plan.block}`)}.json`);
+async function leaseExclude(plan, root, options, remove = false, expectedVersion = null) {
   if (!plan?.file || !plan.block) return true;
   const canonical = options.projectRoot ?? root;
   const state = path.join(stateRoot(options), hash(canonical));
-  const leaseFile = path.join(state, `exclude-${hash(`${plan.file}:${plan.block}`)}.json`);
+  const leaseFile = excludeLeaseFile(plan, root, options);
   const lock = process.platform === 'win32' ? withWindowsLock : withProjectLock;
   return lock(state, async (assertHeld = () => {}) => {
     const mutate = async operation => {
@@ -166,6 +175,29 @@ async function leaseExclude(plan, root, options, remove = false) {
       assertHeld();
       return result;
     };
+    if (process.platform === 'win32') {
+      let observed;
+      try { observed = await readOptionalVersion(leaseFile, true); }
+      catch { return false; }
+      if (!remove) {
+        if (observed || plan.added) return false;
+        const lease = { file: plan.file, block: plan.block, createdByCBS: false, owners: [root] };
+        try { return await mutate(() => writeAtomic(leaseFile, JSON.stringify(lease) + '\n', true, '')); }
+        catch { return false; }
+      }
+      if (!observed) return !plan.added;
+      if (!sameVersion(observed, expectedVersion)) return false;
+      let lease;
+      try { lease = JSON.parse(observed.text); } catch { return false; }
+      if (plan.added || lease.file !== plan.file || lease.block !== plan.block ||
+          lease.createdByCBS !== false || lease.releasing ||
+          !Array.isArray(lease.owners) || lease.owners.length !== 1 || lease.owners[0] !== root) {
+        return false;
+      }
+      try { await mutate(() => removeIfCurrent(leaseFile, observed, true)); }
+      catch { return false; }
+      return true;
+    }
     let lease;
     try {
       const raw = await readOptional(leaseFile, true);
@@ -224,9 +256,19 @@ async function readOptional(file, privateState = false) {
   try { return await fs.readFile(file, 'utf8'); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
-async function removeIfCurrent(file, expectedText, privateState = false) {
+async function readOptionalVersion(file, privateState = false) {
   if (process.platform === 'win32') {
-    const removed = await removeWindowsPrivateFile(file, expectedText, { privateState });
+    const result = await readWindowsPrivateFile(file, { privateState });
+    if (result.ok) return result;
+    if (result.code === 'missing') return null;
+    throw new Error('unsafe_native_file');
+  }
+  const text = await readOptional(file, privateState);
+  return text === null ? null : { text };
+}
+async function removeIfCurrent(file, expectedVersion, privateState = false) {
+  if (process.platform === 'win32') {
+    const removed = await removeWindowsPrivateFile(file, expectedVersion, { privateState });
     if (!removed.ok) throw new Error(removed.code);
     return;
   }
@@ -234,17 +276,16 @@ async function removeIfCurrent(file, expectedText, privateState = false) {
 }
 async function writeAtomic(file, contents, privateState = true, expectedText) {
   if (process.platform === 'win32') {
+    if (expectedText === undefined) throw new Error('expected_version_required');
+    if (expectedText !== '') throw new Error('unsupported_windows_replace');
     const directory = await ensureWindowsPrivateDirectory(path.dirname(file), { privateState });
     if (!directory.ok) throw new Error('unsafe_native_directory');
     const existing = await readWindowsPrivateFile(file, { privateState });
     if (!existing.ok && existing.code !== 'missing') throw new Error('unsafe_native_file');
-    if (expectedText !== undefined && (existing.ok ? existing.text : '') !== expectedText) {
-      throw new Error('native_config_changed');
-    }
-    const written = await writeWindowsPrivateFile(file, contents,
-      { replace: existing.ok, privateState, expectedText: existing.ok ? existing.text : null });
+    if (existing.ok) throw new Error('unsupported_windows_replace');
+    const written = await writeWindowsPrivateFile(file, contents, { privateState });
     if (!written.ok) throw new Error(written.code);
-    return;
+    return written;
   }
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
@@ -252,6 +293,25 @@ async function writeAtomic(file, contents, privateState = true, expectedText) {
     await fs.writeFile(temp, contents, { flag: 'wx', mode: 0o600 });
     await fs.rename(temp, file);
   } catch (error) { await fs.rm(temp, { force: true }); throw error; }
+}
+
+async function readWindowsManifest(snapshot, saved, snapshotVersion) {
+  const observed = await readOptionalVersion(versionFile(snapshot), true);
+  if (!observed) return { kind: 'missing' };
+  let data;
+  try { data = JSON.parse(observed.text); } catch { return { kind: 'invalid' }; }
+  const hasCapture = saved.cli === 'codex';
+  if (!/^[a-f0-9-]{36}$/.test(saved.nonce ?? '') || !data ||
+      Object.keys(data).join(',') !== 'nonce,snapshot,config,capture,exclude,captureExclude' ||
+      observed.text !== JSON.stringify(data) + '\n' ||
+      ![data.snapshot, data.config, data.exclude,
+        ...(hasCapture ? [data.capture, data.captureExclude] : [])]
+        .every(value => Object.keys(value ?? {}).join(',') === 'sha256,fileId') ||
+      data.nonce !== saved.nonce || !sameVersion(snapshotVersion, data.snapshot) ||
+      !validVersion(data.config) || !validVersion(data.exclude) ||
+      (hasCapture ? !validVersion(data.capture) || !validVersion(data.captureExclude)
+        : data.capture !== null || data.captureExclude !== null)) return { kind: 'invalid' };
+  return { kind: 'valid', data, observed };
 }
 
 function claudeEdit(raw, prior) {
@@ -343,6 +403,8 @@ export async function applyNativeExclusion(root, options = {}) {
   if (await tracked(root, file)) return blocked('tracked_native_config');
   const snapshot = snapshotFile(root, cli, options);
   if (!await safeParent(snapshot, true) || !await safeFile(snapshot, true)) return blocked('unsafe_snapshot');
+  const versionsPath = versionFile(snapshot);
+  if (process.platform === 'win32' && !await safeFile(versionsPath, true)) return blocked('unsafe_snapshot');
   const priorSnapshot = await readOptional(snapshot, true);
   if (priorSnapshot !== null) {
     let saved;
@@ -356,6 +418,9 @@ export async function applyNativeExclusion(root, options = {}) {
     const verification = await verifyNativeCapture(root, { ...options, projectRoot: scope.projectRoot });
     return verification.kind === 'verified' ? { kind: 'applied', existing: true } : blocked(verification.reason);
   }
+  if (process.platform === 'win32' && await readOptional(versionsPath, true) !== null) {
+    return blocked('native_recovery_required');
+  }
   const raw = await readOptional(file);
   const edit = (cli === 'claude' ? claudeEdit : codexEdit)(raw);
   if (!edit) return blocked('invalid_native_config');
@@ -368,19 +433,36 @@ export async function applyNativeExclusion(root, options = {}) {
   const exclude = await excludePlan(root, cli);
   const captureExclude = cli === 'codex' ? await excludePlan(root, cli, capturePath) : { added: false };
   if (!exclude || !captureExclude) return blocked('unsafe_git_exclude');
+  if (process.platform === 'win32' && (raw !== null ||
+      (cli === 'codex' && captureRaw !== null) || exclude.added || captureExclude.added)) {
+    return blocked('unsupported_windows_replace');
+  }
   const save = { cli, file, projectRoot: scope.projectRoot, nativeRoot: root, leased: true,
     existed: raw !== null, had: edit.had, previous: edit.previous,
     hadEnabledPlugins: cli === 'claude' && raw !== null && Object.hasOwn(JSON.parse(raw), 'enabledPlugins'),
     hadSection: edit.hadSection, old: edit.old, exclude,
     capturePath, captureExisted: cli === 'codex' && captureRaw !== null, captureExclude,
     pluginChecked: cli === 'codex' };
+  if (process.platform === 'win32') {
+    save.rollback = { config: null, capture: null };
+    save.nonce = randomUUID();
+  }
   const snapshotText = JSON.stringify(save) + '\n';
-  await writeAtomic(snapshot, snapshotText);
+  let snapshotVersion;
+  try { snapshotVersion = await writeAtomic(snapshot, snapshotText, true, ''); }
+  catch (error) {
+    if (process.platform === 'win32') return blocked(error.message === 'unsupported_windows_replace'
+      ? 'native_snapshot_changed' : 'unsafe_snapshot');
+    throw error;
+  }
   let leasedExclude = false;
   let leasedCapture = false;
+  let configVersion;
+  let captureVersion;
+  let manifestVersion;
   try {
-    await writeAtomic(file, cli === 'claude' ? captureEdit : edit.raw, false, raw ?? '');
-    if (cli === 'codex') await writeAtomic(capturePath, captureEdit, false, captureRaw ?? '');
+    configVersion = await writeAtomic(file, cli === 'claude' ? captureEdit : edit.raw, false, raw ?? '');
+    if (cli === 'codex') captureVersion = await writeAtomic(capturePath, captureEdit, false, captureRaw ?? '');
     leasedExclude = await leaseExclude(exclude, root, { ...options, projectRoot: scope.projectRoot });
     if (!leasedExclude) throw new Error('exclude_lease_failed');
     leasedCapture = await leaseExclude(captureExclude, root, { ...options, projectRoot: scope.projectRoot });
@@ -389,7 +471,22 @@ export async function applyNativeExclusion(root, options = {}) {
         (cli === 'codex' && !await actuallyIgnored(root, captureExclude.target)))) {
       throw new Error('git_exclude_unverified');
     }
+    if (process.platform === 'win32') {
+      const manifest = { nonce: save.nonce, snapshot: fileVersion(snapshotVersion),
+        config: fileVersion(configVersion), capture: cli === 'codex' ? fileVersion(captureVersion) : null,
+        exclude: fileVersion(leasedExclude),
+        captureExclude: cli === 'codex' ? fileVersion(leasedCapture) : null };
+      if (!manifest.snapshot || !manifest.config || !manifest.exclude ||
+          (cli === 'codex' && (!manifest.capture || !manifest.captureExclude))) {
+        throw new Error('native_version_missing');
+      }
+      manifestVersion = await writeAtomic(versionsPath, JSON.stringify(manifest) + '\n', true, '');
+      if (!sameVersion(await readOptionalVersion(snapshot, true), snapshotVersion)) {
+        throw new Error('native_snapshot_changed');
+      }
+    }
   }
+
   catch (error) {
     try {
       const current = await readOptional(file);
@@ -400,19 +497,21 @@ export async function applyNativeExclusion(root, options = {}) {
         return blocked('native_rollback_failed');
       }
       const captureReleased = !leasedCapture || await leaseExclude(captureExclude, root,
-        { ...options, projectRoot: scope.projectRoot }, true).catch(() => false);
+        { ...options, projectRoot: scope.projectRoot }, true, fileVersion(leasedCapture)).catch(() => false);
       const excludeReleased = !leasedExclude || await leaseExclude(exclude, root,
-        { ...options, projectRoot: scope.projectRoot }, true).catch(() => false);
+        { ...options, projectRoot: scope.projectRoot }, true, fileVersion(leasedExclude)).catch(() => false);
       if (!captureReleased || !excludeReleased) return blocked('native_rollback_failed');
       if (current !== raw) {
-        if (raw === null) await removeIfCurrent(file, installed);
+        if (raw === null) await removeIfCurrent(file, process.platform === 'win32' ? configVersion : installed);
         else await writeAtomic(file, raw, false, installed);
       }
       if (cli === 'codex' && currentCapture !== captureRaw) {
-        if (captureRaw === null) await removeIfCurrent(capturePath, captureEdit);
+        if (captureRaw === null) await removeIfCurrent(capturePath,
+          process.platform === 'win32' ? captureVersion : captureEdit);
         else await writeAtomic(capturePath, captureRaw, false, captureEdit);
       }
-      await removeIfCurrent(snapshot, snapshotText, true);
+      if (manifestVersion) await removeIfCurrent(versionsPath, manifestVersion, true);
+      await removeIfCurrent(snapshot, process.platform === 'win32' ? snapshotVersion : snapshotText, true);
       return blocked('native_write_failed');
     } catch { return blocked('native_rollback_failed'); }
   }
@@ -434,9 +533,25 @@ export async function restoreNativeExclusion(root, options = {}) {
   }
   const snapshot = snapshotFile(root, cli, options);
   let saved;
+  let savedVersion;
   if (!await safeFile(snapshot, true)) return blocked('unsafe_snapshot');
-  try { saved = JSON.parse(await readOptional(snapshot, true)); }
+  try {
+    savedVersion = await readOptionalVersion(snapshot, true);
+    saved = JSON.parse(savedVersion?.text);
+  }
   catch { return blocked('missing_snapshot'); }
+  if (process.platform === 'win32' && !saved.rollback) return blocked('unsupported_windows_replace');
+  let manifest;
+  if (process.platform === 'win32') {
+    if (saved.leased !== true || !saved.exclude?.file || !saved.exclude?.block ||
+        (cli === 'codex' && (!saved.captureExclude?.file || !saved.captureExclude?.block)) ||
+        saved.existed || saved.captureExisted || saved.exclude?.added ||
+        saved.captureExclude?.added || saved.rollback.config !== null ||
+        saved.rollback.capture !== null) return blocked('unsupported_windows_replace');
+    try { manifest = await readWindowsManifest(snapshot, saved, savedVersion); }
+    catch { return blocked('native_recovery_required'); }
+    if (manifest.kind === 'invalid') return blocked('native_recovery_required');
+  }
   const file = configFile(root, cli);
   const scope = await identifyProject(root);
   if (scope.kind !== 'git' || scope.projectRoot !== (options.projectRoot ?? scope.projectRoot) ||
@@ -447,8 +562,34 @@ export async function restoreNativeExclusion(root, options = {}) {
   const capturePath = saved.capturePath;
   if (hasCapture && (capturePath !== (cli === 'claude' ? file : hookFile(root)) ||
       !await safeFile(capturePath))) return blocked('unsafe_capture_hooks');
-  const raw = await readOptional(file);
-  const captureRaw = hasCapture ? await readOptional(capturePath) : null;
+  const rawVersion = await readOptionalVersion(file);
+  const raw = rawVersion?.text ?? null;
+  const captureVersion = hasCapture ? await readOptionalVersion(capturePath) : null;
+  const captureRaw = captureVersion?.text ?? null;
+  if (process.platform === 'win32') {
+    const leaseVersions = [];
+    try {
+      for (const plan of [saved.exclude, saved.captureExclude]) {
+        leaseVersions.push(plan?.file && plan?.block
+          ? await readOptionalVersion(excludeLeaseFile(plan, root, options), true) : null);
+      }
+    } catch { return blocked('native_recovery_required'); }
+    if (manifest.kind === 'missing') {
+      if (rawVersion || (cli === 'codex' && captureVersion) || leaseVersions.some(Boolean)) {
+        return blocked('native_recovery_required');
+      }
+      try { await removeIfCurrent(snapshot, savedVersion, true); }
+      catch { return blocked('native_snapshot_changed'); }
+      return { kind: 'restored' };
+    }
+    if ((rawVersion && !sameVersion(rawVersion, manifest.data.config)) ||
+        (cli === 'codex' && captureVersion && !sameVersion(captureVersion, manifest.data.capture)) ||
+        (leaseVersions[0] && !sameVersion(leaseVersions[0], manifest.data.exclude)) ||
+        (cli === 'codex' && leaseVersions[1] &&
+          !sameVersion(leaseVersions[1], manifest.data.captureExclude))) {
+      return blocked('native_config_changed');
+    }
+  }
   let plan = saved.rollback;
   if (!plan) {
     if (raw === null) return blocked('native_config_changed');
@@ -486,19 +627,28 @@ export async function restoreNativeExclusion(root, options = {}) {
   if (!saved.rollback && saved.captureExclude?.added && !(await readOptional(saved.captureExclude.file))?.includes(saved.captureExclude.block)) {
     return blocked('git_exclude_changed');
   }
+  if (process.platform === 'win32' &&
+      ((raw !== plan.config && plan.config !== null) ||
+       (cli === 'codex' && hasCapture && captureRaw !== plan.capture && plan.capture !== null))) {
+    return blocked('unsupported_windows_replace');
+  }
   try {
     if (!saved.rollback) await writeAtomic(snapshot, JSON.stringify({ ...saved, rollback: plan }) + '\n');
     if (raw !== plan.config) {
-      if (plan.config === null) await removeIfCurrent(file, raw);
+      if (plan.config === null) await removeIfCurrent(file,
+        process.platform === 'win32' ? rawVersion : raw);
       else await writeAtomic(file, plan.config, false, raw ?? '');
     }
     if (cli === 'codex' && hasCapture && captureRaw !== plan.capture) {
-      if (plan.capture === null) await removeIfCurrent(capturePath, captureRaw);
+      if (plan.capture === null) await removeIfCurrent(capturePath,
+        process.platform === 'win32' ? captureVersion : captureRaw);
       else await writeAtomic(capturePath, plan.capture, false, captureRaw ?? '');
     }
     if (saved.leased) {
-      if (!await leaseExclude(saved.exclude, root, { ...options, projectRoot: scope.projectRoot }, true) ||
-          !await leaseExclude(saved.captureExclude, root, { ...options, projectRoot: scope.projectRoot }, true)) {
+      if (!await leaseExclude(saved.exclude, root, { ...options, projectRoot: scope.projectRoot },
+        true, manifest?.data.exclude) ||
+          !await leaseExclude(saved.captureExclude, root, { ...options, projectRoot: scope.projectRoot },
+            true, manifest?.data.captureExclude)) {
         return blocked('git_exclude_changed');
       }
     } else {
@@ -506,8 +656,17 @@ export async function restoreNativeExclusion(root, options = {}) {
         return blocked('git_exclude_changed');
       }
     }
-  } catch { return blocked('git_exclude_changed'); }
-  await removeIfCurrent(snapshot, await readOptional(snapshot, true), true);
+  } catch (error) {
+    return blocked(process.platform === 'win32' && error.message === 'changed'
+      ? 'native_config_changed' : 'git_exclude_changed');
+  }
+  if (process.platform === 'win32') {
+    try { await removeIfCurrent(versionFile(snapshot), manifest.observed, true); }
+    catch { return blocked('native_snapshot_changed'); }
+  }
+  try { await removeIfCurrent(snapshot, process.platform === 'win32'
+    ? savedVersion : await readOptional(snapshot, true), true); }
+  catch { return blocked('native_snapshot_changed'); }
   return { kind: 'restored' };
 }
 
@@ -529,7 +688,14 @@ export async function verifyNativeCapture(root, options = {}) {
   if (!await safeFile(file) || !await safeFile(capturePath) || await tracked(root, file) ||
       (cli === 'codex' && await tracked(root, capturePath))) return blocked('unsafe_native_config');
   let saved;
-  try { saved = JSON.parse(await readOptional(snapshotFile(root, cli, options), true)); }
+  const snapshot = snapshotFile(root, cli, options);
+  let snapshotVersion;
+  try {
+    if (process.platform === 'win32') {
+      snapshotVersion = await readOptionalVersion(snapshot, true);
+      saved = JSON.parse(snapshotVersion?.text);
+    } else saved = JSON.parse(await readOptional(snapshot, true));
+  }
   catch { return blocked('missing_native_snapshot'); }
   if (!saved || saved.cli !== cli || saved.file !== file || saved.capturePath !== capturePath ||
       (saved.projectRoot && saved.projectRoot !== scope.projectRoot) ||
@@ -539,8 +705,31 @@ export async function verifyNativeCapture(root, options = {}) {
       (cli === 'codex' && !await actuallyIgnored(root, windowsGitPattern(root, capturePath).slice(1))))) {
     return blocked('git_exclude_unverified');
   }
-  const raw = await readOptional(file);
-  const captureRaw = await readOptional(capturePath);
+  let manifest;
+  if (process.platform === 'win32') {
+    try { manifest = await readWindowsManifest(snapshot, saved, snapshotVersion); }
+    catch { return blocked('native_recovery_required'); }
+    if (manifest.kind !== 'valid') return blocked('native_recovery_required');
+  }
+  const rawVersion = process.platform === 'win32' ? await readOptionalVersion(file) : null;
+  const captureVersion = process.platform === 'win32' && cli === 'codex'
+    ? await readOptionalVersion(capturePath) : null;
+  const raw = process.platform === 'win32' ? rawVersion?.text : await readOptional(file);
+  const captureRaw = process.platform === 'win32' ?
+    (cli === 'claude' ? raw : captureVersion?.text) : await readOptional(capturePath);
+  if (process.platform === 'win32' && (!sameVersion(rawVersion, manifest.data.config) ||
+      (cli === 'codex' && !sameVersion(captureVersion, manifest.data.capture)))) {
+    return blocked('native_config_changed');
+  }
+  if (process.platform === 'win32') {
+    const excludeLease = await readOptionalVersion(excludeLeaseFile(saved.exclude, root, options), true);
+    const captureLease = cli === 'codex'
+      ? await readOptionalVersion(excludeLeaseFile(saved.captureExclude, root, options), true) : null;
+    if (!sameVersion(excludeLease, manifest.data.exclude) ||
+        (cli === 'codex' && !sameVersion(captureLease, manifest.data.captureExclude))) {
+      return blocked('git_exclude_changed');
+    }
+  }
   if (!raw || !captureRaw || !(cli === 'claude' ? claudeEdit(raw, saved) : codexEdit(raw, saved))) {
     return blocked('native_config_changed');
   }
