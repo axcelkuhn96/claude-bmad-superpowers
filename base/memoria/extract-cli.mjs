@@ -2,27 +2,29 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { extractionSchema, validateExtractionOutput } from './extract-contract.mjs';
 
-const schema = JSON.stringify({ type: 'object', additionalProperties: false,
-  required: ['candidates', 'no_facts'], properties: {
-    no_facts: { type: 'boolean' }, candidates: { type: 'array', maxItems: 5, items: {
-      type: 'object', additionalProperties: false,
-      required: ['candidate_key', 'source_message_id', 'text', 'type', 'scope'], properties: {
-        candidate_key: { type: 'string' }, source_message_id: { type: 'string' },
-        logical_key: { type: 'string' }, text: { type: 'string' }, type: { type: 'string' },
-        scope: { type: 'string' }, owner_id: { type: 'string' },
-        condition: { type: 'string' }, valid_from: { type: 'string' }, valid_to: { type: 'string' },
-        supersedes_id: { type: 'string' },
-      },
-    } },
-  },
-});
+const schema = JSON.stringify(extractionSchema);
+const tokenCount = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
 
 export async function runSonnetExtraction(prompt, policy = {}) {
-  if (policy.route !== 'sonnet' || policy.account !== 'claude2' ||
+  if (policy.route !== 'sonnet' ||
       typeof prompt !== 'string' || Buffer.byteLength(prompt) > 1024 * 1024) {
     return { kind: 'error', reason: 'invalid_cli_request' };
   }
+  const configuredProfile = process.env.CLAUDE_CONFIG_DIR;
+  if (!configuredProfile) return { kind: 'error', reason: 'cli_profile_unselected' };
+  let profile;
+  try {
+    if (!path.isAbsolute(configuredProfile)) throw new Error('relative profile');
+    profile = await fs.realpath(configuredProfile);
+    const project = await fs.realpath(process.cwd());
+    const metadata = await fs.stat(profile);
+    if (!metadata.isDirectory() || profile === project || profile.startsWith(project + path.sep) ||
+        !process.getuid || metadata.uid !== process.getuid() || (metadata.mode & 0o022)) {
+      throw new Error('untrusted profile');
+    }
+  } catch { return { kind: 'error', reason: 'cli_profile_untrusted' }; }
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-extract-'));
   await fs.chmod(cwd, 0o700);
   try {
@@ -31,7 +33,7 @@ export async function runSonnetExtraction(prompt, policy = {}) {
         '--model', 'sonnet', '--no-session-persistence', '--permission-mode', 'dontAsk',
         '--max-budget-usd', '0.10', '--json-schema', schema];
       const env = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: cwd,
-        CLAUDE_CONFIG_DIR: '/home/axcel/.claude-conta2', LANG: 'C.UTF-8' };
+        CLAUDE_CONFIG_DIR: profile, LANG: 'C.UTF-8' };
       const child = spawn('claude', args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
       let output = '';
       let oversized = false;
@@ -55,18 +57,24 @@ export async function runSonnetExtraction(prompt, policy = {}) {
         if (code !== 0) return finish({ kind: 'error', reason: 'cli_failed' });
         let result;
         try { result = JSON.parse(output); } catch { return finish({ kind: 'error', reason: 'cli_invalid_json' }); }
-        if (result.subtype !== 'success' || result.is_error || !result.structured_output ||
-            !Array.isArray(result.structured_output.candidates) ||
-            typeof result.structured_output.no_facts !== 'boolean') {
+        if (!result || typeof result !== 'object' || Array.isArray(result) ||
+            result.subtype !== 'success' || result.is_error ||
+            !validateExtractionOutput(result.structured_output)) {
           return finish({ kind: 'error', reason: 'cli_invalid_schema' });
         }
         const model = Object.values(result.modelUsage ?? {})[0]?.canonicalModel;
         if (typeof model !== 'string' || !/^claude-sonnet-[a-z0-9-]+$/.test(model)) {
           return finish({ kind: 'error', reason: 'cli_model_mismatch' });
         }
+        const inputUncachedTokens = tokenCount(result.usage?.input_tokens);
+        const inputCacheReadTokens = tokenCount(result.usage?.cache_read_input_tokens);
+        const inputCacheCreationTokens = tokenCount(result.usage?.cache_creation_input_tokens);
+        const knownInput = [inputUncachedTokens, inputCacheReadTokens, inputCacheCreationTokens]
+          .filter(value => value !== null);
         return finish({ kind: 'success', ...result.structured_output, model,
-          usage: { inputTokens: result.usage?.input_tokens ?? null,
-            outputTokens: result.usage?.output_tokens ?? null,
+          usage: { inputTokens: knownInput.length ? knownInput.reduce((sum, value) => sum + value, 0) : null,
+            inputUncachedTokens, inputCacheReadTokens, inputCacheCreationTokens,
+            outputTokens: tokenCount(result.usage?.output_tokens),
             costUsd: result.total_cost_usd ?? null } });
       });
       child.stdin.on('error', () => {});

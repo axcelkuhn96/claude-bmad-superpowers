@@ -10,6 +10,7 @@ import { validateCandidate, extractCheckpoint, approveCandidate, rejectCandidate
   markDuplicateCandidate } from '../base/memoria/candidates.mjs';
 import { storeMemory } from '../base/memoria/bridge.mjs';
 import { runSonnetExtraction } from '../base/memoria/extract-cli.mjs';
+import { extractionSchema, validateExtractionOutput } from '../base/memoria/extract-contract.mjs';
 import { parsePersistedSlice } from '../base/memoria/transcript.mjs';
 
 const source = { origin: 'human', actor: 'user', speakerRole: 'user', text: 'Fable faz só revisão final; Mira implementa.',
@@ -22,6 +23,10 @@ const slice = { cli: 'claude', sessionId: 's', start: 0, end: 80, sliceHash: 'a'
 const syntheticToken = ['sk', 'synthetic12345678901234567890'].join('-');
 const syntheticKeyBody = ['abcPRIVATE', 'KEYbody123'].join('');
 const beginPrivateKey = ['-----BEGIN', 'PRIVATE KEY-----'].join(' ');
+const modelCandidate = { candidate_key: 'fable_review', source_message_id: 'm1',
+  text: source.text, type: 'rule', scope: 'project', condition: 'revisão final' };
+const modelFact = { candidate_key: 'fable_review', source_message_id: 'm1',
+  text: source.text, type: 'fact', scope: 'project' };
 
 async function fixture(t, messages = [source]) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-candidates-'));
@@ -73,10 +78,12 @@ test('assistant report without observation stays assistant report', () => {
     speaker_role: 'assistant', origin: 'assistant_report', type: 'report', condition: null }, assistant).eligible, true);
 });
 
-test('historical evidence and condition are required, transient episodes stay inactive', () => {
+test('historical evidence and supplied condition are preserved, transient episodes stay inactive', () => {
   assert.equal(validateCandidate(candidate, source).eligible, true);
   assert.ok(validateCandidate({ ...candidate, evidence_at: '2026-10-01T00:00:00Z' }, source).reasons.includes('evidence_date_mismatch'));
   assert.ok(validateCandidate({ ...candidate, condition: '' }, source).reasons.includes('unsupported_claim'));
+  assert.ok(validateCandidate({ ...candidate, text: 'Fable faz', condition: 'revisão final' },
+    source).reasons.includes('unsupported_claim'));
   assert.ok(validateCandidate({ ...candidate, type: 'episode', valid_to: null }, source).reasons.includes('transient_episode'));
   assert.ok(validateCandidate({ ...candidate, source_offsets: { start: 1, end: 80 } }, source).reasons.includes('source_mismatch'));
   assert.ok(validateCandidate({ ...candidate, scope: null }, source).reasons.includes('missing_scope'));
@@ -113,8 +120,8 @@ test('AWS key and JWT are absent from CLI input and cannot become candidates', a
   const { box, checkpoint } = await fixture(t, [sensitiveSource]);
   let prompt;
   const result = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async input => { prompt = input; return { kind: 'success', candidates: [
-      { ...candidate, text: aws },
+    outbox: box, runCli: async input => { prompt = input; return { kind: 'success', no_facts: false, candidates: [
+      { ...modelCandidate, text: aws },
     ] }; },
   });
   assert.equal(prompt.includes(aws), false);
@@ -146,8 +153,8 @@ test('safe fact beside source secrets reaches remote payload without secret byte
     text: `${source.text}\npassword: "${password}"\n${privateKey}` }]);
   let prompt, operation;
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async input => { prompt = input; return { kind: 'success',
-      candidates: [candidate] }; },
+    outbox: box, runCli: async input => { prompt = input; return { kind: 'success', no_facts: false,
+      candidates: [modelCandidate] }; },
   })).kind, 'manifested');
   assert.equal((await sealFixture(box, checkpoint.operationId, 'fable_review', 'approve')).kind, 'sealed');
   assert.equal((await approveCandidate(checkpoint.operationId, 'fable_review', {
@@ -169,8 +176,8 @@ test('space-separated quoted password cannot reach prompt, candidate or sealed s
   const { dir, box, checkpoint } = await fixture(t, [message]);
   let prompt;
   const poisoned = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async input => { prompt = input; return { kind: 'success', candidates: [
-      { ...candidate, text: 'beta gamma', type: 'fact', condition: null },
+    outbox: box, runCli: async input => { prompt = input; return { kind: 'success', no_facts: false, candidates: [
+      { ...modelFact, text: 'beta gamma' },
     ] }; },
   });
   assert.equal(prompt.includes(value), false);
@@ -180,8 +187,8 @@ test('space-separated quoted password cannot reach prompt, candidate or sealed s
   assert.equal((await box.readManifest(checkpoint.operationId)).reason, 'missing_manifest');
 
   const clean = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [
-      { ...candidate, text: fact, type: 'fact', condition: null },
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [
+      { ...modelFact, text: fact },
     ] }),
   });
   assert.equal(clean.kind, 'manifested');
@@ -213,8 +220,8 @@ test('unquoted password with spaces cannot reach prompt, candidate, review seal 
   const { dir, box, checkpoint } = await fixture(t, [message]);
   let prompt;
   const poisoned = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async input => { prompt = input; return { kind: 'success', candidates: [
-      { ...candidate, text: tail, type: 'fact', condition: null },
+    outbox: box, runCli: async input => { prompt = input; return { kind: 'success', no_facts: false, candidates: [
+      { ...modelFact, text: tail },
     ] }; },
   });
   assert.equal(prompt.includes(tail), false);
@@ -225,8 +232,8 @@ test('unquoted password with spaces cannot reach prompt, candidate, review seal 
   assert.equal((await box.readManifest(checkpoint.operationId)).reason, 'missing_manifest');
 
   const clean = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [
-      { ...candidate, text: fact, type: 'fact', condition: null },
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [
+      { ...modelFact, text: fact },
     ] }),
   });
   assert.equal(clean.kind, 'manifested');
@@ -319,7 +326,7 @@ test('incomplete private key blocks CLI before any call', async t => {
 test('model-controlled metadata with secret cannot be persisted or published', async t => {
   const { box, checkpoint } = await fixture(t);
   const result = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [{ ...candidate,
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [{ ...modelCandidate,
       logical_key: syntheticToken }] }),
   });
   assert.equal(result.reason, 'sensitive_content');
@@ -359,11 +366,9 @@ test('extraction derives actor, origin and evidence date from native human sourc
   const checkpoint = { ...item, operationId: queued.operationId, projectId: 'p', policyVersion: 'native-v1' };
   const selected = parsed.messages[0];
   const result = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', model: 'claude-sonnet-4-5',
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, model: 'claude-sonnet-4-5',
       candidates: [{ candidate_key: 'fable_review', source_message_id: selected.messageId,
-        text: selected.text, type: 'rule', condition: 'revisão final', scope: 'project',
-        actor: 'assistant', speaker_role: 'assistant', origin: 'assistant_report',
-        evidence_at: '2026-10-01T00:00:00Z' }] }),
+        text: selected.text, type: 'rule', condition: 'revisão final', scope: 'project' }] }),
   });
   assert.equal(result.kind, 'manifested');
   const payload = await box.readCandidatePayload(checkpoint.operationId, 'fable_review');
@@ -376,7 +381,7 @@ test('extraction derives actor, origin and evidence date from native human sourc
 test('callback-shaped model JSON cannot authorize an approval', async t => {
   const { box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   const result = await approveCandidate(checkpoint.operationId, 'fable_review', { outbox: box,
     review: async (_item, sha) => ({ decision: 'approve', payloadSha256: sha, approved: true }),
@@ -387,7 +392,7 @@ test('callback-shaped model JSON cannot authorize an approval', async t => {
 test('sealed operation with injected secret metadata cannot reach remote store', async t => {
   const { box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   const entry = (await box.readManifest(checkpoint.operationId)).candidates[0];
   const payload = await box.readCandidatePayload(checkpoint.operationId, 'fable_review');
@@ -410,7 +415,7 @@ test('sealed operation with injected secret metadata cannot reach remote store',
 test('owner terminal rejection records local UID, username, item hash and decision', async t => {
   const { dir, box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   const entry = (await box.readManifest(checkpoint.operationId)).candidates[0];
   const runner = path.join(dir, 'owner-review.mjs');
@@ -440,6 +445,7 @@ test('owner terminal rejection records local UID, username, item hash and decisi
   assert.match(output, /RESULT=\{"kind":"processed"/);
   assert.ok(output.includes(entry.payloadRef.sha256));
   assert.ok(output.includes(candidate.text));
+  assert.ok(output.includes(`Source ${JSON.stringify(source.text)}`));
   const audit = JSON.parse(await fs.readFile(path.join(dir, 'candidates', 'reviews', `${entry.externalId}.json`)));
   assert.equal(audit.review.actor, `uid:${process.getuid()}:${os.userInfo().username}`);
   assert.equal(audit.review.decision, 'reject');
@@ -449,7 +455,7 @@ test('owner terminal rejection records local UID, username, item hash and decisi
 test('owner terminal acceptance seals review before one verified child ACK', async t => {
   const { dir, box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   const runner = path.join(dir, 'owner-accept.mjs');
   await fs.writeFile(runner, `import { createOutbox } from ${JSON.stringify(new URL('../base/memoria/outbox.mjs', import.meta.url).href)};\n` +
@@ -487,9 +493,9 @@ test('owner terminal acceptance seals review before one verified child ACK', asy
 
 test('first child ACK returns success while sibling remains pending', async t => {
   const { box, checkpoint } = await fixture(t);
-  const second = { ...candidate, candidate_key: 'mira_implement', text: 'Mira implementa.' };
+  const second = { ...modelFact, candidate_key: 'mira_implement', text: 'Mira implementa.' };
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate, second] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate, second] }),
   })).kind, 'manifested');
   const manifest = await box.readManifest(checkpoint.operationId);
   let adds = 0;
@@ -508,7 +514,7 @@ test('first child ACK returns success while sibling remains pending', async t =>
 test('claimed store success without durable child ACK remains pending', async t => {
   const { box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   assert.equal((await sealFixture(box, checkpoint.operationId, 'fable_review', 'approve')).kind, 'sealed');
   const entry = (await box.readManifest(checkpoint.operationId)).candidates[0];
@@ -522,7 +528,7 @@ test('claimed store success without durable child ACK remains pending', async t 
 test('terminal child replay completes parent after receipt ENOSPC without another add', async t => {
   const { dir, box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   const child = (await box.readManifest(checkpoint.operationId)).candidates[0];
   assert.equal((await sealFixture(box, checkpoint.operationId, child.candidateKey, 'approve')).kind, 'sealed');
@@ -542,10 +548,10 @@ test('terminal child replay completes parent after receipt ENOSPC without anothe
 
 test('two-child final ACK survives parent receipt ENOSPC and restart without reextraction', async t => {
   const { dir, box, checkpoint } = await fixture(t);
-  const second = { ...candidate, candidate_key: 'mira_implement', text: 'Mira implementa.' };
+  const second = { ...modelFact, candidate_key: 'mira_implement', text: 'Mira implementa.' };
   let extracts = 0;
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => { extracts++; return { kind: 'success', candidates: [candidate, second] }; },
+    outbox: box, runCli: async () => { extracts++; return { kind: 'success', no_facts: false, candidates: [modelCandidate, second] }; },
   })).kind, 'manifested');
   const children = (await box.readManifest(checkpoint.operationId)).candidates;
   for (const child of children) assert.equal((await sealFixture(box, checkpoint.operationId,
@@ -577,7 +583,7 @@ test('rejected and duplicate terminal children replay parent receipt without ren
   for (const disposition of ['rejected', 'duplicate']) {
     const { dir, box, checkpoint } = await fixture(t);
     assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-      outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+      outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
     })).kind, 'manifested');
     const key = 'fable_review';
     assert.equal((await sealFixture(box, checkpoint.operationId, key,
@@ -596,9 +602,9 @@ test('rejected and duplicate terminal children replay parent receipt without ren
 
 test('two complementary facts persist separate payloads and reload after restart', async t => {
   const { dir, box, checkpoint } = await fixture(t);
-  const second = { ...candidate, candidate_key: 'mira_implement', text: 'Mira implementa.' };
+  const second = { ...modelFact, candidate_key: 'mira_implement', text: 'Mira implementa.' };
   const result = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate, second], usage: { inputTokens: 2, outputTokens: 3, costUsd: 0.01 } }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelFact, second], usage: { inputTokens: 2, outputTokens: 3, costUsd: 0.01 } }),
   });
   assert.equal(result.kind, 'manifested');
   const manifest = await createOutbox(dir).readManifest(checkpoint.operationId);
@@ -612,7 +618,7 @@ test('four calls are durable across restart; an empty success never closes the c
   const { dir, checkpoint } = await fixture(t);
   for (let n = 0; n < 4; n++) {
     const result = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-      outbox: createOutbox(dir), runCli: async () => ({ kind: 'success', candidates: [] }),
+      outbox: createOutbox(dir), runCli: async () => ({ kind: 'success', no_facts: false, candidates: [] }),
     });
     assert.equal(result.reason, 'extractor_schema_invalid');
   }
@@ -650,7 +656,7 @@ test('valid no-facts disposition is local and keeps remote ACK separate', async 
 test('payload tampering blocks review and checkpoint completion', async t => {
   const { dir, box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   const manifest = await box.readManifest(checkpoint.operationId);
   const child = manifest.candidates[0];
@@ -663,7 +669,7 @@ test('payload tampering blocks review and checkpoint completion', async t => {
 test('rehash cannot detach candidate payload from source CLI and policy', async t => {
   const { dir, box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   const manifest = await box.readManifest(checkpoint.operationId);
   const entry = manifest.candidates[0];
@@ -682,7 +688,7 @@ test('rehash cannot detach candidate payload from source CLI and policy', async 
 test('approved item seals exact operation, stores through canonical facade and ACKs its child', async t => {
   const { dir, box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   const manifest = await box.readManifest(checkpoint.operationId);
   const child = manifest.candidates[0];
@@ -707,7 +713,7 @@ test('approved item seals exact operation, stores through canonical facade and A
 test('review directory symlink blocks approval before reading a planted decision', async t => {
   const { dir, box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   const child = (await box.readManifest(checkpoint.operationId)).candidates[0];
   const foreign = path.join(dir, 'foreign');
@@ -724,7 +730,7 @@ test('review directory symlink blocks approval before reading a planted decision
 test('review rejection is auditable local disposition and never calls remote store', async t => {
   const { box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   assert.equal((await sealFixture(box, checkpoint.operationId, 'fable_review', 'reject',
     { reason: 'unsupported_claim' })).kind, 'sealed');
@@ -738,7 +744,7 @@ test('review rejection is auditable local disposition and never calls remote sto
 test('duplicate disposition requires verified active reference and keeps separate source identity', async t => {
   const { box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   assert.equal((await sealFixture(box, checkpoint.operationId, 'fable_review', 'duplicate',
     { duplicateRef: 'older-source' })).kind, 'sealed');
@@ -755,7 +761,7 @@ test('duplicate disposition requires verified active reference and keeps separat
 test('canonical store reuses remote commit after failed local child ACK', async t => {
   const { dir, box, checkpoint } = await fixture(t);
   assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
-    outbox: box, runCli: async () => ({ kind: 'success', candidates: [candidate] }),
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
   })).kind, 'manifested');
   const child = (await box.readManifest(checkpoint.operationId)).candidates[0];
   const remote = [];
@@ -796,6 +802,8 @@ test('canonical store reuses remote commit after failed local child ACK', async 
 test('CLI route excludes inherited API secrets and rejects an unexpected model', async t => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-cli-fixture-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const profile = path.join(dir, 'profile');
+  await fs.mkdir(profile, { mode: 0o700 });
   const script = `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (process.env.CBS_MEMORIA_API_KEY || process.env.OPENAI_API_KEY ||
 !args.includes('--safe-mode') || args[args.indexOf('--tools')+1] !== '' ||
 !args.includes('--no-session-persistence') || args[args.indexOf('--permission-mode')+1] !== 'dontAsk') process.exit(17);\n
@@ -806,17 +814,239 @@ modelUsage:{'unexpected':{canonicalModel:'unexpected'}}, usage:{input_tokens:1,o
   const oldPath = process.env.PATH;
   const oldKey = process.env.CBS_MEMORIA_API_KEY;
   const oldOpenAI = process.env.OPENAI_API_KEY;
+  const oldProfile = process.env.CLAUDE_CONFIG_DIR;
   try {
     process.env.PATH = `${dir}:${oldPath}`;
+    process.env.CLAUDE_CONFIG_DIR = profile;
     process.env.CBS_MEMORIA_API_KEY = 'fixture-secret';
     process.env.OPENAI_API_KEY = 'fixture-secret';
     assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', account: 'claude2' }),
       { kind: 'error', reason: 'cli_model_mismatch' });
+    await fs.writeFile(path.join(dir, 'claude'), `#!${process.execPath}\nprocess.stdin.resume();\n` +
+      `process.stdin.on('end', () => process.stdout.write('null'));`, { mode: 0o700 });
+    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', account: 'claude2' }),
+      { kind: 'error', reason: 'cli_invalid_schema' });
   } finally {
     process.env.PATH = oldPath;
     if (oldKey === undefined) delete process.env.CBS_MEMORIA_API_KEY;
     else process.env.CBS_MEMORIA_API_KEY = oldKey;
     if (oldOpenAI === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = oldOpenAI;
+    if (oldProfile === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = oldProfile;
+  }
+});
+
+test('structured schema and local guard reject invalid fields before any manifest', async t => {
+  const item = extractionSchema.properties.candidates.items;
+  assert.deepEqual(item.properties.scope.enum, ['project', 'personal', 'episode']);
+  assert.deepEqual(item.properties.type.enum, ['rule', 'fact', 'preference', 'decision', 'report', 'episode']);
+  assert.equal(item.additionalProperties, false);
+  assert.equal('owner_id' in item.properties, false);
+  assert.equal('supersedes_id' in item.properties, false);
+  const bad = [
+    { ...modelCandidate, scope: 'organization' },
+    { ...modelCandidate, candidate_key: 'Bad Key' },
+    { ...modelCandidate, logical_key: 'Bad Key' },
+    { ...modelCandidate, type: 'unknown' },
+    { ...modelCandidate, text: '' },
+    { ...modelCandidate, source_message_id: '' },
+    { ...modelCandidate, owner_id: 'model-user' },
+    { ...modelCandidate, supersedes_id: 'old' },
+    { ...modelCandidate, unknown: 'injected' },
+    { ...modelCandidate, condition: '' },
+    { ...modelCandidate, valid_from: 'yesterday' },
+    { ...modelCandidate, valid_to: '2026-02-30T00:00:00Z' },
+    { ...modelCandidate, valid_to: '2026-10-03T24:00:00Z' },
+    { ...modelCandidate, type: 'episode' },
+    { ...modelCandidate, scope: 'episode' },
+    { ...modelCandidate, source_message_id: 'missing' },
+  ];
+  for (const malformed of bad) {
+    const { box, checkpoint } = await fixture(t);
+    let captured, payloadWrites = 0, stores = 0;
+    const result = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+      outbox: { ...box, persistCandidatePayload: async () => { payloadWrites++; throw new Error('unexpected payload'); } },
+      store: async () => { stores++; throw new Error('unexpected store'); },
+      runCli: async () => { captured = { kind: 'success', candidates: [malformed], no_facts: false };
+        return captured; },
+    });
+    assert.equal(result.kind, 'pending', JSON.stringify(malformed));
+    assert.equal((await box.readManifest(checkpoint.operationId)).reason, 'missing_manifest');
+    assert.equal(captured.candidates[0], malformed);
+    assert.equal(payloadWrites, 0);
+    assert.equal(stores, 0);
+  }
+  for (const field of ['candidate_key', 'source_message_id', 'text', 'type', 'scope']) {
+    const missing = { ...modelCandidate };
+    delete missing[field];
+    assert.equal(validateExtractionOutput({ candidates: [missing], no_facts: false }), false, field);
+  }
+  assert.equal(validateExtractionOutput({ candidates: [modelCandidate, modelCandidate], no_facts: false }), false);
+  assert.equal(validateExtractionOutput({ candidates: [
+    { ...modelCandidate, valid_to: '2026-10-03T24:00:00Z' }], no_facts: false }), false);
+  assert.equal(validateExtractionOutput({ candidates: [modelCandidate], no_facts: true }), false);
+  assert.equal(validateExtractionOutput({ candidates: [modelCandidate], no_facts: false, extra: true }), false);
+  assert.equal(validateExtractionOutput({ candidates: Array(6).fill(modelCandidate), no_facts: false }), false);
+});
+
+test('two independent facts derive provenance and keep source identity', async t => {
+  const { box, checkpoint } = await fixture(t);
+  const facts = [
+    { candidate_key: 'fable_review', source_message_id: 'm1', text: 'Fable faz só revisão final', type: 'fact', scope: 'project' },
+    { candidate_key: 'mira_implement', source_message_id: 'm1', text: 'Mira implementa.', type: 'fact', scope: 'project' },
+  ];
+  const result = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', candidates: facts, no_facts: false }),
+  });
+  assert.equal(result.kind, 'manifested');
+  for (const fact of facts) {
+    const payload = await box.readCandidatePayload(checkpoint.operationId, fact.candidate_key);
+    assert.equal(payload.project_id, 'p');
+    assert.equal(payload.session_id, 's');
+    assert.equal(payload.actor, 'user');
+    assert.equal(payload.origin, 'user_direct');
+    assert.equal(payload.evidence_at, source.timestamp);
+    assert.deepEqual(payload.source_offsets, { start: 0, end: 80 });
+  }
+});
+
+test('rule without explicit condition remains eligible; episode requires grounded expiry', async t => {
+  const unconditional = { ...source, text: 'Mira implementa.' };
+  const { box, checkpoint } = await fixture(t, [unconditional]);
+  const rule = { candidate_key: 'mira_rule', source_message_id: 'm1',
+    text: unconditional.text, type: 'rule', scope: 'project' };
+  assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', candidates: [rule], no_facts: false }),
+  })).kind, 'manifested');
+  const dated = { ...source, text: 'Deploy freeze until 2026-10-03T00:00:00Z.' };
+  const episode = { candidate_key: 'freeze', source_message_id: 'm1', text: dated.text,
+    type: 'episode', scope: 'episode', valid_to: '2026-10-03T00:00:00Z' };
+  const pass = await fixture(t, [dated]);
+  assert.equal((await extractCheckpoint(pass.checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: pass.box, runCli: async () => ({ kind: 'success', candidates: [episode], no_facts: false }),
+  })).kind, 'manifested');
+  const fail = await fixture(t, [source]);
+  assert.equal((await extractCheckpoint(fail.checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: fail.box, runCli: async () => ({ kind: 'success', candidates: [episode], no_facts: false }),
+  })).kind, 'pending');
+});
+
+test('validity timestamps require exact support in the quoted claim', async t => {
+  const dated = { ...source, text: 'Policy applies from 2026-10-03T00:00:00Z.' };
+  const supported = { candidate_key: 'policy_start', source_message_id: 'm1', text: dated.text,
+    type: 'fact', scope: 'project', valid_from: '2026-10-03T00:00:00Z' };
+  const accepted = await fixture(t, [dated]);
+  assert.equal((await extractCheckpoint(accepted.checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: accepted.box, runCli: async () => ({ kind: 'success', candidates: [supported], no_facts: false }),
+  })).kind, 'manifested');
+  const invented = await fixture(t, [dated]);
+  const result = await extractCheckpoint(invented.checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: invented.box, runCli: async () => ({ kind: 'success', candidates: [
+      { ...supported, valid_from: '2026-10-04T00:00:00Z' }], no_facts: false }),
+  });
+  assert.equal(result.reason, 'invalid_metadata');
+  assert.equal((await invented.box.readManifest(invented.checkpoint.operationId)).reason, 'missing_manifest');
+  const unrelated = { ...source, text: 'Meeting on 2026-10-03T00:00:00Z. Policy applies indefinitely.' };
+  const other = await fixture(t, [unrelated]);
+  const unrelatedResult = await extractCheckpoint(other.checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: other.box, runCli: async () => ({ kind: 'success', candidates: [
+      { ...supported, text: unrelated.text }], no_facts: false }),
+  });
+  assert.equal(unrelatedResult.reason, 'invalid_metadata');
+});
+
+test('personal scope uses trusted owner only and no_facts is exclusive', async t => {
+  const personal = { candidate_key: 'pref', source_message_id: 'm1', text: source.text,
+    type: 'preference', scope: 'personal' };
+  const missing = await fixture(t);
+  const result = await extractCheckpoint(missing.checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: missing.box, runCli: async () => ({ kind: 'success', candidates: [personal], no_facts: false }),
+  });
+  assert.equal(result.reason, 'missing_scope');
+  assert.equal((await missing.box.readManifest(missing.checkpoint.operationId)).reason, 'missing_manifest');
+  const blank = await fixture(t, [{ ...source, ownerId: ' ' }]);
+  assert.equal((await extractCheckpoint(blank.checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: blank.box, runCli: async () => ({ kind: 'success', candidates: [personal], no_facts: false }),
+  })).reason, 'missing_scope');
+  const owned = await fixture(t, [{ ...source, ownerId: 'trusted-owner' }]);
+  assert.equal((await extractCheckpoint(owned.checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: owned.box, runCli: async () => ({ kind: 'success', candidates: [personal], no_facts: false }),
+  })).kind, 'manifested');
+  assert.equal((await owned.box.readCandidatePayload(owned.checkpoint.operationId, 'pref')).owner_id, 'trusted-owner');
+  assert.equal(validateExtractionOutput({ candidates: [personal], no_facts: true }), false);
+  assert.equal(validateExtractionOutput({ candidates: [], no_facts: false }), false);
+  assert.equal(validateExtractionOutput({ candidates: [], no_facts: true }), true);
+});
+
+test('CLI keeps available cache-token categories and derives the outbox input total', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-cli-usage-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const profile = path.join(dir, 'profile');
+  await fs.mkdir(profile, { mode: 0o700 });
+  const script = `#!${process.execPath}\nconst args = process.argv.slice(2);\n` +
+    `const schema = JSON.parse(args[args.indexOf('--json-schema') + 1]);\n` +
+    `if (!schema.properties.candidates.items.properties.scope.enum.includes('episode') ||\n` +
+    `    'owner_id' in schema.properties.candidates.items.properties) process.exit(18);\n` +
+    `let prompt=''; process.stdin.on('data', chunk => prompt+=chunk); process.stdin.on('end', () => process.stdout.write(JSON.stringify({\n` +
+    `subtype:'success', is_error:false, structured_output:{candidates:[],no_facts:true},\n` +
+    `modelUsage:{sonnet:{canonicalModel:'claude-sonnet-5-5'}},\n` +
+    `usage:prompt==='uncached-only' ? {input_tokens:2,output_tokens:3} :\n` +
+    `{input_tokens:2,cache_read_input_tokens:7,cache_creation_input_tokens:11,output_tokens:3},\n` +
+    `total_cost_usd:0.01})));`;
+  await fs.writeFile(path.join(dir, 'claude'), script, { mode: 0o700 });
+  const oldPath = process.env.PATH;
+  const oldProfile = process.env.CLAUDE_CONFIG_DIR;
+  try {
+    process.env.PATH = `${dir}:${oldPath}`;
+    process.env.CLAUDE_CONFIG_DIR = profile;
+    const result = await runSonnetExtraction('{}', { route: 'sonnet', account: 'claude2' });
+    assert.equal(result.kind, 'success');
+    assert.deepEqual(result.usage, { inputTokens: 20, inputUncachedTokens: 2,
+      inputCacheReadTokens: 7, inputCacheCreationTokens: 11, outputTokens: 3, costUsd: 0.01 });
+    const { box, checkpoint } = await fixture(t);
+    const extraction = await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+      outbox: box, runCli: async () => result,
+    });
+    assert.equal(extraction.kind, 'processed');
+    assert.deepEqual(await box.extractionUsage('claude', 's'),
+      { calls: 1, inputTokens: 20, outputTokens: 3, costUsd: 0.01 });
+    const partial = await runSonnetExtraction('uncached-only', { route: 'sonnet', account: 'claude2' });
+    assert.deepEqual(partial.usage, { inputTokens: 2, inputUncachedTokens: 2,
+      inputCacheReadTokens: null, inputCacheCreationTokens: null, outputTokens: 3, costUsd: 0.01 });
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldProfile === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = oldProfile;
+  }
+});
+
+test('CLI requires an explicit trusted local profile and ignores a model or policy path', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-cli-profile-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const profile = path.join(dir, 'profile');
+  await fs.mkdir(profile, { mode: 0o700 });
+  await fs.writeFile(path.join(dir, 'claude'), `#!${process.execPath}\n` +
+    `if (process.env.CLAUDE_CONFIG_DIR !== ${JSON.stringify(profile)}) process.exit(18);\n` +
+    `process.stdin.resume(); process.stdin.on('end', () => process.stdout.write(JSON.stringify({\n` +
+    `subtype:'success',is_error:false,structured_output:{candidates:[],no_facts:true},\n` +
+    `modelUsage:{sonnet:{canonicalModel:'claude-sonnet-5-5'}}})));`, { mode: 0o700 });
+  const oldPath = process.env.PATH;
+  const oldProfile = process.env.CLAUDE_CONFIG_DIR;
+  try {
+    process.env.PATH = `${dir}:${oldPath}`;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', account: 'claude2',
+      profileDir: profile }), { kind: 'error', reason: 'cli_profile_unselected' });
+    process.env.CLAUDE_CONFIG_DIR = process.cwd();
+    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', account: 'claude2' }),
+      { kind: 'error', reason: 'cli_profile_untrusted' });
+    process.env.CLAUDE_CONFIG_DIR = profile;
+    assert.equal((await runSonnetExtraction('{}', { route: 'sonnet', account: 'claude2' })).kind, 'success');
+    assert.equal((await runSonnetExtraction('{}', { route: 'sonnet', account: 'other-local-profile' })).kind, 'success');
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldProfile === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = oldProfile;
   }
 });
