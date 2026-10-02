@@ -9,7 +9,7 @@ import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
 import { readLocalTrust, trustTuple } from './trust.mjs';
 import { brokerEndpointStatus } from './broker.mjs';
-import { verifyNativeCapture } from './native.mjs';
+import { inspectCodexMainHooks, verifyNativeCapture } from './native.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
   writeWindowsPrivateFile } from './windows-security.mjs';
 
@@ -53,6 +53,18 @@ function same(current, saved) {
     JSON.stringify(current.destination) === JSON.stringify(saved.destination);
 }
 
+async function codexCaptureSource(nativeRoot, projectRoot, stateRoot) {
+  const active = await verifyNativeCapture(nativeRoot, { cli: 'codex', projectRoot, stateRoot,
+    includeLaunchHooks: nativeRoot !== projectRoot });
+  if (active.kind !== 'verified') return active;
+  const main = await inspectCodexMainHooks(projectRoot, { stateRoot });
+  if (main.kind === 'blocked') return main;
+  if (nativeRoot === projectRoot && main.kind !== 'verified') return blocked('stale_main_hooks');
+  return main.kind === 'verified'
+    ? { kind: 'verified', source: 'main', fingerprint: main.fingerprint }
+    : { kind: 'verified', source: 'session', hooks: active.hooks };
+}
+
 export async function createLaunch(cwd, cli, { stateRoot } = {}) {
   if (!['claude', 'codex'].includes(cli) || (process.platform !== 'win32' && !process.getuid)) return blocked('native_windows_unproved');
   const current = await inspectConfiguration(cwd, { stateRoot });
@@ -63,15 +75,13 @@ export async function createLaunch(cwd, cli, { stateRoot } = {}) {
   const trust = await readLocalTrust(current.stateDir);
   const expected = trustTuple(current);
   if (!trust || Object.entries(expected).some(([key, value]) => trust[key] !== value)) return blocked('trust_changed');
-  let launchHooks;
+  let captureSource;
   if (process.platform === 'win32') {
     const verified = await verifyNativeCapture(nativeRoot, { cli, projectRoot: current.projectRoot, stateRoot });
     if (verified.kind !== 'verified') return blocked(verified.reason);
   } else if (cli === 'codex') {
-    const verified = await verifyNativeCapture(nativeRoot,
-      { cli, projectRoot: current.projectRoot, stateRoot, includeLaunchHooks: true });
-    if (verified.kind !== 'verified') return blocked(verified.reason);
-    launchHooks = verified.hooks;
+    captureSource = await codexCaptureSource(nativeRoot, current.projectRoot, stateRoot);
+    if (captureSource.kind !== 'verified') return blocked(captureSource.reason);
   }
   const token = randomBytes(32).toString('hex');
   const dir = launchDir(stateRoot);
@@ -90,7 +100,7 @@ export async function createLaunch(cwd, cli, { stateRoot } = {}) {
       return blocked('unsafe_launch_state');
     }
   } else await fs.writeFile(launchFile(stateRoot, token), JSON.stringify(record) + '\n', { flag: 'wx', mode: 0o600 });
-  return { kind: 'created', token, record, ...(launchHooks ? { launchHooks } : {}) };
+  return { kind: 'created', token, record, ...(captureSource ? { captureSource } : {}) };
 }
 
 export async function bindLaunch(token, cli, cwd, nativeSessionId, { stateRoot } = {}) {
@@ -132,7 +142,8 @@ export async function resolveBoundLaunch(token, cli, { stateRoot } = {}) {
 
 export async function launchCli(cwd, cli, args = [], options = {}) {
   if (process.platform === 'win32') return blocked('native_windows_unproved');
-  if (cli === 'codex' && !safeCodexArgs(args)) return blocked('unsafe_cli_args');
+  const codexArgs = cli === 'codex' ? safeCodexArgs(args) : null;
+  if (cli === 'codex' && !codexArgs) return blocked('unsafe_cli_args');
   const made = await createLaunch(cwd, cli, options);
   if (made.kind !== 'created') return made;
   const root = options.stateRoot ?? rootDefault();
@@ -152,9 +163,16 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
   const mcpArgs = cli === 'claude' ? ['--mcp-config', JSON.stringify(mcp)] :
     ['-c', `mcp_servers.cbs_memoria.command=${JSON.stringify(process.execPath)}`,
       '-c', `mcp_servers.cbs_memoria.args=${JSON.stringify([mcpScript])}`];
-  const hookArgs = cli === 'codex' ? Object.entries(made.launchHooks).flatMap(([event, groups]) =>
+  const hookArgs = cli === 'codex' && made.captureSource.source === 'session'
+    ? Object.entries(made.captureSource.hooks).flatMap(([event, groups]) =>
     ['-c', `hooks.${event}=${JSON.stringify(groups)}`]) : [];
-  const child = spawn(cli, [...mcpArgs, ...hookArgs, ...args], { cwd, stdio: 'inherit',
+  if (cli === 'codex') {
+    const currentSource = await codexCaptureSource(made.record.nativeRoot,
+      made.record.projectRoot, options.stateRoot);
+    if (currentSource.kind !== 'verified') return blocked(currentSource.reason);
+    if (JSON.stringify(currentSource) !== JSON.stringify(made.captureSource)) return blocked('capture_source_changed');
+  }
+  const child = spawn(cli, [...mcpArgs, ...hookArgs, ...(codexArgs ?? args)], { cwd, stdio: 'inherit',
     env: { ...process.env, CBS_MEMORIA_LAUNCH_ID: made.token, CBS_MEMORIA_CLI: cli,
       ...(options.stateRoot ? { CBS_MEMORIA_STATE_ROOT: options.stateRoot } : {}) } });
   return await new Promise(resolve => {
@@ -164,14 +182,32 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
 }
 
 function safeCodexArgs(args) {
-  if (!Array.isArray(args)) return false;
+  if (!Array.isArray(args)) return null;
   const values = new Set(['-m', '--model']);
   const flags = new Set(['--no-alt-screen', '--no-daemon', '--strict-config']);
+  const commands = new Set(['agents', 'exec', 'e', 'review', 'login', 'logout', 'mcp', 'plugin',
+    'app-server', 'remote-control', 'completion', 'update', 'doctor', 'sandbox', 'debug',
+    'apply', 'a', 'resume', 'queue', 'archive', 'delete', 'migrate-rollouts', 'unarchive',
+    'fork', 'cloud', 'exec-server', 'features', 'help']);
+  const safe = [];
+  let terminated = false;
+  let prompt;
   for (let i = 0; i < args.length; i++) {
-    if (flags.has(args[i])) continue;
-    if (!values.has(args[i]) || typeof args[++i] !== 'string' || !args[i] || args[i].startsWith('-')) return false;
+    const arg = args[i];
+    if (!terminated && arg === '--') { terminated = true; continue; }
+    if (!terminated && flags.has(arg)) { safe.push(arg); continue; }
+    if (!terminated && values.has(arg)) {
+      const value = args[++i];
+      if (typeof value !== 'string' || !value || value.startsWith('-')) return null;
+      safe.push(arg, value);
+      continue;
+    }
+    if (prompt !== undefined || typeof arg !== 'string' || !arg ||
+        (!terminated && arg.startsWith('-')) || commands.has(arg)) return null;
+    prompt = arg;
+    terminated = true;
   }
-  return true;
+  return prompt === undefined ? safe : [...safe, '--', prompt];
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

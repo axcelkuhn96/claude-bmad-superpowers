@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -12,6 +13,7 @@ import { recordSessionCheckout } from '../base/memoria/session-checkout.mjs';
 import { createOutbox } from '../base/memoria/outbox.mjs';
 import { withProjectLock } from '../base/memoria/ledger.mjs';
 import { createLaunch, bindLaunch, resolveBoundLaunch, launchCli } from '../base/memoria/launch.mjs';
+import { recallForPrompt } from '../base/memoria/hook-recall.mjs';
 import { inspectConfiguration, initializeSession } from '../base/memoria/provider.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { applyNativeExclusion, restoreNativeExclusion, verifyNativeCapture } from '../base/memoria/native.mjs';
@@ -372,6 +374,34 @@ process.stdout.write(JSON.stringify(await captureEvent(JSON.parse(process.argv[1
   const first = invoke('SessionStart', launch.token);
   assert.equal(first.kind, 'no_complete_bytes', JSON.stringify(first));
   assert.equal((await resolveBoundLaunch(launch.token, 'claude', { stateRoot })).nativeSessionId, 'native-session');
+  const pretranscript = invoke('UserPromptSubmit', launch.token);
+  assert.equal(pretranscript.kind, 'no_complete_bytes');
+  assert.equal((await createOutbox(current.stateDir).pending()).length, 0);
+  const injection = await recallForPrompt({ cli: 'claude', payload: {
+    ...payload, hook_event_name: 'UserPromptSubmit', prompt: 'What is the approved rule?',
+  }, result: pretranscript, stateRoot,
+  search: async () => ({ kind: 'items', items: [{ projectId: 'p', sdkId: 'fixture', status: 'active',
+    score: 0.9, scoreSource: 'mem0_sdk_search', text: 'Use the approved fixture rule.',
+    metadata: { source: 'fixture-message', actor: 'owner', evidence_at: '2026-09-01T00:00:00Z',
+      origin: 'user_direct', speaker_role: 'user', scope: 'project', valid_from: '2026-09-01T00:00:00Z' } }] }),
+  now: () => '2026-10-01T00:00:00Z' });
+  assert.match(injection?.hookSpecificOutput.additionalContext ?? '', /approved fixture rule/);
+  assert.equal((await createOutbox(current.stateDir).pending()).length, 0);
+  assert.equal(invoke('Stop', launch.token).reason, 'missing_transcript');
+  assert.equal(invoke('SessionEnd', launch.token).reason, 'missing_transcript');
+  assert.equal(invoke('UserPromptSubmit', launch.token, 'unbound-session',
+    path.join(dir, 'unbound-session.jsonl')).reason, 'fresh_session');
+  assert.equal(invoke('UserPromptSubmit', launch.token, 'native-session',
+    path.join(dir, 'wrong.jsonl')).reason, 'transcript_session_mismatch');
+  const hostile = path.join(dir, 'hostile');
+  await fs.mkdir(hostile);
+  await fs.symlink(transcriptPath, path.join(hostile, 'native-session.jsonl'));
+  assert.equal(invoke('UserPromptSubmit', launch.token, 'native-session',
+    path.join(hostile, 'native-session.jsonl')).reason, 'unsafe_transcript');
+  const directorySource = path.join(dir, 'directory', 'native-session.jsonl');
+  await fs.mkdir(directorySource, { recursive: true });
+  assert.equal(invoke('UserPromptSubmit', launch.token, 'native-session', directorySource).reason,
+    'unsafe_transcript');
   await fs.copyFile(new URL('./fixtures/memoria-native-claude.jsonl', import.meta.url), transcriptPath);
   assert.equal(invoke('Stop', launch.token).kind, 'queued');
   assert.equal((await createOutbox(current.stateDir).pending()).length, 1);
@@ -425,7 +455,8 @@ test('trusted linked Codex launch carries only its verified hooks as session con
     { cli: 'codex', stateRoot, installedPlugin: true, projectRoot: root })).kind, 'applied');
   const expected = JSON.parse(await fs.readFile(path.join(linked, '.codex', 'hooks.json'), 'utf8')).hooks;
   await fs.mkdir(stateRoot, { recursive: true, mode: 0o700 });
-  const server = net.createServer(socket => socket.end());
+  let onProbe;
+  const server = net.createServer(socket => { onProbe?.(); socket.end(); });
   t.after(() => server.close());
   await new Promise(resolve => server.listen(brokerPath(stateRoot), resolve));
   await fs.chmod(brokerPath(stateRoot), 0o600);
@@ -457,7 +488,53 @@ test('trusted linked Codex launch carries only its verified hooks as session con
   assert.equal(seen.args.includes('CBS_TEST_KEY'), false);
   await assert.rejects(fs.readFile(path.join(root, '.codex', 'hooks.json'), 'utf8'), { code: 'ENOENT' });
 
+  assert.deepEqual(await launchCli(linked, 'codex', ['--model', 'safe-model', 'Qual regra?'], { stateRoot }),
+    { kind: 'exited', code: 0, signal: null });
+  assert.deepEqual(JSON.parse(await fs.readFile(capture, 'utf8')).args.slice(-2), ['--', 'Qual regra?']);
+  for (const args of [['resume'], ['--', 'resume'], ['--profile', 'other'],
+    ['--cd', root], ['--dangerously-bypass-hook-trust'], ['-c', 'hooks.SessionStart=[]']]) {
+    assert.equal((await launchCli(linked, 'codex', args, { stateRoot })).reason, 'unsafe_cli_args');
+  }
+
+  const mainHooksFile = path.join(root, '.codex', 'hooks.json');
+  await fs.mkdir(path.dirname(mainHooksFile), { recursive: true });
+  const custom = [{ hooks: [{ type: 'command', command: 'echo custom' }] }];
+  await fs.writeFile(mainHooksFile, JSON.stringify({ hooks: { PreToolUse: custom } }));
+  assert.deepEqual(await launchCli(linked, 'codex', [], { stateRoot }),
+    { kind: 'exited', code: 0, signal: null });
+  assert.equal(JSON.parse(await fs.readFile(capture, 'utf8')).args.filter(arg =>
+    arg.startsWith('hooks.')).length, 4);
+  await fs.rm(mainHooksFile);
+
+  assert.equal((await applyNativeExclusion(root,
+    { cli: 'codex', stateRoot, installedPlugin: true, projectRoot: root })).kind, 'applied');
+  const mainHooks = JSON.parse(await fs.readFile(mainHooksFile, 'utf8'));
+  mainHooks.hooks.PreToolUse = custom;
+  await fs.writeFile(mainHooksFile, JSON.stringify(mainHooks));
+  for (const checkout of [root, linked]) {
+    assert.deepEqual(await launchCli(checkout, 'codex', [], { stateRoot }),
+      { kind: 'exited', code: 0, signal: null });
+    const launched = JSON.parse(await fs.readFile(capture, 'utf8'));
+    assert.equal(launched.cwd, checkout);
+    assert.equal(launched.args.filter(arg => arg.startsWith('hooks.')).length, 0);
+    assert.deepEqual(JSON.parse(await fs.readFile(mainHooksFile, 'utf8')).hooks.PreToolUse,
+      mainHooks.hooks.PreToolUse);
+  }
+  const duplicate = structuredClone(mainHooks);
+  duplicate.hooks.SessionStart.push(structuredClone(duplicate.hooks.SessionStart[0]));
   await fs.rm(capture);
+  onProbe = () => writeFileSync(mainHooksFile, JSON.stringify(duplicate));
+  assert.equal((await launchCli(linked, 'codex', [], { stateRoot })).reason, 'ambiguous_main_hooks');
+  onProbe = undefined;
+  await assert.rejects(fs.readFile(capture, 'utf8'), { code: 'ENOENT' });
+  await fs.writeFile(mainHooksFile, JSON.stringify(mainHooks));
+  await fs.writeFile(mainHooksFile, JSON.stringify(duplicate));
+  assert.equal((await launchCli(linked, 'codex', [], { stateRoot })).reason, 'ambiguous_main_hooks');
+  await fs.writeFile(mainHooksFile, JSON.stringify(mainHooks));
+  await fs.rm(path.join(current.stateDir, 'native-codex.json'));
+  assert.equal((await launchCli(linked, 'codex', [], { stateRoot })).reason, 'stale_main_hooks');
+
+  await fs.rm(capture, { force: true });
   const hooksFile = path.join(linked, '.codex', 'hooks.json');
   const changed = JSON.parse(await fs.readFile(hooksFile, 'utf8'));
   changed.hooks.PreToolUse = [{ hooks: [{ type: 'command', command: 'echo custom' }] }];

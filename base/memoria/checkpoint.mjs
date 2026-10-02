@@ -48,7 +48,7 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   let stat;
   try { stat = await fs.lstat(transcriptPath); }
   catch (error) {
-    if (error.code !== 'ENOENT' || event !== 'SessionStart') {
+    if (error.code !== 'ENOENT' || !['SessionStart', 'UserPromptSubmit'].includes(event)) {
       return blocked(error.code === 'ENOENT' ? 'missing_transcript' : 'unsafe_transcript');
     }
   }

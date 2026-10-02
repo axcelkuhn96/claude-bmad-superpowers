@@ -59,6 +59,34 @@ function editCaptureHooks(raw, cli, remove = false) {
   return JSON.stringify(value, null, 2) + '\n';
 }
 
+function exactCodexHooks(hooks, allowUnrelated = false) {
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) return null;
+  if (!allowUnrelated && Object.keys(hooks).length !== captureEvents.codex.length) return null;
+  const selected = {};
+  for (const [event, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) return null;
+    for (const group of groups) {
+      if (!Array.isArray(group?.hooks)) return null;
+      const ours = group.hooks.filter(handler =>
+        typeof handler?.command === 'string' && handler.command.includes('capture-hook.mjs'));
+      if (!ours.length) {
+        if (!allowUnrelated) return null;
+        continue;
+      }
+      const handler = ours[0];
+      if (!captureEvents.codex.includes(event) || ours.length !== 1 ||
+          group.hooks.length !== 1 || Object.keys(group).length !== 1 ||
+          Object.keys(handler).length !== 3 || handler.type !== 'command' ||
+          handler.command !== captureCommand('codex', event) || handler.timeout !== 10 ||
+          selected[event]) return null;
+      selected[event] = [group];
+    }
+  }
+  const count = Object.keys(selected).length;
+  if (!count) return { kind: 'absent' };
+  return count === captureEvents.codex.length ? { kind: 'exact', hooks: selected } : null;
+}
+
 async function safeFile(file, privateState = false) {
   if (process.platform === 'win32') {
     const result = await inspectWindowsPath(file, 'file', { privateState });
@@ -503,7 +531,7 @@ export async function verifyNativeCapture(root, options = {}) {
   let saved;
   try { saved = JSON.parse(await readOptional(snapshotFile(root, cli, options), true)); }
   catch { return blocked('missing_native_snapshot'); }
-  if (saved.cli !== cli || saved.file !== file || saved.capturePath !== capturePath ||
+  if (!saved || saved.cli !== cli || saved.file !== file || saved.capturePath !== capturePath ||
       (saved.projectRoot && saved.projectRoot !== scope.projectRoot) ||
       (saved.nativeRoot && saved.nativeRoot !== root) ||
       (cli === 'codex' && saved.pluginChecked !== true)) return blocked('native_snapshot_changed');
@@ -523,17 +551,33 @@ export async function verifyNativeCapture(root, options = {}) {
   if (cli === 'codex' && options.includeLaunchHooks) {
     // Only CBS definitions may be copied to argv. Unknown hooks in this otherwise
     // undiscovered linked-worktree file require a separate merge decision.
-    if (Object.keys(hooks).length !== captureEvents.codex.length ||
-        !captureEvents.codex.every(event => {
-          const groups = hooks[event];
-          const group = groups?.[0];
-          const handler = group?.hooks?.[0];
-          return groups?.length === 1 && Object.keys(group).length === 1 &&
-            group.hooks?.length === 1 && Object.keys(handler).length === 3 &&
-            handler.type === 'command' && handler.command === captureCommand(cli, event) &&
-            handler.timeout === 10;
-        })) return blocked('unmerged_capture_hooks');
-    return { kind: 'verified', hooks };
+    const exact = exactCodexHooks(hooks);
+    if (exact?.kind !== 'exact') return blocked('unmerged_capture_hooks');
+    return { kind: 'verified', hooks: exact.hooks };
   }
   return { kind: 'verified' };
+}
+
+export async function inspectCodexMainHooks(root, options = {}) {
+  if (process.platform === 'win32') return blocked('native_windows_unproved');
+  const file = hookFile(root);
+  const snapshot = snapshotFile(root, 'codex', { ...options, projectRoot: root });
+  if (!await safeParent(file) || !await safeFile(file) || !await safeFile(snapshot, true)) {
+    return blocked('unsafe_main_hooks');
+  }
+  let raw, saved;
+  try {
+    raw = await readOptional(file);
+    saved = await readOptional(snapshot, true);
+  } catch { return blocked('unsafe_main_hooks'); }
+  if (raw === null) return saved === null ? { kind: 'absent' } : blocked('stale_main_hooks');
+  let hooks;
+  try { hooks = JSON.parse(raw).hooks ?? {}; } catch { return blocked('ambiguous_main_hooks'); }
+  const exact = exactCodexHooks(hooks, true);
+  if (!exact) return blocked('ambiguous_main_hooks');
+  if (exact.kind === 'absent') return saved === null ? { kind: 'absent' } : blocked('stale_main_hooks');
+  if (saved === null) return blocked('stale_main_hooks');
+  const verified = await verifyNativeCapture(root, { ...options, cli: 'codex', projectRoot: root });
+  if (verified.kind !== 'verified') return blocked(verified.reason);
+  return { kind: 'verified', fingerprint: hash(raw) };
 }
