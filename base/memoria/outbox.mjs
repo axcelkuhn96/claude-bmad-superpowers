@@ -20,6 +20,7 @@ export function createOutbox(stateDir, options = {}) {
   const acks = path.join(root, 'acks');
   const processed = path.join(root, 'processed');
   const payloads = path.join(stateDir, 'candidates', 'payloads');
+  const reviews = path.join(stateDir, 'candidates', 'reviews');
   const lock = path.join(root, 'lock');
   const kernelLock = path.join(root, '.kernel-lock');
   const itemFile = id => path.join(items, `${id}.json`);
@@ -29,6 +30,8 @@ export function createOutbox(stateDir, options = {}) {
   const retryFile = id => path.join(items, `${id}.retry.json`);
   const summaryFile = (cli, sessionId) => path.join(root,
     `cursor-${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.json`);
+  const extractionFile = (cli, sessionId) => path.join(root,
+    `extract-${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.json`);
   const hash = value => createHash('sha256').update(value).digest('hex');
 
   async function syncDir(dir) {
@@ -399,7 +402,7 @@ export function createOutbox(stateDir, options = {}) {
   }
   async function usageUnlocked() {
     let bytes = 0;
-    for (const dir of [items, acks, processed, root, lock, path.dirname(payloads), payloads]) {
+    for (const dir of [items, acks, processed, root, lock, path.dirname(payloads), payloads, reviews]) {
       try { await fs.lstat(dir); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
       const directory = await fs.lstat(dir);
       if (dir === lock && !directory.isDirectory()) continue;
@@ -436,6 +439,10 @@ export function createOutbox(stateDir, options = {}) {
       try { data = JSON.parse(bytes); } catch { return false; }
       if (data?.external_id !== candidate.externalId || data.project_id !== row.projectId ||
           data.checkpoint_id !== row.operationId || data.source_message_id !== candidate.evidence.messageId ||
+          data.candidate_key !== candidate.candidateKey || data.origin_cli !== row.cli ||
+          data.session_id !== row.sessionId || data.policy_version !== row.policyVersion ||
+          data.slice_start !== row.start || data.slice_end !== row.end ||
+          data.slice_hash !== row.sliceHash ||
           data.source_offsets?.start !== candidate.evidence.start ||
           data.source_offsets?.end !== candidate.evidence.end) return false;
       await handle.sync();
@@ -443,7 +450,7 @@ export function createOutbox(stateDir, options = {}) {
       if (after.dev !== actual.dev || after.ino !== actual.ino || after.size !== actual.size ||
           after.mtimeMs !== actual.mtimeMs || after.ctimeMs !== actual.ctimeMs) return false;
       await syncDir(payloads);
-      return true;
+      return data;
     } catch (error) {
       if (['ENOENT', 'ELOOP'].includes(error.code)) return false;
       throw error;
@@ -451,6 +458,186 @@ export function createOutbox(stateDir, options = {}) {
   }
   async function fits(value) {
     return await usageUnlocked() + allocated(JSON.stringify(value) + '\n') <= maxBytes;
+  }
+  async function persistCandidatePayload(operationId, candidate) {
+    if (!validId(operationId) || !candidate || typeof candidate !== 'object') return blocked('invalid_candidate');
+    return withLock(async () => {
+      const row = await read(itemFile(operationId));
+      if (!row || await read(manifestFile(operationId))) return blocked('candidate_source_unavailable');
+      const identity = { projectId: row.projectId, originCli: row.cli, sessionId: row.sessionId,
+        start: row.start, end: row.end, sliceHash: row.sliceHash, policyVersion: row.policyVersion,
+        candidateKey: candidate.candidate_key };
+      let externalId;
+      try { externalId = externalIdFor(identity); } catch { return blocked('invalid_candidate'); }
+      if (candidate.external_id !== externalId || candidate.project_id !== row.projectId ||
+          candidate.checkpoint_id !== operationId || candidate.session_id !== row.sessionId ||
+          candidate.origin_cli !== row.cli || candidate.policy_version !== row.policyVersion ||
+          candidate.slice_hash !== row.sliceHash || !row.messages.some(message =>
+            message.messageId === candidate.source_message_id &&
+            message.start === candidate.source_offsets?.start &&
+            message.end === candidate.source_offsets?.end)) return blocked('candidate_source_mismatch');
+      const content = JSON.stringify(candidate) + '\n';
+      const digest = hash(content);
+      const file = path.join(payloads, `${externalId}.${digest}.json`);
+      for (const dir of [path.dirname(payloads), payloads]) {
+        await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+        const stat = await fs.lstat(dir);
+        if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077)) return blocked('unsafe_candidate_dir');
+      }
+      const existing = await fs.lstat(file).catch(error => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (existing) return await payloadValid({ sha256: digest }, row,
+        { externalId, evidence: { messageId: candidate.source_message_id,
+          start: candidate.source_offsets.start, end: candidate.source_offsets.end } })
+        ? { kind: 'persisted', externalId, payloadRef: { sha256: digest } }
+        : blocked('candidate_payload_mismatch');
+      if (await usageUnlocked() + 2 * allocated(content) + reserve > maxBytes) {
+        return { kind: 'full', operationId };
+      }
+      const temp = path.join(payloads, `.${randomUUID()}.tmp`);
+      const handle = await fs.open(temp, 'wx', 0o600);
+      try {
+        await handle.writeFile(content);
+        await handle.sync();
+        await fs.link(temp, file);
+        await syncDir(payloads);
+      } finally {
+        await handle.close();
+        await fs.rm(temp, { force: true });
+      }
+      await syncDir(payloads);
+      return { kind: 'persisted', externalId, payloadRef: { sha256: digest } };
+    });
+  }
+  async function claimExtraction(operationId) {
+    if (!validId(operationId)) return blocked('invalid_operation');
+    return withLock(async () => {
+      const row = await read(itemFile(operationId));
+      if (!row || await read(manifestFile(operationId))) return blocked('extraction_source_unavailable');
+      const file = extractionFile(row.cli, row.sessionId);
+      const prior = await read(file);
+      if (prior && (prior.projectId !== row.projectId || prior.policyVersion !== row.policyVersion)) {
+        return blocked('extraction_session_mismatch');
+      }
+      if ((prior?.calls ?? 0) >= 4) return blocked('extraction_call_limit');
+      const count = { cli: row.cli, sessionId: row.sessionId, projectId: row.projectId,
+        policyVersion: row.policyVersion, calls: (prior?.calls ?? 0) + 1,
+        results: prior?.results ?? [] };
+      if (!await fits(count)) return { kind: 'full', operationId };
+      await durable(file, count);
+      return { kind: 'claimed', calls: count.calls };
+    });
+  }
+  async function recordExtractionUsage(operationId, callIndex, usage, latencyMs) {
+    if (!validId(operationId) || !Number.isSafeInteger(callIndex) || callIndex < 1 ||
+        !Number.isSafeInteger(latencyMs) || latencyMs < 0) return blocked('invalid_extraction_usage');
+    return withLock(async () => {
+      const row = await read(itemFile(operationId));
+      if (!row) return blocked('missing_operation');
+      const file = extractionFile(row.cli, row.sessionId);
+      const counter = await read(file);
+      if (!counter || callIndex > counter.calls) return blocked('missing_extraction_claim');
+      if (counter.results.some(result => result.callIndex === callIndex)) return { kind: 'recorded' };
+      const number = value => Number.isFinite(value) && value >= 0 ? value : null;
+      counter.results.push({ callIndex, operationId, inputTokens: number(usage.inputTokens),
+        outputTokens: number(usage.outputTokens), costUsd: number(usage.costUsd), latencyMs });
+      if (!await fits(counter)) return { kind: 'full', operationId };
+      await durable(file, counter);
+      return { kind: 'recorded' };
+    });
+  }
+  async function extractionUsage(cli, sessionId) {
+    return withLock(async () => {
+      const counter = await read(extractionFile(cli, sessionId));
+      if (!counter) return { calls: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 };
+      return { calls: counter.calls,
+        inputTokens: counter.results.reduce((n, row) => n + (row.inputTokens ?? 0), 0),
+        outputTokens: counter.results.reduce((n, row) => n + (row.outputTokens ?? 0), 0),
+        costUsd: counter.results.reduce((n, row) => n + (row.costUsd ?? 0), 0) };
+    });
+  }
+  async function readCandidatePayload(operationId, candidateKey) {
+    if (!validId(operationId) || typeof candidateKey !== 'string') return blocked('invalid_candidate');
+    return withLock(async () => {
+      const row = await read(itemFile(operationId));
+      const manifest = await read(manifestFile(operationId));
+      const candidate = manifest?.candidates?.find(item => item.candidateKey === candidateKey);
+      if (!row || !candidate) return blocked('missing_candidate');
+      return await payloadValid(candidate.payloadRef, row, candidate) || blocked('candidate_payload_mismatch');
+    });
+  }
+  async function readReview(operationId, candidateKey) {
+    if (!validId(operationId) || typeof candidateKey !== 'string') return blocked('invalid_candidate');
+    return withLock(async () => {
+      const manifest = await read(manifestFile(operationId));
+      const candidate = manifest?.candidates?.find(item => item.candidateKey === candidateKey);
+      if (!candidate) return blocked('missing_candidate');
+      const file = path.join(reviews, `${candidate.externalId}.json`);
+      let handle;
+      try {
+        const parent = await fs.lstat(reviews);
+        if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== process.getuid() ||
+            (parent.mode & 0o077)) return blocked('unsafe_review_dir');
+        const before = await fs.lstat(file);
+        if (!before.isFile() || before.isSymbolicLink() || before.uid !== process.getuid() ||
+            before.nlink !== 1 || (before.mode & 0o777) !== 0o600) return blocked('unsafe_review');
+        handle = await fs.open(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        const opened = await handle.stat();
+        if (opened.dev !== before.dev || opened.ino !== before.ino) return blocked('unsafe_review');
+        const content = await handle.readFile('utf8');
+        const record = JSON.parse(content);
+        const after = await fs.lstat(file);
+        if (after.dev !== opened.dev || after.ino !== opened.ino ||
+            after.size !== opened.size || after.mtimeMs !== opened.mtimeMs ||
+            after.ctimeMs !== opened.ctimeMs) return blocked('unsafe_review');
+        if (record.externalId !== candidate.externalId || record.operationId !== operationId ||
+            record.payloadSha256 !== candidate.payloadRef.sha256 ||
+            record.digest !== hash(JSON.stringify(record.review))) return blocked('review_mismatch');
+        return record;
+      } catch (error) {
+        if (error.code === 'ENOENT') return blocked('missing_review');
+        throw error;
+      } finally { await handle?.close(); }
+    });
+  }
+  async function sealReview(operationId, candidateKey, review) {
+    if (!validId(operationId) || typeof candidateKey !== 'string' ||
+        !['approve', 'reject', 'duplicate'].includes(review?.decision)) return blocked('invalid_review');
+    return withLock(async () => {
+      const row = await read(itemFile(operationId));
+      const manifest = await read(manifestFile(operationId));
+      const candidate = manifest?.candidates?.find(item => item.candidateKey === candidateKey);
+      if (!row || !candidate || !await payloadValid(candidate.payloadRef, row, candidate)) {
+        return blocked('candidate_payload_mismatch');
+      }
+      if (review.payloadSha256 !== candidate.payloadRef.sha256) return blocked('review_source_mismatch');
+      await fs.mkdir(reviews, { recursive: true, mode: 0o700 });
+      const directory = await fs.lstat(reviews);
+      if (!directory.isDirectory() || directory.uid !== process.getuid() ||
+          (directory.mode & 0o077)) return blocked('unsafe_review_dir');
+      const file = path.join(reviews, `${candidate.externalId}.json`);
+      const prior = await fs.lstat(file).catch(error => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (prior) return blocked('review_conflict');
+      const record = { operationId, externalId: candidate.externalId,
+        payloadSha256: candidate.payloadRef.sha256, review, digest: hash(JSON.stringify(review)) };
+      const content = JSON.stringify(record) + '\n';
+      if (await usageUnlocked() + 2 * allocated(content) + reserve > maxBytes) return { kind: 'full', operationId };
+      const temp = path.join(reviews, `.${randomUUID()}.tmp`);
+      const handle = await fs.open(temp, 'wx', 0o600);
+      try {
+        await handle.writeFile(content);
+        await handle.sync();
+        await fs.link(temp, file);
+        await syncDir(reviews);
+      } finally { await handle.close(); await fs.rm(temp, { force: true }); }
+      await syncDir(reviews);
+      return { kind: 'sealed', review, digest: record.digest };
+    });
   }
   async function ackVerified(operationId, proof) {
     if (!validId(operationId)) return blocked('invalid_operation');
@@ -635,7 +822,8 @@ export function createOutbox(stateDir, options = {}) {
       return structuredClone(manifest);
     });
   }
-  return { enqueueCheckpoint, ackVerified, recordManifest,
+  return { enqueueCheckpoint, ackVerified, recordManifest, persistCandidatePayload,
+    claimExtraction, recordExtractionUsage, extractionUsage, readCandidatePayload, readReview, sealReview,
     readManifest,
     ackCandidate: (id, key, proof) => updateCandidate(id, key, 'remote_acked', null, proof),
     disposeCandidate: (id, key, status, reason) =>

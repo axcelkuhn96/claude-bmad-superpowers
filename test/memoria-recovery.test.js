@@ -21,9 +21,17 @@ const run = promisify(execFile);
 async function writeCandidateRef(dir, parentId, projectId, candidate, text = 'approved fact') {
   const folder = path.join(dir, 'candidates', 'payloads');
   await fs.mkdir(folder, { recursive: true, mode: 0o700 });
-  const payload = { external_id: candidate.externalId, project_id: projectId, checkpoint_id: parentId,
-    source_message_id: candidate.evidence.messageId,
-    source_offsets: { start: candidate.evidence.start, end: candidate.evidence.end }, text };
+  const parent = JSON.parse(await fs.readFile(path.join(dir, 'outbox', 'items', `${parentId}.json`)));
+  const payload = { memory_id: null, external_id: candidate.externalId, project_id: projectId,
+    checkpoint_id: parentId, candidate_key: candidate.candidateKey, logical_key: candidate.candidateKey,
+    text, type: 'fact', actor: 'user', speaker_role: 'user', origin: 'user_direct',
+    origin_cli: parent.cli, session_id: parent.sessionId, source_message_id: candidate.evidence.messageId,
+    source_offsets: { start: candidate.evidence.start, end: candidate.evidence.end },
+    slice_start: parent.start, slice_end: parent.end, slice_hash: parent.sliceHash,
+    evidence_at: '2026-10-01T00:00:00Z', ingested_at: '2026-10-01T00:00:00Z',
+    valid_from: null, valid_to: null, scope: 'project', status: 'candidate',
+    supersedes_id: null, policy_version: parent.policyVersion,
+    extractor_model: 'fixture', embedding_fingerprint: null };
   const bytes = Buffer.from(JSON.stringify(payload) + '\n');
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   const file = path.join(folder, `${candidate.externalId}.${sha256}.json`);
@@ -387,9 +395,15 @@ test('tiny files consume allocated blocks in quota and stop before physical limi
   const firstFile = (await fs.readdir(path.join(dir, 'outbox', 'items')))[0];
   const stat = await fs.stat(path.join(dir, 'outbox', 'items', firstFile));
   assert.ok(used > stat.size * 10, `allocated=${used} logical=${stat.size}`);
-  assert.equal((await outbox.enqueueCheckpoint({ ...first, start: 1, end: 2,
-    sliceHash: 'b'.repeat(64) }, identity)).kind, 'full');
-  assert.equal((await outbox.cursor('codex', 's')).queuedEnd, 1);
+  let stopped = false;
+  for (let n = 1; n < 10; n++) {
+    const next = await outbox.enqueueCheckpoint({ ...first, start: n, end: n + 1,
+      sliceHash: n.toString(16).padStart(64, '0') }, identity);
+    if (next.kind === 'full') { stopped = true; assert.equal((await outbox.cursor('codex', 's')).queuedEnd, n); break; }
+    assert.equal(next.kind, 'queued');
+    assert.ok(await outbox.usage() <= 32768);
+  }
+  assert.equal(stopped, true);
 });
 
 test('no facts and rejected or duplicate candidates close locally without fake remote ACK', async t => {
@@ -440,7 +454,7 @@ test('remote outage records bounded retry state while bytes and ACK remain pendi
 
 test('capacity rejects without advancing queued cursor; replay follows freed capacity', async t => {
   const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  const outbox = createOutbox(dir, { maxBytes: 48000 });
+  const outbox = createOutbox(dir, { maxBytes: 45000 });
   const one = { cli: 'codex', sessionId: 's', start: 0, end: 4, sliceHash: 'a'.repeat(64), messages: [{ text: 'x'.repeat(9000) }] };
   const queued = await outbox.enqueueCheckpoint(one, { projectId: 'p', policyVersion: 'native-v1' });
   assert.equal(queued.kind, 'queued');
@@ -450,7 +464,7 @@ test('capacity rejects without advancing queued cursor; replay follows freed cap
   assert.equal((await outbox.cursor('codex', 's')).queuedEnd, 4);
   await outbox.ackVerified(queued.operationId, { externalId: queued.operationId, sdkId: 's', qdrantId: 'q', projectId: 'p', status: 'active' });
   assert.ok(await outbox.usage() > 0, 'ACK and cursor summary consume disk quota');
-  const replay = await createOutbox(dir, { maxBytes: 48000 }).enqueueCheckpoint({ ...one, start: 4, end: 8, sliceHash: 'b'.repeat(64) }, { projectId: 'p', policyVersion: 'native-v1' });
+  const replay = await createOutbox(dir, { maxBytes: 45000 }).enqueueCheckpoint({ ...one, start: 4, end: 8, sliceHash: 'b'.repeat(64) }, { projectId: 'p', policyVersion: 'native-v1' });
   assert.equal(replay.kind, 'queued');
   assert.equal((await outbox.cursor('codex', 's')).queuedEnd, 8);
   assert.equal((await outbox.enqueueCheckpoint(one, { projectId: 'p', policyVersion: 'native-v1' })).kind,

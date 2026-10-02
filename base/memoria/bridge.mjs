@@ -64,7 +64,7 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
         operation.sourceIdentity.projectId !== operation.projectId ||
         operation.sourceIdentity.sessionId !== operation.sessionId) return blocked('source_identity_mismatch');
   } catch { return blocked('invalid_source_identity'); }
-  const resolution = await resolveProject(cwd, sessionId, options);
+  const resolution = await (options.resolve ?? resolveProject)(cwd, sessionId, options);
   if (resolution.provider !== 'mem0' || resolution.projectId !== operation.projectId) return blocked('project_mismatch');
   const bridge = request => runBridgeOperation(cwd, sessionId, request, readSecret, options);
   const response = await withProjectLock(resolution.stateDir, () => reconcileStore(operation, {
