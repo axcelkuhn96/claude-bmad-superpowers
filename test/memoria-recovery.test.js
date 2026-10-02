@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readCompleteJsonl, parsePersistedSlice } from '../base/memoria/transcript.mjs';
@@ -17,6 +18,18 @@ import { trustTuple, writeLocalTrust } from '../base/memoria/trust.mjs';
 const fixture = name => path.join(import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname), 'fixtures', name);
 const temp = () => fs.mkdtemp(path.join(os.tmpdir(), 'cbs-mem0-recovery-'));
 const run = promisify(execFile);
+async function writeCandidateRef(dir, parentId, projectId, candidate, text = 'approved fact') {
+  const folder = path.join(dir, 'candidates', 'payloads');
+  await fs.mkdir(folder, { recursive: true, mode: 0o700 });
+  const payload = { external_id: candidate.externalId, project_id: projectId, checkpoint_id: parentId,
+    source_message_id: candidate.evidence.messageId,
+    source_offsets: { start: candidate.evidence.start, end: candidate.evidence.end }, text };
+  const bytes = Buffer.from(JSON.stringify(payload) + '\n');
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const file = path.join(folder, `${candidate.externalId}.${sha256}.json`);
+  await fs.writeFile(file, bytes, { mode: 0o600 });
+  return { sha256, file };
+}
 
 test('reader stops before incomplete UTF-8 record and counts CRLF bytes', () => {
   const first = Buffer.from('{"role":"user","text":"ação"}\r\n');
@@ -146,6 +159,8 @@ test('checkpoint manifest resolves two child facts only after exact remote ACKs'
   { projectId: 'p', policyVersion: 'native-v1' });
   const children = ['fact-0', 'fact-1'].map(candidateKey => ({ candidateKey, evidence: { messageId: 'm1', start: 0, end: 9 },
     externalId: externalIdFor({ ...source, candidateKey }) }));
+  for (const child of children) child.payloadRef = await writeCandidateRef(dir, parent.operationId, 'p', child);
+  for (const child of children) delete child.payloadRef.file;
   assert.equal((await outbox.recordManifest(parent.operationId, children)).kind, 'manifested');
   assert.deepEqual((await outbox.recordManifest(parent.operationId, children)).kind, 'manifested');
   await assert.rejects(outbox.recordManifest(parent.operationId, children.slice(0, 1)), /manifest_conflict/);
@@ -168,6 +183,110 @@ test('checkpoint manifest resolves two child facts only after exact remote ACKs'
   assert.equal((await createOutbox(dir).pending()).length, 0);
 });
 
+test('manifest survives restart and binds child IDs to protected payload bytes', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const source = { projectId: 'p', originCli: 'codex', sessionId: 's', start: 0, end: 9,
+    sliceHash: 'b'.repeat(64), policyVersion: 'native-v1' };
+  const outbox = createOutbox(dir);
+  const parent = await outbox.enqueueCheckpoint({ cli: 'codex', sessionId: 's', start: 0, end: 9,
+    sliceHash: source.sliceHash, messages: [{ messageId: 'm1', start: 0, end: 9 }] },
+  { projectId: 'p', policyVersion: 'native-v1' });
+  const child = { candidateKey: 'fact-0', externalId: externalIdFor({ ...source, candidateKey: 'fact-0' }),
+    evidence: { messageId: 'm1', start: 0, end: 9 } };
+  assert.equal((await outbox.recordManifest(parent.operationId, [child])).reason, 'invalid_manifest');
+  const { file, ...payloadRef } = await writeCandidateRef(dir, parent.operationId, 'p', child);
+  child.payloadRef = payloadRef;
+  assert.equal((await outbox.recordManifest(parent.operationId,
+    [{ ...child, payloadRef: { ...payloadRef, path: file } }])).reason, 'invalid_manifest');
+  assert.equal((await outbox.recordManifest(parent.operationId, [child])).kind, 'manifested');
+  const loaded = await createOutbox(dir).readManifest(parent.operationId);
+  assert.equal(loaded.candidates[0].externalId, child.externalId);
+  assert.deepEqual(loaded.candidates[0].payloadRef, payloadRef);
+  const manifestFile = path.join(dir, 'outbox', 'items', `${parent.operationId}.manifest.json`);
+  const original = await fs.readFile(manifestFile);
+  const corrupt = JSON.parse(original);
+  corrupt.candidates[0].externalId = 'src-' + 'f'.repeat(64);
+  await fs.writeFile(manifestFile, JSON.stringify(corrupt));
+  assert.deepEqual(await createOutbox(dir).readManifest(parent.operationId),
+    { kind: 'blocked', reason: 'corrupt_manifest' });
+  await fs.writeFile(manifestFile, original);
+  await fs.writeFile(file, '{"text":"changed"}\n');
+  assert.deepEqual(await createOutbox(dir).readManifest(parent.operationId),
+    { kind: 'blocked', reason: 'candidate_payload_mismatch' });
+  await fs.rm(file);
+  await fs.symlink(path.join(dir, 'other.json'), file);
+  assert.deepEqual(await createOutbox(dir).readManifest(parent.operationId),
+    { kind: 'blocked', reason: 'candidate_payload_mismatch' });
+});
+
+test('root snapshot temp is cleaned after crash before rename', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const outbox = createOutbox(dir, { maxBytes: 65000 });
+  for (let n = 0; n < 3; n++) {
+    const queued = await outbox.enqueueCheckpoint({ cli: 'codex', sessionId: 's', start: n, end: n + 1,
+      sliceHash: n.toString(16).padStart(64, '0'), messages: [{ text: 'x' }] },
+    { projectId: 'p', policyVersion: 'native-v1' });
+    await outbox.ackVerified(queued.operationId, { externalId: queued.operationId,
+      projectId: 'p', sdkId: 's', qdrantId: 'q', status: 'active' });
+  }
+  const root = path.join(dir, 'outbox');
+  const stale = path.join(root, '.00000000-0000-0000-0000-000000000000.tmp');
+  await fs.writeFile(stale, 'x'.repeat(8192));
+  const before = await outbox.usage();
+  assert.equal((await fs.readdir(root)).includes(path.basename(stale)), false);
+  assert.ok(before < 8192 + 65000);
+});
+
+test('repeated no-facts compact to source-bound processed highwater and replay safely', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const outbox = createOutbox(dir, { maxBytes: 65536 });
+  let firstReceipt;
+  let firstId;
+  for (let n = 0; n < 30; n++) {
+    const slice = { cli: 'codex', sessionId: 's', start: n, end: n + 1,
+      sliceHash: n.toString(16).padStart(64, '0'), messages: [] };
+    const queued = await outbox.enqueueCheckpoint(slice, { projectId: 'p', policyVersion: 'native-v1' });
+    assert.equal(queued.kind, 'queued', `enqueue ${n}: ${JSON.stringify(queued)}`);
+    assert.equal((await outbox.recordManifest(queued.operationId, [])).kind, 'manifested');
+    assert.equal((await outbox.completeCheckpoint(queued.operationId)).kind, 'processed');
+    if (n === 0) {
+      firstId = queued.operationId;
+      firstReceipt = await fs.readFile(path.join(dir, 'outbox', 'processed', `${firstId}.json`));
+    }
+  }
+  await fs.writeFile(path.join(dir, 'outbox', 'processed', `${firstId}.json`), firstReceipt);
+  assert.deepEqual(await createOutbox(dir, { maxBytes: 65536 }).cursor('codex', 's'),
+    { queuedEnd: 30, ackedEnd: 0, processedEnd: 30 });
+  assert.equal((await fs.readdir(path.join(dir, 'outbox', 'processed'))).includes(`${firstId}.json`), false);
+  assert.equal((await outbox.enqueueCheckpoint({ cli: 'codex', sessionId: 's', start: 0, end: 1,
+    sliceHash: 'f'.repeat(64), messages: [] }, { projectId: 'p', policyVersion: 'native-v1' })).kind, 'blocked');
+  assert.ok((await fs.readdir(path.join(dir, 'outbox', 'processed'))).length < 10);
+  assert.ok(await outbox.usage() <= 65536);
+  const cursors = (await fs.readdir(path.join(dir, 'outbox'))).filter(name => name.startsWith('cursor-'));
+  assert.equal(cursors.length, 1);
+  const summary = JSON.parse(await fs.readFile(path.join(dir, 'outbox', cursors[0])));
+  assert.equal(summary.projectId, 'p');
+  assert.equal(summary.policyVersion, 'native-v1');
+  assert.equal(summary.processedCount + (await fs.readdir(path.join(dir, 'outbox', 'processed'))).length, 30);
+  assert.match(summary.processedAudit, /^[a-f0-9]{64}$/);
+});
+
+test('tiny files consume allocated blocks in quota and stop before physical limit', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const outbox = createOutbox(dir, { maxBytes: 32768 });
+  const identity = { projectId: 'p', policyVersion: 'native-v1' };
+  const first = { cli: 'codex', sessionId: 's', start: 0, end: 1,
+    sliceHash: 'a'.repeat(64), messages: [] };
+  assert.equal((await outbox.enqueueCheckpoint(first, identity)).kind, 'queued');
+  const used = await outbox.usage();
+  const firstFile = (await fs.readdir(path.join(dir, 'outbox', 'items')))[0];
+  const stat = await fs.stat(path.join(dir, 'outbox', 'items', firstFile));
+  assert.ok(used > stat.size * 10, `allocated=${used} logical=${stat.size}`);
+  assert.equal((await outbox.enqueueCheckpoint({ ...first, start: 1, end: 2,
+    sliceHash: 'b'.repeat(64) }, identity)).kind, 'full');
+  assert.equal((await outbox.cursor('codex', 's')).queuedEnd, 1);
+});
+
 test('no facts and rejected or duplicate candidates close locally without fake remote ACK', async t => {
   const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const outbox = createOutbox(dir);
@@ -182,6 +301,8 @@ test('no facts and rejected or duplicate candidates close locally without fake r
   { projectId: 'p', policyVersion: 'native-v1' });
   const children = ['rejected', 'duplicate'].map(candidateKey => ({ candidateKey, evidence: { messageId: 'm2', start: 4, end: 8 },
     externalId: externalIdFor({ ...source, start: 4, end: 8, sliceHash: 'd'.repeat(64), candidateKey }) }));
+  for (const child of children) child.payloadRef = await writeCandidateRef(dir, second.operationId, 'p', child);
+  for (const child of children) delete child.payloadRef.file;
   await outbox.recordManifest(second.operationId, children);
   assert.equal((await outbox.disposeCandidate(second.operationId, 'rejected', 'rejected', 'unsupported_claim')).kind, 'disposed');
   assert.equal((await outbox.disposeCandidate(second.operationId, 'duplicate', 'duplicate', 'existing_fact')).kind, 'disposed');
@@ -214,8 +335,8 @@ test('remote outage records bounded retry state while bytes and ACK remain pendi
 
 test('capacity rejects without advancing queued cursor; replay follows freed capacity', async t => {
   const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  const outbox = createOutbox(dir, { maxBytes: 1600 });
-  const one = { cli: 'codex', sessionId: 's', start: 0, end: 4, sliceHash: 'a'.repeat(64), messages: [{ text: 'x'.repeat(1000) }] };
+  const outbox = createOutbox(dir, { maxBytes: 48000 });
+  const one = { cli: 'codex', sessionId: 's', start: 0, end: 4, sliceHash: 'a'.repeat(64), messages: [{ text: 'x'.repeat(9000) }] };
   const queued = await outbox.enqueueCheckpoint(one, { projectId: 'p', policyVersion: 'native-v1' });
   assert.equal(queued.kind, 'queued');
   assert.equal(queued.alert, true);
@@ -224,7 +345,7 @@ test('capacity rejects without advancing queued cursor; replay follows freed cap
   assert.equal((await outbox.cursor('codex', 's')).queuedEnd, 4);
   await outbox.ackVerified(queued.operationId, { externalId: queued.operationId, sdkId: 's', qdrantId: 'q', projectId: 'p', status: 'active' });
   assert.ok(await outbox.usage() > 0, 'ACK and cursor summary consume disk quota');
-  const replay = await createOutbox(dir, { maxBytes: 1600 }).enqueueCheckpoint({ ...one, start: 4, end: 8, sliceHash: 'b'.repeat(64) }, { projectId: 'p', policyVersion: 'native-v1' });
+  const replay = await createOutbox(dir, { maxBytes: 48000 }).enqueueCheckpoint({ ...one, start: 4, end: 8, sliceHash: 'b'.repeat(64) }, { projectId: 'p', policyVersion: 'native-v1' });
   assert.equal(replay.kind, 'queued');
   assert.equal((await outbox.cursor('codex', 's')).queuedEnd, 8);
   assert.equal((await outbox.enqueueCheckpoint(one, { projectId: 'p', policyVersion: 'native-v1' })).kind,
@@ -263,7 +384,7 @@ test('six MiB backlog resumes at complete lines after full queue and restart', a
 
 test('receipt compaction keeps cursor and project binding before removing old receipts', async t => {
   const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  const outbox = createOutbox(dir, { maxBytes: 1800 });
+  const outbox = createOutbox(dir, { maxBytes: 48000 });
   const identity = { projectId: 'p', policyVersion: 'native-v1' };
   let first;
   for (let n = 0; n < 3; n++) {
@@ -275,7 +396,7 @@ test('receipt compaction keeps cursor and project binding before removing old re
       projectId: 'p', sdkId: 's', qdrantId: 'q', status: 'active' })).kind, 'acked');
   }
   const next = { cli: 'codex', sessionId: 's', start: 3, end: 4,
-    sliceHash: '3'.padStart(64, '0'), messages: [{ text: 'x'.repeat(870) }] };
+    sliceHash: '3'.padStart(64, '0'), messages: [{ text: 'x'.repeat(9000) }] };
   assert.equal((await outbox.enqueueCheckpoint(next, identity)).kind, 'queued');
   assert.deepEqual((await createOutbox(dir).cursor('codex', 's')), { queuedEnd: 4, ackedEnd: 3, processedEnd: 3 });
   assert.equal((await outbox.enqueueCheckpoint({ ...next, start: 0, end: 1, sliceHash: '0'.repeat(64) }, identity)).kind,
@@ -291,9 +412,9 @@ test('receipt compaction keeps cursor and project binding before removing old re
 
 test('SIGKILL during highwater compaction resumes without duplicate or lost cursor', async t => {
   const moduleUrl = new URL('../base/memoria/outbox.mjs', import.meta.url).href;
-  for (const boundary of ['after_rename', 'after_dir_sync']) {
+  for (const boundary of ['after_write', 'after_file_sync', 'after_rename', 'after_dir_sync']) {
     const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
-    const outbox = createOutbox(dir, { maxBytes: 1800 });
+    const outbox = createOutbox(dir, { maxBytes: 48000 });
     const identity = { projectId: 'p', policyVersion: 'native-v1' };
     for (let n = 0; n < 3; n++) {
       const queued = await outbox.enqueueCheckpoint({ cli: 'codex', sessionId: 's', start: n, end: n + 1,
@@ -302,9 +423,9 @@ test('SIGKILL during highwater compaction resumes without duplicate or lost curs
         projectId: 'p', sdkId: 'sdk', qdrantId: 'q', status: 'active' });
     }
     const next = { cli: 'codex', sessionId: 's', start: 3, end: 4,
-      sliceHash: '3'.padStart(64, '0'), messages: [{ text: 'x'.repeat(870) }] };
+      sliceHash: '3'.padStart(64, '0'), messages: [{ text: 'x'.repeat(9000) }] };
     const source = `import { createOutbox } from ${JSON.stringify(moduleUrl)};
-const outbox = createOutbox(process.argv[1], { maxBytes: 1800, fault: stage => {
+const outbox = createOutbox(process.argv[1], { maxBytes: 48000, fault: stage => {
   if (stage === process.argv[2]) process.kill(process.pid, 'SIGKILL');
 } });
 await outbox.enqueueCheckpoint(JSON.parse(process.argv[3]), { projectId: 'p', policyVersion: 'native-v1' });`;
@@ -315,7 +436,8 @@ await outbox.enqueueCheckpoint(JSON.parse(process.argv[3]), { projectId: 'p', po
     });
     assert.equal(signal, 'SIGKILL');
     assert.equal((await createOutbox(dir).cursor('codex', 's')).ackedEnd, 3);
-    const replay = await createOutbox(dir, { maxBytes: 1800 }).enqueueCheckpoint(next, identity);
+    assert.equal((await fs.readdir(path.join(dir, 'outbox'))).some(name => name.endsWith('.tmp')), false);
+    const replay = await createOutbox(dir, { maxBytes: 48000 }).enqueueCheckpoint(next, identity);
     assert.equal(replay.kind, 'queued', JSON.stringify(replay));
     assert.equal((await outbox.cursor('codex', 's')).queuedEnd, 4);
   }
@@ -373,6 +495,45 @@ for (const cli of ['claude', 'codex']) {
       await fs.writeFile(nativePath, (await fs.readFile(nativePath, 'utf8')).replace('enabled = false', 'enabled = true'));
     }
     assert.equal((await verifyNativeCapture(dir, { cli, stateRoot, installedPlugin: true })).kind, 'blocked');
+  });
+}
+
+for (const cli of ['claude', 'codex']) {
+  test(`${cli} tracked native config blocks capture under forged GIT_DIR and GIT_WORK_TREE`, async t => {
+    const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    const root = path.join(dir, 'project'); await fs.mkdir(root); await run('git', ['init', '-q', root]);
+    const foreign = path.join(dir, 'foreign'); await fs.mkdir(foreign); await run('git', ['init', '-q', foreign]);
+    const stateRoot = path.join(dir, 'state');
+    await fs.mkdir(path.join(root, '.cbs'));
+    await fs.writeFile(path.join(root, '.cbs/memoria.json'), JSON.stringify({ provider: 'mem0',
+      project_id: 'project-one', qdrant: { url: 'https://qdrant.internal', collection: 'cbs-project-one',
+        api_key_env: 'CBS_MEMORIA_TEST_KEY' }, embedding: { model: 'multilingual-e5-small', dimension: 384,
+        fingerprint: 'ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665:0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39' } }));
+    const transcriptPath = path.join(dir, cli === 'claude' ? 'native-session.jsonl' : 'rollout-native-session.jsonl');
+    await fs.copyFile(fixture(`memoria-native-${cli}.jsonl`), transcriptPath);
+    assert.equal((await applyNativeExclusion(root, { cli, stateRoot, installedPlugin: true })).kind, 'applied');
+    const resolution = await inspectConfiguration(root, { stateRoot });
+    await writeLocalTrust(resolution.stateDir, trustTuple(resolution));
+    const payload = { cwd: root, session_id: 'native-session', transcript_path: transcriptPath,
+      hook_event_name: 'SessionStart' };
+    const args = { cli, event: 'SessionStart', payload, stateRoot, installedPlugin: true };
+    assert.equal((await captureEvent(args)).kind, 'queued');
+    const nativePath = path.join(root, cli === 'claude' ? '.claude/settings.local.json' : '.codex/config.toml');
+    await run('git', ['-C', root, 'add', '-f', '--', path.relative(root, nativePath)]);
+    const nativeLine = (await fs.readFile(transcriptPath, 'utf8')).split('\n')[0];
+    await fs.appendFile(transcriptPath, nativeLine + '\n');
+    const outbox = createOutbox(resolution.stateDir);
+    const prior = (await outbox.pending()).length;
+    assert.equal((await verifyNativeCapture(root, { cli, stateRoot, installedPlugin: true })).reason, 'unsafe_native_config');
+    const moduleUrl = new URL('../base/memoria/checkpoint.mjs', import.meta.url).href;
+    const script = `import { captureEvent } from ${JSON.stringify(moduleUrl)};
+const result = await captureEvent(JSON.parse(process.argv[1]));
+process.stdout.write(JSON.stringify(result));`;
+    const stop = { ...args, event: 'Stop', payload: { ...payload, hook_event_name: 'Stop' } };
+    const { stdout } = await run(process.execPath, ['--input-type=module', '-e', script, JSON.stringify(stop)],
+      { env: { ...process.env, GIT_DIR: path.join(foreign, '.git'), GIT_WORK_TREE: root } });
+    assert.deepEqual(JSON.parse(stdout), { kind: 'blocked', reason: 'unsafe_native_config' });
+    assert.equal((await outbox.pending()).length, prior);
   });
 }
 

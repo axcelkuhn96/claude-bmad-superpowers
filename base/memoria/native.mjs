@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { identifyProject } from './project-id.mjs';
 
 const run = promisify(execFile);
+const gitEnv = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
 const plugins = { claude: 'claude-mem@thedotmack', codex: 'claude-mem@claude-mem-local' };
 const blocked = (reason) => ({ kind: 'blocked', reason });
 const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -59,20 +60,20 @@ async function safeParent(file) {
 async function tracked(root, file) {
   const relative = path.relative(root, file);
   try {
-    const { stdout } = await run('git', ['-C', root, 'ls-files', '--cached', '--', relative], { timeout: 5000 });
+    const { stdout } = await run('git', ['-C', root, 'ls-files', '--cached', '--', relative], { env: gitEnv(), timeout: 5000 });
     return !!stdout.trim();
   } catch { return true; }
 }
 async function excludePlan(root, cli, target = configFile(root, cli)) {
   const relative = path.relative(root, target);
   try {
-    await run('git', ['-C', root, 'check-ignore', '-q', '--', relative], { timeout: 5000 });
+    await run('git', ['-C', root, 'check-ignore', '-q', '--', relative], { env: gitEnv(), timeout: 5000 });
     return { added: false };
   } catch (error) {
     if (error.code !== 1) return null;
   }
   try {
-    const { stdout } = await run('git', ['-C', root, 'rev-parse', '--git-path', 'info/exclude'], { timeout: 5000 });
+    const { stdout } = await run('git', ['-C', root, 'rev-parse', '--git-path', 'info/exclude'], { env: gitEnv(), timeout: 5000 });
     const file = path.resolve(root, stdout.trim());
     if (!await safeParent(file) || !await safeFile(file)) return null;
     return { added: true, file, block: `# cbs-memoria ${cli}\n/${relative}\n` };

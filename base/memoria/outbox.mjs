@@ -13,10 +13,12 @@ export function createOutbox(stateDir, options = {}) {
   const maxBytes = options.maxBytes ?? DEFAULT_MAX;
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error('invalid_outbox_limit');
   const reserve = maxBytes >= 64 * 1024 * 1024 ? 16 * 1024 * 1024 : 0;
+  let blockSize = 4096;
   const root = path.join(stateDir, 'outbox');
   const items = path.join(root, 'items');
   const acks = path.join(root, 'acks');
   const processed = path.join(root, 'processed');
+  const payloads = path.join(stateDir, 'candidates', 'payloads');
   const lock = path.join(root, 'lock');
   const itemFile = id => path.join(items, `${id}.json`);
   const ackFile = id => path.join(acks, `${id}.json`);
@@ -25,6 +27,7 @@ export function createOutbox(stateDir, options = {}) {
   const retryFile = id => path.join(items, `${id}.retry.json`);
   const summaryFile = (cli, sessionId) => path.join(root,
     `cursor-${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.json`);
+  const hash = value => createHash('sha256').update(value).digest('hex');
 
   async function syncDir(dir) {
     const h = await fs.open(dir, 'r');
@@ -36,6 +39,7 @@ export function createOutbox(stateDir, options = {}) {
       await fs.mkdir(dir, { recursive: true, mode: 0o700 });
       const st = await fs.lstat(dir);
       if (!st.isDirectory() || st.uid !== process.getuid() || (st.mode & 0o077)) throw new Error('unsafe_outbox_dir');
+      blockSize = Math.max(blockSize, st.blksize ?? 4096);
     }
   }
   async function read(file) {
@@ -66,7 +70,7 @@ export function createOutbox(stateDir, options = {}) {
         await fs.mkdir(lock, { mode: 0o700 });
         await fs.writeFile(path.join(lock, 'pid'), String(process.pid), { flag: 'wx', mode: 0o600 });
         try {
-          for (const dir of [items, acks, processed]) {
+          for (const dir of [items, acks, processed, root]) {
             let removed = false;
             for (const name of await fs.readdir(dir)) if (/^\.[a-f0-9-]+\.tmp$/.test(name)) {
               await fs.rm(path.join(dir, name));
@@ -96,6 +100,22 @@ export function createOutbox(stateDir, options = {}) {
             await fs.rm(manifestFile(id), { force: true });
             await fs.rm(retryFile(id), { force: true });
           }
+          let cleanedProcessed = false;
+          for (const name of await fs.readdir(root)) if (/^cursor-[a-f0-9]{64}\.json$/.test(name)) {
+            const summary = await read(path.join(root, name));
+            if (!summary?.processedAudit) continue;
+            for (const receiptName of await fs.readdir(processed)) {
+              if (!/^src-[a-f0-9]{64}\.json$/.test(receiptName)) continue;
+              const receipt = await read(path.join(processed, receiptName));
+              if (receipt?.disposition === 'no_facts' && receipt.cli === summary.cli &&
+                  receipt.sessionId === summary.sessionId && receipt.projectId === summary.projectId &&
+                  receipt.policyVersion === summary.policyVersion && receipt.end <= summary.processedEnd) {
+                await fs.rm(path.join(processed, receiptName));
+                cleanedProcessed = true;
+              }
+            }
+          }
+          if (cleanedProcessed) await syncDir(processed);
           return await callback();
         }
         finally { await fs.rm(lock, { recursive: true, force: true }); }
@@ -167,7 +187,7 @@ export function createOutbox(stateDir, options = {}) {
       .sort((a, b) => a.start - b.start);
     if (prior) {
       let removed = false;
-      for (const row of rows) if (row.acknowledged && row.end <= prior.queuedEnd) {
+      for (const row of rows) if (row.acknowledged && prior.entries?.some(([id]) => id === row.operationId)) {
         if (row.projectId !== prior.projectId || row.policyVersion !== prior.policyVersion) {
           throw new Error('cursor_source_mismatch');
         }
@@ -175,9 +195,9 @@ export function createOutbox(stateDir, options = {}) {
         removed = true;
       }
       if (removed) await syncDir(acks);
-      rows = rows.filter(row => row.end > prior.queuedEnd);
+      rows = rows.filter(row => !prior.entries?.some(([id]) => id === row.operationId));
     }
-    let end = prior?.queuedEnd ?? 0;
+    let end = prior?.ackedEnd ?? 0;
     const removable = [];
     for (const row of rows) {
       if (row.start !== end || !row.acknowledged) break;
@@ -190,13 +210,43 @@ export function createOutbox(stateDir, options = {}) {
     if (!removable.length) return;
     const last = removable.at(-1);
     const snapshot = { cli, sessionId, projectId: last.projectId,
-      policyVersion: last.policyVersion, queuedEnd: end, ackedEnd: end, processedEnd: end,
+      policyVersion: last.policyVersion, queuedEnd: Math.max(prior?.queuedEnd ?? 0, end),
+      ackedEnd: end, processedEnd: Math.max(prior?.processedEnd ?? 0, end),
+      processedAudit: prior?.processedAudit, processedCount: prior?.processedCount,
       entries: [...(prior?.entries ?? []), ...removable.map(row =>
         [row.operationId, proofDigest(row)])] };
     if (!await fits(snapshot)) return;
     await durable(summaryFile(cli, sessionId), snapshot);
     for (const row of removable) await fs.rm(ackFile(row.operationId));
     await syncDir(acks);
+  }
+  async function compactProcessedUnlocked(cli, sessionId) {
+    const prior = await read(summaryFile(cli, sessionId));
+    const rows = unique(await records()).filter(row => row.cli === cli && row.sessionId === sessionId)
+      .sort((a, b) => a.start - b.start);
+    let end = prior?.processedEnd ?? 0;
+    let digest = prior?.processedAudit ?? '0'.repeat(64);
+    const removable = [];
+    for (const row of rows) {
+      if (row.end <= end) continue;
+      if (row.start !== end || row.disposition !== 'no_facts' || row.candidates?.length) break;
+      if (prior && (row.projectId !== prior.projectId || row.policyVersion !== prior.policyVersion)) {
+        throw new Error('cursor_source_mismatch');
+      }
+      digest = hash(JSON.stringify([digest, row.operationId, row.sliceHash, row.start, row.end]));
+      end = row.end;
+      removable.push(row);
+    }
+    if (!removable.length) return;
+    const last = removable.at(-1);
+    const snapshot = { cli, sessionId, projectId: last.projectId, policyVersion: last.policyVersion,
+      queuedEnd: Math.max(prior?.queuedEnd ?? 0, end), ackedEnd: prior?.ackedEnd ?? 0,
+      processedEnd: end, processedAudit: digest, processedCount: (prior?.processedCount ?? 0) + removable.length,
+      entries: prior?.entries ?? [] };
+    if (!await fits(snapshot)) return;
+    await durable(summaryFile(cli, sessionId), snapshot);
+    for (const row of removable) await fs.rm(processedFile(row.operationId));
+    await syncDir(processed);
   }
   async function enqueueCheckpoint(slice, identity) {
     const { cli, sessionId, start, end, sliceHash, messages } = slice ?? {};
@@ -223,10 +273,11 @@ export function createOutbox(stateDir, options = {}) {
       const position = cursorFrom(rows, cli, sessionId, summary);
       if (start !== position.queuedEnd) return blocked('cursor_gap');
       const row = { operationId, projectId, cli, sessionId, start, end, sliceHash, policyVersion, messages };
-      const size = Buffer.byteLength(JSON.stringify(row) + '\n');
+      const size = allocated(JSON.stringify(row) + '\n');
       let used = await usageUnlocked();
       if (used + size + reserve > maxBytes) {
         await compactAcksUnlocked(cli, sessionId);
+        await compactProcessedUnlocked(cli, sessionId);
         used = await usageUnlocked();
       }
       if (used + size + reserve > maxBytes) return { kind: 'full', operationId, usedBytes: used, maxBytes };
@@ -237,17 +288,57 @@ export function createOutbox(stateDir, options = {}) {
   }
   async function usageUnlocked() {
     let bytes = 0;
-    for (const dir of [items, acks, processed, root]) {
+    for (const dir of [items, acks, processed, root, lock, path.dirname(payloads), payloads]) {
+      try { await fs.lstat(dir); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+      const directory = await fs.lstat(dir);
+      bytes += Math.max(directory.size, (directory.blocks ?? 0) * 512);
       for (const name of await fs.readdir(dir)) {
-        if (dir === root && !name.endsWith('.json')) continue;
         const stat = await fs.lstat(path.join(dir, name));
-        if (stat.isFile()) bytes += stat.size;
+        if (stat.isFile()) bytes += Math.max(stat.size, (stat.blocks ?? 0) * 512);
       }
     }
     return bytes;
   }
+  function allocated(value) {
+    const size = typeof value === 'number' ? value : Buffer.byteLength(value);
+    return Math.ceil(size / blockSize) * blockSize + blockSize;
+  }
+  async function payloadValid(ref, row, candidate) {
+    if (!ref || Object.keys(ref).length !== 1 || !/^[a-f0-9]{64}$/.test(ref.sha256 ?? '')) return false;
+    const file = path.join(payloads, `${candidate.externalId}.${ref.sha256}.json`);
+    let handle;
+    try {
+      for (const dir of [path.dirname(payloads), payloads]) {
+        const stat = await fs.lstat(dir);
+        if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077)) return false;
+      }
+      const before = await fs.lstat(file);
+      if (!before.isFile() || before.isSymbolicLink() || before.size > maxBytes || before.uid !== process.getuid() ||
+          (before.mode & 0o077)) return false;
+      handle = await fs.open(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const actual = await handle.stat();
+      if (actual.dev !== before.dev || actual.ino !== before.ino) return false;
+      const bytes = await handle.readFile();
+      if (hash(bytes) !== ref.sha256) return false;
+      let data;
+      try { data = JSON.parse(bytes); } catch { return false; }
+      if (data?.external_id !== candidate.externalId || data.project_id !== row.projectId ||
+          data.checkpoint_id !== row.operationId || data.source_message_id !== candidate.evidence.messageId ||
+          data.source_offsets?.start !== candidate.evidence.start ||
+          data.source_offsets?.end !== candidate.evidence.end) return false;
+      await handle.sync();
+      const after = await fs.lstat(file);
+      if (after.dev !== actual.dev || after.ino !== actual.ino || after.size !== actual.size ||
+          after.mtimeMs !== actual.mtimeMs || after.ctimeMs !== actual.ctimeMs) return false;
+      await syncDir(payloads);
+      return true;
+    } catch (error) {
+      if (['ENOENT', 'ELOOP'].includes(error.code)) return false;
+      throw error;
+    } finally { await handle?.close(); }
+  }
   async function fits(value) {
-    return await usageUnlocked() + Buffer.byteLength(JSON.stringify(value) + '\n') <= maxBytes;
+    return await usageUnlocked() + allocated(JSON.stringify(value) + '\n') <= maxBytes;
   }
   async function ackVerified(operationId, proof) {
     if (!validId(operationId)) return blocked('invalid_operation');
@@ -298,23 +389,28 @@ export function createOutbox(stateDir, options = {}) {
         const evidence = candidate.evidence;
         if (!candidateKey || candidate.externalId !== externalId || seen.has(candidateKey) ||
             !evidence || !row.messages.some(message => message.messageId === evidence.messageId &&
-              message.start === evidence.start && message.end === evidence.end)) return blocked('invalid_manifest');
+              message.start === evidence.start && message.end === evidence.end) ||
+            !await payloadValid(candidate.payloadRef, row, candidate)) return blocked('invalid_manifest');
         seen.add(candidateKey);
         entries.push({ candidateKey, externalId,
           evidence: { messageId: evidence.messageId, start: evidence.start, end: evidence.end },
+          payloadRef: { sha256: candidate.payloadRef.sha256 },
           status: 'pending' });
       }
       const prior = await read(manifestFile(operationId));
       if (prior) {
-        if (JSON.stringify(prior.candidates.map(({ candidateKey, externalId, evidence }) => ({ candidateKey, externalId, evidence }))) !==
-            JSON.stringify(entries.map(({ candidateKey, externalId, evidence }) => ({ candidateKey, externalId, evidence })))) {
+        if (JSON.stringify(prior.candidates.map(({ candidateKey, externalId, evidence, payloadRef }) => ({ candidateKey, externalId, evidence, payloadRef }))) !==
+            JSON.stringify(entries.map(({ candidateKey, externalId, evidence, payloadRef }) => ({ candidateKey, externalId, evidence, payloadRef })))) {
           throw new Error('manifest_conflict');
         }
         return { kind: 'manifested', operationId };
       }
       const manifest = { operationId, projectId: row.projectId,
         disposition: entries.length ? 'candidates' : 'no_facts', candidates: entries };
-      if (!await fits(manifest)) return { kind: 'full', operationId };
+      if (!await fits(manifest)) {
+        await compactProcessedUnlocked(row.cli, row.sessionId);
+        if (!await fits(manifest)) return { kind: 'full', operationId };
+      }
       await durable(manifestFile(operationId), manifest);
       return { kind: 'manifested', operationId };
     });
@@ -327,6 +423,7 @@ export function createOutbox(stateDir, options = {}) {
       if (!row || !manifest) return blocked('missing_manifest');
       const candidate = manifest.candidates.find(item => item.candidateKey === candidateKey);
       if (!candidate) return blocked('missing_candidate');
+      if (!await payloadValid(candidate.payloadRef, row, candidate)) return blocked('candidate_payload_mismatch');
       if (candidate.status !== 'pending') {
         if (candidate.status !== status || status === 'remote_acked' &&
             (proof?.externalId !== candidate.externalId || proof.projectId !== row.projectId ||
@@ -354,17 +451,26 @@ export function createOutbox(stateDir, options = {}) {
       const row = await read(itemFile(operationId));
       const manifest = await read(manifestFile(operationId));
       if (!row || !manifest) return blocked('missing_manifest');
+      if (!(await Promise.all(manifest.candidates.map(candidate => payloadValid(candidate.payloadRef, row, candidate)))).every(Boolean)) {
+        return blocked('candidate_payload_mismatch');
+      }
       if (manifest.candidates.some(candidate => candidate.status === 'pending')) return blocked('unresolved_candidates');
       const receipt = { operationId, projectId: row.projectId,
         cli: row.cli, sessionId: row.sessionId, start: row.start, end: row.end,
         sliceHash: row.sliceHash, policyVersion: row.policyVersion,
         disposition: manifest.disposition, candidates: manifest.candidates };
-      if (!await fits(receipt)) return { kind: 'full', operationId };
+      if (!await fits(receipt)) {
+        await compactProcessedUnlocked(row.cli, row.sessionId);
+        if (!await fits(receipt)) return { kind: 'full', operationId };
+      }
       await durable(processedFile(operationId), receipt);
       await fs.rm(itemFile(operationId));
       await fs.rm(manifestFile(operationId));
       await fs.rm(retryFile(operationId), { force: true });
       await syncDir(items);
+      if (manifest.disposition === 'no_facts' && await usageUnlocked() >= maxBytes * 0.6) {
+        await compactProcessedUnlocked(row.cli, row.sessionId);
+      }
       return { kind: 'processed', operationId };
     });
   }
@@ -390,7 +496,35 @@ export function createOutbox(stateDir, options = {}) {
     if (!Number.isSafeInteger(now) || now < 0) throw new Error('invalid_retry_clock');
     return (await withLock(pendingUnlocked)).filter(row => row.attempts < 5 && row.retryAt <= now);
   }
+  async function readManifest(operationId) {
+    if (!validId(operationId)) return blocked('invalid_operation');
+    return withLock(async () => {
+      const manifest = await read(manifestFile(operationId));
+      const row = await read(itemFile(operationId));
+      if (!manifest || !row || manifest.operationId !== row.operationId ||
+          manifest.projectId !== row.projectId) return blocked('missing_manifest');
+      if (!Array.isArray(manifest.candidates) || manifest.candidates.length > 5 ||
+          manifest.disposition !== (manifest.candidates.length ? 'candidates' : 'no_facts') ||
+          new Set(manifest.candidates.map(candidate => candidate.candidateKey)).size !== manifest.candidates.length) {
+        return blocked('corrupt_manifest');
+      }
+      for (const candidate of manifest.candidates) {
+        let expected;
+        try { expected = externalIdFor({ projectId: row.projectId, originCli: row.cli,
+          sessionId: row.sessionId, start: row.start, end: row.end, sliceHash: row.sliceHash,
+          policyVersion: row.policyVersion, candidateKey: candidate.candidateKey }); }
+        catch { return blocked('corrupt_manifest'); }
+        if (candidate.externalId !== expected || !row.messages.some(message =>
+            message.messageId === candidate.evidence?.messageId && message.start === candidate.evidence.start &&
+            message.end === candidate.evidence.end) ||
+            !['pending', 'remote_acked', 'rejected', 'duplicate'].includes(candidate.status)) return blocked('corrupt_manifest');
+        if (!await payloadValid(candidate.payloadRef, row, candidate)) return blocked('candidate_payload_mismatch');
+      }
+      return structuredClone(manifest);
+    });
+  }
   return { enqueueCheckpoint, ackVerified, recordManifest,
+    readManifest,
     ackCandidate: (id, key, proof) => updateCandidate(id, key, 'remote_acked', null, proof),
     disposeCandidate: (id, key, status, reason) =>
       ['rejected', 'duplicate'].includes(status) && /^[a-z_]{1,64}$/.test(reason ?? '')
