@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { extractionSchema, validateExtractionOutput } from './extract-contract.mjs';
+import { identifyProject } from './project-id.mjs';
 
 const schema = JSON.stringify(extractionSchema);
 const tokenCount = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -14,13 +15,15 @@ export async function runSonnetExtraction(prompt, policy = {}) {
   }
   const configuredProfile = process.env.CLAUDE_CONFIG_DIR;
   if (!configuredProfile) return { kind: 'error', reason: 'cli_profile_unselected' };
+  const scope = await identifyProject(process.cwd());
+  if (scope.kind !== 'git') return { kind: 'error', reason: 'cli_project_unresolved' };
   let profile;
   try {
     if (!path.isAbsolute(configuredProfile)) throw new Error('relative profile');
     profile = await fs.realpath(configuredProfile);
-    const project = await fs.realpath(process.cwd());
     const metadata = await fs.stat(profile);
-    if (!metadata.isDirectory() || profile === project || profile.startsWith(project + path.sep) ||
+    if (!metadata.isDirectory() || [scope.projectRoot, scope.activeRoot].some(root =>
+      profile === root || profile.startsWith(root + path.sep)) ||
         !process.getuid || metadata.uid !== process.getuid() || (metadata.mode & 0o022)) {
       throw new Error('untrusted profile');
     }

@@ -1050,3 +1050,67 @@ test('CLI requires an explicit trusted local profile and ignores a model or poli
     else process.env.CLAUDE_CONFIG_DIR = oldProfile;
   }
 });
+
+test('CLI rejects checkout profiles from external and nested cwd, including symlinks', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-cli-root-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const repo = path.join(dir, 'repo');
+  const outside = path.join(dir, 'outside');
+  const nested = path.join(repo, 'nested');
+  const inRepo = path.join(repo, 'profile');
+  const external = path.join(dir, 'external-profile');
+  const linkedCwd = path.join(dir, 'linked-cwd');
+  const linkedInRepo = path.join(dir, 'linked-in-repo');
+  const linkedExternal = path.join(dir, 'linked-external');
+  const marker = path.join(dir, 'spawned');
+  await fs.mkdir(nested, { recursive: true });
+  await fs.mkdir(outside);
+  await fs.mkdir(inRepo, { mode: 0o700 });
+  await fs.mkdir(external, { mode: 0o700 });
+  await fs.symlink(nested, linkedCwd, 'dir');
+  await fs.symlink(inRepo, linkedInRepo, 'dir');
+  await fs.symlink(external, linkedExternal, 'dir');
+  await new Promise((resolve, reject) => {
+    const git = spawn('git', ['init', '-q', repo], { stdio: 'ignore',
+      env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))) });
+    git.once('error', reject);
+    git.once('close', code => code === 0 ? resolve() : reject(new Error(`git init exited ${code}`)));
+  });
+  await fs.writeFile(path.join(dir, 'claude'), `#!${process.execPath}\n` +
+    `require('node:fs').writeFileSync(${JSON.stringify(marker)}, process.env.CLAUDE_CONFIG_DIR);\n` +
+    `process.stdin.resume(); process.stdin.on('end', () => process.stdout.write(JSON.stringify({\n` +
+    `subtype:'success',is_error:false,structured_output:{candidates:[],no_facts:true},\n` +
+    `modelUsage:{sonnet:{canonicalModel:'claude-sonnet-5-5'}}})));`, { mode: 0o700 });
+  const oldCwd = process.cwd();
+  const oldPath = process.env.PATH;
+  const oldProfile = process.env.CLAUDE_CONFIG_DIR;
+  const oldGitDir = process.env.GIT_DIR;
+  try {
+    process.env.PATH = `${dir}:${oldPath}`;
+    process.env.CLAUDE_CONFIG_DIR = inRepo;
+    process.env.GIT_DIR = path.join(repo, '.git');
+    process.chdir(outside);
+    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet' }),
+      { kind: 'error', reason: 'cli_project_unresolved' });
+    if (oldGitDir === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = oldGitDir;
+    process.chdir(nested);
+    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet' }),
+      { kind: 'error', reason: 'cli_profile_untrusted' });
+    process.chdir(linkedCwd);
+    process.env.CLAUDE_CONFIG_DIR = linkedInRepo;
+    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet' }),
+      { kind: 'error', reason: 'cli_profile_untrusted' });
+    await assert.rejects(fs.access(marker), { code: 'ENOENT' });
+    process.env.CLAUDE_CONFIG_DIR = linkedExternal;
+    assert.equal((await runSonnetExtraction('{}', { route: 'sonnet' })).kind, 'success');
+    assert.equal(await fs.readFile(marker, 'utf8'), await fs.realpath(external));
+  } finally {
+    process.chdir(oldCwd);
+    process.env.PATH = oldPath;
+    if (oldProfile === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = oldProfile;
+    if (oldGitDir === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = oldGitDir;
+  }
+});
