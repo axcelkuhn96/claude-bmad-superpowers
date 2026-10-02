@@ -474,5 +474,20 @@ export async function verifyNativeCapture(root, options = {}) {
   try { hooks = JSON.parse(captureRaw).hooks; } catch { return blocked('capture_hooks_changed'); }
   if (!captureEvents[cli].every(event => hooks?.[event]?.some(group =>
     group?.hooks?.some(h => h?.command === captureCommand(cli, event))))) return blocked('capture_hooks_changed');
+  if (cli === 'codex' && options.includeLaunchHooks) {
+    // Only CBS definitions may be copied to argv. Unknown hooks in this otherwise
+    // undiscovered linked-worktree file require a separate merge decision.
+    if (Object.keys(hooks).length !== captureEvents.codex.length ||
+        !captureEvents.codex.every(event => {
+          const groups = hooks[event];
+          const group = groups?.[0];
+          const handler = group?.hooks?.[0];
+          return groups?.length === 1 && Object.keys(group).length === 1 &&
+            group.hooks?.length === 1 && Object.keys(handler).length === 3 &&
+            handler.type === 'command' && handler.command === captureCommand(cli, event) &&
+            handler.timeout === 10;
+        })) return blocked('unmerged_capture_hooks');
+    return { kind: 'verified', hooks };
+  }
   return { kind: 'verified' };
 }

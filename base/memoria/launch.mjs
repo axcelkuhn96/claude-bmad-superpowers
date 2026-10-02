@@ -63,9 +63,15 @@ export async function createLaunch(cwd, cli, { stateRoot } = {}) {
   const trust = await readLocalTrust(current.stateDir);
   const expected = trustTuple(current);
   if (!trust || Object.entries(expected).some(([key, value]) => trust[key] !== value)) return blocked('trust_changed');
+  let launchHooks;
   if (process.platform === 'win32') {
     const verified = await verifyNativeCapture(nativeRoot, { cli, projectRoot: current.projectRoot, stateRoot });
     if (verified.kind !== 'verified') return blocked(verified.reason);
+  } else if (cli === 'codex') {
+    const verified = await verifyNativeCapture(nativeRoot,
+      { cli, projectRoot: current.projectRoot, stateRoot, includeLaunchHooks: true });
+    if (verified.kind !== 'verified') return blocked(verified.reason);
+    launchHooks = verified.hooks;
   }
   const token = randomBytes(32).toString('hex');
   const dir = launchDir(stateRoot);
@@ -84,7 +90,7 @@ export async function createLaunch(cwd, cli, { stateRoot } = {}) {
       return blocked('unsafe_launch_state');
     }
   } else await fs.writeFile(launchFile(stateRoot, token), JSON.stringify(record) + '\n', { flag: 'wx', mode: 0o600 });
-  return { kind: 'created', token, record };
+  return { kind: 'created', token, record, ...(launchHooks ? { launchHooks } : {}) };
 }
 
 export async function bindLaunch(token, cli, cwd, nativeSessionId, { stateRoot } = {}) {
@@ -126,6 +132,7 @@ export async function resolveBoundLaunch(token, cli, { stateRoot } = {}) {
 
 export async function launchCli(cwd, cli, args = [], options = {}) {
   if (process.platform === 'win32') return blocked('native_windows_unproved');
+  if (cli === 'codex' && !safeCodexArgs(args)) return blocked('unsafe_cli_args');
   const made = await createLaunch(cwd, cli, options);
   if (made.kind !== 'created') return made;
   const root = options.stateRoot ?? rootDefault();
@@ -145,13 +152,26 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
   const mcpArgs = cli === 'claude' ? ['--mcp-config', JSON.stringify(mcp)] :
     ['-c', `mcp_servers.cbs_memoria.command=${JSON.stringify(process.execPath)}`,
       '-c', `mcp_servers.cbs_memoria.args=${JSON.stringify([mcpScript])}`];
-  const child = spawn(cli, [...mcpArgs, ...args], { cwd, stdio: 'inherit',
+  const hookArgs = cli === 'codex' ? Object.entries(made.launchHooks).flatMap(([event, groups]) =>
+    ['-c', `hooks.${event}=${JSON.stringify(groups)}`]) : [];
+  const child = spawn(cli, [...mcpArgs, ...hookArgs, ...args], { cwd, stdio: 'inherit',
     env: { ...process.env, CBS_MEMORIA_LAUNCH_ID: made.token, CBS_MEMORIA_CLI: cli,
       ...(options.stateRoot ? { CBS_MEMORIA_STATE_ROOT: options.stateRoot } : {}) } });
   return await new Promise(resolve => {
     child.once('error', () => resolve(blocked('cli_unavailable')));
     child.once('exit', (code, signal) => resolve({ kind: 'exited', code, signal }));
   });
+}
+
+function safeCodexArgs(args) {
+  if (!Array.isArray(args)) return false;
+  const values = new Set(['-m', '--model']);
+  const flags = new Set(['--no-alt-screen', '--no-daemon', '--strict-config']);
+  for (let i = 0; i < args.length; i++) {
+    if (flags.has(args[i])) continue;
+    if (!values.has(args[i]) || typeof args[++i] !== 'string' || !args[i] || args[i].startsWith('-')) return false;
+  }
+  return true;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

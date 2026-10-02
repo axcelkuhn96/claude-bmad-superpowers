@@ -11,14 +11,14 @@ import { scheduleExtraction, consumeCheckpoints } from '../base/memoria/extract-
 import { recordSessionCheckout } from '../base/memoria/session-checkout.mjs';
 import { createOutbox } from '../base/memoria/outbox.mjs';
 import { withProjectLock } from '../base/memoria/ledger.mjs';
-import { createLaunch, bindLaunch, resolveBoundLaunch } from '../base/memoria/launch.mjs';
+import { createLaunch, bindLaunch, resolveBoundLaunch, launchCli } from '../base/memoria/launch.mjs';
 import { inspectConfiguration, initializeSession } from '../base/memoria/provider.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { applyNativeExclusion, restoreNativeExclusion, verifyNativeCapture } from '../base/memoria/native.mjs';
 import { RUNTIME_PINS, runtimePython, openArtifactIdentity } from '../base/memoria/runtime.mjs';
 import { pinDestination } from '../base/memoria/activation.mjs';
 import net from 'node:net';
-import { readBrokerRequest, brokerEndpointStatus, prepareBrokerEndpoint } from '../base/memoria/broker.mjs';
+import { readBrokerRequest, brokerEndpointStatus, prepareBrokerEndpoint, brokerPath } from '../base/memoria/broker.mjs';
 
 function git(cwd, ...args) {
   const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
@@ -405,6 +405,71 @@ test('Codex worktrees own native config independently and share exclude safely',
   assert.ok((await fs.readFile(path.resolve(root, excludePath), 'utf8')).includes('/.codex/config.toml'));
   assert.equal((await restoreNativeExclusion(worktree, options)).kind, 'restored');
   assert.equal((await fs.readFile(path.resolve(root, excludePath), 'utf8')).includes('# cbs-memoria codex'), false);
+});
+
+test('trusted linked Codex launch carries only its verified hooks as session config', async t => {
+  const { dir, root, stateRoot } = await fixture(t);
+  const linked = path.join(dir, 'linked');
+  git(root, 'worktree', 'add', '-q', '-b', 'linked-hooks', linked);
+  const config = JSON.stringify({ provider: 'mem0', project_id: 'p',
+    qdrant: { url: 'https://qdrant.internal', collection: 'cbs-p', api_key_env: 'CBS_TEST_KEY' },
+    embedding: { model: 'multilingual-e5-small', dimension: 384,
+      fingerprint: `${RUNTIME_PINS.modelSha256}:${RUNTIME_PINS.tokenizerSha256}` } });
+  for (const checkout of [root, linked]) {
+    await fs.mkdir(path.join(checkout, '.cbs'));
+    await fs.writeFile(path.join(checkout, '.cbs', 'memoria.json'), config);
+  }
+  const current = await inspectConfiguration(linked, { stateRoot });
+  await writeLocalTrust(current.stateDir, trustTuple(current));
+  assert.equal((await applyNativeExclusion(linked,
+    { cli: 'codex', stateRoot, installedPlugin: true, projectRoot: root })).kind, 'applied');
+  const expected = JSON.parse(await fs.readFile(path.join(linked, '.codex', 'hooks.json'), 'utf8')).hooks;
+  await fs.mkdir(stateRoot, { recursive: true, mode: 0o700 });
+  const server = net.createServer(socket => socket.end());
+  t.after(() => server.close());
+  await new Promise(resolve => server.listen(brokerPath(stateRoot), resolve));
+  await fs.chmod(brokerPath(stateRoot), 0o600);
+  const bin = path.join(dir, 'bin');
+  await fs.mkdir(bin);
+  const capture = path.join(dir, 'cli-args.json');
+  const script = path.join(bin, 'codex');
+  await fs.writeFile(script, `#!${process.execPath}\nrequire('node:fs').writeFileSync(process.env.CBS_TEST_LAUNCH_CAPTURE, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd(), launchId: process.env.CBS_MEMORIA_LAUNCH_ID }));\n`);
+  await fs.chmod(script, 0o700);
+  const oldPath = process.env.PATH;
+  const oldCapture = process.env.CBS_TEST_LAUNCH_CAPTURE;
+  process.env.PATH = `${bin}${path.delimiter}${oldPath}`;
+  process.env.CBS_TEST_LAUNCH_CAPTURE = capture;
+  t.after(() => {
+    process.env.PATH = oldPath;
+    if (oldCapture === undefined) delete process.env.CBS_TEST_LAUNCH_CAPTURE;
+    else process.env.CBS_TEST_LAUNCH_CAPTURE = oldCapture;
+  });
+  assert.deepEqual(await launchCli(linked, 'codex', ['--model', 'safe-model'], { stateRoot }),
+    { kind: 'exited', code: 0, signal: null });
+  const seen = JSON.parse(await fs.readFile(capture, 'utf8'));
+  assert.equal(seen.cwd, linked);
+  assert.match(seen.launchId, /^[a-f0-9]{64}$/);
+  for (const [event, groups] of Object.entries(expected)) {
+    assert.ok(seen.args.includes(`hooks.${event}=${JSON.stringify(groups)}`), event);
+  }
+  assert.equal(seen.args.filter(arg => arg.startsWith('hooks.')).length, Object.keys(expected).length);
+  assert.ok(seen.args.some(arg => arg.startsWith('mcp_servers.cbs_memoria.command=')));
+  assert.equal(seen.args.includes('CBS_TEST_KEY'), false);
+  await assert.rejects(fs.readFile(path.join(root, '.codex', 'hooks.json'), 'utf8'), { code: 'ENOENT' });
+
+  await fs.rm(capture);
+  const hooksFile = path.join(linked, '.codex', 'hooks.json');
+  const changed = JSON.parse(await fs.readFile(hooksFile, 'utf8'));
+  changed.hooks.PreToolUse = [{ hooks: [{ type: 'command', command: 'echo custom' }] }];
+  await fs.writeFile(hooksFile, JSON.stringify(changed));
+  assert.equal((await launchCli(linked, 'codex', [], { stateRoot })).reason, 'unmerged_capture_hooks');
+  await assert.rejects(fs.readFile(capture, 'utf8'), { code: 'ENOENT' });
+  assert.equal((await launchCli(linked, 'codex', ['-c', 'hooks.SessionStart=[]'], { stateRoot })).reason,
+    'unsafe_cli_args');
+  for (const args of [['--cd', root], ['--profile', 'other'], ['--dangerously-bypass-hook-trust']]) {
+    assert.equal((await launchCli(linked, 'codex', args, { stateRoot })).reason, 'unsafe_cli_args');
+  }
+  await assert.rejects(fs.readFile(capture, 'utf8'), { code: 'ENOENT' });
 });
 
 test('native rollback retries after Git exclude write failure on final shared lease', async t => {
