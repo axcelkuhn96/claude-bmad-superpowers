@@ -48,11 +48,33 @@ const report = { schema: 'cbs-mem0-windows-native-fixture-v4', platform: process
   startedMonotonicMs: performance.now(), controls };
 const budgets = { captureP95Ms: 250, recallTotalP95Ms: 1000, recallTotalMaxMs: 1000,
   contextTokens: 500, outboxBytes: 256 * 1024 * 1024 };
+const controlStarts = new Map();
+const beginControl = (...names) => {
+  const began = performance.now();
+  for (const name of names) controlStarts.set(name, began);
+};
+const controlBudgetMs = name =>
+  ['native_claude_launch', 'native_cli_hook_recall', 'codex_native_hook_observation',
+    'default_claude_mem_simultaneous_control', 'manual_review', 'real_extraction',
+    'runtime_broker_recall', 'remote_add_crash_replay'].includes(name)
+    ? 15 * 60 * 1000 : name.startsWith('outbox_crash_') || name.startsWith('state_crash_')
+      ? 120000 : 60000;
 const record = (name, status, evidence = {}) => {
   if (!['passed', 'failed', 'missing_prerequisite', 'blocked_missing_implementation'].includes(status)) {
     throw new Error('invalid_fixture_status');
   }
-  controls[name] = { status, observedAt: new Date().toISOString(), evidence };
+  const endedMonotonicMs = performance.now();
+  const executionStarted = controlStarts.has(name);
+  const startedMonotonicMs = controlStarts.get(name) ?? endedMonotonicMs;
+  const elapsedMs = endedMonotonicMs - startedMonotonicMs;
+  const budgetMs = controlBudgetMs(name);
+  if (status === 'passed' && (!executionStarted || elapsedMs > budgetMs)) {
+    status = 'failed';
+    evidence = { ...evidence, reason: !executionStarted
+      ? 'required_control_measurement_missing' : 'control_budget_exceeded' };
+  }
+  controls[name] = { status, startedMonotonicMs, endedMonotonicMs,
+    elapsedMs, budgetMs, executionStarted, observedAt: new Date().toISOString(), evidence };
 };
 const failure = error => ({ reason: error?.message ?? 'fixture_error' });
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -62,7 +84,10 @@ async function provenance() {
   for (const name of ['base/memoria/broker.mjs', 'base/memoria/windows-state.mjs',
     'base/memoria/outbox.mjs', 'base/memoria/windows-native.c',
     'base/memoria/windows-native.def', 'base/memoria/hook-recall.mjs',
-    'test/memoria-windows-native-fixture.mjs', 'test/memoria-windows-crash-child.mjs']) {
+    'base/memoria/capture-hook.mjs', 'base/memoria/mcp.mjs',
+    'base/memoria/native.mjs', 'base/memoria/windows-overlay.mjs',
+    'test/memoria-windows-native-fixture.mjs', 'test/memoria-windows-validation.ps1',
+    'test/memoria-windows-crash-child.mjs']) {
     source[name] = sha(await fs.readFile(path.join(productRoot, name)));
   }
   const addon = sha(await fs.readFile(path.join(productRoot, 'base', 'memoria', 'bin',
@@ -98,16 +123,19 @@ async function save() {
   if (process.platform === 'win32') {
     const unconditional = ['provenance', 'fresh_private_ntfs_fixture', 'fresh_git_checkout',
       'default_claude_mem_selection', 'public_windows_release_gate',
+      'explicit_absolute_sha_tool_enrollment',
       'outbox_same_process_idempotence', 'native_publish_callback_contract',
       'outbox_crash_temp_flushed_before_publish', 'outbox_crash_item_durable',
       'outbox_crash_manifest_durable', 'outbox_crash_receipt_durable',
       'outbox_crash_cursor_durable', 'state_crash_intent_durable',
       'state_crash_rewrite_durable', 'adversarial_reparse', 'adversarial_acl',
       'adversarial_file_id', 'journal_retention', 'worker_guard_and_presecret_ipc'];
-    const dependent = ['destination_trust', 'core_capture_binding', 'capture_p95',
+    const dependent = ['destination_trust', 'core_capture_binding',
+      'capture_source_and_args_negative', 'native_claude_launch', 'capture_p95',
       'real_extraction', 'manual_review', 'remote_add_crash_replay',
       'runtime_broker_recall', 'hook_recall_policy_diagnostic',
-      'hook_executable_direct', 'native_cli_hook_recall',
+      'hook_executable_direct', 'mcp_recall_response', 'native_cli_hook_recall',
+      'codex_native_hook_observation',
       'default_claude_mem_simultaneous_control'];
     for (const name of unconditional) if (!controls[name]) {
       record(name, 'failed', { reason: 'control_not_executed' });
@@ -118,6 +146,28 @@ async function save() {
           ? 'bound_capture' : null;
       record(name, dependency ? 'missing_prerequisite' : 'failed',
         { reason: dependency ?? 'control_not_executed' });
+    }
+    for (const [name, metricBudget] of [['capture_p95', budgets.captureP95Ms],
+      ['runtime_broker_recall', budgets.recallTotalP95Ms]]) {
+      const control = controls[name];
+      if (control?.status !== 'passed') continue;
+      const measure = control.evidence;
+      if ((name === 'runtime_broker_recall' && measure?.requiredMetric !== 'full_hook_and_mcp_response') ||
+          (name === 'capture_p95' && measure?.actualHookProcess !== true) ||
+          !Array.isArray(measure.samplesMs) || measure.samplesMs.length !== 5 ||
+          measure.samplesMs.some(value => !Number.isFinite(value) || value < 0) ||
+          !Number.isFinite(measure.p95Ms) ||
+          Math.abs(p95(measure.samplesMs) - measure.p95Ms) > 1e-9 ||
+          measure.p95Ms > metricBudget ||
+          (name === 'runtime_broker_recall' &&
+            (!Array.isArray(measure.mcpSamplesMs) || measure.mcpSamplesMs.length !== 5 ||
+              measure.mcpSamplesMs.some(value => !Number.isFinite(value) || value < 0) ||
+              !Number.isFinite(measure.mcpP95Ms) ||
+              Math.abs(p95(measure.mcpSamplesMs) - measure.mcpP95Ms) > 1e-9 ||
+              measure.mcpP95Ms > metricBudget))) {
+        control.status = 'failed';
+        control.evidence = { ...measure, reason: 'required_full_hook_measurement_missing' };
+      }
     }
   }
   report.finishedAt = new Date().toISOString();
@@ -151,6 +201,7 @@ async function gitCheckout(root, leaf = 'project') {
 }
 
 async function enroll(root, project) {
+  beginControl('explicit_absolute_sha_tool_enrollment');
   const outcomes = {};
   for (const name of ['claude', 'codex', 'python']) {
     const source = settings.tools?.[name];
@@ -171,6 +222,7 @@ async function enroll(root, project) {
 }
 
 async function configuredProject(project, stateRoot, fixture) {
+  beginControl('destination_trust');
   const destination = settings.destination;
   if (!destination?.url || !destination?.collection || !destination?.apiKeyEnv) {
     record('destination_trust', 'missing_prerequisite', { reason: 'destination_and_key_env_required' });
@@ -532,6 +584,7 @@ async function nativePublishCallbackContract(stateRoot) {
 }
 
 async function adversarialWindowsFiles(stateRoot) {
+  beginControl('adversarial_reparse', 'adversarial_acl', 'adversarial_file_id');
   const dir = path.join(stateRoot, `adversarial-${randomUUID()}`);
   await requirePrivate(dir);
   const bytes = Buffer.from('{"revision":1}\n');
@@ -679,13 +732,14 @@ async function captureCore(project, stateRoot, resolution, profile) {
   const row = rows.find(item => item.operationId === captured.operationId);
   if (!row || row.messages.length !== 1 || row.messages[0].origin !== 'human' ||
       row.messages[0].sessionId !== sessionId) throw new Error('fixture_capture_identity');
-  return { made, captured, sessionId, row, transcript };
+  return { made, captured, sessionId, row, transcript, stateDir: resolution.stateDir };
 }
 
 async function captureP95(capture, project, stateRoot, profile) {
   process.env.CLAUDE_CONFIG_DIR = profile;
   process.env.CBS_MEMORIA_LAUNCH_ID = capture.made.token;
   const times = [];
+  const box = createOutbox(capture.stateDir);
   const payload = { cwd: project, session_id: capture.sessionId,
     transcript_path: capture.transcript, hook_event_name: 'UserPromptSubmit' };
   for (let i = 0; i < 5; i++) {
@@ -695,13 +749,15 @@ async function captureP95(capture, project, stateRoot, profile) {
       message: { role: 'user', content: [{ type: 'text', text: `Fixture timing source ${i}.` }] } }) + '\r\n';
     await rewriteWindowsBinary(capture.transcript, current.fileId, current.bytes,
       Buffer.concat([current.bytes, Buffer.from(line)]));
-    const began = performance.now();
-    const result = await captureEvent({ cli: 'claude', event: 'UserPromptSubmit', payload, stateRoot });
-    times.push(performance.now() - began);
-    if (result.kind !== 'queued') throw new Error(result.reason ?? 'fixture_capture_timing_failed');
+    const before = await box.cursor('claude', capture.sessionId);
+    const result = await executeHookExecutable({ capture, project, stateRoot,
+      profile, event: 'UserPromptSubmit', payload });
+    times.push(result.elapsedMs);
+    const after = await box.cursor('claude', capture.sessionId);
+    if (!(after.queuedEnd > before.queuedEnd)) throw new Error('fixture_capture_hook_no_checkpoint');
   }
   return { samplesMs: times, p95Ms: p95(times), thresholdMs: budgets.captureP95Ms,
-    observed: times.length, directCore: true };
+    observed: times.length, actualHookProcess: true, dispatchToExit: true };
 }
 
 async function crashRemoteAdd({ capture, project, stateRoot, resolution }) {
@@ -779,28 +835,63 @@ async function runActualCli(command) {
   });
 }
 
-async function directHookExecutable({ capture, project, stateRoot, profile, prompt }) {
+async function executeHookExecutable({ capture, project, stateRoot, profile, event, payload }) {
   const file = path.join(productRoot, 'base', 'memoria', 'capture-hook.mjs');
-  const payload = { cwd: project, session_id: capture.sessionId,
-    hook_event_name: 'UserPromptSubmit', transcript_path: capture.transcript, prompt };
   const began = performance.now();
-  const child = spawn(process.execPath, [file, 'claude', 'UserPromptSubmit'], {
+  const child = spawn(process.execPath, [file, 'claude', event], {
     cwd: project, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
     env: { ...process.env, CLAUDE_CONFIG_DIR: profile, CBS_MEMORIA_STATE_ROOT: stateRoot,
       CBS_MEMORIA_LAUNCH_ID: capture.made.token } });
+  child.stdin.on('error', () => {});
   child.stdin.end(JSON.stringify(payload));
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(0, 16000); });
   child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(0, 1000); });
   const exit = await new Promise((resolve, reject) => {
-    child.once('error', reject);
-    child.once('close', code => resolve(code));
+    const timer = setTimeout(() => { child.kill(); reject(new Error('fixture_hook_timeout')); }, 10000);
+    child.once('error', error => { clearTimeout(timer); reject(error); });
+    child.once('close', code => { clearTimeout(timer); resolve(code); });
   });
   const elapsedMs = performance.now() - began;
   if (exit !== 0 || stderr) throw new Error('fixture_direct_hook_failed');
-  const output = JSON.parse(stdout.trim());
+  const output = stdout.trim() ? JSON.parse(stdout.trim()) : null;
   return { output, elapsedMs };
+}
+
+async function directHookExecutable({ capture, project, stateRoot, profile, prompt }) {
+  return executeHookExecutable({ capture, project, stateRoot, profile,
+    event: 'UserPromptSubmit', payload: { cwd: project, session_id: capture.sessionId,
+      hook_event_name: 'UserPromptSubmit', transcript_path: capture.transcript, prompt } });
+}
+
+async function mcpSearchExecutable({ capture, project, stateRoot, profile, query }) {
+  const file = path.join(productRoot, 'base', 'memoria', 'mcp.mjs');
+  const began = performance.now();
+  const child = spawn(process.execPath, [file], { cwd: project,
+    stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    env: { ...process.env, CLAUDE_CONFIG_DIR: profile, CBS_MEMORIA_STATE_ROOT: stateRoot,
+      CBS_MEMORIA_LAUNCH_ID: capture.made.token, CBS_MEMORIA_CLI: 'claude' } });
+  child.stdin.on('error', () => {});
+  const request = (id, method, params) => JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
+  child.stdin.end(request(1, 'initialize', { protocolVersion: '2025-03-26',
+    capabilities: {}, clientInfo: { name: 'cbs-fixture', version: '1' } }) +
+    request(2, 'tools/call', { name: 'search', arguments: { query } }));
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(0, 16000); });
+  child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(0, 1000); });
+  const exit = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill(); reject(new Error('fixture_mcp_timeout')); }, 10000);
+    child.once('error', error => { clearTimeout(timer); reject(error); });
+    child.once('close', code => { clearTimeout(timer); resolve(code); });
+  });
+  const elapsedMs = performance.now() - began;
+  if (exit !== 0 || stderr) throw new Error('fixture_mcp_process_failed');
+  const response = stdout.trim().split(/\r?\n/).map(line => JSON.parse(line))
+    .find(value => value.id === 2);
+  const value = JSON.parse(response?.result?.content?.[0]?.text ?? 'null');
+  return { value, elapsedMs };
 }
 
 async function nativeHookObservation(profile, afterMs, text, source) {
@@ -832,7 +923,7 @@ async function nativeHookObservation(profile, afterMs, text, source) {
       }
     }
   };
-  await visit(profile);
+  await visit(path.join(profile, 'projects'));
   return { matched, contextSha256: hashes, filesVisited: visited };
 }
 
@@ -889,13 +980,113 @@ async function pluginHealth(port, copied, version) {
     pid: value.pid };
 }
 
+function privateCliEnv(profile, pluginEnv) {
+  const env = { ...process.env, ...pluginEnv, CLAUDE_CONFIG_DIR: profile,
+    CLAUDE_CODE_PLUGIN_CACHE_DIR: path.join(profile, 'plugins'),
+    CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: '1', DISABLE_AUTOUPDATER: '1' };
+  delete env.CLAUDE_CODE_PLUGIN_DIRS;
+  delete env.CLAUDE_CODE_PLUGIN_SEED_DIR;
+  return env;
+}
+
+async function installedPrivatePlugin(claude, profile, marketplace, pluginSource,
+  version, sourceHash, pluginEnv) {
+  const env = privateCliEnv(profile, pluginEnv);
+  await runFile(claude, ['plugin', 'marketplace', 'add', marketplace],
+    { env, timeout: 30000, maxBuffer: 8192, windowsHide: true });
+  const marketList = await runFile(claude, ['plugin', 'marketplace', 'list', '--json'],
+    { env, timeout: 15000, maxBuffer: 65536, windowsHide: true });
+  const markets = JSON.parse(marketList.stdout);
+  const registered = Array.isArray(markets) ? markets.filter(row =>
+    row?.name === 'thedotmack' && row.source === 'directory' &&
+    windowsPathKey(row.path ?? '') === windowsPathKey(marketplace) &&
+    windowsPathKey(row.installLocation ?? '') === windowsPathKey(marketplace)) : [];
+  if (registered.length !== 1) throw new Error('fixture_private_marketplace_registration_changed');
+  await runFile(claude, ['plugin', 'install', 'claude-mem@thedotmack', '--scope', 'user'],
+    { env, timeout: 60000, maxBuffer: 8192, windowsHide: true });
+  const { stdout } = await runFile(claude, ['plugin', 'list', '--json'],
+    { env, timeout: 15000, maxBuffer: 65536, windowsHide: true });
+  const entries = JSON.parse(stdout);
+  const installed = Array.isArray(entries) ? entries.filter(row =>
+    row?.id === 'claude-mem@thedotmack' && row.enabled === true &&
+    row.scope === 'user' && row.version === version) : [];
+  if (installed.length !== 1 || entries.some(row => row?.id === 'claude-mem@inline')) {
+    throw new Error('fixture_private_plugin_install_unverified');
+  }
+  const settingsText = await fs.readFile(path.join(profile, 'settings.json'), 'utf8');
+  const saved = JSON.parse(settingsText);
+  if (saved.enabledPlugins?.['claude-mem@thedotmack'] !== true) {
+    throw new Error('fixture_private_plugin_not_enabled');
+  }
+  if (installed[0].errors?.length) throw new Error('fixture_private_plugin_load_error');
+  const loadedPathEvidence = installed[0].readFromFolder ? 'readFromFolder' :
+    installed[0].installPath ? 'installPath' : 'registered_marketplace_in_place';
+  const loadedFrom = installed[0].readFromFolder || installed[0].installPath || pluginSource;
+  const loadedKey = windowsPathKey(loadedFrom ?? '');
+  if (!loadedFrom || !path.isAbsolute(loadedFrom) ||
+      !(loadedKey.startsWith(windowsPathKey(marketplace) + '\\') ||
+        loadedKey.startsWith(windowsPathKey(path.join(profile, 'plugins')) + '\\'))) {
+    throw new Error('fixture_private_plugin_source_changed');
+  }
+  const loadedTreeSha256 = await hashPluginTree(loadedFrom);
+  if (loadedTreeSha256 !== sourceHash) throw new Error('fixture_loaded_plugin_hash_changed');
+  const authResult = await runFile(claude, ['auth', 'status'],
+    { env, timeout: 10000, maxBuffer: 8192, windowsHide: true });
+  const auth = JSON.parse(authResult.stdout);
+  if (!auth || auth.authMethod === 'none' || typeof auth.authMethod !== 'string') {
+    throw new Error('fixture_private_claude_account_missing');
+  }
+  const { configDirectory, ...account } = auth;
+  return { env, settings: saved, installed: { id: installed[0].id,
+    version: installed[0].version, scope: installed[0].scope,
+    enabled: installed[0].enabled }, loadedFrom, loadedTreeSha256,
+    loadedPathEvidence,
+    authMethod: auth.authMethod, accountSha256: sha(JSON.stringify(account)) };
+}
+
+async function nativeToolEffect(profile, afterMs, marker) {
+  let visited = 0;
+  const used = new Set();
+  const succeeded = new Set();
+  let pluginToolCalls = 0;
+  const visit = async dir => {
+    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+      if (++visited > 5000 || entry.isSymbolicLink()) throw new Error('fixture_native_trace_unsafe');
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) await visit(file);
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        const stat = await fs.lstat(file);
+        if (stat.mtimeMs < afterMs || stat.size > 8 * 1024 * 1024) continue;
+        for (const line of (await fs.readFile(file, 'utf8')).split(/\r?\n/).filter(Boolean)) {
+          let value;
+          try { value = JSON.parse(line); } catch { continue; }
+          for (const item of value.message?.content ?? []) {
+            if (item?.type === 'tool_use' && typeof item.name === 'string' &&
+                /claude[-_]?mem|thedotmack/i.test(item.name)) pluginToolCalls++;
+            if (item?.type === 'tool_use' && item.name === 'Bash' &&
+                item.input?.command?.includes(marker) && typeof item.id === 'string') used.add(item.id);
+            if (item?.type === 'tool_result' && item.is_error !== true &&
+                typeof item.tool_use_id === 'string' &&
+                JSON.stringify(item.content).includes(marker)) succeeded.add(item.tool_use_id);
+          }
+        }
+      }
+    }
+  };
+  await visit(path.join(profile, 'projects'));
+  return { completed: [...used].some(id => succeeded.has(id)),
+    pluginToolCalls, filesVisited: visited };
+}
+
 async function defaultPluginControl({ root, defaultProject, project, stateRoot,
   defaultProfile, optInProfile, enrolled }) {
   const supplied = settings.plugin;
-  if (!supplied?.source || !/^[a-f0-9]{64}$/.test(supplied.treeSha256 ?? '') ||
+  if (!supplied?.source || !supplied?.marketplaceSource ||
+      !/^[a-f0-9]{64}$/.test(supplied.treeSha256 ?? '') ||
+      !/^[a-f0-9]{64}$/.test(supplied.marketplaceTreeSha256 ?? '') ||
       enrolled.claude !== 'passed' || enrolled.python !== 'passed' || !settings.runInteractiveCli) {
     return { status: 'missing_prerequisite', evidence: {
-      reason: 'private_verified_plugin_copy_cli_python_and_interactive_sessions_required' } };
+      reason: 'verified_real_marketplace_plugin_cli_python_and_interactive_sessions_required' } };
   }
   const sourceAudit = await inspectWindowsPath(supplied.source, 'directory', { privateState: false });
   if (!sourceAudit.ok) throw new Error('fixture_plugin_source_unsafe');
@@ -907,12 +1098,31 @@ async function defaultPluginControl({ root, defaultProject, project, stateRoot,
   }
   const sourceHash = await hashPluginTree(supplied.source);
   if (sourceHash !== supplied.treeSha256) throw new Error('fixture_plugin_hash_changed');
+  const marketplaceAudit = await inspectWindowsPath(supplied.marketplaceSource, 'directory',
+    { privateState: false });
+  if (!marketplaceAudit.ok ||
+      await hashPluginTree(supplied.marketplaceSource) !== supplied.marketplaceTreeSha256) {
+    throw new Error('fixture_marketplace_source_unsafe');
+  }
+  const catalog = JSON.parse(await fs.readFile(path.join(supplied.marketplaceSource,
+    '.claude-plugin', 'marketplace.json'), 'utf8'));
+  const entry = catalog.plugins?.filter(row => row.name === 'claude-mem');
+  if (catalog.name !== 'thedotmack' || entry?.length !== 1 ||
+      typeof entry[0].source !== 'string' ||
+      !/^\.\/[A-Za-z0-9._/-]+$/.test(entry[0].source) ||
+      entry[0].source.includes('..') ||
+      await hashPluginTree(path.join(supplied.marketplaceSource, entry[0].source)) !== sourceHash) {
+    throw new Error('fixture_marketplace_plugin_identity');
+  }
   const pluginsDir = path.join(root, 'plugins');
   await requirePrivate(pluginsDir);
-  const copied = path.join(pluginsDir, 'claude-mem');
-  await fs.cp(supplied.source, copied, { recursive: true, force: false, errorOnExist: true });
-  await requirePrivate(copied);
-  if (await hashPluginTree(copied) !== sourceHash) throw new Error('fixture_plugin_copy_changed');
+  const privateMarketplace = path.join(pluginsDir, 'thedotmack');
+  await fs.cp(supplied.marketplaceSource, privateMarketplace,
+    { recursive: true, force: false, errorOnExist: true });
+  await requirePrivate(privateMarketplace);
+  if (await hashPluginTree(privateMarketplace) !== supplied.marketplaceTreeSha256) {
+    throw new Error('fixture_marketplace_copy_changed');
+  }
   const pluginData = path.join(root, 'plugin-state');
   await requirePrivate(pluginData);
   await requirePrivate(defaultProfile);
@@ -926,22 +1136,62 @@ async function defaultPluginControl({ root, defaultProject, project, stateRoot,
   await publishWindowsBinary(path.join(pluginData, 'settings.json'), pluginSettings);
   const pluginEnv = { CLAUDE_MEM_DATA_DIR: pluginData, CLAUDE_MEM_WORKER_PORT: String(port),
     CLAUDE_MEM_WORKER_HOST: '127.0.0.1', CLAUDE_MEM_IDLE_EXIT_SEC: '30' };
+  for (const [profile, cwd] of [[defaultProfile, defaultProject], [optInProfile, project]]) {
+    process.stdout.write(`Fixture private Claude account/trust: log in to the same account, review ${cwd}, accept only its private workspace trust, then exit without a prompt.\n`);
+    const trusted = await runActualCli({ command: settings.tools.claude.executable,
+      args: [], cwd, env: privateCliEnv(profile, pluginEnv) });
+    if (trusted.kind !== 'exited' || trusted.code !== 0) {
+      return { status: 'missing_prerequisite', evidence: { reason: 'private_claude_trust' } };
+    }
+  }
+  let profiles;
+  try {
+    profiles = [];
+    for (const profile of [defaultProfile, optInProfile]) {
+      profiles.push(await installedPrivatePlugin(settings.tools.claude.executable, profile,
+        privateMarketplace, path.join(privateMarketplace, entry[0].source),
+        manifest.version, sourceHash, pluginEnv));
+    }
+  } catch (error) {
+    if (/^fixture_(private_marketplace_registration_changed|private_plugin_install_unverified|private_plugin_not_enabled|private_plugin_load_error|private_plugin_source_changed|loaded_plugin_hash_changed)$/.test(error.message)) {
+      throw error;
+    }
+    return { status: 'missing_prerequisite', evidence: {
+      reason: 'private_marketplace_install_or_policy_unavailable', detail: error.message } };
+  }
+  if (JSON.stringify(profiles[0].settings) !== JSON.stringify(profiles[1].settings) ||
+      JSON.stringify(profiles[0].installed) !== JSON.stringify(profiles[1].installed) ||
+      profiles[0].loadedTreeSha256 !== profiles[1].loadedTreeSha256 ||
+      profiles[0].loadedPathEvidence !== profiles[1].loadedPathEvidence ||
+      profiles[0].accountSha256 !== profiles[1].accountSha256) {
+    throw new Error('fixture_private_profiles_not_equivalent');
+  }
+  const marker = `CBSMEM0${randomUUID().replaceAll('-', '')}`;
+  const startedAt = Date.now();
   const defaultChild = spawn(settings.tools.claude.executable,
-    ['--plugin-dir', copied, '--allowedTools', 'Bash', '-p',
-      'Use the Bash tool to run powershell.exe -NoProfile -Command Start-Sleep -Seconds 90, then reply DONE.'],
-    { cwd: defaultProject, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, ...pluginEnv, CLAUDE_CONFIG_DIR: defaultProfile } });
+    ['--allowedTools', 'Bash', '-p', '--input-format', 'stream-json',
+      '--output-format', 'stream-json', '--verbose'],
+    { cwd: defaultProject, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+      env: profiles[0].env });
   let defaultClosed = false;
   let defaultError = '';
-  const defaultExit = new Promise((resolve, reject) => {
-    defaultChild.once('error', reject);
+  const defaultExit = new Promise(resolve => {
+    defaultChild.once('error', error => {
+      defaultClosed = true;
+      defaultError = error.message;
+      resolve({ error: error.message });
+    });
     defaultChild.once('close', (code, signal) => { defaultClosed = true; resolve({ code, signal }); });
   });
   defaultChild.stdout.on('data', () => {});
+  defaultChild.stdin.on('error', () => {});
   defaultChild.stderr.on('data', chunk => { defaultError = (defaultError + chunk).slice(-1000); });
+  defaultChild.stdin.write(JSON.stringify({ type: 'user', message: { role: 'user',
+    content: `Use the Bash tool to run powershell.exe -NoProfile -Command Write-Output ${marker}, then reply DONE.` } }) + '\n');
   try {
     const deadline = Date.now() + 30000;
     let before;
+    let defaultTool;
     let toolEvents = 0;
     while (!defaultClosed && Date.now() < deadline) {
       try {
@@ -949,11 +1199,14 @@ async function defaultPluginControl({ root, defaultProject, project, stateRoot,
           path.join(pluginData, 'claude-mem.db'), defaultProject, project);
         toolEvents = Object.entries(before.default.events).filter(([name]) =>
           /tool|command/i.test(name)).reduce((sum, [, count]) => sum + count, 0);
-        if (toolEvents > 0) break;
+        if (toolEvents > 0) {
+          defaultTool = await nativeToolEffect(defaultProfile, startedAt, marker);
+          if (defaultTool.completed) break;
+        }
       } catch {}
       await new Promise(resolve => setTimeout(resolve, 250));
     }
-    if (defaultClosed || toolEvents < 1) {
+    if (defaultClosed || toolEvents < 1 || !defaultTool?.completed) {
       if (/login|authentication|not logged|api key/i.test(defaultError)) {
         return { status: 'missing_prerequisite',
           evidence: { reason: 'claude_account_in_private_profile' } };
@@ -965,35 +1218,77 @@ async function defaultPluginControl({ root, defaultProject, project, stateRoot,
       throw new Error('fixture_default_plugin_ineffective');
     }
     const beforeEvents = Object.values(before.default.events).reduce((a, b) => a + b, 0);
-    const liveBefore = await pluginHealth(port, copied, manifest.version);
+    const liveBefore = await pluginHealth(port, profiles[0].loadedFrom, manifest.version);
     process.env.CLAUDE_CONFIG_DIR = optInProfile;
     const made = await createLaunch(project, 'claude', { stateRoot });
     if (made.kind !== 'created') throw new Error(made.reason ?? 'fixture_opt_in_launch');
     const launch = await buildLaunchCommand(project, 'claude', [], { stateRoot }, made);
     if (launch.kind !== 'ready') throw new Error(launch.reason ?? 'fixture_opt_in_launch');
     let opted;
+    const optMarker = `CBSMEM0${randomUUID().replaceAll('-', '')}`;
+    const optStartedAt = Date.now();
     try {
       if (defaultClosed) throw new Error('fixture_default_exited_before_overlap');
-      process.stdout.write('Fixture opt-in session: submit a prompt and a tool/command, then exit.\n');
+      if (launch.args[0] !== '--settings' ||
+          windowsPathKey(launch.args[1] ?? '') !== windowsPathKey(made.record.overlay.file)) {
+        throw new Error('fixture_opt_in_productive_overlay_missing');
+      }
+      const optEnv = { ...profiles[1].env, ...launch.env, ...pluginEnv,
+        CLAUDE_CONFIG_DIR: optInProfile,
+        CLAUDE_CODE_PLUGIN_CACHE_DIR: path.join(optInProfile, 'plugins') };
+      const activeList = await runFile(launch.command,
+        ['--settings', launch.args[1], 'plugin', 'list', '--json'],
+        { env: optEnv, timeout: 15000, maxBuffer: 65536, windowsHide: true });
+      const activePlugins = JSON.parse(activeList.stdout);
+      if (!Array.isArray(activePlugins) ||
+          activePlugins.filter(row => row?.id === 'claude-mem@thedotmack' &&
+            row.enabled === false).length !== 1 ||
+          activePlugins.some(row => row?.id === 'claude-mem@inline')) {
+        throw new Error('fixture_opt_in_plugin_still_enabled');
+      }
+      process.stdout.write(`Fixture opt-in session: submit a prompt, run Bash command powershell.exe -NoProfile -Command Write-Output ${optMarker}, then exit.\n`);
       opted = await runActualCli({ ...launch, cwd: project,
-        env: { ...launch.env, ...pluginEnv } });
+        env: optEnv });
     } finally { launch.release(); await launch.cleanup(); }
     if (opted.kind !== 'exited' || opted.code !== 0) throw new Error('fixture_opt_in_cli_failed');
     if (defaultClosed) throw new Error('fixture_default_exited_during_overlap');
     const after = await pluginCounts(settings.tools.python.executable,
       path.join(pluginData, 'claude-mem.db'), defaultProject, project);
-    const liveAfter = await pluginHealth(port, copied, manifest.version);
+    const liveAfter = await pluginHealth(port, profiles[0].loadedFrom, manifest.version);
+    const optInSettingsAfter = JSON.parse(await fs.readFile(
+      path.join(optInProfile, 'settings.json'), 'utf8'));
+    if (JSON.stringify(optInSettingsAfter) !== JSON.stringify(profiles[1].settings)) {
+      throw new Error('fixture_opt_in_profile_settings_changed');
+    }
+    const optTool = await nativeToolEffect(optInProfile, optStartedAt, optMarker);
+    const bound = await resolveBoundLaunch(made.token, 'claude', { stateRoot });
+    const cursor = bound.kind === 'bound'
+      ? await createOutbox(bound.stateDir).cursor('claude', bound.nativeSessionId) : null;
+    if (!optTool.completed || optTool.pluginToolCalls !== 0 || !(cursor?.queuedEnd > 0)) {
+      throw new Error('fixture_opt_in_tool_or_cbs_hook_missing');
+    }
     if (JSON.stringify(after.opt_in) !== JSON.stringify(before.opt_in) ||
         Object.values(after.default.events).reduce((a, b) => a + b, 0) < beforeEvents) {
       throw new Error('fixture_plugin_exclusivity_failed');
     }
     return { status: 'passed', evidence: { version: manifest.version, treeSha256: sourceHash,
+      marketplaceTreeSha256: supplied.marketplaceTreeSha256,
+      installed: profiles[0].installed, equivalentEnabledSettings: true,
+      loadedTreeSha256: profiles[0].loadedTreeSha256,
+      loadedPathEvidence: profiles[0].loadedPathEvidence,
+      accountSha256: profiles[0].accountSha256, authMethod: profiles[0].authMethod,
       privatePort: port, defaultEvents: before.default.events, optInEvents: after.opt_in.events,
-      defaultToolCommandEvents: toolEvents, overlapStartedWhileDefaultLive: true,
-      workerBefore: liveBefore, workerAfter: liveAfter } };
+      defaultToolCommandEvents: toolEvents, defaultTool, optTool,
+      optInCbsCheckpointObserved: true, optInMergedPluginEnabled: false,
+      overlapStartedWhileDefaultLive: true,
+      ownedDefaultChildClosed: true, workerBefore: liveBefore, workerAfter: liveAfter } };
   } finally {
+    defaultChild.stdin.end();
     if (!defaultClosed) defaultChild.kill();
-    await defaultExit;
+    let timer;
+    await Promise.race([defaultExit, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('fixture_default_child_not_closed')), 5000);
+    })]).finally(() => clearTimeout(timer));
   }
 }
 
@@ -1002,6 +1297,7 @@ async function main() {
     record('native_platform', 'missing_prerequisite', { requires: 'Windows x64 NTFS' });
     return;
   }
+  beginControl('provenance');
   report.provenance = await provenance();
   record('provenance', ['claude', 'codex', 'python'].every(name =>
     report.provenance.tools[name]?.version)
@@ -1014,21 +1310,28 @@ async function main() {
   const claudeProfile = path.join(root, 'profiles', 'claude');
   const codexProfile = path.join(root, 'profiles', 'codex');
   const defaultProfile = path.join(root, 'profiles', 'default');
+  const pluginOptInProfile = path.join(root, 'profiles', 'plugin-opt-in');
   report.fixtureRoot = root; // Retained for audit; no recursive cleanup of unknown objects.
-  for (const dir of [root, stateRoot, claudeProfile, codexProfile, defaultProfile]) await requirePrivate(dir);
+  beginControl('fresh_private_ntfs_fixture');
+  for (const dir of [root, stateRoot, claudeProfile, codexProfile, defaultProfile,
+    pluginOptInProfile]) await requirePrivate(dir);
   record('fresh_private_ntfs_fixture', 'passed', { privateState: true });
+  beginControl('fresh_git_checkout');
   const project = await gitCheckout(root);
   record('fresh_git_checkout', 'passed', { project });
   const defaultProject = await gitCheckout(root, 'default-project');
+  beginControl('default_claude_mem_selection');
   const defaultSelection = await initializeSession(defaultProject, `fixture-default-${fixture}`,
     { stateRoot, event: 'SessionStart' });
   record('default_claude_mem_selection', defaultSelection.provider === 'claude-mem'
     ? 'passed' : 'failed', { provider: defaultSelection.provider });
+  beginControl('public_windows_release_gate');
   const gates = [await activateProject(project, {}), await launchCli(project, 'claude', [], { stateRoot })];
   record('public_windows_release_gate', gates.every(value => value.kind === 'blocked' &&
     value.reason === 'windows_release_unproved') ? 'passed' : 'failed', { results: gates });
   const enrolled = await enroll(stateRoot, project);
   if (settings.destination?.url) {
+    beginControl('private_destination_proxy');
     report.provenance.destinationUpstreamSha256 = sha(settings.destination.url);
     ownedProxy = await privateQdrantProxy(settings.destination.url);
     settings.destination.url = ownedProxy.url;
@@ -1036,26 +1339,34 @@ async function main() {
       upstreamSha256: report.provenance.destinationUpstreamSha256 });
   } else record('private_destination_proxy', 'missing_prerequisite', { reason: 'destination_url' });
   const resolution = await configuredProject(project, stateRoot, fixture);
+  beginControl('outbox_same_process_idempotence');
   try {
     const persisted = await persistenceCore(path.join(stateRoot, 'fixture-persistence'),
       resolution?.projectId ?? `fixture-${fixture}`);
     record('outbox_same_process_idempotence', 'passed', persisted);
   } catch (error) { record('outbox_same_process_idempotence', 'failed', failure(error)); }
+  beginControl('outbox_crash_temp_flushed_before_publish', 'outbox_crash_item_durable',
+    'outbox_crash_manifest_durable', 'outbox_crash_receipt_durable',
+    'outbox_crash_cursor_durable');
   try {
     const crashed = await crashOutbox(stateRoot, resolution?.projectId ?? `fixture-${fixture}`);
     for (const [name, evidence] of Object.entries(crashed)) record(`outbox_crash_${name}`, 'passed', evidence);
   } catch (error) { record('outbox_crash_replay', 'failed', failure(error)); }
+  beginControl('native_publish_callback_contract');
   try { record('native_publish_callback_contract', 'passed',
     await nativePublishCallbackContract(stateRoot)); }
   catch (error) { record('native_publish_callback_contract', 'failed', failure(error)); }
+  beginControl('state_crash_intent_durable', 'state_crash_rewrite_durable');
   try {
     const crashed = await crashWindowsState(stateRoot);
     for (const [name, evidence] of Object.entries(crashed)) record(`state_crash_${name}`, 'passed', evidence);
   } catch (error) { record('state_crash_replay', 'failed', failure(error)); }
   try { await adversarialWindowsFiles(stateRoot); }
   catch (error) { record('adversarial_files', 'failed', failure(error)); }
+  beginControl('journal_retention');
   try { record('journal_retention', 'passed', await journalRetention(stateRoot)); }
   catch (error) { record('journal_retention', 'failed', failure(error)); }
+  beginControl('worker_guard_and_presecret_ipc');
   try { record('worker_guard_and_presecret_ipc', 'passed', await negativeWindowsIpc(stateRoot)); }
   catch (error) { record('worker_guard_and_presecret_ipc', 'failed', failure(error)); }
   if (!resolution) {
@@ -1068,6 +1379,7 @@ async function main() {
     return;
   }
   let capture;
+  beginControl('core_capture_binding');
   try {
     capture = await captureCore(project, stateRoot, resolution, claudeProfile);
     ownedCaptureOverlay = { stateRoot, token: capture.made.token,
@@ -1076,6 +1388,7 @@ async function main() {
       messageCount: capture.row.messages.length });
   } catch (error) { record('core_capture_binding', 'failed', failure(error)); }
   if (capture) {
+    beginControl('capture_source_and_args_negative');
     const unsafe = await buildLaunchCommand(project, 'claude', ['--settings', 'foreign'],
       { stateRoot }, capture.made);
     const sourceDir = path.join(project, '.claude');
@@ -1095,6 +1408,7 @@ async function main() {
     { unsafeArg: unsafe.reason, duplicatedSource: duplicated.reason });
   }
   if (enrolled.claude === 'passed') {
+    beginControl('native_claude_launch');
     const made = await createLaunch(project, 'claude', { stateRoot });
     if (made.kind !== 'created') record('native_claude_launch', 'failed', { reason: made.reason });
     else {
@@ -1121,6 +1435,7 @@ async function main() {
   } else record('native_claude_launch', 'missing_prerequisite', { reason: 'claude_enrollment' });
   let approvedCandidate;
   if (capture && enrolled.claude === 'passed' && settings.runExtraction) {
+    beginControl('real_extraction');
     process.env.CBS_MEMORIA_STATE_ROOT = stateRoot;
     const result = await consumeCheckpoints({ cli: 'claude', cwd: project,
       sessionId: capture.sessionId, stateRoot });
@@ -1129,6 +1444,7 @@ async function main() {
     const manifest = await createOutbox(resolution.stateDir).readManifest(capture.captured.operationId);
     const candidate = manifest?.candidates?.find(item => item.status === 'pending');
     if (candidate && settings.runReview) {
+      beginControl('manual_review');
       const payload = await createOutbox(resolution.stateDir).readCandidatePayload(
         capture.captured.operationId, candidate.candidateKey);
       const sid = (await inspectWindowsPath(resolution.stateDir, 'directory')).currentSid;
@@ -1151,6 +1467,7 @@ async function main() {
   const inputs = settings.runtime;
   if (capture && enrolled.python === 'passed' && inputs?.model && inputs?.tokenizer &&
       settings.runRuntime) {
+    beginControl('runtime_broker_recall');
     const verified = await verifyRuntimeArtifacts(inputs.model, inputs.tokenizer);
     const prepared = verified.kind === 'verified'
       ? await provisionRuntime(project, inputs.model, inputs.tokenizer, { stateRoot }) : verified;
@@ -1170,6 +1487,7 @@ async function main() {
         }
         const status = await brokerEndpointStatus(stateRoot);
         if (status === 'live' && settings.runCrashRemote) {
+          beginControl('remote_add_crash_replay');
           try {
             const replay = await crashRemoteAdd({ capture, project, stateRoot, resolution });
             if (!approvedCandidate) approvedCandidate = replay.approved;
@@ -1180,6 +1498,7 @@ async function main() {
           } catch (error) { record('remote_add_crash_replay', 'failed', failure(error)); }
         } else record('remote_add_crash_replay', 'missing_prerequisite',
           { reason: status === 'live' ? 'operator_source_approval' : 'broker_not_live' });
+        beginControl('runtime_broker_search_diagnostic');
         const diagnostic = status === 'live' && capture
           ? await requestBroker({ cwd: project, sessionId: capture.sessionId,
             operation: { op: 'search', projectId: resolution.projectId,
@@ -1193,27 +1512,21 @@ async function main() {
           record('runtime_broker_recall', 'missing_prerequisite',
             { reason: 'reviewed_active_source_memory_required' });
           for (const name of ['hook_recall_policy_diagnostic', 'hook_executable_direct',
-            'native_cli_hook_recall']) record(name, 'missing_prerequisite',
+            'mcp_recall_response', 'native_cli_hook_recall']) record(name, 'missing_prerequisite',
             { reason: 'reviewed_active_source_memory_required' });
         } else {
+          beginControl('hook_recall_policy_diagnostic', 'hook_executable_direct',
+            'mcp_recall_response');
           const payload = { cwd: project, session_id: capture.sessionId,
             prompt: approvedCandidate.text };
-          const times = [];
           let context;
-          let correct = true;
-          for (let i = 0; i < 5; i++) {
-            if (i) await recallForPrompt({ cli: 'claude', event: 'PreCompact', payload,
-              result: capture.captured, stateRoot });
-            const began = performance.now();
-            const output = await recallForPrompt({ cli: 'claude', payload,
-              result: capture.captured, stateRoot, began });
-            const elapsed = performance.now() - began;
-            times.push(elapsed);
-            context = output?.hookSpecificOutput?.additionalContext;
-            if (!context?.includes(approvedCandidate.text) ||
-                !context.includes(approvedCandidate.source) ||
-                Buffer.byteLength(context, 'utf8') > 500) correct = false;
-          }
+          const directBegan = performance.now();
+          const output = await recallForPrompt({ cli: 'claude', payload,
+            result: capture.captured, stateRoot, began: directBegan });
+          const directElapsedMs = performance.now() - directBegan;
+          context = output?.hookSpecificOutput?.additionalContext;
+          const correct = !!context?.includes(approvedCandidate.text) &&
+            context.includes(approvedCandidate.source) && Buffer.byteLength(context, 'utf8') <= 500;
           const dedup = await recallForPrompt({ cli: 'claude', payload,
             result: capture.captured, stateRoot });
           await recallForPrompt({ cli: 'claude', event: 'PreCompact', payload,
@@ -1248,27 +1561,71 @@ async function main() {
             ? 'passed' : 'failed', { injectedRowsFromRealSearch: !!sourced,
               foreignProjectAndMissingSourceFiltered: policyFiltered,
               absoluteDeadlineRejected: late === null });
+          let fullHook;
+          try {
+            const samplesMs = [];
+            let hookCorrect = true;
+            const contextSha256 = [];
+            for (let i = 0; i < 5; i++) {
+              await recallForPrompt({ cli: 'claude', event: 'PreCompact', payload,
+                result: capture.captured, stateRoot });
+              const direct = await directHookExecutable({ capture, project, stateRoot,
+                profile: claudeProfile, prompt: approvedCandidate.text });
+              samplesMs.push(direct.elapsedMs);
+              const additionalContext = direct.output?.hookSpecificOutput?.additionalContext;
+              if (!additionalContext?.includes(approvedCandidate.text) ||
+                  !additionalContext.includes(approvedCandidate.source) ||
+                  Buffer.byteLength(additionalContext, 'utf8') > 500) hookCorrect = false;
+              contextSha256.push(additionalContext ? sha(additionalContext) : null);
+            }
+            fullHook = { samplesMs, p95Ms: p95(samplesMs),
+              maxMs: Math.max(...samplesMs), thresholdMs: budgets.recallTotalP95Ms,
+              hookCorrect, contextSha256, actualHookProcess: true,
+              brokerIpcAndResponse: true, dispatchToExit: true };
+            record('hook_executable_direct', hookCorrect &&
+              fullHook.p95Ms <= budgets.recallTotalP95Ms &&
+              fullHook.maxMs <= budgets.recallTotalMaxMs ? 'passed' : 'failed', fullHook);
+          } catch (error) { record('hook_executable_direct', 'failed', failure(error)); }
+          let mcpMeasurement;
+          try {
+            const samplesMs = [];
+            let responseCorrect = true;
+            for (let i = 0; i < 5; i++) {
+              await recallForPrompt({ cli: 'claude', event: 'PreCompact', payload,
+                result: capture.captured, stateRoot });
+              const response = await mcpSearchExecutable({ capture, project, stateRoot,
+                profile: claudeProfile, query: approvedCandidate.text });
+              samplesMs.push(response.elapsedMs);
+              if (response.value?.kind !== 'items' ||
+                  !response.value.context?.includes(approvedCandidate.text) ||
+                  !response.value.context.includes(approvedCandidate.source) ||
+                  Buffer.byteLength(response.value.context, 'utf8') > 500) responseCorrect = false;
+            }
+            mcpMeasurement = { samplesMs, p95Ms: p95(samplesMs),
+              maxMs: Math.max(...samplesMs), responseCorrect,
+              actualMcpProcess: true, dispatchToResponseAndExit: true };
+            record('mcp_recall_response', responseCorrect &&
+              mcpMeasurement.p95Ms <= budgets.recallTotalP95Ms &&
+              mcpMeasurement.maxMs <= budgets.recallTotalMaxMs ? 'passed' : 'failed',
+            mcpMeasurement);
+          } catch (error) { record('mcp_recall_response', 'failed', failure(error)); }
           record('runtime_broker_recall', correct && dedup === null && negative === null &&
-            unavailable === null && realOutageObserved && p95(times) <= budgets.recallTotalP95Ms &&
-            Math.max(...times) <= budgets.recallTotalMaxMs ? 'passed' : 'failed',
-          { directCore: true, nativeCliHookObserved: false, contextSha256: context ? sha(context) : null,
-            timesMs: times, p95Ms: p95(times), dedupAbstained: dedup === null,
+            unavailable === null && realOutageObserved && fullHook?.hookCorrect &&
+            mcpMeasurement?.responseCorrect &&
+            fullHook.p95Ms <= budgets.recallTotalP95Ms &&
+            fullHook.maxMs <= budgets.recallTotalMaxMs &&
+            mcpMeasurement.p95Ms <= budgets.recallTotalP95Ms &&
+            mcpMeasurement.maxMs <= budgets.recallTotalMaxMs ? 'passed' : 'failed',
+          { directCoreDiagnostic: { elapsedMs: directElapsedMs,
+            contextSha256: context ? sha(context) : null }, nativeCliHookObserved: false,
+            samplesMs: fullHook?.samplesMs, p95Ms: fullHook?.p95Ms,
+            mcpSamplesMs: mcpMeasurement?.samplesMs, mcpP95Ms: mcpMeasurement?.p95Ms,
+            requiredMetric: 'full_hook_and_mcp_response', dedupAbstained: dedup === null,
             negativeAbstained: negative === null, qdrantUnavailableObserved: realOutageObserved,
             qdrantUnavailableAbstained: unavailable === null,
             source: approvedCandidate.source, projectId: approvedCandidate.projectId });
-          await recallForPrompt({ cli: 'claude', event: 'PreCompact', payload,
-            result: capture.captured, stateRoot });
-          try {
-            const direct = await directHookExecutable({ capture, project, stateRoot,
-              profile: claudeProfile, prompt: approvedCandidate.text });
-            const additionalContext = direct.output?.hookSpecificOutput?.additionalContext;
-            record('hook_executable_direct', additionalContext?.includes(approvedCandidate.text) &&
-              additionalContext.includes(approvedCandidate.source) &&
-              direct.elapsedMs <= budgets.recallTotalMaxMs ? 'passed' : 'failed',
-            { elapsedMs: direct.elapsedMs, contextSha256: additionalContext ? sha(additionalContext) : null,
-              processExit: 0, cliDispatch: false });
-          } catch (error) { record('hook_executable_direct', 'failed', failure(error)); }
           if (settings.runInteractiveCli && enrolled.claude === 'passed') {
+            beginControl('native_cli_hook_recall');
             process.env.CLAUDE_CONFIG_DIR = claudeProfile;
             const made = await createLaunch(project, 'claude', { stateRoot });
             const launch = made.kind === 'created'
@@ -1293,11 +1650,13 @@ async function main() {
       } finally { await serve; }
     }
   } else for (const name of ['runtime_broker_recall', 'remote_add_crash_replay',
-    'hook_recall_policy_diagnostic', 'hook_executable_direct', 'native_cli_hook_recall']) {
+    'hook_recall_policy_diagnostic', 'hook_executable_direct', 'mcp_recall_response',
+    'native_cli_hook_recall']) {
     record(name, 'missing_prerequisite',
       { reason: 'pinned_runtime_artifacts_python_or_operator_run' });
   }
   if (enrolled.codex === 'passed') {
+    beginControl('codex_native_hook_observation');
     process.env.CODEX_HOME = codexProfile;
     const native = await applyNativeExclusion(project,
       { cli: 'codex', projectRoot: project, stateRoot, profile: codexProfile });
@@ -1324,15 +1683,17 @@ async function main() {
   } else record('codex_native_hook_observation', 'missing_prerequisite',
     { reason: 'codex_enrollment' });
   if (capture) {
+    beginControl('capture_p95');
     try {
       const measurement = await captureP95(capture, project, stateRoot, claudeProfile);
       record('capture_p95', measurement.p95Ms <= budgets.captureP95Ms ? 'passed' : 'failed',
         measurement);
     } catch (error) { record('capture_p95', 'failed', failure(error)); }
   } else record('capture_p95', 'missing_prerequisite', { reason: 'bound_capture' });
+  beginControl('default_claude_mem_simultaneous_control');
   try {
     const control = await defaultPluginControl({ root, defaultProject, project, stateRoot,
-      defaultProfile, optInProfile: claudeProfile, enrolled });
+      defaultProfile, optInProfile: pluginOptInProfile, enrolled });
     record('default_claude_mem_simultaneous_control', control.status, control.evidence);
   } catch (error) { record('default_claude_mem_simultaneous_control', 'failed', failure(error)); }
 }

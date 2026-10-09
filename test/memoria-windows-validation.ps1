@@ -13,6 +13,8 @@ param(
   [string]$TokenizerPath,
   [string]$ClaudeMemPluginSource,
   [string]$ClaudeMemPluginTreeSha256,
+  [string]$ClaudeMemMarketplaceSource,
+  [string]$ClaudeMemMarketplaceTreeSha256,
   [switch]$RunInteractiveCli,
   [switch]$RunExtraction,
   [switch]$RunReview,
@@ -52,6 +54,19 @@ if (($ClaudeMemPluginSource -and !$ClaudeMemPluginTreeSha256) -or
 if ($ClaudeMemPluginTreeSha256 -and $ClaudeMemPluginTreeSha256 -notmatch '^[a-fA-F0-9]{64}$') {
   throw 'Invalid plugin tree SHA-256'
 }
+if (($ClaudeMemMarketplaceSource -and !$ClaudeMemMarketplaceTreeSha256) -or
+    ($ClaudeMemMarketplaceTreeSha256 -and !$ClaudeMemMarketplaceSource)) {
+  throw 'Marketplace source and tree SHA-256 must be supplied together'
+}
+if ($ClaudeMemMarketplaceTreeSha256 -and
+    $ClaudeMemMarketplaceTreeSha256 -notmatch '^[a-fA-F0-9]{64}$') {
+  throw 'Invalid marketplace tree SHA-256'
+}
+foreach ($source in @($ClaudeMemPluginSource, $ClaudeMemMarketplaceSource)) {
+  if ($source -and ![System.IO.Path]::IsPathRooted($source)) {
+    throw 'Plugin and marketplace sources must be absolute paths'
+  }
+}
 if ($RunCrashRemote) {
   $confirmation = Read-Host 'Private Qdrant fixture: type APPROVE FIXTURE FACT to permit the synthetic sourced remote-add crash control'
   if ($confirmation -cne 'APPROVE FIXTURE FACT') { throw 'Synthetic fixture source was not approved' }
@@ -60,15 +75,22 @@ if ($RunCrashRemote) {
 $node = (Get-Command node.exe -ErrorAction Stop).Source
 $script = Join-Path $PSScriptRoot 'memoria-windows-native-fixture.mjs'
 if (!(Test-Path -LiteralPath $script)) { throw 'Fixture implementation is missing' }
+$claudeHash = if ($ClaudeSha256) { $ClaudeSha256.ToLowerInvariant() } else { '' }
+$codexHash = if ($CodexSha256) { $CodexSha256.ToLowerInvariant() } else { '' }
+$pythonHash = if ($PythonSha256) { $PythonSha256.ToLowerInvariant() } else { '' }
+$pluginHash = if ($ClaudeMemPluginTreeSha256) { $ClaudeMemPluginTreeSha256.ToLowerInvariant() } else { '' }
+$marketplaceHash = if ($ClaudeMemMarketplaceTreeSha256) { $ClaudeMemMarketplaceTreeSha256.ToLowerInvariant() } else { '' }
 $config = @{
   tools = @{
-    claude = @{ executable = $ClaudeExecutable; sha256 = $ClaudeSha256.ToLowerInvariant() }
-    codex = @{ executable = $CodexExecutable; sha256 = $CodexSha256.ToLowerInvariant() }
-    python = @{ executable = $PythonExecutable; sha256 = $PythonSha256.ToLowerInvariant() }
+    claude = @{ executable = $ClaudeExecutable; sha256 = $claudeHash }
+    codex = @{ executable = $CodexExecutable; sha256 = $codexHash }
+    python = @{ executable = $PythonExecutable; sha256 = $pythonHash }
   }
   destination = @{ url = $QdrantUrl; collection = $QdrantCollection; apiKeyEnv = $QdrantKeyEnv }
   runtime = @{ model = $ModelPath; tokenizer = $TokenizerPath }
-  plugin = @{ source = $ClaudeMemPluginSource; treeSha256 = $ClaudeMemPluginTreeSha256.ToLowerInvariant() }
+  plugin = @{ source = $ClaudeMemPluginSource; treeSha256 = $pluginHash;
+    marketplaceSource = $ClaudeMemMarketplaceSource;
+    marketplaceTreeSha256 = $marketplaceHash }
   runInteractiveCli = [bool]$RunInteractiveCli
   runExtraction = [bool]$RunExtraction
   runReview = [bool]$RunReview
