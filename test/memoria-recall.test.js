@@ -206,6 +206,22 @@ test('prompt recall reports fixed failure categories without changing its null r
   assert.deepEqual(observed, ['auth', 'deadline', 'capture', 'trust', 'transport', 'selection', 'error']);
 });
 
+test('expired initial hook budget reports deadline before resolve or search', async () => {
+  const observed = [];
+  let resolved = 0;
+  let searched = 0;
+  const result = await recallForPrompt({ cli: 'claude',
+    payload: { cwd: '/checkout', session_id: 's', prompt: 'rule' },
+    result: { kind: 'queued' }, began: performance.now() - 1001,
+    resolve: async () => { resolved++; throw new Error('unexpected resolve'); },
+    search: async () => { searched++; throw new Error('unexpected search'); },
+    onFailure: reason => observed.push(reason) });
+  assert.equal(result, null);
+  assert.deepEqual(observed, ['deadline']);
+  assert.equal(resolved, 0);
+  assert.equal(searched, 0);
+});
+
 test('empty query and no eligible recall remain diagnostically silent', async () => {
   const observed = [];
   const input = { cli: 'claude', payload: { cwd: '/checkout', session_id: 's', prompt: '' },
