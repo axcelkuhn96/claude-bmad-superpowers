@@ -2,6 +2,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { ensureWindowsPrivateDirectory, publishWindowsBinary, readWindowsBinary,
+  withWindowsFileLock } from './windows-security.mjs';
+import { createWindowsState } from './windows-state.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const pending = reason => ({ kind: 'pending', reason });
@@ -28,10 +31,16 @@ export function createLedger(stateDir, writerId) {
   const dir = path.join(stateDir, 'ledger');
   const file = externalId => path.join(dir, `${hash(externalId)}.json`);
   async function read(externalId) {
+    if (process.platform === 'win32') return createWindowsState(file(externalId)).read();
     try { return JSON.parse(await fs.readFile(file(externalId), 'utf8')); }
     catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
   async function durable(filePath, data) {
+    if (process.platform === 'win32') {
+      if (!(await ensureWindowsPrivateDirectory(dir)).ok) throw new Error('unsafe_ledger_dir');
+      await createWindowsState(filePath).write(data);
+      return;
+    }
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     const temp = `${filePath}.${randomUUID()}.tmp`;
     const handle = await fs.open(temp, 'wx', 0o600);
@@ -43,6 +52,11 @@ export function createLedger(stateDir, writerId) {
     try { await directory.sync(); } finally { await directory.close(); }
   }
   async function exclusive(filePath, data) {
+    if (process.platform === 'win32') {
+      if (!(await ensureWindowsPrivateDirectory(dir)).ok) throw new Error('unsafe_ledger_dir');
+      await publishWindowsBinary(filePath, Buffer.from(JSON.stringify(data) + '\n'));
+      return;
+    }
     const temp = `${filePath}.${randomUUID()}.tmp`;
     const handle = await fs.open(temp, 'wx', 0o600);
     try { await handle.writeFile(JSON.stringify(data) + '\n'); await handle.sync(); }
@@ -54,18 +68,25 @@ export function createLedger(stateDir, writerId) {
   }
   async function save(record) { await durable(file(record.externalId), record); }
   async function begin(operation) {
-    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    if (process.platform === 'win32') {
+      if (!(await ensureWindowsPrivateDirectory(dir)).ok) throw new Error('unsafe_ledger_dir');
+    } else await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     const writerFile = path.join(dir, 'writer.json');
     try { await exclusive(writerFile, { writerId, projectId: operation.projectId }); }
-    catch (error) { if (error.code !== 'EEXIST') throw error; }
-    const owner = JSON.parse(await fs.readFile(writerFile, 'utf8'));
+    catch (error) { if (process.platform !== 'win32' ? error.code !== 'EEXIST' :
+      error.message !== 'windows_publish_failed') throw error; }
+    const owner = process.platform === 'win32' ? await createWindowsState(writerFile).read() :
+      JSON.parse(await fs.readFile(writerFile, 'utf8'));
     if (owner.writerId !== writerId || owner.projectId !== operation.projectId) return pending('writer_mismatch');
     if (operation.metadata?.supersedes_id) {
       const correction = path.join(dir, `correction-${hash(operation.metadata.supersedes_id)}.json`);
       try { await exclusive(correction, { externalId: operation.externalId }); }
-      catch (error) { if (error.code !== 'EEXIST') throw error; }
-      const claim = JSON.parse(await fs.readFile(correction, 'utf8'));
-      if (claim.externalId !== operation.externalId) return { kind: 'conflict', reason: 'concurrent_correction' };
+      catch (error) { if (process.platform !== 'win32' ? error.code !== 'EEXIST' :
+        error.message !== 'windows_publish_failed') throw error; }
+      const claim = process.platform === 'win32' ? await readWindowsBinary(correction, { length: 8192 }) : null;
+      const savedClaim = claim ? JSON.parse(claim.bytes.toString('utf8')) :
+        JSON.parse(await fs.readFile(correction, 'utf8'));
+      if (savedClaim.externalId !== operation.externalId) return { kind: 'conflict', reason: 'concurrent_correction' };
     }
     const digest = hash(JSON.stringify({ text: operation.text, metadata: operation.metadata }));
     let record = await read(operation.externalId);
@@ -83,12 +104,13 @@ export function createLedger(stateDir, writerId) {
 export async function withProjectLock(stateDir, callback, lockName = 'writer.lock', timeoutMs = 5000) {
   if (!/^[a-z][a-z0-9-]{0,63}\.lock$/.test(lockName)) throw new Error('invalid_lock_name');
   const directory = path.join(stateDir, 'ledger');
+  if (process.platform === 'win32') {
+    if (!(await ensureWindowsPrivateDirectory(directory)).ok) throw new Error('unsafe_ledger_dir');
+    return withWindowsFileLock(path.join(directory, lockName), callback, { timeoutMs });
+  }
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-  const program = process.platform === 'win32'
-    ? 'import msvcrt,sys,time; f=open(sys.argv[1],"a+b"); f.seek(0); f.write(b"0"); f.flush(); f.seek(0); deadline=time.monotonic()+5\nwhile True:\n try: msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1); break\n except OSError:\n  if time.monotonic()>deadline: sys.exit(2)\n  time.sleep(.05)\nprint("ready",flush=True); sys.stdin.read(); f.seek(0); msvcrt.locking(f.fileno(),msvcrt.LK_UNLCK,1)'
-    : 'import fcntl,sys; f=open(sys.argv[1],"a+"); fcntl.flock(f,fcntl.LOCK_EX); print("ready",flush=True); sys.stdin.read()';
-  const child = spawn(process.platform === 'win32' ? 'python' : 'python3',
-    ['-c', program, path.join(directory, lockName)],
+  const child = spawn('python3',
+    ['-c', 'import fcntl,sys; f=open(sys.argv[1],"a+"); fcntl.flock(f,fcntl.LOCK_EX); print("ready",flush=True); sys.stdin.read()', path.join(directory, lockName)],
     { stdio: ['pipe', 'pipe', 'ignore'] });
   try {
     await new Promise((resolve, reject) => {
@@ -116,6 +138,13 @@ export async function transferWriter(stateDir, { projectId, fromWriterId, toWrit
   return withProjectLock(stateDir, async () => {
     const dir = path.join(stateDir, 'ledger');
     const file = path.join(dir, 'writer.json');
+    if (process.platform === 'win32') {
+      const writer = createWindowsState(file);
+      const owner = await writer.read();
+      if (owner?.projectId !== projectId || owner.writerId !== fromWriterId) return pending('writer_mismatch');
+      await writer.write({ projectId, writerId: toWriterId });
+      return { kind: 'transferred', writerId: toWriterId };
+    }
     const owner = JSON.parse(await fs.readFile(file, 'utf8'));
     if (owner.projectId !== projectId || owner.writerId !== fromWriterId) return pending('writer_mismatch');
     const temp = `${file}.${randomUUID()}.tmp`;

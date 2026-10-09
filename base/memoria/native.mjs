@@ -11,6 +11,7 @@ import { canonicalWindowsPath, ensureWindowsPrivateDirectory, inspectWindowsPath
   probeWindowsCodexPlugin, readWindowsPrivateFile, removeWindowsPrivateFile,
   resolveWindowsExecutable, windowsPathKey, withWindowsLock,
   writeWindowsPrivateFile, windowsGitPattern } from './windows-security.mjs';
+import { inspectWindowsCaptureSources, verifyWindowsLaunchOverlay } from './windows-overlay.mjs';
 
 const run = promisify(execFile);
 const gitEnv = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
@@ -64,6 +65,12 @@ function editCaptureHooks(raw, cli, remove = false) {
   if (Object.keys(hooks).length) value.hooks = hooks;
   else delete value.hooks;
   return JSON.stringify(value, null, 2) + '\n';
+}
+
+function windowsSessionHooks(cli) {
+  const edited = editCaptureHooks(null, cli);
+  if (!edited) throw new Error('unsafe_capture_hooks');
+  return JSON.parse(edited).hooks;
 }
 
 function exactCodexHooks(hooks, allowUnrelated = false) {
@@ -397,6 +404,14 @@ export async function applyNativeExclusion(root, options = {}) {
     options = { ...options, projectRoot: scope.projectRoot };
   } else if (scope.kind !== 'git' || scope.projectRoot !== (options.projectRoot ?? await fs.realpath(root).catch(() => null)) ||
       scope.activeRoot !== await fs.realpath(root).catch(() => null)) return blocked('unsupported_git');
+  if (process.platform === 'win32') {
+    try {
+      await inspectWindowsCaptureSources({ cli, root, projectRoot: scope.projectRoot,
+        profile: options.profile ?? (cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR) });
+      windowsSessionHooks(cli);
+      return { kind: 'applied', existing: false, source: 'session' };
+    } catch (error) { return blocked(error.message); }
+  }
   if (cli === 'codex' && !await supportedCodex(root, options)) return blocked('unsupported_plugin');
   const file = configFile(root, cli);
   if (!await safeParent(file) || !await safeFile(file)) return blocked('unsafe_native_config');
@@ -686,6 +701,18 @@ export async function verifyNativeCapture(root, options = {}) {
     options = { ...options, projectRoot: scope.projectRoot };
   } else if (root !== await fs.realpath(root).catch(() => null) || scope.kind !== 'git' ||
       scope.projectRoot !== (options.projectRoot ?? scope.projectRoot) || scope.activeRoot !== root) return blocked('unsupported_git');
+  if (process.platform === 'win32') {
+    try {
+      const profile = options.profile ?? (cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR);
+      await inspectWindowsCaptureSources({ cli, root, projectRoot: scope.projectRoot, profile });
+      if (options.launchToken) {
+        const launch = await verifyWindowsLaunchOverlay({ stateRoot: options.stateRoot,
+          token: options.launchToken, cli, nativeRoot: root, projectRoot: scope.projectRoot });
+        if (windowsPathKey(launch.profile) !== windowsPathKey(profile)) return blocked('capture_profile_changed');
+      }
+      return { kind: 'verified', source: 'session', hooks: windowsSessionHooks(cli) };
+    } catch (error) { return blocked(error.message); }
+  }
   const file = configFile(root, cli);
   const capturePath = cli === 'claude' ? file : hookFile(root);
   if (!await safeFile(file) || !await safeFile(capturePath) || await tracked(root, file) ||
@@ -751,7 +778,14 @@ export async function verifyNativeCapture(root, options = {}) {
 }
 
 export async function inspectCodexMainHooks(root, options = {}) {
-  if (process.platform === 'win32') return blocked('native_windows_unproved');
+  if (process.platform === 'win32') {
+    try {
+      await inspectWindowsCaptureSources({ cli: 'codex', root,
+        projectRoot: options.projectRoot ?? root,
+        profile: options.profile ?? process.env.CODEX_HOME });
+      return { kind: 'absent' };
+    } catch (error) { return blocked(error.message); }
+  }
   const file = hookFile(root);
   const snapshot = snapshotFile(root, 'codex', { ...options, projectRoot: root });
   if (!await safeParent(file) || !await safeFile(file) || !await safeFile(snapshot, true)) {

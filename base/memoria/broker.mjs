@@ -4,6 +4,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { FrameReader, encodeFrame } from './frame.mjs';
 import { inspectConfiguration, resolveProject } from './provider.mjs';
@@ -12,11 +13,41 @@ import { readLocalTrust, trustTuple } from './trust.mjs';
 import { openArtifactIdentity, runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { withProjectLock } from './ledger.mjs';
 import { createBrokerWorker } from './broker-worker.mjs';
+import { ensureWindowsPrivateDirectory, readWindowsBinary, publishWindowsBinary,
+  deleteWindowsBinary, hashWindowsFile, holdWindowsHash,
+  windowsSystemLocations } from './windows-security.mjs';
+import { parseWindowsDiscovery, newWindowsDiscovery, authenticateWindowsClient,
+  authenticateWindowsServer } from './windows-transport.mjs';
 
 const blocked = reason => ({ kind: 'unavailable', reason });
 export const brokerPath = (root = path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria')) =>
-  path.join(root, 'encoder.sock');
+  path.join(root, process.platform === 'win32' ? 'encoder.discovery.json' : 'encoder.sock');
+async function windowsDiscovery(root) {
+  const observed = await readWindowsBinary(brokerPath(root), { length: 4096 });
+  if (observed.size !== observed.bytes.length) throw new Error('windows_broker_discovery_invalid');
+  return { observed, value: parseWindowsDiscovery(observed.bytes.toString('utf8')) };
+}
 export async function brokerEndpointStatus(root) {
+  if (process.platform === 'win32') {
+    let discovery;
+    try { discovery = (await windowsDiscovery(root)).value; }
+    catch (error) {
+      if (error.message === 'windows_read_open' &&
+          await fs.lstat(brokerPath(root)).then(() => false, cause => cause.code === 'ENOENT')) return 'missing';
+      return 'unsafe';
+    }
+    const socket = net.createConnection({ host: '127.0.0.1', port: discovery.port });
+    try {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { socket.destroy(); reject(new Error('timeout')); }, 1000);
+        socket.once('connect', () => { clearTimeout(timer); resolve(); });
+        socket.once('error', error => { clearTimeout(timer); reject(error); });
+      });
+      await authenticateWindowsClient(socket, discovery, Date.now() + 1000);
+      return 'live';
+    } catch (error) { return error.code === 'ECONNREFUSED' ? 'orphan' : 'unsafe'; }
+    finally { socket.destroy(); }
+  }
   if (!process.getuid) return 'unsafe';
   const file = brokerPath(root);
   let stat;
@@ -34,6 +65,14 @@ export async function brokerEndpointStatus(root) {
 
 // Called only while encoder.lock is held by the prospective owner.
 export async function prepareBrokerEndpoint(root) {
+  if (process.platform === 'win32') {
+    const status = await brokerEndpointStatus(root);
+    if (status === 'missing') return 'ready';
+    if (status !== 'orphan') return status === 'unsafe' ? 'unsafe' : 'live';
+    const { observed } = await windowsDiscovery(root);
+    await deleteWindowsBinary(brokerPath(root), observed.fileId, observed.bytes);
+    return 'ready';
+  }
   const file = brokerPath(root);
   let before;
   try { before = await fs.lstat(file); }
@@ -49,6 +88,18 @@ export async function prepareBrokerEndpoint(root) {
 // encoder.lock serializes claims; the durable guard survives a broker crash or uncertain child stop.
 export async function claimBrokerWorker(root) {
   const directory = path.join(root, 'ledger');
+  if (process.platform === 'win32') {
+    if (!(await ensureWindowsPrivateDirectory(directory)).ok) throw new Error('unsafe_worker_guard');
+    const file = path.join(directory, 'encoder-worker.guard');
+    const bytes = Buffer.from(JSON.stringify({ state: 'worker_may_be_live',
+      generation: randomUUID() }) + '\n');
+    const identity = await publishWindowsBinary(file, bytes);
+    return { async release(confirmedClosed) {
+      if (!confirmedClosed) return false;
+      await deleteWindowsBinary(file, identity.fileId, bytes);
+      return true;
+    } };
+  }
   const dirStat = await fs.lstat(directory);
   if (!dirStat.isDirectory() || dirStat.uid !== process.getuid() || (dirStat.mode & 0o077)) {
     throw new Error('unsafe_worker_guard');
@@ -113,7 +164,54 @@ export function readBrokerRequest(socket, accept, { receptionMs = 1000 } = {}) {
 }
 
 export async function requestBroker(request, secret, { stateRoot, deadlineMs = 120000 } = {}) {
-  if (process.platform === 'win32') return blocked('native_windows_unproved');
+  if (process.platform === 'win32') {
+    const root = stateRoot ?? path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
+    const key = Buffer.from(secret ?? '');
+    let socket;
+    try {
+      const discovery = (await windowsDiscovery(root)).value;
+      const deadlineAt = Date.now() + Math.max(1, Math.min(deadlineMs, 120000));
+      socket = net.createConnection({ host: '127.0.0.1', port: discovery.port });
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { socket.destroy(); reject(new Error('deadline')); },
+          Math.max(1, deadlineAt - Date.now()));
+        socket.once('connect', () => { clearTimeout(timer); resolve(); });
+        socket.once('error', error => { clearTimeout(timer); reject(error); });
+      });
+      await authenticateWindowsClient(socket, discovery, deadlineAt);
+      const parser = new FrameReader({ response: true });
+      return await new Promise(resolve => {
+        let settled = false;
+        let response;
+        const finish = value => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(value);
+        };
+        const timer = setTimeout(() => finish(blocked('deadline')),
+          Math.max(1, deadlineAt - Date.now()));
+        socket.on('data', chunk => {
+          try {
+            const frames = parser.push(chunk);
+            if (frames.length > 1 || frames.length && (parser.buffer.length || response !== undefined)) {
+              finish(blocked('broker_protocol'));
+            } else if (frames.length) response = frames[0].value;
+          } catch { finish(blocked('broker_protocol')); }
+        });
+        socket.once('end', () => {
+          try { parser.end(); finish(response === undefined ? blocked('broker_protocol') : response); }
+          catch { finish(blocked('broker_protocol')); }
+        });
+        socket.once('error', () => finish(blocked('broker_unavailable')));
+        socket.once('close', () => finish(blocked('broker_unavailable')));
+        socket.resume();
+        socket.write(encodeFrame({ ...request, deadlineAt }, key));
+      });
+    } catch { return blocked('broker_unavailable'); }
+    finally { key.fill(0); socket?.destroy(); }
+  }
   const file = brokerPath(stateRoot);
   let socket;
   const key = Buffer.from(secret ?? '');
@@ -141,7 +239,7 @@ export async function requestBroker(request, secret, { stateRoot, deadlineMs = 1
 }
 
 export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId, idleMs = 300000 } = {}) {
-  if (process.platform === 'win32' || !process.getuid) return blocked('native_windows_unproved');
+  if (process.platform !== 'win32' && !process.getuid) return blocked('native_windows_unproved');
   const resolution = await inspectConfiguration(bootstrapCwd, { stateRoot });
   if (resolution.provider !== 'mem0') return blocked(resolution.reason ?? 'unbound');
   const trust = await readLocalTrust(resolution.stateDir);
@@ -152,31 +250,62 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
   const tokenizer = path.join(resolution.stateDir, 'artifacts', 'tokenizer.json');
   if ((await verifyRuntimeArtifacts(model, tokenizer)).kind !== 'verified') return blocked('missing_artifact');
   const root = stateRoot ?? path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
-  await fs.mkdir(root, { recursive: true, mode: 0o700 });
-  const dir = await fs.lstat(root);
-  if (dir.uid !== process.getuid() || (dir.mode & 0o077)) return blocked('unsafe_broker');
+  if (process.platform === 'win32') {
+    if (!(await ensureWindowsPrivateDirectory(root)).ok) return blocked('unsafe_broker');
+  } else {
+    await fs.mkdir(root, { recursive: true, mode: 0o700 });
+    const dir = await fs.lstat(root);
+    if (dir.uid !== process.getuid() || (dir.mode & 0o077)) return blocked('unsafe_broker');
+  }
   const file = brokerPath(root);
   const endpoint = await brokerEndpointStatus(root);
   if (endpoint === 'live' || endpoint === 'unknown') return blocked('broker_owned');
   if (endpoint === 'unsafe') return blocked('unsafe_broker');
   try { return await withProjectLock(root, async () => {
-  const prepared = await prepareBrokerEndpoint(root);
-  if (prepared !== 'ready') return blocked(prepared === 'unsafe' ? 'unsafe_broker' : 'broker_owned');
-  const artifacts = await openArtifactIdentity([model, tokenizer]);
-  if (artifacts.kind !== 'opened') return blocked(artifacts.reason);
   let guard;
-  try { guard = await claimBrokerWorker(root); }
+  if (process.platform === 'win32') {
+    try { guard = await claimBrokerWorker(root); }
+    catch { return blocked('broker_owned'); }
+  }
+  const prepared = await prepareBrokerEndpoint(root);
+  if (prepared !== 'ready') {
+    await guard?.release(true);
+    return blocked(prepared === 'unsafe' ? 'unsafe_broker' : 'broker_owned');
+  }
+  const artifacts = await openArtifactIdentity([model, tokenizer]);
+  if (artifacts.kind !== 'opened') {
+    await guard?.release(true);
+    return blocked(artifacts.reason);
+  }
+  let runtimeRelease = () => {};
+  let windowsSystem;
+  if (process.platform === 'win32') {
+    try {
+      windowsSystem = await windowsSystemLocations();
+      const python = runtimePython(resolution.stateDir);
+      const current = await hashWindowsFile(python);
+      runtimeRelease = await holdWindowsHash(python, current.fileId, current.sha256);
+    } catch {
+      await guard.release(true);
+      await artifacts.close();
+      return blocked('runtime_unsafe');
+    }
+  }
+  try { guard ??= await claimBrokerWorker(root); }
   catch { await artifacts.close(); return blocked('broker_owned'); }
   let server;
   const bridge = createBrokerWorker(() => spawn(runtimePython(resolution.stateDir), [script], {
     stdio: ['pipe', 'pipe', 'ignore'],
-    env: { ...envAllow(), CBS_MEMORIA_MODEL: model, CBS_MEMORIA_TOKENIZER: tokenizer,
+    env: { ...envAllow(), ...(process.platform === 'win32' ? {
+      PATH: [path.dirname(runtimePython(resolution.stateDir)),
+        path.join(windowsSystem.windows, 'System32')].join(path.delimiter),
+    } : {}), CBS_MEMORIA_MODEL: model, CBS_MEMORIA_TOKENIZER: tokenizer,
       OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1', MKL_NUM_THREADS: '1' },
   }), { onFatal: () => { if (server?.listening) server.close(); } });
   async function closeOwnedWorker() {
     const confirmedClosed = await bridge.close();
     try { await guard.release(confirmedClosed); }
-    finally { await artifacts.close(); }
+    finally { runtimeRelease(); await artifacts.close(); }
   }
   const ready = await bridge.start();
   if (ready.kind !== 'ready' || !await artifacts.unchanged()) {
@@ -186,11 +315,13 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
   let chain = Promise.resolve();
   let active = 0;
   let idle;
+  let discovery;
+  let discoveryIdentity;
   server = net.createServer(socket => {
     active++;
     clearTimeout(idle);
     const controller = new AbortController();
-    readBrokerRequest(socket, frame => {
+    const accept = frame => {
       if (queued >= 2) {
         frame.secret.fill(0);
         socket.end(encodeFrame(blocked('queue_full'), undefined, true));
@@ -208,7 +339,13 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
           if (!socket.destroyed) socket.end(encodeFrame(result, undefined, true));
         } finally { secret.fill(0); }
       }).catch(() => { if (!socket.destroyed) socket.end(encodeFrame(blocked('broker_failed'), undefined, true)); });
-    });
+    };
+    if (process.platform === 'win32') {
+      if (!discovery) socket.destroy();
+      else authenticateWindowsServer(socket, discovery, Date.now() + 1000)
+        .then(() => { readBrokerRequest(socket, accept); socket.resume(); })
+        .catch(() => socket.destroy());
+    } else readBrokerRequest(socket, accept);
     socket.once('close', () => {
       controller.abort();
       active--;
@@ -236,16 +373,39 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     return bridge.request(request, secret, deadlineAt);
   }
   try {
-    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(file, resolve); });
-    await fs.chmod(file, 0o600);
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      if (process.platform === 'win32') server.listen(0, '127.0.0.1', resolve);
+      else server.listen(file, resolve);
+    });
+    if (process.platform === 'win32') {
+      const address = server.address();
+      if (!address || typeof address === 'string' || address.address !== '127.0.0.1') {
+        throw new Error('unsafe_broker_endpoint');
+      }
+      discovery = newWindowsDiscovery(address.port);
+      const bytes = Buffer.from(JSON.stringify(discovery) + '\n');
+      discoveryIdentity = { ...(await publishWindowsBinary(file, bytes)), bytes };
+    } else await fs.chmod(file, 0o600);
     idle = setTimeout(() => server.close(), idleMs);
     await new Promise(resolve => server.once('close', resolve));
-  } catch { return blocked('broker_unavailable'); }
+  } catch {
+    if (server?.listening) server.close();
+    return blocked('broker_unavailable');
+  }
   finally {
     try { await closeOwnedWorker(); }
     finally {
       clearTimeout(idle);
-      try { const stat = await fs.lstat(file); if (stat.isSocket() && stat.uid === process.getuid()) await fs.rm(file); }
+      try {
+        if (process.platform === 'win32') {
+          if (discoveryIdentity) await deleteWindowsBinary(file,
+            discoveryIdentity.fileId, discoveryIdentity.bytes);
+        } else {
+          const stat = await fs.lstat(file);
+          if (stat.isSocket() && stat.uid === process.getuid()) await fs.rm(file);
+        }
+      }
       catch { /* no owned endpoint */ }
     }
   }

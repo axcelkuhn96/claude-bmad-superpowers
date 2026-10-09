@@ -12,7 +12,11 @@ import { brokerEndpointStatus } from './broker.mjs';
 import { inspectCodexMainHooks, verifyNativeCapture } from './native.mjs';
 import { codexHookOverride, codexTomlString } from './codex-config-toml.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
-  writeWindowsPrivateFile } from './windows-security.mjs';
+  writeWindowsPrivateFile, readWindowsBinary, publishWindowsBinary,
+  withWindowsFileLock } from './windows-security.mjs';
+import { prepareWindowsOverlay, holdWindowsOverlay, removeWindowsOverlay,
+  verifyWindowsLaunchOverlay } from './windows-overlay.mjs';
+import { resolveEnrolledWindowsTool } from './windows-enrollment.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const rootDefault = () => path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
@@ -24,12 +28,44 @@ const sessionBindingFile = (root, cli, sessionId) => path.join(launchDir(root),
   `${digest(JSON.stringify([cli, sessionId]))}.session-bind`);
 
 async function sameBinding(root, token, cli, sessionId) {
+  if (process.platform === 'win32') {
+    const [bound, session] = await Promise.all([
+      readWindowsBinary(bindingFile(root, token), { length: 8192 }),
+      readWindowsBinary(sessionBindingFile(root, cli, sessionId), { length: 8192 }),
+    ]);
+    if (bound.size !== bound.bytes.length || session.size !== session.bytes.length) return false;
+    const one = JSON.parse(bound.bytes.toString('utf8'));
+    const other = JSON.parse(session.bytes.toString('utf8'));
+    return one.nativeSessionId === sessionId && other.nativeSessionId === sessionId &&
+      other.tokenDigest === digest(token) && one.cli === cli && other.cli === cli;
+  }
   const [tokenStat, sessionStat] = await Promise.all([
     fs.lstat(bindingFile(root, token)), fs.lstat(sessionBindingFile(root, cli, sessionId)),
   ]);
   return tokenStat.isFile() && sessionStat.isFile() && tokenStat.dev === sessionStat.dev &&
     tokenStat.ino === sessionStat.ino && tokenStat.uid === process.getuid() &&
     sessionStat.uid === process.getuid() && !(tokenStat.mode & 0o077);
+}
+
+async function windowsClaim(file) {
+  try {
+    await fs.lstat(file);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  const observed = await readWindowsBinary(file, { length: 8192 });
+  if (observed.size !== observed.bytes.length) throw new Error('unsafe_launch_binding');
+  let claim;
+  try { claim = JSON.parse(observed.bytes.toString('utf8')); }
+  catch { throw new Error('unsafe_launch_binding'); }
+  if (!['claude', 'codex'].includes(claim.cli) ||
+      typeof claim.nativeSessionId !== 'string' || !claim.nativeSessionId ||
+      claim.nativeSessionId.length > 256 ||
+      !/^[a-f0-9]{64}$/.test(claim.tokenDigest ?? '')) {
+    throw new Error('unsafe_launch_binding');
+  }
+  return claim;
 }
 
 async function safeRead(file) {
@@ -60,6 +96,7 @@ async function codexCaptureSource(nativeRoot, projectRoot, stateRoot) {
   if (active.kind !== 'verified') return active;
   const main = await inspectCodexMainHooks(projectRoot, { stateRoot });
   if (main.kind === 'blocked') return main;
+  if (process.platform === 'win32') return { kind: 'verified', source: 'session', hooks: active.hooks };
   if (nativeRoot === projectRoot && main.kind !== 'verified') return blocked('stale_main_hooks');
   return main.kind === 'verified'
     ? { kind: 'verified', source: 'main', fingerprint: main.fingerprint }
@@ -77,17 +114,30 @@ export async function createLaunch(cwd, cli, { stateRoot } = {}) {
   const expected = trustTuple(current);
   if (!trust || Object.entries(expected).some(([key, value]) => trust[key] !== value)) return blocked('trust_changed');
   let captureSource;
+  const profile = cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR;
   if (process.platform === 'win32') {
-    const verified = await verifyNativeCapture(nativeRoot, { cli, projectRoot: current.projectRoot, stateRoot });
+    const verified = await verifyNativeCapture(nativeRoot, { cli, projectRoot: current.projectRoot,
+      stateRoot, profile });
     if (verified.kind !== 'verified') return blocked(verified.reason);
+    captureSource = cli === 'codex'
+      ? await codexCaptureSource(nativeRoot, current.projectRoot, stateRoot) : verified;
+    if (captureSource.kind !== 'verified') return blocked(captureSource.reason);
   } else if (cli === 'codex') {
     captureSource = await codexCaptureSource(nativeRoot, current.projectRoot, stateRoot);
     if (captureSource.kind !== 'verified') return blocked(captureSource.reason);
   }
   const token = randomBytes(32).toString('hex');
+  let overlay;
+  if (process.platform === 'win32' && cli === 'claude') {
+    try { overlay = await prepareWindowsOverlay({ stateRoot, token, hooks: captureSource.hooks }); }
+    catch (error) { return blocked(error.message); }
+  }
   const dir = launchDir(stateRoot);
   if (process.platform === 'win32') {
-    if (!(await ensureWindowsPrivateDirectory(dir)).ok) return blocked('unsafe_launch_state');
+    if (!(await ensureWindowsPrivateDirectory(dir)).ok) {
+      if (overlay) await removeWindowsOverlay({ stateRoot, token, expected: overlay }).catch(() => {});
+      return blocked('unsafe_launch_state');
+    }
   } else {
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     const stat = await fs.lstat(dir);
@@ -95,9 +145,11 @@ export async function createLaunch(cwd, cli, { stateRoot } = {}) {
   }
   const record = { cli, nativeRoot, projectRoot: current.projectRoot, projectId: current.projectId,
     destination: current.destination, embeddingFingerprint: current.embeddingFingerprint,
-    createdAt: Date.now() };
+    createdAt: Date.now(), ...(process.platform === 'win32'
+      ? { profile, ...(overlay ? { overlay } : {}) } : {}) };
   if (process.platform === 'win32') {
     if (!(await writeWindowsPrivateFile(launchFile(stateRoot, token), JSON.stringify(record) + '\n')).ok) {
+      if (overlay) await removeWindowsOverlay({ stateRoot, token, expected: overlay }).catch(() => {});
       return blocked('unsafe_launch_state');
     }
   } else await fs.writeFile(launchFile(stateRoot, token), JSON.stringify(record) + '\n', { flag: 'wx', mode: 0o600 });
@@ -105,7 +157,6 @@ export async function createLaunch(cwd, cli, { stateRoot } = {}) {
 }
 
 export async function bindLaunch(token, cli, cwd, nativeSessionId, { stateRoot } = {}) {
-  if (process.platform === 'win32') return blocked('native_windows_unproved');
   if (!/^[a-f0-9]{64}$/.test(token ?? '') || !nativeSessionId || nativeSessionId.length > 256) return blocked('unbound');
   const saved = await safeRead(launchFile(stateRoot, token));
   if (!saved || saved.cli !== cli || Date.now() - saved.createdAt > 12 * 60 * 60 * 1000) return blocked('unbound');
@@ -113,6 +164,27 @@ export async function bindLaunch(token, cli, cwd, nativeSessionId, { stateRoot }
   const current = await inspectConfiguration(cwd, { stateRoot });
   if (scope.kind !== 'git' || scope.activeRoot !== saved.nativeRoot || !same(current, saved)) return blocked('launch_changed');
   const file = bindingFile(stateRoot, token);
+  if (process.platform === 'win32') {
+    try {
+      return await withWindowsFileLock(path.join(launchDir(stateRoot),
+        `${digest(JSON.stringify([cli, nativeSessionId]))}.session-lock`), async () =>
+        withWindowsFileLock(path.join(launchDir(stateRoot), `${digest(token)}.lock`), async () => {
+        const reciprocal = sessionBindingFile(stateRoot, cli, nativeSessionId);
+        const [byToken, bySession] = await Promise.all([windowsClaim(file), windowsClaim(reciprocal)]);
+        const matches = claim => !claim || claim.cli === cli && claim.nativeSessionId === nativeSessionId &&
+          claim.tokenDigest === digest(token);
+        if (!matches(byToken) || !matches(bySession)) return blocked('already_bound');
+        if (byToken && bySession) return { kind: 'bound', nativeSessionId };
+        const claim = Buffer.from(JSON.stringify({ cli, nativeSessionId,
+          tokenDigest: digest(token), boundAt: byToken?.boundAt ?? bySession?.boundAt ?? Date.now() }) + '\n');
+        // A crash may leave either claim. Only the same token/session can complete it.
+        if (!bySession) await publishWindowsBinary(reciprocal, claim);
+        if (!byToken) await publishWindowsBinary(file, claim);
+        return await sameBinding(stateRoot, token, cli, nativeSessionId)
+          ? { kind: 'bound', nativeSessionId } : blocked('already_bound');
+      }));
+    } catch { return blocked('bind_failed'); }
+  }
   try { await fs.writeFile(file, JSON.stringify({ nativeSessionId, boundAt: Date.now() }) + '\n',
     { flag: 'wx', mode: 0o600 }); }
   catch (error) {
@@ -128,7 +200,6 @@ export async function bindLaunch(token, cli, cwd, nativeSessionId, { stateRoot }
 }
 
 export async function resolveBoundLaunch(token, cli, { stateRoot } = {}) {
-  if (process.platform === 'win32') return blocked('native_windows_unproved');
   if (!/^[a-f0-9]{64}$/.test(token ?? '')) return blocked('unbound');
   const saved = await safeRead(launchFile(stateRoot, token));
   const bound = await safeRead(bindingFile(stateRoot, token));
@@ -141,25 +212,13 @@ export async function resolveBoundLaunch(token, cli, { stateRoot } = {}) {
     projectId: saved.projectId, stateDir: current.stateDir, cli };
 }
 
-export async function launchCli(cwd, cli, args = [], options = {}) {
-  if (process.platform === 'win32') return blocked('native_windows_unproved');
+export async function buildLaunchCommand(cwd, cli, args = [], options = {}, made) {
   const codexArgs = cli === 'codex' ? safeCodexArgs(args) : null;
   if (cli === 'codex' && !codexArgs) return blocked('unsafe_cli_args');
-  const made = await createLaunch(cwd, cli, options);
-  if (made.kind !== 'created') return made;
+  if (process.platform === 'win32' && !safeClaudeArgs(args) && cli === 'claude') return blocked('unsafe_cli_args');
+  if (made?.kind !== 'created' || made.record.cli !== cli) return blocked('unbound');
   const root = options.stateRoot ?? rootDefault();
   const mcpScript = fileURLToPath(new URL('./mcp.mjs', import.meta.url));
-  const brokerScript = fileURLToPath(new URL('./broker.mjs', import.meta.url));
-  if (process.platform !== 'win32') {
-    const endpoint = await brokerEndpointStatus(root);
-    if (endpoint === 'unsafe') return blocked('unsafe_broker');
-    if (endpoint === 'missing' || endpoint === 'orphan') {
-      const broker = spawn(process.execPath, [brokerScript, root, cwd], { detached: true,
-        stdio: 'ignore', env: { PATH: process.env.PATH, HOME: process.env.HOME,
-          ...(process.env.CBS_MEMORIA_CA_FILE ? { CBS_MEMORIA_CA_FILE: process.env.CBS_MEMORIA_CA_FILE } : {}) } });
-      broker.unref();
-    }
-  }
   const mcp = { mcpServers: { cbs_memoria: { command: process.execPath, args: [mcpScript] } } };
   let mcpArgs;
   if (cli === 'claude') mcpArgs = ['--mcp-config', JSON.stringify(mcp)];
@@ -182,13 +241,97 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
     if (currentSource.kind !== 'verified') return blocked(currentSource.reason);
     if (JSON.stringify(currentSource) !== JSON.stringify(made.captureSource)) return blocked('capture_source_changed');
   }
-  const child = spawn(cli, [...mcpArgs, ...hookArgs, ...(codexArgs ?? args)], { cwd, stdio: 'inherit',
+  let command = cli;
+  let release = () => {};
+  let overlayRelease = () => {};
+  let overlay;
+  if (process.platform === 'win32') {
+    try {
+      const saved = await verifyWindowsLaunchOverlay({ stateRoot: options.stateRoot, token: made.token,
+        cli, nativeRoot: made.record.nativeRoot, projectRoot: made.record.projectRoot });
+      if (saved.projectId !== made.record.projectId ||
+          saved.profile !== (cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR)) {
+        return blocked('launch_changed');
+      }
+      const capture = await verifyNativeCapture(made.record.nativeRoot, {
+        cli, projectRoot: made.record.projectRoot, stateRoot: options.stateRoot,
+        profile: saved.profile, launchToken: made.token,
+      });
+      if (capture.kind !== 'verified' ||
+          JSON.stringify(capture.hooks) !== JSON.stringify(made.captureSource.hooks)) {
+        return blocked(capture.reason ?? 'capture_source_changed');
+      }
+      const tool = await resolveEnrolledWindowsTool({ stateRoot: root, name: cli,
+        projectRoot: made.record.projectRoot, activeRoot: made.record.nativeRoot,
+        productRoot: path.resolve(path.dirname(mcpScript), '..', '..') });
+      command = tool.executable;
+      release = tool.release;
+      if (cli === 'claude') {
+        overlay = saved.overlay;
+        overlayRelease = await holdWindowsOverlay({ stateRoot: options.stateRoot,
+          token: made.token, expected: overlay });
+      }
+    } catch (error) {
+      try { overlayRelease(); } finally { release(); }
+      return blocked(error.message);
+    }
+  }
+  const overlayArgs = process.platform === 'win32' && cli === 'claude'
+    ? ['--settings', overlay.file] : [];
+  return { kind: 'ready', command,
+    args: [...overlayArgs, ...mcpArgs, ...hookArgs, ...(codexArgs ?? args)],
     env: { ...process.env, CBS_MEMORIA_LAUNCH_ID: made.token, CBS_MEMORIA_CLI: cli,
-      ...(options.stateRoot ? { CBS_MEMORIA_STATE_ROOT: options.stateRoot } : {}) } });
-  return await new Promise(resolve => {
-    child.once('error', () => resolve(blocked('cli_unavailable')));
-    child.once('exit', (code, signal) => resolve({ kind: 'exited', code, signal }));
-  });
+      ...(options.stateRoot ? { CBS_MEMORIA_STATE_ROOT: options.stateRoot } : {}) },
+    release: () => { try { overlayRelease(); } finally { release(); } },
+    cleanup: async () => {
+      if (overlay) await removeWindowsOverlay({ stateRoot: options.stateRoot,
+        token: made.token, expected: overlay });
+    } };
+}
+
+export async function launchCli(cwd, cli, args = [], options = {}) {
+  if (process.platform === 'win32') return blocked('windows_release_unproved');
+  if (cli === 'codex' && !safeCodexArgs(args)) return blocked('unsafe_cli_args');
+  const made = await createLaunch(cwd, cli, options);
+  if (made.kind !== 'created') return made;
+  const root = options.stateRoot ?? rootDefault();
+  const brokerScript = fileURLToPath(new URL('./broker.mjs', import.meta.url));
+  const endpoint = await brokerEndpointStatus(root);
+  if (endpoint === 'unsafe') return blocked('unsafe_broker');
+  if (endpoint === 'missing' || endpoint === 'orphan') {
+    const broker = spawn(process.execPath, [brokerScript, root, cwd], { detached: true,
+      stdio: 'ignore', env: { PATH: process.env.PATH, HOME: process.env.HOME,
+        ...(process.env.CBS_MEMORIA_CA_FILE ? { CBS_MEMORIA_CA_FILE: process.env.CBS_MEMORIA_CA_FILE } : {}) } });
+    broker.unref();
+  }
+  const launch = await buildLaunchCommand(cwd, cli, args, options, made);
+  if (launch.kind !== 'ready') return launch;
+  try {
+    const child = spawn(launch.command, launch.args, { cwd, stdio: 'inherit', env: launch.env });
+    return await new Promise(resolve => {
+      child.once('error', () => resolve(blocked('cli_unavailable')));
+      child.once('exit', (code, signal) => resolve({ kind: 'exited', code, signal }));
+    });
+  } finally { launch.release(); await launch.cleanup(); }
+}
+
+function safeClaudeArgs(args) {
+  if (!Array.isArray(args)) return false;
+  let expectModel = false;
+  let after = false;
+  let prompt = false;
+  for (const arg of args) {
+    if (typeof arg !== 'string' || !arg) return false;
+    if (expectModel) {
+      if (arg.startsWith('-')) return false;
+      expectModel = false;
+    } else if (!after && arg === '--model') expectModel = true;
+    else if (!after && arg === '--') after = true;
+    else if (!after && arg.startsWith('-')) return false;
+    else if (prompt) return false;
+    else prompt = true;
+  }
+  return !expectModel;
 }
 
 function safeCodexArgs(args) {

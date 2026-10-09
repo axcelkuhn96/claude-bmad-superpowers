@@ -7,8 +7,9 @@ import { createOutbox } from './outbox.mjs';
 import { parsePersistedSlice, POLICY_VERSION } from './transcript.mjs';
 import { readLocalTrust, trustTuple } from './trust.mjs';
 import { identifyProject } from './project-id.mjs';
-import { bindLaunch } from './launch.mjs';
+import { bindLaunch, resolveBoundLaunch } from './launch.mjs';
 import { recordSessionCheckout, readSessionCheckout } from './session-checkout.mjs';
+import { readWindowsBinary } from './windows-security.mjs';
 
 const events = { claude: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'SessionEnd']),
   codex: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd']) };
@@ -18,7 +19,10 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   if (!events[cli]?.has(event) || payload?.hook_event_name !== event ||
       typeof payload.cwd !== 'string' || typeof payload.session_id !== 'string' ||
       typeof payload.transcript_path !== 'string') return blocked('invalid_hook_payload');
-  if (process.platform === 'win32' || !process.getuid) return blocked('native_windows_unproved');
+  if (process.platform !== 'win32' && !process.getuid) return blocked('native_windows_unproved');
+  if (process.platform === 'win32' && !/^[a-f0-9]{64}$/.test(process.env.CBS_MEMORIA_LAUNCH_ID ?? '')) {
+    return blocked('unbound');
+  }
   const options = { stateRoot };
   const resolution = event === 'SessionStart'
     ? await inspectConfiguration(payload.cwd, options) : await resolveProject(payload.cwd, payload.session_id, options);
@@ -30,7 +34,9 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   const scope = await identifyProject(payload.cwd);
   if (scope.kind !== 'git' || scope.projectRoot !== current.projectRoot) return blocked('unsupported_git');
   const native = await verifyNativeCapture(cli === 'codex' ? scope.activeRoot : current.projectRoot,
-    { cli, stateRoot, installedPlugin, projectRoot: current.projectRoot });
+    { cli, stateRoot, installedPlugin, projectRoot: current.projectRoot,
+      ...(process.platform === 'win32' ? { launchToken: process.env.CBS_MEMORIA_LAUNCH_ID,
+        profile: cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR } : {}) });
   if (native.kind !== 'verified') return blocked(native.reason);
   const trust = await readLocalTrust(current.stateDir);
   if (!trust || Object.entries(trustTuple(current)).some(([key, value]) => trust[key] !== value)) {
@@ -52,7 +58,13 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
       return blocked(error.code === 'ENOENT' ? 'missing_transcript' : 'unsafe_transcript');
     }
   }
-  if (stat && (!stat.isFile() || stat.uid !== process.getuid())) return blocked('unsafe_transcript');
+  if (stat && process.platform === 'win32') {
+    if (!stat.isFile()) return blocked('unsafe_transcript');
+    try {
+      const opened = await readWindowsBinary(transcriptPath, { length: 0, privateState: false });
+      stat = { size: opened.size, fileId: opened.fileId };
+    } catch { return blocked('unsafe_transcript'); }
+  } else if (stat && (!stat.isFile() || stat.uid !== process.getuid())) return blocked('unsafe_transcript');
   const checkout = event === 'SessionStart'
     ? await recordSessionCheckout(session, cli, payload.session_id, scope.activeRoot)
     : await readSessionCheckout(session.stateDir, cli, payload.session_id);
@@ -63,6 +75,12 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   if (event === 'SessionStart' && process.env.CBS_MEMORIA_LAUNCH_ID) {
     const binding = await bindLaunch(process.env.CBS_MEMORIA_LAUNCH_ID, cli, payload.cwd, payload.session_id, { stateRoot });
     if (binding.kind !== 'bound') return blocked(binding.reason);
+  }
+  if (process.platform === 'win32') {
+    const binding = await resolveBoundLaunch(process.env.CBS_MEMORIA_LAUNCH_ID, cli, { stateRoot });
+    if (binding.kind !== 'bound' || binding.nativeSessionId !== payload.session_id) {
+      return blocked(binding.reason ?? 'unbound');
+    }
   }
   const outbox = createOutbox(session.stateDir);
   let { queuedEnd } = await outbox.cursor(cli, payload.session_id);

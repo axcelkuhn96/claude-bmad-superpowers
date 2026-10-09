@@ -234,14 +234,17 @@ async function finishChild(box, operationId, entry, childResult) {
 
 function granted(options, decision, hash) {
   const grant = options.reviewGrant;
+  const actor = process.platform === 'win32' ? options.actor :
+    `uid:${process.getuid()}:${os.userInfo().username}`;
   if (!grant || !localGrants.has(grant) || grant.decision !== decision ||
-      grant.payloadSha256 !== hash || grant.actor !== `uid:${process.getuid()}:${os.userInfo().username}`) return null;
+      grant.payloadSha256 !== hash || grant.actor !== actor) return null;
   localGrants.delete(grant);
   return grant;
 }
 
 export async function reviewCandidateOnTerminal(operationId, candidateKey, options = {}) {
-  if (!process.getuid || !process.stdin.isTTY || !process.stdout.isTTY) return blocked('trusted_review_required');
+  if (!(process.platform === 'win32' ? /^sid:S-\d+(?:-\d+){2,}:.+$/.test(options.actor ?? '') :
+    !!process.getuid) || !process.stdin.isTTY || !process.stdout.isTTY) return blocked('trusted_review_required');
   const context = await reviewContext(operationId, candidateKey, options);
   if (!context.box) return context;
   if (context.processed || context.entry.status !== 'pending') return blocked('candidate_unavailable');
@@ -267,7 +270,8 @@ export async function reviewCandidateOnTerminal(operationId, candidateKey, optio
     const confirm = (await prompt.question(`Confirm ${answer} for ${entry.payloadRef.sha256} (yes): `)).trim();
     if (confirm !== 'yes') return blocked('owner_approval_required');
     const reviewGrant = { decision, payloadSha256: entry.payloadRef.sha256,
-      actor: `uid:${process.getuid()}:${os.userInfo().username}`,
+      actor: process.platform === 'win32' ? options.actor :
+        `uid:${process.getuid()}:${os.userInfo().username}`,
       reviewedAt: new Date().toISOString(), text };
     localGrants.add(reviewGrant);
     const next = { ...options, reviewGrant };

@@ -4,6 +4,8 @@ import { createOutbox } from './outbox.mjs';
 import { reviewCandidateOnTerminal } from './candidates.mjs';
 import { identifyProject } from './project-id.mjs';
 import { readSessionCheckout } from './session-checkout.mjs';
+import { inspectWindowsPath } from './windows-security.mjs';
+import os from 'node:os';
 
 const [cli, cwd, sessionId, operationId, candidateKey] = process.argv.slice(2);
 if (!['claude', 'codex'].includes(cli) || !cwd || !sessionId || !operationId || !candidateKey ||
@@ -24,11 +26,20 @@ if (!['claude', 'codex'].includes(cli) || !cwd || !sessionId || !operationId || 
     process.stderr.write('CBS Mem0: session unavailable\n');
     process.exitCode = 1;
   } else {
+    const sid = process.platform === 'win32'
+      ? (await inspectWindowsPath(current.stateDir, 'directory')).currentSid : null;
+    if (process.platform === 'win32' && !/^S-\d+(?:-\d+){2,}$/.test(sid ?? '')) {
+      process.stderr.write('CBS Mem0: reviewer unavailable\n');
+      process.exitCode = 1;
+    } else {
     const result = await reviewCandidateOnTerminal(operationId, candidateKey, {
       outbox: createOutbox(current.stateDir), cwd, sessionId,
-      writerId: `uid:${process.getuid()}`, readSecret: name => process.env[name],
+      writerId: process.platform === 'win32' ? `sid:${sid}` : `uid:${process.getuid()}`,
+      ...(sid ? { actor: `sid:${sid}:${os.userInfo().username}` } : {}),
+      readSecret: name => process.env[name],
     });
     process.stdout.write(`${result.kind}: ${result.reason ?? result.operationId ?? ''}\n`);
     process.exitCode = ['acked', 'processed'].includes(result.kind) ? 0 : 1;
+    }
   }
 }

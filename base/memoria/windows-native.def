@@ -10,3 +10,11 @@ EXPORTS
   napi_create_external
   napi_get_value_external
   napi_throw_error
+  napi_get_value_string_utf16
+  napi_create_string_utf8
+  napi_create_double
+  napi_get_buffer_info
+  napi_get_value_int64
+  napi_get_value_uint32
+  napi_get_value_bool
+  napi_create_buffer_copy

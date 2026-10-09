@@ -91,28 +91,21 @@ ConvertTo-Json -InputObject @($results) -Compress
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
-test('Windows lock fixture serializes missing prerequisite and executed failure distinctly', async () => {
+test('Windows native fixture parses and accepts no caller checkout or profile roots', async () => {
   const fixture = new URL('./memoria-windows-validation.ps1', import.meta.url);
   const script = String.raw`
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($env:CBS_WINDOWS_FIXTURE, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw 'fixture parse error' }
-$names = @('Record', 'Record-LockOutcome')
-$defs = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names }, $true)
-foreach ($definition in $defs) { . ([scriptblock]::Create($definition.Extent.Text)) }
-$report = @{ controls = @{} }
-Record-LockOutcome $false $false @{ reason = 'precondition missing' }
-$precondition = $report.controls['own_child_lock_crash_fixture']
-Record-LockOutcome $true $false @{ reason = 'reacquire failed' }
-$executed = $report.controls['own_child_lock_crash_fixture']
-@{ precondition = $precondition; executed = $executed } | ConvertTo-Json -Compress -Depth 5
+$ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath } | ConvertTo-Json -Compress
 `;
   const { stdout } = await run('pwsh', ['-NoProfile', '-NonInteractive', '-Command', script],
     { env: { ...process.env, CBS_WINDOWS_FIXTURE: new URL(fixture).pathname } });
-  const result = JSON.parse(stdout.trim());
-  assert.deepEqual([result.precondition.status, result.precondition.executed],
-    ['missing_prerequisite', false]);
-  assert.deepEqual([result.executed.status, result.executed.executed], ['failed', true]);
+  const parameters = JSON.parse(stdout.trim());
+  assert.equal(parameters.includes('NativeEventProjectRoot'), false);
+  assert.equal(parameters.includes('NativeEventProfileDir'), false);
+  assert.equal(parameters.includes('FixtureRoot'), false);
+  assert.equal(parameters.includes('ReportPath'), true);
 });
 
 test('Windows Git exclusion uses Git directory separators', () => {

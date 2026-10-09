@@ -3,6 +3,9 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { externalIdFor } from './ledger.mjs';
+import { ensureWindowsPrivateDirectory, inspectWindowsPath, readWindowsBinary,
+  publishWindowsBinary, deleteWindowsBinary, withWindowsFileLock } from './windows-security.mjs';
+import { createWindowsState } from './windows-state.mjs';
 
 const DEFAULT_MAX = 256 * 1024 * 1024;
 const blocked = reason => ({ kind: 'blocked', reason });
@@ -33,13 +36,37 @@ export function createOutbox(stateDir, options = {}) {
   const extractionFile = (cli, sessionId) => path.join(root,
     `extract-${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.json`);
   const hash = value => createHash('sha256').update(value).digest('hex');
+  const windows = process.platform === 'win32';
+  const mutable = file => /(?:^|[\\/])(?:cursor-|extract-)[a-f0-9]{64}\.json$/.test(file) ||
+    /\.(?:manifest|retry)\.json$/.test(file);
+
+  async function removeOwned(file, optional = false) {
+    if (!windows) return fs.rm(file, { force: optional });
+    if (mutable(file)) await createWindowsState(file).read();
+    let observed;
+    try { observed = await readWindowsBinary(file, { length: 16 * 1024 * 1024 }); }
+    catch (error) {
+      if (optional && error.message === 'windows_read_open' &&
+          await fs.lstat(file).then(() => false, cause => cause.code === 'ENOENT')) return;
+      throw error;
+    }
+    if (observed.size !== observed.bytes.length) throw new Error('windows_outbox_oversize');
+    await deleteWindowsBinary(file, observed.fileId, observed.bytes);
+  }
 
   async function syncDir(dir) {
+    if (windows) return;
     const h = await fs.open(dir, 'r');
     try { await h.sync(); } finally { await h.close(); }
   }
   async function ensure() {
-    if (process.platform === 'win32' || !process.getuid) throw new Error('native_windows_unproved');
+    if (windows) {
+      for (const dir of [stateDir, root, items, acks, processed]) {
+        if (!(await ensureWindowsPrivateDirectory(dir)).ok) throw new Error('unsafe_outbox_dir');
+      }
+      return;
+    }
+    if (!process.getuid) throw new Error('native_windows_unproved');
     for (const dir of [stateDir, root, items, acks, processed]) {
       await fs.mkdir(dir, { recursive: true, mode: 0o700 });
       const st = await fs.lstat(dir);
@@ -48,10 +75,27 @@ export function createOutbox(stateDir, options = {}) {
     }
   }
   async function read(file) {
+    if (windows) {
+      if (mutable(file)) return createWindowsState(file).read();
+      try {
+        const observed = await readWindowsBinary(file, { length: 16 * 1024 * 1024 });
+        if (observed.size !== observed.bytes.length) throw new Error('windows_outbox_oversize');
+        return JSON.parse(observed.bytes.toString('utf8'));
+      } catch (error) {
+        if (error.message === 'windows_read_open' &&
+            await fs.lstat(file).then(() => false, cause => cause.code === 'ENOENT')) return null;
+        throw error;
+      }
+    }
     try { return JSON.parse(await fs.readFile(file, 'utf8')); }
     catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
   async function durable(file, value) {
+    if (windows) {
+      if (mutable(file)) await createWindowsState(file).write(value);
+      else await publishWindowsBinary(file, Buffer.from(JSON.stringify(value) + '\n'));
+      return;
+    }
     const dir = path.dirname(file);
     const temporary = path.join(dir, `.${randomUUID()}.tmp`);
     const handle = await fs.open(temporary, 'wx', 0o600);
@@ -70,6 +114,20 @@ export function createOutbox(stateDir, options = {}) {
   }
   async function withLock(callback) {
     await ensure();
+    if (windows) return withWindowsFileLock(kernelLock, async () => {
+      for (const name of await fs.readdir(acks)) if (/^src-[a-f0-9]{64}\.json$/.test(name)) {
+        const id = name.slice(0, -5);
+        if (await read(itemFile(id))) await removeOwned(itemFile(id));
+        if (await read(retryFile(id))) await removeOwned(retryFile(id));
+      }
+      for (const name of await fs.readdir(processed)) if (/^src-[a-f0-9]{64}\.json$/.test(name)) {
+        const id = name.slice(0, -5);
+        for (const file of [itemFile(id), manifestFile(id), retryFile(id)]) {
+          if (await read(file)) await removeOwned(file);
+        }
+      }
+      return callback();
+    });
     if (process.platform !== 'linux') throw new Error('outbox_lock_unsupported');
     const supported = new Set([0xef53, 0x58465342, 0x9123683e, 0x01021994, 0x794c7630]);
     if (!supported.has((await fs.statfs(root)).type)) throw new Error('outbox_lock_unsupported');
@@ -299,7 +357,7 @@ export function createOutbox(stateDir, options = {}) {
         if (row.projectId !== prior.projectId || row.policyVersion !== prior.policyVersion) {
           throw new Error('cursor_source_mismatch');
         }
-        await fs.rm(ackFile(row.operationId));
+        await removeOwned(ackFile(row.operationId));
         removed = true;
       }
       if (removed) await syncDir(acks);
@@ -325,7 +383,7 @@ export function createOutbox(stateDir, options = {}) {
         [row.operationId, proofDigest(row)])] };
     if (!await fits(snapshot)) return;
     await durable(summaryFile(cli, sessionId), snapshot);
-    for (const row of removable) await fs.rm(ackFile(row.operationId));
+    for (const row of removable) await removeOwned(ackFile(row.operationId));
     await syncDir(acks);
   }
   async function compactProcessedUnlocked(cli, sessionId) {
@@ -359,7 +417,7 @@ export function createOutbox(stateDir, options = {}) {
       entries: prior?.entries ?? [] };
     if (!await fits(snapshot)) return;
     await durable(summaryFile(cli, sessionId), snapshot);
-    for (const row of removable) await fs.rm(processedFile(row.operationId));
+    for (const row of removable) await removeOwned(processedFile(row.operationId));
     await syncDir(processed);
   }
   async function enqueueCheckpoint(slice, identity) {
@@ -401,6 +459,30 @@ export function createOutbox(stateDir, options = {}) {
     });
   }
   async function usageUnlocked() {
+    if (windows) {
+      let total = 0;
+      let count = 0;
+      const visit = async dir => {
+        const audit = await inspectWindowsPath(dir, 'directory');
+        if (!audit.ok) throw new Error('unsafe_outbox_dir');
+        total += blockSize;
+        for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+          if (++count > 65536 || entry.isSymbolicLink()) throw new Error('unsafe_outbox_entry');
+          const file = path.join(dir, entry.name);
+          if (entry.isDirectory()) await visit(file);
+          else if (entry.isFile()) {
+            const observed = await readWindowsBinary(file, { length: 0 });
+            total += Math.max(observed.allocatedBytes, allocated(observed.size));
+          } else throw new Error('unsafe_outbox_entry');
+        }
+      };
+      for (const dir of [root, path.dirname(payloads)]) {
+        try { await fs.lstat(dir); }
+        catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+        await visit(dir);
+      }
+      return total;
+    }
     let bytes = 0;
     for (const dir of [items, acks, processed, root, lock, path.dirname(payloads), payloads, reviews]) {
       try { await fs.lstat(dir); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
@@ -421,6 +503,24 @@ export function createOutbox(stateDir, options = {}) {
   async function payloadValid(ref, row, candidate) {
     if (!ref || Object.keys(ref).length !== 1 || !/^[a-f0-9]{64}$/.test(ref.sha256 ?? '')) return false;
     const file = path.join(payloads, `${candidate.externalId}.${ref.sha256}.json`);
+    if (windows) {
+      try {
+        const observed = await readWindowsBinary(file, { length: 16 * 1024 * 1024 });
+        if (observed.size !== observed.bytes.length || hash(observed.bytes) !== ref.sha256) return false;
+        const data = JSON.parse(observed.bytes.toString('utf8'));
+        return data?.external_id === candidate.externalId && data.project_id === row.projectId &&
+          data.checkpoint_id === row.operationId && data.source_message_id === candidate.evidence.messageId &&
+          data.candidate_key === candidate.candidateKey && data.origin_cli === row.cli &&
+          data.session_id === row.sessionId && data.policy_version === row.policyVersion &&
+          data.slice_start === row.start && data.slice_end === row.end && data.slice_hash === row.sliceHash &&
+          data.source_offsets?.start === candidate.evidence.start &&
+          data.source_offsets?.end === candidate.evidence.end ? data : false;
+      } catch (error) {
+        if (error.message === 'windows_read_open' &&
+            await fs.lstat(file).then(() => false, cause => cause.code === 'ENOENT')) return false;
+        throw error;
+      }
+    }
     let handle;
     try {
       for (const dir of [path.dirname(payloads), payloads]) {
@@ -479,6 +579,21 @@ export function createOutbox(stateDir, options = {}) {
       const content = JSON.stringify(candidate) + '\n';
       const digest = hash(content);
       const file = path.join(payloads, `${externalId}.${digest}.json`);
+      if (windows) {
+        if (!(await ensureWindowsPrivateDirectory(payloads)).ok) return blocked('unsafe_candidate_dir');
+        const existing = await read(file);
+        if (existing) return await payloadValid({ sha256: digest }, row,
+          { candidateKey: candidate.candidate_key, externalId,
+            evidence: { messageId: candidate.source_message_id,
+              start: candidate.source_offsets.start, end: candidate.source_offsets.end } })
+          ? { kind: 'persisted', externalId, payloadRef: { sha256: digest } }
+          : blocked('candidate_payload_mismatch');
+        if (await usageUnlocked() + 2 * allocated(content) + reserve > maxBytes) {
+          return { kind: 'full', operationId };
+        }
+        await publishWindowsBinary(file, Buffer.from(content));
+        return { kind: 'persisted', externalId, payloadRef: { sha256: digest } };
+      }
       for (const dir of [path.dirname(payloads), payloads]) {
         await fs.mkdir(dir, { recursive: true, mode: 0o700 });
         const stat = await fs.lstat(dir);
@@ -575,6 +690,22 @@ export function createOutbox(stateDir, options = {}) {
       const candidate = manifest?.candidates?.find(item => item.candidateKey === candidateKey);
       if (!candidate) return blocked('missing_candidate');
       const file = path.join(reviews, `${candidate.externalId}.json`);
+      if (windows) {
+        try {
+          const observed = await readWindowsBinary(file, { length: 1024 * 1024 });
+          if (observed.size !== observed.bytes.length) return blocked('unsafe_review');
+          const record = JSON.parse(observed.bytes.toString('utf8'));
+          return record.externalId === candidate.externalId && record.operationId === operationId &&
+            record.payloadSha256 === candidate.payloadRef.sha256 &&
+            record.digest === hash(JSON.stringify(record.review)) ? record : blocked('review_mismatch');
+        } catch (error) {
+          if (error.message === 'windows_read_open' &&
+              await fs.lstat(file).then(() => false, cause => cause.code === 'ENOENT')) {
+            return blocked('missing_review');
+          }
+          throw error;
+        }
+      }
       let handle;
       try {
         const parent = await fs.lstat(reviews);
@@ -613,6 +744,17 @@ export function createOutbox(stateDir, options = {}) {
         return blocked('candidate_payload_mismatch');
       }
       if (review.payloadSha256 !== candidate.payloadRef.sha256) return blocked('review_source_mismatch');
+      if (windows) {
+        if (!(await ensureWindowsPrivateDirectory(reviews)).ok) return blocked('unsafe_review_dir');
+        const file = path.join(reviews, `${candidate.externalId}.json`);
+        if (await read(file)) return blocked('review_conflict');
+        const record = { operationId, externalId: candidate.externalId,
+          payloadSha256: candidate.payloadRef.sha256, review, digest: hash(JSON.stringify(review)) };
+        const content = JSON.stringify(record) + '\n';
+        if (await usageUnlocked() + 2 * allocated(content) + reserve > maxBytes) return { kind: 'full', operationId };
+        await publishWindowsBinary(file, Buffer.from(content));
+        return { kind: 'sealed', review, digest: record.digest };
+      }
       await fs.mkdir(reviews, { recursive: true, mode: 0o700 });
       const directory = await fs.lstat(reviews);
       if (!directory.isDirectory() || directory.uid !== process.getuid() ||
@@ -665,8 +807,8 @@ export function createOutbox(stateDir, options = {}) {
         policyVersion: row.policyVersion, sdkId: proof.sdkId, qdrantId: proof.qdrantId };
       if (!await fits(receipt)) return { kind: 'full', operationId };
       await durable(ackFile(operationId), receipt);
-      await fs.rm(itemFile(operationId));
-      await fs.rm(retryFile(operationId), { force: true });
+      await removeOwned(itemFile(operationId));
+      await removeOwned(retryFile(operationId), true);
       await syncDir(items);
       if (reserve && await usageUnlocked() >= maxBytes * 0.8) await compactAcksUnlocked(row.cli, row.sessionId);
       return { kind: 'acked', operationId };
@@ -763,9 +905,9 @@ export function createOutbox(stateDir, options = {}) {
         if (!await fits(receipt)) return { kind: 'full', operationId };
       }
       await durable(processedFile(operationId), receipt);
-      await fs.rm(itemFile(operationId));
-      await fs.rm(manifestFile(operationId));
-      await fs.rm(retryFile(operationId), { force: true });
+      await removeOwned(itemFile(operationId));
+      await removeOwned(manifestFile(operationId));
+      await removeOwned(retryFile(operationId), true);
       await syncDir(items);
       if (manifest.disposition === 'no_facts' && await usageUnlocked() >= maxBytes * 0.6) {
         await compactProcessedUnlocked(row.cli, row.sessionId);

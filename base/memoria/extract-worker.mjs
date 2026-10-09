@@ -13,7 +13,8 @@ export function scheduleExtraction({ cli, event, payload, result, stateRoot, spa
   if (!boundaryEvents.has(event) || !['claude', 'codex'].includes(cli) ||
       result?.kind === 'blocked' || result?.kind === 'pass_through' || !result ||
       typeof payload?.cwd !== 'string' || typeof payload.session_id !== 'string') return false;
-  const env = Object.fromEntries(['PATH', 'HOME', 'LANG', 'TMPDIR', 'TEMP', 'TMP', 'CLAUDE_CONFIG_DIR']
+  const env = Object.fromEntries(['PATH', 'HOME', 'LANG', 'TMPDIR', 'TEMP', 'TMP', 'SystemRoot', 'WINDIR', 'USERPROFILE',
+    'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'CBS_MEMORIA_LAUNCH_ID', 'CBS_MEMORIA_STATE_ROOT']
     .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
   const child = spawnChild(process.execPath, [script, cli, payload.cwd, payload.session_id,
     stateRoot ?? ''], { cwd: payload.cwd, env, detached: true, stdio: 'ignore', windowsHide: true });
@@ -23,7 +24,7 @@ export function scheduleExtraction({ cli, event, payload, result, stateRoot, spa
 }
 
 export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCli } = {}) {
-  if (!['claude', 'codex'].includes(cli) || !cwd || !sessionId || process.platform === 'win32') {
+  if (!['claude', 'codex'].includes(cli) || !cwd || !sessionId) {
     return blocked('invalid_consumer_identity');
   }
   const [{ identifyProject }, { resolveProject }, { verifyNativeCapture },
@@ -43,9 +44,17 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
       checkout.projectRoot !== current.projectRoot || checkout.projectId !== current.projectId) {
     return blocked('session_checkout_changed');
   }
+  if (process.platform === 'win32' && checkout.profile !== (cli === 'codex'
+    ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR)) return blocked('session_checkout_changed');
   const native = await verifyNativeCapture(cli === 'codex' ? scope.activeRoot : current.projectRoot,
-    { cli, stateRoot, projectRoot: current.projectRoot });
+    { cli, stateRoot, projectRoot: current.projectRoot,
+      ...(process.platform === 'win32' ? { profile: checkout.profile } : {}) });
   if (native.kind !== 'verified') return native;
+  if (process.platform === 'win32') {
+    const { resolveBoundLaunch } = await import('./launch.mjs');
+    const bound = await resolveBoundLaunch(process.env.CBS_MEMORIA_LAUNCH_ID, cli, { stateRoot });
+    if (bound.kind !== 'bound' || bound.nativeSessionId !== sessionId) return blocked('unbound');
+  }
   const trust = await readLocalTrust(current.stateDir);
   if (!trust || Object.entries(trustTuple(current)).some(([key, value]) => trust[key] !== value)) {
     return blocked('trust_changed');
@@ -55,9 +64,14 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
   let profile;
   try {
     profile = await fs.realpath(selected);
-    const stat = await fs.lstat(profile);
-    if (!stat.isDirectory() || !process.getuid || stat.uid !== process.getuid() || (stat.mode & 0o022)) {
-      return blocked('cli_profile_untrusted');
+    if (process.platform === 'win32') {
+      const { inspectWindowsPath } = await import('./windows-security.mjs');
+      if (!(await inspectWindowsPath(profile, 'directory')).ok) return blocked('cli_profile_untrusted');
+    } else {
+      const stat = await fs.lstat(profile);
+      if (!stat.isDirectory() || !process.getuid || stat.uid !== process.getuid() || (stat.mode & 0o022)) {
+        return blocked('cli_profile_untrusted');
+      }
     }
   } catch { return blocked('cli_profile_untrusted'); }
   // The extractor's own guard checks main and active checkout; this also rejects third worktrees.
@@ -80,7 +94,8 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
             sourceScope.projectRoot !== current.projectRoot || fresh.provider !== 'mem0' ||
             fresh.projectId !== current.projectId || fresh.stateDir !== current.stateDir) { pending++; continue; }
         const sourceNative = await verifyNativeCapture(row.cli === 'codex' ? original.nativeRoot : current.projectRoot,
-          { cli: row.cli, stateRoot, projectRoot: current.projectRoot });
+          { cli: row.cli, stateRoot, projectRoot: current.projectRoot,
+            ...(process.platform === 'win32' ? { profile: original.profile } : {}) });
         if (sourceNative.kind !== 'verified') { pending++; continue; }
         const sourceTrust = await readLocalTrust(fresh.stateDir);
         if (!sourceTrust || Object.entries(trustTuple(fresh)).some(([key, value]) => sourceTrust[key] !== value)) {
@@ -92,7 +107,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
           // This dedicated extraction child is serialized by extract.lock; the broker cwd never changes.
           if (!runCli) process.chdir(original.nativeRoot);
           result = await extractCheckpoint(row, { route: 'sonnet',
-            embeddingFingerprint: fresh.embeddingFingerprint }, { outbox: box, runCli });
+            embeddingFingerprint: fresh.embeddingFingerprint, stateRoot }, { outbox: box, runCli });
         } finally { if (!runCli) process.chdir(previousCwd); }
         if (result.kind === 'manifested' || result.kind === 'processed') manifested++;
         else pending++;

@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
+import { readWindowsBinary } from './windows-security.mjs';
 
 export const POLICY_VERSION = 'native-v1';
 const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -66,6 +67,54 @@ export async function parsePersistedSlice({ cli, transcriptPath, start = 0, end,
       !Number.isSafeInteger(start) || start < 0 || (end !== undefined &&
       (!Number.isSafeInteger(end) || end < start)) || typeof sessionId !== 'string' || !sessionId) {
     throw new Error('invalid_transcript_request');
+  }
+  if (process.platform === 'win32') {
+    const maxWindow = 4 * 1024 * 1024;
+    const requested = Math.min(maxWindow, end === undefined ? maxWindow : end - start);
+    const observed = await readWindowsBinary(transcriptPath,
+      { offset: start, length: requested, privateState: false });
+    if (expectedFile?.fileId && expectedFile.fileId !== observed.fileId) {
+      throw new Error('unsafe_transcript');
+    }
+    const bytes = observed.bytes;
+    const parsed = readCompleteJsonl(bytes, start);
+    if (parsed.lastCompleteByte === start && observed.size > start + maxWindow - 1) {
+      throw new Error('oversized_transcript_record');
+    }
+    let directUser = false;
+    if (cli === 'codex') {
+      let first = parsed.records[0]?.value;
+      if (start > 0) {
+        const header = await readWindowsBinary(transcriptPath,
+          { offset: 0, length: 128 * 1024, privateState: false });
+        if (header.fileId !== observed.fileId) throw new Error('unsafe_transcript');
+        const newline = header.bytes.indexOf(10);
+        if (newline >= 0) {
+          try { first = JSON.parse(decoder.decode(header.bytes.subarray(0, newline))); }
+          catch { first = null; }
+        }
+      }
+      const meta = first?.type === 'session_meta' ? first.payload : null;
+      if (meta && ((meta.session_id && meta.session_id !== sessionId) ||
+          (meta.id && meta.id !== sessionId))) throw new Error('transcript_session_mismatch');
+      directUser = ['exec', 'vscode'].includes(meta?.source) && meta?.thread_source === 'user' &&
+        meta?.session_id === sessionId && meta?.id === sessionId;
+    }
+    const messages = [];
+    for (const record of parsed.records) {
+      const mapped = cli === 'claude' ? claudeMessage(record.value) : codexMessage(record.value, directUser);
+      if (!mapped) continue;
+      if (!mapped.messageId || !mapped.timestamp ||
+          (mapped.nativeSessionId && mapped.nativeSessionId !== sessionId)) throw new Error('invalid_native_message');
+      messages.push({ ...mapped, cli, sessionId, start: record.start, end: record.end,
+        policyVersion: POLICY_VERSION });
+    }
+    const after = await readWindowsBinary(transcriptPath,
+      { offset: start, length: bytes.length, privateState: false });
+    if (after.fileId !== observed.fileId || !after.bytes.equals(bytes)) throw new Error('unsafe_transcript');
+    return { messages, lastCompleteByte: parsed.lastCompleteByte,
+      completeBytes: bytes.subarray(0, parsed.lastCompleteByte - start), fileId: observed.fileId,
+      size: observed.size };
   }
   const before = await fs.lstat(transcriptPath);
   if (!before.isFile() || (process.getuid && before.uid !== process.getuid()) ||

@@ -2,6 +2,7 @@ import { createReadStream, constants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { hashWindowsFile, holdWindowsHash, readWindowsBinary } from './windows-security.mjs';
 
 export const RUNTIME_PINS = Object.freeze({
   python: '>=3.11', sdk: 'mem0ai==2.2.1', qdrant: 'qdrant-client==1.19.1',
@@ -23,6 +24,28 @@ export function runtimePython(stateDir, platform = process.platform) {
 }
 
 export async function openArtifactIdentity(paths) {
+  if (process.platform === 'win32') {
+    const held = [];
+    try {
+      for (const file of paths) {
+        const identity = await hashWindowsFile(file);
+        const release = await holdWindowsHash(file, identity.fileId, identity.sha256);
+        held.push({ file, identity, release });
+      }
+      return { kind: 'opened', unchanged: async () => {
+        try {
+          for (const { file, identity } of held) {
+            const current = await readWindowsBinary(file, { length: 0 });
+            if (current.fileId !== identity.fileId || current.size !== identity.size) return false;
+          }
+          return true;
+        } catch { return false; }
+      }, close: async () => { for (const { release } of held.reverse()) release(); } };
+    } catch {
+      for (const { release } of held.reverse()) release();
+      return { kind: 'blocked', reason: 'artifact_changed' };
+    }
+  }
   const handles = [];
   const baseline = [];
   const fields = ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'];
@@ -58,8 +81,10 @@ async function sha256(file) {
 
 export async function verifyRuntimeArtifacts(model, tokenizer) {
   try {
-    if (await sha256(model) !== RUNTIME_PINS.modelSha256 ||
-        await sha256(tokenizer) !== RUNTIME_PINS.tokenizerSha256) {
+    const modelHash = process.platform === 'win32' ? (await hashWindowsFile(model)).sha256 : await sha256(model);
+    const tokenizerHash = process.platform === 'win32'
+      ? (await hashWindowsFile(tokenizer)).sha256 : await sha256(tokenizer);
+    if (modelHash !== RUNTIME_PINS.modelSha256 || tokenizerHash !== RUNTIME_PINS.tokenizerSha256) {
       return { kind: 'blocked', reason: 'artifact_mismatch' };
     }
   } catch { return { kind: 'blocked', reason: 'missing_artifact' }; }

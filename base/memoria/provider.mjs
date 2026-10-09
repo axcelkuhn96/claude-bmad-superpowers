@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { identifyProject } from './project-id.mjs';
 import { RUNTIME_PINS } from './runtime.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
-  writeWindowsPrivateFile } from './windows-security.mjs';
+  writeWindowsPrivateFile, readWindowsBinary } from './windows-security.mjs';
 
 const blocked = (reason) => ({ provider: 'blocked', reason });
 const stateRootDefault = () => path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
@@ -25,7 +25,17 @@ function destinationUrlValid(value) {
 
 async function configFor(scope) {
   async function read(root) {
-    try { return await fs.readFile(path.join(root, '.cbs', 'memoria.json'), 'utf8'); }
+    try {
+      const file = path.join(root, '.cbs', 'memoria.json');
+      if (process.platform === 'win32') {
+        try { await fs.lstat(file); }
+        catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+        const observed = await readWindowsBinary(file, { length: 1024 * 1024, privateState: false });
+        if (observed.size !== observed.bytes.length) throw new Error('oversize_config');
+        return observed.bytes.toString('utf8');
+      }
+      return await fs.readFile(file, 'utf8');
+    }
     catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
   let data;

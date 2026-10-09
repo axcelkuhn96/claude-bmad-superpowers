@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +11,7 @@ import { createRequire } from 'node:module';
 const runFile = promisify(execFile);
 const nativeFile = new URL('./bin/windows-native-x64.node', import.meta.url);
 const requireNative = createRequire(import.meta.url);
-export const WINDOWS_NATIVE_SHA256 = '67acff10cfe721fbe8e340759da3d6b5124fe830ed53824af51bd529c25b7cc9';
+export const WINDOWS_NATIVE_SHA256 = 'ba9bc964d0b0b9b859e299caabdf60fadd54a4620e60c5d5f4ff31d54c6ca77a';
 
 export function windowsGitPattern(root, target) {
   const relative = path.win32.relative(windowsPathKey(root), windowsPathKey(target));
@@ -374,8 +374,10 @@ async function nativeWindows() {
       throw new Error('unsafe_windows_native');
     }
     const native = requireNative(file);
-    if (typeof native.locations !== 'function' || typeof native.acquire !== 'function' ||
-        typeof native.release !== 'function') throw new Error('unsafe_windows_native');
+    if (['locations', 'acquire', 'release', 'readPrivate', 'fileLock', 'fileUnlock',
+      'publishNew', 'rewriteExisting', 'deleteExpected', 'holdPrivate', 'releasePrivate',
+      'hashPrivate', 'holdHash']
+      .some(name => typeof native[name] !== 'function')) throw new Error('unsafe_windows_native');
     return native;
   })();
   return nativePromise;
@@ -391,6 +393,8 @@ async function systemLocations() {
   })();
   return systemLocationsPromise;
 }
+
+export const windowsSystemLocations = systemLocations;
 
 async function powershellExe() {
   const { windows } = await systemLocations();
@@ -466,6 +470,114 @@ export async function writeWindowsPrivateFile(file, text, { replace = false, pri
 
 export async function readWindowsPrivateFile(file, { privateState = true } = {}) {
   return invoke('read-file', file, { privateState });
+}
+
+async function checkedWindowsParent(file, privateState = true) {
+  windowsPathKey(file);
+  const parent = path.win32.dirname(file);
+  const result = await inspectWindowsPath(parent, 'directory', { privateState });
+  if (!result.ok) throw new Error('unsafe_windows_parent');
+  if (windowsPathKey(parent) !== windowsPathKey(await fs.realpath(parent))) {
+    throw new Error('unsafe_windows_parent');
+  }
+}
+
+export async function readWindowsBinary(file, { offset = 0, length = 4 * 1024 * 1024,
+  privateState = true } = {}) {
+  await checkedWindowsParent(file, privateState);
+  if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(length) ||
+      length < 0 || length > 16 * 1024 * 1024) throw new Error('windows_read_args');
+  const result = (await nativeWindows()).readPrivate(file, offset, length, privateState);
+  if (!Buffer.isBuffer(result.bytes) || !/^[a-f0-9]{8}:[a-f0-9]{16}$/.test(result.fileId) ||
+      !Number.isSafeInteger(result.size) || result.size < 0 ||
+      !Number.isSafeInteger(result.allocatedBytes) || result.allocatedBytes < 0 ||
+      windowsPathKey(file) !== windowsPathKey(await fs.realpath(file))) {
+    throw new Error('unsafe_windows_read');
+  }
+  return result;
+}
+
+export async function publishWindowsBinary(file, bytes) {
+  await checkedWindowsParent(file);
+  if (!Buffer.isBuffer(bytes) || bytes.length > 16 * 1024 * 1024) {
+    throw new Error('windows_publish_args');
+  }
+  const temporary = path.win32.join(path.win32.dirname(file), `.${randomUUID()}.tmp`);
+  const result = (await nativeWindows()).publishNew(temporary, file, bytes);
+  const observed = await readWindowsBinary(file, { length: bytes.length });
+  if (observed.fileId !== result.fileId || observed.size !== bytes.length ||
+      !observed.bytes.equals(bytes)) {
+    throw new Error('windows_publish_changed');
+  }
+  return result;
+}
+
+export async function rewriteWindowsBinary(file, fileId, oldBytes, newBytes) {
+  await checkedWindowsParent(file);
+  if (!Buffer.isBuffer(oldBytes) || !Buffer.isBuffer(newBytes)) throw new Error('windows_rewrite_args');
+  return (await nativeWindows()).rewriteExisting(file, fileId, oldBytes, newBytes);
+}
+
+export async function deleteWindowsBinary(file, fileId, expectedBytes) {
+  await checkedWindowsParent(file);
+  if (!Buffer.isBuffer(expectedBytes)) throw new Error('windows_delete_args');
+  return (await nativeWindows()).deleteExpected(file, fileId, expectedBytes);
+}
+
+export async function holdWindowsPrivate(file, fileId, expectedBytes) {
+  await checkedWindowsParent(file);
+  if (!Buffer.isBuffer(expectedBytes)) throw new Error('windows_hold_args');
+  const native = await nativeWindows();
+  const lease = native.holdPrivate(file, fileId, expectedBytes);
+  return () => native.releasePrivate(lease);
+}
+
+export async function hashWindowsFile(file, { privateState = true } = {}) {
+  await checkedWindowsParent(file, privateState);
+  const result = (await nativeWindows()).hashPrivate(file, privateState);
+  if (!/^[a-f0-9]{64}$/.test(result.sha256) ||
+      windowsPathKey(file) !== windowsPathKey(await fs.realpath(file))) {
+    throw new Error('unsafe_windows_hash');
+  }
+  return result;
+}
+
+export async function holdWindowsHash(file, fileId, sha256, { privateState = true } = {}) {
+  await checkedWindowsParent(file, privateState);
+  const native = await nativeWindows();
+  const lease = native.holdHash(file, fileId, sha256, privateState);
+  return () => native.releasePrivate(lease);
+}
+
+const windowsFileQueues = new Map();
+export async function withWindowsFileLock(file, callback, { timeoutMs = 200 } = {}) {
+  if (typeof callback !== 'function') throw new Error('windows_file_lock_args');
+  const key = windowsPathKey(file);
+  const previous = windowsFileQueues.get(key) ?? Promise.resolve();
+  let done;
+  const pending = new Promise(resolve => { done = resolve; });
+  windowsFileQueues.set(key, pending);
+  try {
+    await previous;
+    const deadline = Date.now() + timeoutMs;
+    await checkedWindowsParent(file);
+    const native = await nativeWindows();
+    for (;;) {
+      let held;
+      try { held = native.fileLock(file); }
+      catch (error) {
+        if (error.message !== 'windows_file_lock_busy') throw error;
+        if (Date.now() >= deadline) throw error;
+        await new Promise(resolve => setTimeout(resolve, Math.min(10, Math.max(1, deadline - Date.now()))));
+        continue;
+      }
+      try { return await callback({ fileId: held.fileId }); }
+      finally { native.fileUnlock(held.lease); }
+    }
+  } finally {
+    done();
+    if (windowsFileQueues.get(key) === pending) windowsFileQueues.delete(key);
+  }
 }
 
 export function windowsCodexPluginInstalled(output) {
