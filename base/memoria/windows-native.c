@@ -19,6 +19,7 @@
 typedef struct { HANDLE handle; DWORD thread; int held; } Lease;
 typedef struct { HANDLE handle; OVERLAPPED overlap; int held; } FileLease;
 typedef struct { HANDLE handle; int held; } ReadLease;
+typedef struct { int publishing_callback; } PublishState;
 
 static napi_value fail(napi_env env, const char *code) {
   napi_throw_error(env, code, code);
@@ -665,14 +666,21 @@ static napi_value hold_hash(napi_env env, napi_callback_info info) {
 }
 
 static napi_value publish_new(napi_env env, napi_callback_info info) {
-  napi_value argv[3];
-  size_t argc = 3, byte_length = 0;
+  napi_value argv[4];
+  size_t argc = 4, byte_length = 0;
   wchar_t *temporary = NULL, *target = NULL;
   unsigned char *bytes = NULL;
-  if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) != napi_ok || argc != 3 ||
+  napi_valuetype callback_type = napi_undefined;
+  PublishState *state = NULL;
+  if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) != napi_ok ||
+      (argc != 3 && argc != 4) ||
       !path_arg(env, argv[0], &temporary) || !path_arg(env, argv[1], &target) ||
       napi_get_buffer_info(env, argv[2], (void **)&bytes, &byte_length) != napi_ok ||
-      byte_length > 16 * 1024 * 1024) {
+      byte_length > 16 * 1024 * 1024 ||
+      (argc == 4 && napi_typeof(env, argv[3], &callback_type) != napi_ok) ||
+      (argc == 4 && callback_type != napi_undefined && callback_type != napi_function) ||
+      napi_get_instance_data(env, (void **)&state) != napi_ok || !state ||
+      state->publishing_callback) {
     free(temporary); free(target);
     return fail(env, "windows_publish_args");
   }
@@ -694,13 +702,57 @@ static napi_value publish_new(napi_env env, napi_callback_info info) {
     0, &attributes, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH |
       FILE_FLAG_OPEN_REPARSE_POINT, NULL);
   LocalFree(descriptor);
-  free(temporary);
-  if (handle == INVALID_HANDLE_VALUE) { free(target); return fail(env, "windows_publish_temp"); }
+  if (handle == INVALID_HANDLE_VALUE) {
+    free(temporary); free(target); return fail(env, "windows_publish_temp");
+  }
   BY_HANDLE_FILE_INFORMATION first, after;
   FILE_STANDARD_INFO standard, after_standard;
   int published = 0;
+  int callback_failed = 0;
   int okay = audit_file(handle, 1, &first, &standard) &&
     write_all(handle, bytes, byte_length) && FlushFileBuffers(handle);
+  if (okay && argc == 4 && callback_type == napi_function) {
+    BY_HANDLE_FILE_INFORMATION flushed;
+    FILE_STANDARD_INFO flushed_standard;
+    okay = audit_file(handle, 1, &flushed, &flushed_standard) &&
+      flushed.dwVolumeSerialNumber == first.dwVolumeSerialNumber &&
+      flushed.nFileIndexHigh == first.nFileIndexHigh &&
+      flushed.nFileIndexLow == first.nFileIndexLow &&
+      flushed_standard.EndOfFile.QuadPart == (LONGLONG)byte_length;
+    if (okay) {
+      napi_value observation, receiver, result, undefined;
+      state->publishing_callback = 1;
+      napi_status status = napi_create_object(env, &observation);
+      if (status == napi_ok) status = property(env, observation, "boundary",
+        L"temp_flushed_before_publish") ? napi_ok : napi_generic_failure;
+      if (status == napi_ok) status = property(env, observation, "temporary", temporary)
+        ? napi_ok : napi_generic_failure;
+      if (status == napi_ok) status = property(env, observation, "target", target)
+        ? napi_ok : napi_generic_failure;
+      if (status == napi_ok) status = result_identity(env, observation,
+        &flushed, &flushed_standard) ? napi_ok : napi_generic_failure;
+      if (status == napi_ok) status = napi_get_global(env, &receiver);
+      if (status == napi_ok) status = napi_get_undefined(env, &undefined);
+      if (status == napi_ok) status = napi_call_function(env, receiver, argv[3],
+        1, &observation, &result);
+      if (status == napi_ok) {
+        bool same = false;
+        status = napi_strict_equals(env, result, undefined, &same);
+        if (status == napi_ok && !same) status = napi_generic_failure;
+      }
+      state->publishing_callback = 0;
+      if (status != napi_ok) { okay = 0; callback_failed = 1; }
+      if (okay) {
+        BY_HANDLE_FILE_INFORMATION checked;
+        FILE_STANDARD_INFO checked_standard;
+        okay = audit_file(handle, 1, &checked, &checked_standard) &&
+          checked.dwVolumeSerialNumber == flushed.dwVolumeSerialNumber &&
+          checked.nFileIndexHigh == flushed.nFileIndexHigh &&
+          checked.nFileIndexLow == flushed.nFileIndexLow &&
+          checked_standard.EndOfFile.QuadPart == flushed_standard.EndOfFile.QuadPart;
+      }
+    }
+  }
   if (okay) {
     size_t name_bytes = wcslen(target) * sizeof(wchar_t);
     size_t struct_bytes = offsetof(FILE_RENAME_INFO, FileName) + name_bytes;
@@ -714,6 +766,7 @@ static napi_value publish_new(napi_env env, napi_callback_info info) {
       free(rename);
     }
   }
+  free(temporary);
   free(target);
   if (published) okay = audit_file(handle, 1, &after, &after_standard) &&
     after.dwVolumeSerialNumber == first.dwVolumeSerialNumber &&
@@ -724,13 +777,28 @@ static napi_value publish_new(napi_env env, napi_callback_info info) {
     SetFileInformationByHandle(handle, FileDispositionInfo, &disposition, sizeof(disposition));
   }
   CloseHandle(handle);
+  if (callback_failed) {
+    bool pending = false;
+    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) return NULL;
+    return fail(env, "windows_publish_callback");
+  }
   if (!published || !okay) return fail(env, "windows_publish_failed");
   napi_value result;
   if (napi_create_object(env, &result) != napi_ok ||
       !result_identity(env, result, &after, &after_standard)) return fail(env, "windows_publish_result");
   return result;
 }
+static void publish_state_finalizer(napi_env env, void *data, void *hint) {
+  (void)env; (void)hint;
+  free(data);
+}
 static napi_value init(napi_env env, napi_value exports) {
+  PublishState *state = (PublishState *)calloc(1, sizeof(PublishState));
+  if (!state) return fail(env, "windows_publish_state");
+  if (napi_set_instance_data(env, state, publish_state_finalizer, NULL) != napi_ok) {
+    free(state);
+    return fail(env, "windows_publish_state");
+  }
   napi_property_descriptor descriptors[] = {
     { "locations", NULL, locations, NULL, NULL, NULL, napi_default, NULL },
     { "acquire", NULL, acquire, NULL, NULL, NULL, napi_default, NULL },

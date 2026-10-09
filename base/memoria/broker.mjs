@@ -163,6 +163,30 @@ export function readBrokerRequest(socket, accept, { receptionMs = 1000 } = {}) {
   });
 }
 
+// Own each accepted socket until close; late worker results cannot write to a disconnected client.
+export function manageBrokerConnection(socket, onClose) {
+  const controller = new AbortController();
+  let disconnected = false;
+  socket.on('error', () => {
+    disconnected = true;
+    controller.abort();
+    socket.destroy();
+  });
+  socket.once('close', () => {
+    disconnected = true;
+    controller.abort();
+    onClose();
+  });
+  return {
+    signal: controller.signal,
+    respond(value) {
+      if (disconnected || socket.destroyed || socket.writableEnded) return false;
+      try { socket.end(encodeFrame(value, undefined, true)); return true; }
+      catch { disconnected = true; controller.abort(); socket.destroy(); return false; }
+    },
+  };
+}
+
 export async function requestBroker(request, secret, { stateRoot, deadlineMs = 120000 } = {}) {
   if (process.platform === 'win32') {
     const root = stateRoot ?? path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
@@ -320,11 +344,14 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
   server = net.createServer(socket => {
     active++;
     clearTimeout(idle);
-    const controller = new AbortController();
+    const connection = manageBrokerConnection(socket, () => {
+      active--;
+      if (!active) idle = setTimeout(() => server.close(), idleMs);
+    });
     const accept = frame => {
       if (queued >= 2) {
         frame.secret.fill(0);
-        socket.end(encodeFrame(blocked('queue_full'), undefined, true));
+        connection.respond(blocked('queue_full'));
         return;
       }
       const enqueuedAt = Date.now();
@@ -332,13 +359,13 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
       chain = chain.then(async () => {
         queued--;
         const { value, secret } = frame;
-        if (socket.destroyed) { secret.fill(0); return; }
+        if (connection.signal.aborted) { secret.fill(0); return; }
         try {
           const result = Date.now() - enqueuedAt > 100 ? blocked('queue_timeout') :
-            await handle(value, secret, controller.signal);
-          if (!socket.destroyed) socket.end(encodeFrame(result, undefined, true));
+            await handle(value, secret, connection.signal);
+          connection.respond(result);
         } finally { secret.fill(0); }
-      }).catch(() => { if (!socket.destroyed) socket.end(encodeFrame(blocked('broker_failed'), undefined, true)); });
+      }).catch(() => { connection.respond(blocked('broker_failed')); });
     };
     if (process.platform === 'win32') {
       if (!discovery) socket.destroy();
@@ -346,11 +373,6 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
         .then(() => { readBrokerRequest(socket, accept); socket.resume(); })
         .catch(() => socket.destroy());
     } else readBrokerRequest(socket, accept);
-    socket.once('close', () => {
-      controller.abort();
-      active--;
-      if (!active) idle = setTimeout(() => server.close(), idleMs);
-    });
   });
   async function handle(value, secret, signal) {
     if (!value || typeof value !== 'object' || secret.length === 0) return blocked('worker_unavailable');

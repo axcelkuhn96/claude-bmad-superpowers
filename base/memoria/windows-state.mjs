@@ -22,8 +22,24 @@ function decoded(observed) {
   catch { throw new Error('windows_state_corrupt'); }
 }
 
+export function completedWindowsReceipts({ target, fileId, sha256, prefix }, entries) {
+  const owned = entries.filter(({ name }) => name.startsWith(`${prefix}-`) &&
+    name.endsWith('.commit.json'));
+  if (!owned.length) return [];
+  for (const { name, proof } of owned) {
+    const transaction = name.slice(prefix.length + 1, -'.commit.json'.length);
+    if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(transaction) ||
+        !proof || Object.keys(proof).sort().join(',') !== 'fileId,sha256,target,transaction' ||
+        proof.target !== target ||
+        proof.fileId !== fileId || proof.transaction !== transaction ||
+        !/^[a-f0-9]{64}$/.test(proof.sha256 ?? '')) return [];
+  }
+  const keep = owned.find(({ proof }) => proof.sha256 === sha256);
+  return keep ? owned.filter(entry => entry !== keep).map(({ name }) => name) : [];
+}
+
 // Intent is immutable and durable before same-handle rewrite. Unknown post-crash bytes are retained.
-export function createWindowsState(file) {
+export function createWindowsState(file, { onBoundary } = {}) {
   const canonical = windowsPathKey(file);
   const dir = path.win32.dirname(file);
   const journalDir = path.win32.join(dir, '.journal');
@@ -34,9 +50,34 @@ export function createWindowsState(file) {
     return withWindowsFileLock(lockFile, callback);
   };
 
+  async function compactCompleted() {
+    if (!(await missing(intentFile))) return;
+    const current = await readIfPresent(file);
+    if (!current || current.size !== current.bytes.length) return;
+    const prefix = hash(canonical);
+    const names = await fs.readdir(journalDir);
+    const entries = [];
+    for (const name of names) {
+      if (!name.startsWith(`${prefix}-`) || !name.endsWith('.commit.json')) continue;
+      const observed = await readIfPresent(path.win32.join(journalDir, name));
+      if (!observed) return; // Concurrent foreign mutation: retain all evidence.
+      let proof;
+      try { proof = decoded(observed); }
+      catch { return; }
+      if (!proof || !Buffer.from(JSON.stringify(proof) + '\n').equals(observed.bytes)) return;
+      entries.push({ name, proof, observed });
+    }
+    const remove = completedWindowsReceipts({ target: canonical, fileId: current.fileId,
+      sha256: hash(current.bytes), prefix }, entries);
+    for (const name of remove) {
+      const { observed } = entries.find(entry => entry.name === name);
+      await deleteWindowsBinary(path.win32.join(journalDir, name), observed.fileId, observed.bytes);
+    }
+  }
+
   async function replay() {
     const intentObserved = await readIfPresent(intentFile);
-    if (!intentObserved) return;
+    if (!intentObserved) { await compactCompleted(); return; }
     const intent = decoded(intentObserved);
     if (intent?.version !== 1 || intent.target !== canonical ||
         !/^[a-f0-9]{8}:[a-f0-9]{16}$/.test(intent.fileId ?? '') ||
@@ -68,6 +109,7 @@ export function createWindowsState(file) {
       throw new Error('windows_recovery_required');
     }
     await deleteWindowsBinary(intentFile, intentObserved.fileId, intentObserved.bytes);
+    await compactCompleted();
   }
 
   return {
@@ -90,7 +132,9 @@ export function createWindowsState(file) {
         oldSha256: hash(before.bytes), nextSha256: hash(next) });
       if (intentBytes.length > 4 * 1024 * 1024) throw new Error('windows_state_oversize');
       await publishWindowsBinary(intentFile, intentBytes);
+      await onBoundary?.('intent_durable');
       await rewriteWindowsBinary(file, before.fileId, before.bytes, next);
+      await onBoundary?.('rewrite_durable');
       await replay();
       return { fileId: before.fileId };
     }),

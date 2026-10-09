@@ -5,6 +5,39 @@ import os from 'node:os';
 import path from 'node:path';
 import { createLedger, externalIdFor, reconcileStore, transferWriter, withProjectLock } from '../base/memoria/ledger.mjs';
 import { runBridgeOperation, searchProject } from '../base/memoria/bridge.mjs';
+import { storeMemory } from '../base/memoria/bridge.mjs';
+
+test('remote-add observation runs after real bridge add and before local ACK', async t => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-remote-boundary-'));
+  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  const sourceIdentity = { projectId: 'p', originCli: 'claude', sessionId: 's',
+    start: 0, end: 1, sliceHash: 'a'.repeat(64), policyVersion: 'v1' };
+  const operation = { externalId: externalIdFor(sourceIdentity), projectId: 'p', sessionId: 's',
+    sourceIdentity, text: 'fact', approval: { kind: 'approved' },
+    metadata: { source: 'm', actor: 'human', origin: 'user_direct',
+      scope: 'project', evidence_at: '2026-10-09T00:00:00Z' } };
+  const rows = [];
+  let acked = false;
+  let boundary = false;
+  const result = await storeMemory('fixture', 's', operation, () => 'key', {
+    stateRoot: stateDir, writerId: 'writer',
+    resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir,
+      destination: { collection: 'fixture' } }),
+    authorize: async () => ({ kind: 'authorized', key: 'key', connection: { url: 'http://127.0.0.1/' } }),
+    run: async (_python, _script, request) => {
+      if (request.op === 'find') return { kind: 'items', items: rows };
+      if (request.op === 'add') { rows.push({ ...request, sdkId: 'sdk', qdrantId: 'q', status: 'pending' });
+        return { kind: 'pending' }; }
+      throw new Error('unexpected continuation');
+    },
+    onRemoteAdd: async () => { boundary = true; throw new Error('contained_crash_boundary'); },
+    ackLocal: async () => { acked = true; return { kind: 'acked', operationId: operation.externalId }; },
+  });
+  assert.equal(result.kind, 'pending');
+  assert.equal(boundary, true);
+  assert.equal(rows.length, 1);
+  assert.equal(acked, false);
+});
 
 test('remote write before local ACK is reconciled without another SDK add', async () => {
   const operation = { externalId: 'src-claude-s1-0-84-v1', projectId: 'p' };

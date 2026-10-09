@@ -20,7 +20,47 @@ import { applyNativeExclusion, restoreNativeExclusion, verifyNativeCapture } fro
 import { RUNTIME_PINS, runtimePython, openArtifactIdentity } from '../base/memoria/runtime.mjs';
 import { pinDestination } from '../base/memoria/activation.mjs';
 import net from 'node:net';
-import { readBrokerRequest, brokerEndpointStatus, prepareBrokerEndpoint, brokerPath } from '../base/memoria/broker.mjs';
+import { readBrokerRequest, manageBrokerConnection, brokerEndpointStatus, prepareBrokerEndpoint, brokerPath } from '../base/memoria/broker.mjs';
+
+test('broker connection survives disconnect before and after late response, then serves next client', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-broker-disconnect-'));
+  const file = path.join(dir, 'sock');
+  let accepted = 0;
+  const links = [];
+  const server = net.createServer(socket => {
+    const link = manageBrokerConnection(socket, () => {});
+    links.push(link);
+    accepted++;
+    if (accepted === 1) {
+      setTimeout(() => link.respond({ kind: 'items', items: [] }), 40);
+    } else if (accepted === 2) {
+      link.respond({ kind: 'items', items: [] });
+      socket.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+      socket.emit('error', Object.assign(new Error('late ECONNRESET'), { code: 'ECONNRESET' }));
+    } else link.respond({ kind: 'items', items: [{ id: 'next' }] });
+  });
+  t.after(async () => { await new Promise(resolve => server.close(resolve)); await fs.rm(dir, { recursive: true, force: true }); });
+  await new Promise(resolve => server.listen(file, resolve));
+  const first = net.createConnection(file);
+  await new Promise(resolve => first.once('connect', resolve));
+  first.destroy();
+  await new Promise(resolve => setTimeout(resolve, 70));
+  assert.equal(links[0].respond({ kind: 'items', items: [] }), false);
+  const second = net.createConnection(file);
+  second.on('error', () => {});
+  second.resume();
+  await Promise.race([new Promise(resolve => second.once('close', resolve)),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('second_not_closed')), 300))]);
+  const third = net.createConnection(file);
+  const parser = new FrameReader({ response: true });
+  const result = await Promise.race([new Promise((resolve, reject) => {
+    third.on('data', bytes => { for (const frame of parser.push(bytes)) resolve(frame.value); });
+    third.once('error', reject);
+  }), new Promise((_, reject) => setTimeout(() => reject(new Error('third_no_response')), 300))]);
+  assert.deepEqual(result, { kind: 'items', items: [{ id: 'next' }] });
+  assert.equal(links[1].signal.aborted, true);
+  third.destroy();
+});
 
 function git(cwd, ...args) {
   const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
@@ -40,6 +80,21 @@ async function fixture(t) {
   git(root, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'fixture');
   return { dir, root, stateRoot };
 }
+
+test('outbox observation fires after a real durable item is readable', async t => {
+  const { stateRoot } = await fixture(t);
+  const stateDir = path.join(stateRoot, 'observed');
+  let observed;
+  const box = createOutbox(stateDir, { onDurable: async file => {
+    if (!file.includes(`${path.sep}items${path.sep}`)) return;
+    observed = JSON.parse(await fs.readFile(file, 'utf8'));
+  } });
+  const slice = { cli: 'claude', sessionId: 'observed', start: 0, end: 1,
+    sliceHash: 'a'.repeat(64), messages: [] };
+  const queued = await box.enqueueCheckpoint(slice, { projectId: 'fixture', policyVersion: 'v1' });
+  assert.equal(queued.kind, 'queued');
+  assert.equal(observed.operationId, queued.operationId);
+});
 
 test('binary frames handle fragments and keep the secret out of JSON', () => {
   const secret = Buffer.from('private-sentinel');

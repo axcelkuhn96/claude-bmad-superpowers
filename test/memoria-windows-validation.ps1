@@ -11,10 +11,13 @@ param(
   [string]$QdrantKeyEnv,
   [string]$ModelPath,
   [string]$TokenizerPath,
+  [string]$ClaudeMemPluginSource,
+  [string]$ClaudeMemPluginTreeSha256,
   [switch]$RunInteractiveCli,
   [switch]$RunExtraction,
   [switch]$RunReview,
-  [switch]$RunRuntime
+  [switch]$RunRuntime,
+  [switch]$RunCrashRemote
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,6 +45,17 @@ if (($ModelPath -and !$TokenizerPath) -or ($TokenizerPath -and !$ModelPath)) {
 if ($QdrantKeyEnv -and $QdrantKeyEnv -notmatch '^[A-Z][A-Z0-9_]*$') {
   throw 'Invalid Qdrant key environment variable name'
 }
+if (($ClaudeMemPluginSource -and !$ClaudeMemPluginTreeSha256) -or
+    ($ClaudeMemPluginTreeSha256 -and !$ClaudeMemPluginSource)) {
+  throw 'Plugin source and tree SHA-256 must be supplied together'
+}
+if ($ClaudeMemPluginTreeSha256 -and $ClaudeMemPluginTreeSha256 -notmatch '^[a-fA-F0-9]{64}$') {
+  throw 'Invalid plugin tree SHA-256'
+}
+if ($RunCrashRemote) {
+  $confirmation = Read-Host 'Private Qdrant fixture: type APPROVE FIXTURE FACT to permit the synthetic sourced remote-add crash control'
+  if ($confirmation -cne 'APPROVE FIXTURE FACT') { throw 'Synthetic fixture source was not approved' }
+}
 
 $node = (Get-Command node.exe -ErrorAction Stop).Source
 $script = Join-Path $PSScriptRoot 'memoria-windows-native-fixture.mjs'
@@ -54,10 +68,12 @@ $config = @{
   }
   destination = @{ url = $QdrantUrl; collection = $QdrantCollection; apiKeyEnv = $QdrantKeyEnv }
   runtime = @{ model = $ModelPath; tokenizer = $TokenizerPath }
+  plugin = @{ source = $ClaudeMemPluginSource; treeSha256 = $ClaudeMemPluginTreeSha256.ToLowerInvariant() }
   runInteractiveCli = [bool]$RunInteractiveCli
   runExtraction = [bool]$RunExtraction
   runReview = [bool]$RunReview
   runRuntime = [bool]$RunRuntime
+  runCrashRemote = [bool]$RunCrashRemote
 }
 $previous = [System.Environment]::GetEnvironmentVariable('CBS_WINDOWS_FIXTURE_CONFIG_JSON', 'Process')
 try {

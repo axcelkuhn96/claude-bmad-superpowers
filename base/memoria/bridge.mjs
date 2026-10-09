@@ -52,6 +52,7 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
     addViaSdk: async () => {
       const result = await bridge({ op: 'add', ...operation });
       if (result.kind !== 'pending') throw Object.assign(new Error('remote_add_failed'), { code: result.reason ?? 'remote_add_failed' });
+      await options.onRemoteAdd?.();
     },
     readRemote: async sdkId => {
       const result = await bridge({ op: 'read', projectId: operation.projectId, sdkId });

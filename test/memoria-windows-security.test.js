@@ -15,6 +15,27 @@ test('Windows identity folds drive and case without merging different worktrees'
   assert.notEqual(windowsPathKey('C:\\Users\\Me\\Repo'), windowsPathKey('C:\\Users\\Me\\Other'));
 });
 
+test('queued Windows lock caller expires without releasing the earlier holder turn', async () => {
+  const key = 'C:\\fixture\\queue.lock';
+  let releaseFirst;
+  const first = security.withWindowsLockQueue(key, () => new Promise(resolve => {
+    releaseFirst = resolve;
+  }), 1000);
+  await new Promise(resolve => setImmediate(resolve));
+  const started = Date.now();
+  await assert.rejects(security.withWindowsLockQueue(key, () => {
+    throw new Error('expired callback entered');
+  }, 30), /windows_file_lock_busy/);
+  assert.ok(Date.now() - started < 250);
+  let thirdEntered = false;
+  const third = security.withWindowsLockQueue(key, () => { thirdEntered = true; }, 1000);
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(thirdEntered, false);
+  releaseFirst();
+  await Promise.all([first, third]);
+  assert.equal(thirdEntered, true);
+});
+
 test('Windows identity rejects ambiguous paths before filesystem operations', () => {
   for (const value of ['\\\\server\\share\\repo', '\\\\?\\C:\\repo', '\\\\.\\C:\\repo',
     'C:relative', 'C:\\repo\\..\\other', 'C:\\repo\\trailing. ', 'C:\\repo:stream', '/tmp/repo']) {

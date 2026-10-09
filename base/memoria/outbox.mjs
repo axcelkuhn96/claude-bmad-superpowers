@@ -93,7 +93,9 @@ export function createOutbox(stateDir, options = {}) {
   async function durable(file, value) {
     if (windows) {
       if (mutable(file)) await createWindowsState(file).write(value);
-      else await publishWindowsBinary(file, Buffer.from(JSON.stringify(value) + '\n'));
+      else await publishWindowsBinary(file, Buffer.from(JSON.stringify(value) + '\n'),
+        options.onTempFlushed);
+      await options.onDurable?.(file);
       return;
     }
     const dir = path.dirname(file);
@@ -110,6 +112,7 @@ export function createOutbox(stateDir, options = {}) {
       await options.fault?.('after_rename');
       await syncDir(dir);
       await options.fault?.('after_dir_sync');
+      await options.onDurable?.(file);
     } catch (error) { await fs.rm(temporary, { force: true }); throw error; }
   }
   async function withLock(callback) {

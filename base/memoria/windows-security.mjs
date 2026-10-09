@@ -11,7 +11,7 @@ import { createRequire } from 'node:module';
 const runFile = promisify(execFile);
 const nativeFile = new URL('./bin/windows-native-x64.node', import.meta.url);
 const requireNative = createRequire(import.meta.url);
-export const WINDOWS_NATIVE_SHA256 = 'ba9bc964d0b0b9b859e299caabdf60fadd54a4620e60c5d5f4ff31d54c6ca77a';
+export const WINDOWS_NATIVE_SHA256 = '97933936be122f9b2cefc4c8b8aeb79f5e1b5a74548c44b645bc2db5a5a329d1';
 
 export function windowsGitPattern(root, target) {
   const relative = path.win32.relative(windowsPathKey(root), windowsPathKey(target));
@@ -497,13 +497,17 @@ export async function readWindowsBinary(file, { offset = 0, length = 4 * 1024 * 
   return result;
 }
 
-export async function publishWindowsBinary(file, bytes) {
+export async function publishWindowsBinary(file, bytes, onTempFlushed) {
   await checkedWindowsParent(file);
-  if (!Buffer.isBuffer(bytes) || bytes.length > 16 * 1024 * 1024) {
+  if (!Buffer.isBuffer(bytes) || bytes.length > 16 * 1024 * 1024 ||
+      (onTempFlushed !== undefined && typeof onTempFlushed !== 'function')) {
     throw new Error('windows_publish_args');
   }
   const temporary = path.win32.join(path.win32.dirname(file), `.${randomUUID()}.tmp`);
-  const result = (await nativeWindows()).publishNew(temporary, file, bytes);
+  const native = await nativeWindows();
+  const result = onTempFlushed === undefined
+    ? native.publishNew(temporary, file, bytes)
+    : native.publishNew(temporary, file, bytes, onTempFlushed);
   const observed = await readWindowsBinary(file, { length: bytes.length });
   if (observed.fileId !== result.fileId || observed.size !== bytes.length ||
       !observed.bytes.equals(bytes)) {
@@ -550,19 +554,43 @@ export async function holdWindowsHash(file, fileId, sha256, { privateState = tru
 }
 
 const windowsFileQueues = new Map();
-export async function withWindowsFileLock(file, callback, { timeoutMs = 200 } = {}) {
+export async function withWindowsLockQueue(file, callback, timeoutMs = 200) {
   if (typeof callback !== 'function') throw new Error('windows_file_lock_args');
   const key = windowsPathKey(file);
   const previous = windowsFileQueues.get(key) ?? Promise.resolve();
   let done;
   const pending = new Promise(resolve => { done = resolve; });
-  windowsFileQueues.set(key, pending);
+  const turn = previous.then(() => pending);
+  windowsFileQueues.set(key, turn);
+  const deadline = Date.now() + timeoutMs;
+  let timer;
+  let entered = false;
   try {
-    await previous;
-    const deadline = Date.now() + timeoutMs;
+    await Promise.race([previous, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('windows_file_lock_busy')),
+        Math.max(0, deadline - Date.now()));
+    })]);
+    if (Date.now() >= deadline) throw new Error('windows_file_lock_busy');
+    entered = true;
+    return await callback(deadline);
+  } finally {
+    clearTimeout(timer);
+    if (entered) done();
+    else previous.then(done);
+    turn.then(() => {
+      if (windowsFileQueues.get(key) === turn) windowsFileQueues.delete(key);
+    });
+  }
+}
+
+export async function withWindowsFileLock(file, callback, { timeoutMs = 200 } = {}) {
+  if (typeof callback !== 'function') throw new Error('windows_file_lock_args');
+  return withWindowsLockQueue(file, async deadline => {
+    if (Date.now() >= deadline) throw new Error('windows_file_lock_busy');
     await checkedWindowsParent(file);
     const native = await nativeWindows();
     for (;;) {
+      if (Date.now() >= deadline) throw new Error('windows_file_lock_busy');
       let held;
       try { held = native.fileLock(file); }
       catch (error) {
@@ -574,10 +602,7 @@ export async function withWindowsFileLock(file, callback, { timeoutMs = 200 } = 
       try { return await callback({ fileId: held.fileId }); }
       finally { native.fileUnlock(held.lease); }
     }
-  } finally {
-    done();
-    if (windowsFileQueues.get(key) === pending) windowsFileQueues.delete(key);
-  }
+  }, timeoutMs);
 }
 
 export function windowsCodexPluginInstalled(output) {
