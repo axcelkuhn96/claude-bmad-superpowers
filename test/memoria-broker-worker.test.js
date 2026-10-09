@@ -107,6 +107,84 @@ test('synchronous replacement spawn failure closes recovery without a third work
   } finally { await bridge.close(); }
 });
 
+test('an owned child that never closes makes recovery fatal without replacement and permits bounded shutdown', async () => {
+  let started = 0;
+  let fatal = 0;
+  const signals = [];
+  const bridge = createBrokerWorker(() => {
+    started++;
+    const child = new EventEmitter();
+    child.pid = 1; // In-memory child fixture; kill never signals an OS process.
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdout = new EventEmitter();
+    child.stdin = new EventEmitter();
+    child.stdin.write = () => true;
+    child.kill = signal => { signals.push(signal ?? 'SIGTERM'); return true; };
+    queueMicrotask(() => child.stdout.emit('data', encodeFrame({ kind: 'ready' }, undefined, true)));
+    return child;
+  }, { onFatal: () => fatal++ });
+  assert.deepEqual(await bridge.start(), { kind: 'ready' });
+  assert.deepEqual(await bridge.request({ hang: true }, Buffer.from('key'), Date.now() + 30),
+    { kind: 'unavailable', reason: 'deadline' });
+  assert.deepEqual(await bridge.request({ id: 2 }, Buffer.from('key'), Date.now() + 5500),
+    { kind: 'unavailable', reason: 'worker_unstoppable' });
+  assert.equal(started, 1);
+  assert.equal(fatal, 1);
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  assert.deepEqual(await bridge.request({ id: 3 }, Buffer.from('key'), Date.now() + 1000),
+    { kind: 'unavailable', reason: 'worker_unstoppable' });
+  assert.equal(started, 1);
+  let timer;
+  try {
+    assert.equal(await Promise.race([bridge.close().then(() => true),
+      new Promise(resolve => { timer = setTimeout(() => resolve(false), 1000); })]), true);
+  } finally { clearTimeout(timer); }
+  assert.equal(fatal, 1);
+});
+
+test('close finishes within the termination bound when its owned child never closes', async () => {
+  const child = new EventEmitter();
+  child.pid = 1; // In-memory child fixture; kill never signals an OS process.
+  child.exitCode = null;
+  child.signalCode = null;
+  child.stdout = new EventEmitter();
+  child.stdin = new EventEmitter();
+  child.kill = () => true;
+  const bridge = createBrokerWorker(() => {
+    queueMicrotask(() => child.stdout.emit('data', encodeFrame({ kind: 'ready' }, undefined, true)));
+    return child;
+  });
+  assert.deepEqual(await bridge.start(), { kind: 'ready' });
+  let timer;
+  try {
+    assert.equal(await Promise.race([bridge.close().then(() => true),
+      new Promise(resolve => { timer = setTimeout(() => resolve(false), 5500); })]), true);
+  } finally { clearTimeout(timer); }
+});
+
+test('a request that discovers an unclosed exited worker keeps its absolute deadline', async () => {
+  const child = new EventEmitter();
+  child.pid = 1; // In-memory child fixture; no OS process is signaled.
+  child.exitCode = null;
+  child.signalCode = null;
+  child.stdout = new EventEmitter();
+  child.stdin = new EventEmitter();
+  child.kill = () => { throw new Error('exited fixture must not be signaled'); };
+  const bridge = createBrokerWorker(() => {
+    queueMicrotask(() => child.stdout.emit('data', encodeFrame({ kind: 'ready' }, undefined, true)));
+    return child;
+  });
+  assert.deepEqual(await bridge.start(), { kind: 'ready' });
+  child.exitCode = 1;
+  child.emit('exit');
+  const startedAt = Date.now();
+  const result = await bridge.request({ id: 1 }, Buffer.from('key'), startedAt + 100);
+  assert.deepEqual(result, { kind: 'unavailable', reason: 'deadline' });
+  assert.ok(Date.now() - startedAt < 1000);
+  await bridge.close();
+});
+
 test('a response observed after the absolute deadline cannot return late output', async () => {
   const bridge = createBrokerWorker(() => {
     const child = new EventEmitter();

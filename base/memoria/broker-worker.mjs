@@ -8,6 +8,7 @@ export function createBrokerWorker(start, { coldMs = 30000, onFatal = () => {} }
   let restarting = null;
   let closed = false;
   let fatal = null;
+  const children = new WeakMap();
 
   function fail(reason) {
     if (!fatal && !closed) {
@@ -17,18 +18,47 @@ export function createBrokerWorker(start, { coldMs = 30000, onFatal = () => {} }
     return fatal ?? unavailable('worker_exited');
   }
 
-  async function stop(worker) {
-    if (!worker || !worker.pid || worker.exitCode !== null || worker.signalCode !== null) return;
-    const done = new Promise(resolve => worker.once('close', resolve));
-    worker.kill();
-    const timer = setTimeout(() => worker.kill('SIGKILL'), 3000);
-    try { await done; } finally { clearTimeout(timer); }
+  function stop(child) {
+    if (!child) return Promise.resolve(true);
+    const state = children.get(child);
+    state.cancelReady();
+    if (state.closed) return Promise.resolve(true);
+    if (state.stopping) return state.stopping;
+    state.stopping = new Promise(resolve => {
+      let settled = false;
+      let termTimer;
+      let killTimer;
+      const finish = stopped => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(termTimer);
+        clearTimeout(killTimer);
+        child.removeListener('close', onClose);
+        resolve(stopped);
+      };
+      const onClose = () => finish(true);
+      child.once('close', onClose);
+      killTimer = setTimeout(() => finish(false), 4000);
+      if (child.pid && child.exitCode === null && child.signalCode === null) {
+        try { child.kill(); }
+        catch { finish(false); return; }
+        if (!settled) termTimer = setTimeout(() => {
+          if (state.closed || child.exitCode !== null || child.signalCode !== null) return;
+          try { child.kill('SIGKILL'); }
+          catch { finish(false); }
+        }, 3000);
+      }
+    });
+    return state.stopping;
   }
 
   function boot() {
     const child = start();
     const worker = { child, dead: false };
     current = worker;
+    const state = { closed: false, stopping: null, cancelReady: null };
+    children.set(child, state);
+    child.once('close', () => { state.closed = true; });
     const parser = new FrameReader({ response: true });
     let settleReady;
     const readyPromise = new Promise(resolve => { settleReady = resolve; });
@@ -41,6 +71,7 @@ export function createBrokerWorker(start, { coldMs = 30000, onFatal = () => {} }
       clearTimeout(timer);
       settleReady(value);
     };
+    state.cancelReady = () => finishReady(unavailable('worker_exited'));
     child.stdout.on('data', chunk => {
       if (child !== current?.child) return;
       try {
@@ -94,14 +125,15 @@ export function createBrokerWorker(start, { coldMs = 30000, onFatal = () => {} }
     if (restarting) return restarting;
     const old = current;
     restarting = (async () => {
-      await stop(old?.child);
+      if (!await stop(old?.child)) return fail('worker_unstoppable');
       if (closed) return unavailable('worker_exited');
       let fresh;
       try { fresh = boot(); }
       catch { return fail('worker_exited'); }
       const result = await fresh.readyPromise;
+      if (closed) return unavailable('worker_exited');
       if (result?.kind !== 'ready') {
-        await stop(fresh.child);
+        if (!await stop(fresh.child)) return fail('worker_unstoppable');
         return fail(result?.reason ?? 'worker_exited');
       }
       return result;
@@ -117,7 +149,7 @@ export function createBrokerWorker(start, { coldMs = 30000, onFatal = () => {} }
         try { ready = boot(); }
         catch { return fail('worker_exited'); }
         const result = await ready.readyPromise;
-        if (result?.kind !== 'ready') await stop(ready.child);
+        if (result?.kind !== 'ready' && !await stop(ready.child)) return fail('worker_unstoppable');
         return result;
       }
       return ready.readyPromise;
@@ -125,25 +157,22 @@ export function createBrokerWorker(start, { coldMs = 30000, onFatal = () => {} }
     request: async (request, secret, deadlineAt) => {
       if (closed) return unavailable('worker_exited');
       if (fatal) return fatal;
-      if (restarting) {
+      if (restarting || !current || current.dead || current.child.exitCode !== null ||
+          current.child.signalCode !== null) {
         const remaining = deadlineAt - Date.now();
         if (remaining <= 0) return unavailable('deadline');
         let timer;
-        const result = await Promise.race([restarting,
+        const result = await Promise.race([restart(),
           new Promise(resolve => { timer = setTimeout(() => resolve(unavailable('deadline')), remaining); })]);
         clearTimeout(timer);
         if (result?.kind !== 'ready') return result;
       }
+      if (closed) return unavailable('worker_exited');
       if (fatal) return fatal;
-      if (!current || current.dead || current.child.exitCode !== null || current.child.signalCode !== null) {
-        const result = await restart();
-        if (result?.kind !== 'ready') return result;
-      }
       return current.request(request, secret, deadlineAt);
     },
     close: async () => {
       closed = true;
-      if (restarting) await restarting;
       await stop(current?.child);
     },
   };
