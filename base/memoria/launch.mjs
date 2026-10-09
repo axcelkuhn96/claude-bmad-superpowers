@@ -306,28 +306,44 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
   if (made.kind !== 'created') return made;
   const root = options.stateRoot ?? rootDefault();
   const brokerScript = fileURLToPath(new URL('./broker.mjs', import.meta.url));
-  const endpoint = await brokerEndpointStatus(root);
-  if (endpoint === 'unsafe') return blocked('unsafe_broker');
-  if (endpoint === 'missing' || endpoint === 'orphan') {
-    const broker = spawn(process.execPath, [brokerScript, root, cwd], { detached: true,
-      stdio: 'ignore', env: { PATH: process.env.PATH, HOME: process.env.HOME,
-        ...(process.env.CBS_MEMORIA_CA_FILE ? { CBS_MEMORIA_CA_FILE: process.env.CBS_MEMORIA_CA_FILE } : {}) } });
-    broker.unref();
-  }
-  const launch = await buildLaunchCommand(cwd, cli, args, options, made);
-  if (launch.kind !== 'ready') return launch;
+  let launch;
+  let cliMayBeLive = false;
+  let cliSettled = false;
   try {
+    const endpoint = await brokerEndpointStatus(root);
+    if (endpoint === 'unsafe') return blocked('unsafe_broker');
+    if (endpoint === 'missing' || endpoint === 'orphan') {
+      const broker = spawn(process.execPath, [brokerScript, root, cwd], { detached: true,
+        stdio: 'ignore', env: { PATH: process.env.PATH, HOME: process.env.HOME,
+          ...(process.env.CBS_MEMORIA_CA_FILE ? { CBS_MEMORIA_CA_FILE: process.env.CBS_MEMORIA_CA_FILE } : {}) } });
+      broker.unref();
+    }
+    launch = await buildLaunchCommand(cwd, cli, args, options, made);
+    if (launch.kind !== 'ready') return launch;
     const child = spawn(launch.command, launch.args, { cwd, stdio: 'inherit', env: launch.env });
+    cliMayBeLive = !!child.pid;
     return await new Promise(resolve => {
-      child.once('error', () => resolve(blocked('cli_unavailable')));
-      child.once('exit', (code, signal) => resolve({ kind: 'exited', code, signal }));
+      child.once('error', () => { if (!child.pid) cliSettled = true; resolve(blocked('cli_unavailable')); });
+      child.once('exit', (code, signal) => { cliSettled = true; resolve({ kind: 'exited', code, signal }); });
     });
   } finally {
-    launch.release(); await launch.cleanup();
-    const file = path.join(launchDir(options.stateRoot), `${digest(made.token)}.closed`);
-    await fs.writeFile(file, JSON.stringify({ tokenDigest: digest(made.token),
-      projectId: made.record.projectId, closedAt: new Date().toISOString() }) + '\n',
-    { flag: 'wx', mode: 0o600 });
+    try {
+      if (launch?.kind === 'ready') { launch.release(); await launch.cleanup(); }
+    } finally {
+      if (!cliMayBeLive || cliSettled) {
+        const dir = launchDir(options.stateRoot);
+        const file = path.join(dir, `${digest(made.token)}.closed`);
+        const handle = await fs.open(file, 'wx', 0o600);
+        try {
+          await handle.writeFile(JSON.stringify({ tokenDigest: digest(made.token),
+            projectId: made.record.projectId, outcome: cliMayBeLive ? 'exited' : 'pre_spawn_aborted',
+            closedAt: new Date().toISOString() }) + '\n');
+          await handle.sync();
+        } finally { await handle.close(); }
+        const directory = await fs.open(dir, 'r');
+        try { await directory.sync(); } finally { await directory.close(); }
+      }
+    }
   }
 }
 

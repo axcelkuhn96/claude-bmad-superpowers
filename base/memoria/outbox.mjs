@@ -511,13 +511,17 @@ export function createOutbox(stateDir, options = {}) {
         const observed = await readWindowsBinary(file, { length: 16 * 1024 * 1024 });
         if (observed.size !== observed.bytes.length || hash(observed.bytes) !== ref.sha256) return false;
         const data = JSON.parse(observed.bytes.toString('utf8'));
+        const original = row.messages.find(message => message.messageId === data?.source_message_id &&
+          message.start === data?.source_offsets?.start && message.end === data?.source_offsets?.end);
         return data?.external_id === candidate.externalId && data.project_id === row.projectId &&
           data.checkpoint_id === row.operationId && data.source_message_id === candidate.evidence.messageId &&
           data.candidate_key === candidate.candidateKey && data.origin_cli === row.cli &&
           data.session_id === row.sessionId && data.policy_version === row.policyVersion &&
           data.slice_start === row.start && data.slice_end === row.end && data.slice_hash === row.sliceHash &&
           data.source_offsets?.start === candidate.evidence.start &&
-          data.source_offsets?.end === candidate.evidence.end ? data : false;
+          data.source_offsets?.end === candidate.evidence.end &&
+          (data.source_text_sha256 === undefined || typeof original?.text === 'string' &&
+            data.source_text_sha256 === hash(original.text)) ? data : false;
       } catch (error) {
         if (error.message === 'windows_read_open' &&
             await fs.lstat(file).then(() => false, cause => cause.code === 'ENOENT')) return false;
@@ -548,6 +552,10 @@ export function createOutbox(stateDir, options = {}) {
           data.slice_hash !== row.sliceHash ||
           data.source_offsets?.start !== candidate.evidence.start ||
           data.source_offsets?.end !== candidate.evidence.end) return false;
+      const original = row.messages.find(message => message.messageId === data.source_message_id &&
+        message.start === data.source_offsets.start && message.end === data.source_offsets.end);
+      if (data.source_text_sha256 !== undefined &&
+          (typeof original?.text !== 'string' || data.source_text_sha256 !== hash(original.text))) return false;
       await handle.sync();
       const after = await fs.lstat(file);
       if (after.dev !== actual.dev || after.ino !== actual.ino || after.size !== actual.size ||
@@ -572,14 +580,16 @@ export function createOutbox(stateDir, options = {}) {
         candidateKey: candidate.candidate_key };
       let externalId;
       try { externalId = externalIdFor(identity); } catch { return blocked('invalid_candidate'); }
+      const original = row.messages.find(message => message.messageId === candidate.source_message_id &&
+        message.start === candidate.source_offsets?.start &&
+        message.end === candidate.source_offsets?.end);
       if (candidate.external_id !== externalId || candidate.project_id !== row.projectId ||
           candidate.checkpoint_id !== operationId || candidate.session_id !== row.sessionId ||
           candidate.origin_cli !== row.cli || candidate.policy_version !== row.policyVersion ||
-          candidate.slice_hash !== row.sliceHash || !row.messages.some(message =>
-            message.messageId === candidate.source_message_id &&
-            message.start === candidate.source_offsets?.start &&
-            message.end === candidate.source_offsets?.end)) return blocked('candidate_source_mismatch');
-      const content = JSON.stringify(candidate) + '\n';
+          candidate.slice_hash !== row.sliceHash || typeof original?.text !== 'string') {
+        return blocked('candidate_source_mismatch');
+      }
+      const content = JSON.stringify({ ...candidate, source_text_sha256: hash(original.text) }) + '\n';
       const digest = hash(content);
       const file = path.join(payloads, `${externalId}.${digest}.json`);
       if (windows) {
@@ -728,14 +738,71 @@ export function createOutbox(stateDir, options = {}) {
           payload.scope !== metadata.scope || payload.owner_id !== (metadata.owner_id ?? null) ||
           payload.actor !== metadata.actor || payload.origin !== metadata.origin ||
           payload.evidence_at !== metadata.evidence_at ||
-          typeof payload.text !== 'string' || !payload.text.includes(item.text) ||
-          payload.text.length > 8192) return blocked('source_mismatch');
+          typeof payload.text !== 'string' || typeof item.text !== 'string' ||
+          item.text.length > 8192) return blocked('source_mismatch');
+      const record = await verifiedReviewFile(path.join(reviews, `${externalId}.json`));
+      const processed = await read(processedFile(metadata.checkpoint_id));
+      if (processed || item.status === 'active' || record) {
+        const proof = record?.review?.sourceProof;
+        const operation = record?.review?.operation;
+        if (record?.externalId !== externalId || record.operationId !== metadata.checkpoint_id ||
+            record.payloadSha256 !== names[0].slice(externalId.length + 1, -5) ||
+            record.digest !== hash(JSON.stringify(record.review)) ||
+            !['approve', 'correct'].includes(record.review.decision) ||
+            operation?.externalId !== externalId || operation.projectId !== item.projectId ||
+            operation.sessionId !== item.sessionId || operation.text !== item.text ||
+            operation.metadata?.source !== metadata.source ||
+            JSON.stringify(operation.metadata?.source_offsets) !== JSON.stringify(metadata.source_offsets) ||
+            operation.metadata?.checkpoint_id !== metadata.checkpoint_id ||
+            operation.metadata?.scope !== metadata.scope ||
+            (operation.metadata?.owner_id ?? null) !== (metadata.owner_id ?? null) ||
+            proof?.messageId !== metadata.source ||
+            proof?.messageSha256 !== payload.source_text_sha256 ||
+            proof.approvedTextSha256 !== hash(item.text) ||
+            !Number.isSafeInteger(proof.start) || proof.start < 0 ||
+            proof.end !== proof.start + item.text.length) return blocked('source_mismatch');
+      } else if (!payload.text.includes(item.text)) return blocked('source_mismatch');
       return { kind: 'local_source', text: item.text,
         metadata: { source: metadata.source, source_offsets: metadata.source_offsets,
           checkpoint_id: metadata.checkpoint_id, evidence_at: metadata.evidence_at,
           origin: metadata.origin, actor: metadata.actor, scope: metadata.scope,
           owner_id: metadata.owner_id ?? null } };
     });
+  }
+  async function verifiedReviewFile(file) {
+    if (windows) {
+      try {
+        const observed = await readWindowsBinary(file, { length: 1024 * 1024 });
+        if (observed.size !== observed.bytes.length) return blocked('unsafe_review');
+        try { return JSON.parse(observed.bytes.toString('utf8')); }
+        catch { return blocked('unsafe_review'); }
+      } catch (error) {
+        if (error.message === 'windows_read_open' &&
+            await fs.lstat(file).then(() => false, cause => cause.code === 'ENOENT')) return null;
+        throw error;
+      }
+    }
+    let handle;
+    try {
+      const parent = await fs.lstat(reviews);
+      const before = await fs.lstat(file);
+      if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== process.getuid() ||
+          (parent.mode & 0o077)) return blocked('unsafe_review_dir');
+      if (!before.isFile() || before.isSymbolicLink() ||
+          before.uid !== process.getuid() || before.nlink !== 1 ||
+          (before.mode & 0o777) !== 0o600 || before.size > 1024 * 1024) return blocked('unsafe_review');
+      handle = await fs.open(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const opened = await handle.stat();
+      if (opened.dev !== before.dev || opened.ino !== before.ino) return blocked('unsafe_review');
+      const content = await handle.readFile('utf8');
+      const after = await fs.lstat(file);
+      if (after.dev !== opened.dev || after.ino !== opened.ino ||
+          after.size !== opened.size || after.mtimeMs !== opened.mtimeMs ||
+          after.ctimeMs !== opened.ctimeMs) return blocked('unsafe_review');
+      try { return JSON.parse(content); }
+      catch { return blocked('unsafe_review'); }
+    } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    finally { await handle?.close(); }
   }
   async function readReview(operationId, candidateKey) {
     if (!validId(operationId) || typeof candidateKey !== 'string') return blocked('invalid_candidate');
@@ -744,47 +811,12 @@ export function createOutbox(stateDir, options = {}) {
       const candidate = manifest?.candidates?.find(item => item.candidateKey === candidateKey);
       if (!candidate) return blocked('missing_candidate');
       const file = path.join(reviews, `${candidate.externalId}.json`);
-      if (windows) {
-        try {
-          const observed = await readWindowsBinary(file, { length: 1024 * 1024 });
-          if (observed.size !== observed.bytes.length) return blocked('unsafe_review');
-          const record = JSON.parse(observed.bytes.toString('utf8'));
-          return record.externalId === candidate.externalId && record.operationId === operationId &&
-            record.payloadSha256 === candidate.payloadRef.sha256 &&
-            record.digest === hash(JSON.stringify(record.review)) ? record : blocked('review_mismatch');
-        } catch (error) {
-          if (error.message === 'windows_read_open' &&
-              await fs.lstat(file).then(() => false, cause => cause.code === 'ENOENT')) {
-            return blocked('missing_review');
-          }
-          throw error;
-        }
-      }
-      let handle;
-      try {
-        const parent = await fs.lstat(reviews);
-        if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== process.getuid() ||
-            (parent.mode & 0o077)) return blocked('unsafe_review_dir');
-        const before = await fs.lstat(file);
-        if (!before.isFile() || before.isSymbolicLink() || before.uid !== process.getuid() ||
-            before.nlink !== 1 || (before.mode & 0o777) !== 0o600) return blocked('unsafe_review');
-        handle = await fs.open(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-        const opened = await handle.stat();
-        if (opened.dev !== before.dev || opened.ino !== before.ino) return blocked('unsafe_review');
-        const content = await handle.readFile('utf8');
-        const record = JSON.parse(content);
-        const after = await fs.lstat(file);
-        if (after.dev !== opened.dev || after.ino !== opened.ino ||
-            after.size !== opened.size || after.mtimeMs !== opened.mtimeMs ||
-            after.ctimeMs !== opened.ctimeMs) return blocked('unsafe_review');
-        if (record.externalId !== candidate.externalId || record.operationId !== operationId ||
-            record.payloadSha256 !== candidate.payloadRef.sha256 ||
-            record.digest !== hash(JSON.stringify(record.review))) return blocked('review_mismatch');
-        return record;
-      } catch (error) {
-        if (error.code === 'ENOENT') return blocked('missing_review');
-        throw error;
-      } finally { await handle?.close(); }
+      const record = await verifiedReviewFile(file);
+      if (!record) return blocked('missing_review');
+      if (record.kind === 'blocked') return record;
+      return record.externalId === candidate.externalId && record.operationId === operationId &&
+        record.payloadSha256 === candidate.payloadRef.sha256 &&
+        record.digest === hash(JSON.stringify(record.review)) ? record : blocked('review_mismatch');
     });
   }
   async function sealReview(operationId, candidateKey, review) {
@@ -794,20 +826,44 @@ export function createOutbox(stateDir, options = {}) {
       const row = await read(itemFile(operationId));
       const manifest = await read(manifestFile(operationId));
       const candidate = manifest?.candidates?.find(item => item.candidateKey === candidateKey);
-      if (!row || !candidate || !await payloadValid(candidate.payloadRef, row, candidate)) {
+      const payload = row && candidate && await payloadValid(candidate.payloadRef, row, candidate);
+      if (!row || !candidate || !payload) {
         return blocked('candidate_payload_mismatch');
       }
       if (review.payloadSha256 !== candidate.payloadRef.sha256) return blocked('review_source_mismatch');
+      let sealedReview = review;
+      if (['approve', 'correct'].includes(review.decision)) {
+        const source = row.messages.find(message => message.messageId === payload.source_message_id &&
+          message.start === payload.source_offsets.start && message.end === payload.source_offsets.end);
+        const approved = review.operation?.text;
+        const start = typeof approved === 'string' ? source?.text?.indexOf(approved) : -1;
+        if (!source || !approved || approved.length > 8192 || start < 0 ||
+            review.operation.externalId !== candidate.externalId ||
+            review.operation.projectId !== row.projectId ||
+            review.operation.sessionId !== row.sessionId ||
+            review.operation.metadata?.source !== source.messageId ||
+            JSON.stringify(review.operation.metadata?.source_offsets) !==
+              JSON.stringify(payload.source_offsets) ||
+            review.operation.metadata?.checkpoint_id !== operationId ||
+            review.operation.metadata?.scope !== payload.scope ||
+            (review.operation.metadata?.owner_id ?? null) !== (payload.owner_id ?? null)) {
+          return blocked('review_source_mismatch');
+        }
+        sealedReview = { ...review, sourceProof: { messageId: source.messageId,
+          messageSha256: hash(source.text), approvedTextSha256: hash(approved),
+          start, end: start + approved.length } };
+      }
       if (windows) {
         if (!(await ensureWindowsPrivateDirectory(reviews)).ok) return blocked('unsafe_review_dir');
         const file = path.join(reviews, `${candidate.externalId}.json`);
         if (await read(file)) return blocked('review_conflict');
         const record = { operationId, externalId: candidate.externalId,
-          payloadSha256: candidate.payloadRef.sha256, review, digest: hash(JSON.stringify(review)) };
+          payloadSha256: candidate.payloadRef.sha256, review: sealedReview,
+          digest: hash(JSON.stringify(sealedReview)) };
         const content = JSON.stringify(record) + '\n';
         if (await usageUnlocked() + 2 * allocated(content) + reserve > maxBytes) return { kind: 'full', operationId };
         await publishWindowsBinary(file, Buffer.from(content));
-        return { kind: 'sealed', review, digest: record.digest };
+        return { kind: 'sealed', review: sealedReview, digest: record.digest };
       }
       await fs.mkdir(reviews, { recursive: true, mode: 0o700 });
       const directory = await fs.lstat(reviews);
@@ -820,7 +876,8 @@ export function createOutbox(stateDir, options = {}) {
       });
       if (prior) return blocked('review_conflict');
       const record = { operationId, externalId: candidate.externalId,
-        payloadSha256: candidate.payloadRef.sha256, review, digest: hash(JSON.stringify(review)) };
+        payloadSha256: candidate.payloadRef.sha256, review: sealedReview,
+        digest: hash(JSON.stringify(sealedReview)) };
       const content = JSON.stringify(record) + '\n';
       if (await usageUnlocked() + 2 * allocated(content) + reserve > maxBytes) return { kind: 'full', operationId };
       const temp = path.join(reviews, `.${randomUUID()}.tmp`);
@@ -832,7 +889,7 @@ export function createOutbox(stateDir, options = {}) {
         await syncDir(reviews);
       } finally { await handle.close(); await fs.rm(temp, { force: true }); }
       await syncDir(reviews);
-      return { kind: 'sealed', review, digest: record.digest };
+      return { kind: 'sealed', review: sealedReview, digest: record.digest };
     });
   }
   async function ackVerified(operationId, proof) {
@@ -924,19 +981,43 @@ export function createOutbox(stateDir, options = {}) {
             (proof?.externalId !== candidate.externalId || proof.projectId !== row.projectId ||
               proof.status !== 'active' || proof.sdkId !== candidate.sdkId ||
               proof.qdrantId !== candidate.qdrantId) ||
+            status === 'conflict' && proof?.reviewDigest !== candidate.reviewDigest ||
             status !== 'remote_acked' && reason !== candidate.reason) return blocked('candidate_already_terminal');
-        return { kind: status === 'remote_acked' ? 'acked' : 'disposed', operationId: candidate.externalId };
+        return { kind: status === 'remote_acked' ? 'acked' : status === 'conflict' ? 'conflict' : 'disposed',
+          ...(status === 'conflict' ? { reason } : {}), operationId: candidate.externalId };
       }
       if (status === 'remote_acked' && (proof?.externalId !== candidate.externalId ||
           proof.projectId !== row.projectId || proof.status !== 'active' || !proof.sdkId || !proof.qdrantId)) {
         return blocked('unverified_remote');
       }
+      if (status === 'conflict') {
+        const review = await verifiedReviewFile(path.join(reviews, `${candidate.externalId}.json`));
+        if (!review || review.kind === 'blocked' || review.externalId !== candidate.externalId ||
+            review.operationId !== operationId || review.payloadSha256 !== candidate.payloadRef.sha256 ||
+            review.digest !== proof?.reviewDigest ||
+            review.digest !== hash(JSON.stringify(review.review)) ||
+            review.review?.decision !== 'correct' ||
+            review.review.operation?.externalId !== candidate.externalId ||
+            typeof review.review.target?.sdkId !== 'string' || !review.review.target.sdkId ||
+            !validId(review.review.target.externalId) ||
+            !/^[a-f0-9]{64}$/.test(review.review.target.version ?? '') ||
+            review.review.operation?.metadata?.supersedes_id !== review.review.target.sdkId ||
+            review.review.operation?.metadata?.correction_target_external_id !==
+              review.review.target.externalId ||
+            review.review.operation?.metadata?.correction_target_version !==
+              review.review.target.version) {
+          return blocked('review_mismatch');
+        }
+        candidate.target = structuredClone(review.review.target);
+      }
       candidate.status = status;
       if (status === 'remote_acked') { candidate.sdkId = proof.sdkId; candidate.qdrantId = proof.qdrantId; }
       else candidate.reason = reason;
+      if (status === 'conflict') candidate.reviewDigest = proof.reviewDigest;
       if (!await fits(manifest)) return { kind: 'full', operationId: candidate.externalId };
       await durable(manifestFile(operationId), manifest);
-      return { kind: status === 'remote_acked' ? 'acked' : 'disposed', operationId: candidate.externalId };
+      return { kind: status === 'remote_acked' ? 'acked' : status === 'conflict' ? 'conflict' : 'disposed',
+        ...(status === 'conflict' ? { reason } : {}), operationId: candidate.externalId };
     });
   }
   async function completeCheckpoint(operationId) {
@@ -1012,21 +1093,56 @@ export function createOutbox(stateDir, options = {}) {
         if (candidate.externalId !== expected || !row.messages.some(message =>
             message.messageId === candidate.evidence?.messageId && message.start === candidate.evidence.start &&
             message.end === candidate.evidence.end) ||
-            !['pending', 'remote_acked', 'rejected', 'duplicate'].includes(candidate.status)) return blocked('corrupt_manifest');
+            !['pending', 'remote_acked', 'rejected', 'duplicate', 'conflict'].includes(candidate.status)) return blocked('corrupt_manifest');
         if (!await payloadValid(candidate.payloadRef, row, candidate)) return blocked('candidate_payload_mismatch');
+        if (candidate.status === 'conflict' && !await conflictProofValid(operationId, candidate)) {
+          return blocked('review_mismatch');
+        }
       }
       return structuredClone(manifest);
+    });
+  }
+  async function conflictProofValid(operationId, candidate) {
+    if (!/^[a-z_]{1,64}$/.test(candidate.reason ?? '') ||
+        !/^[a-f0-9]{64}$/.test(candidate.reviewDigest ?? '')) return false;
+    const record = await verifiedReviewFile(path.join(reviews, `${candidate.externalId}.json`));
+    return record && record.kind !== 'blocked' && record.operationId === operationId &&
+      record.externalId === candidate.externalId && record.payloadSha256 === candidate.payloadRef.sha256 &&
+      record.digest === candidate.reviewDigest && record.digest === hash(JSON.stringify(record.review)) &&
+      record.review?.decision === 'correct' &&
+      JSON.stringify(record.review.target) === JSON.stringify(candidate.target) &&
+      typeof candidate.target?.sdkId === 'string' && !!candidate.target.sdkId &&
+      validId(candidate.target.externalId) && /^[a-f0-9]{64}$/.test(candidate.target.version ?? '') &&
+      record.review.operation?.externalId === candidate.externalId &&
+      record.review.operation?.metadata?.supersedes_id === candidate.target.sdkId &&
+      record.review.operation?.metadata?.correction_target_external_id === candidate.target.externalId &&
+      record.review.operation?.metadata?.correction_target_version === candidate.target.version;
+  }
+  async function readDisposition(operationId) {
+    return withLock(async () => {
+      const receipt = await read(processedFile(operationId));
+      if (receipt?.candidates?.some(candidate => candidate.status === 'conflict' &&
+          !candidate.reviewDigest)) return blocked('review_mismatch');
+      for (const candidate of receipt?.candidates ?? []) {
+        if (candidate.status === 'conflict' && !await conflictProofValid(operationId, candidate)) {
+          return blocked('review_mismatch');
+        }
+      }
+      return receipt;
     });
   }
   return { enqueueCheckpoint, ackVerified, recordManifest, persistCandidatePayload, sourceForRemote,
     claimExtraction, recordExtractionUsage, extractionUsage, readCandidatePayload, readReview, sealReview,
     readManifest,
     ackCandidate: (id, key, proof) => updateCandidate(id, key, 'remote_acked', null, proof),
+    conflictCandidate: (id, key, reason, reviewDigest) =>
+      /^[a-z_]{1,64}$/.test(reason ?? '') && /^[a-f0-9]{64}$/.test(reviewDigest ?? '')
+        ? updateCandidate(id, key, 'conflict', reason, { reviewDigest }) : blocked('invalid_conflict'),
     disposeCandidate: (id, key, status, reason) =>
       ['rejected', 'duplicate'].includes(status) && /^[a-z_]{1,64}$/.test(reason ?? '')
         ? updateCandidate(id, key, status, reason) : blocked('invalid_disposition'),
     completeCheckpoint, readDisposition: id => validId(id)
-      ? withLock(() => read(processedFile(id))) : blocked('invalid_operation'),
+      ? readDisposition(id) : blocked('invalid_operation'),
     pending: () => withLock(pendingUnlocked),
     cursor: (cli, sessionId) => withLock(() => cursorUnlocked(cli, sessionId)),
     usage: () => withLock(usageUnlocked), markFailed, ready };

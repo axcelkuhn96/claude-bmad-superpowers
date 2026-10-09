@@ -604,6 +604,10 @@ test('trusted linked Codex launch carries only its verified hooks as session con
     assert.equal((await launchCli(linked, 'codex', args, { stateRoot })).reason, 'unsafe_cli_args');
   }
   await assert.rejects(fs.readFile(capture, 'utf8'), { code: 'ENOENT' });
+  const launchFiles = await fs.readdir(path.join(stateRoot, 'launches'));
+  for (const name of launchFiles.filter(file => /^[a-f0-9]{64}\.json$/.test(file))) {
+    assert.ok(launchFiles.includes(name.replace(/\.json$/, '.closed')), name);
+  }
 });
 
 test('native rollback retries after Git exclude write failure on final shared lease', async t => {

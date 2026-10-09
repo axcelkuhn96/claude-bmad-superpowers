@@ -401,7 +401,9 @@ test('sealed operation with injected secret metadata cannot reach remote store',
   const operation = { externalId: entry.externalId, projectId: 'p', sessionId: 's', text: payload.text,
     sourceIdentity: { projectId: 'p', originCli: 'claude', sessionId: 's', start: 0, end: 80,
       sliceHash: 'a'.repeat(64), policyVersion: 'native-v1', candidateKey: 'fable_review' },
-    metadata: { source: 'm1', actor: 'user', origin: 'user_direct', scope: 'project',
+    metadata: { source: 'm1', source_offsets: { start: 0, end: 80 },
+      checkpoint_id: checkpoint.operationId, owner_id: null,
+      actor: 'user', origin: 'user_direct', scope: 'project',
       evidence_at: source.timestamp, logical_key: syntheticToken },
     approval: { kind: 'approved' } };
   assert.equal((await box.sealReview(checkpoint.operationId, 'fable_review', {
@@ -539,6 +541,82 @@ test('owner terminal correction seals an active target before ACK', async t => {
   assert.equal(review.review.decision, 'correct');
   assert.equal(review.review.target.sdkId, 'sdk-old');
   assert.equal((await box.readDisposition(checkpoint.operationId)).candidates[0].status, 'remote_acked');
+});
+
+test('terminal correction records bridge target_changed and replay stays terminal', async t => {
+  const { dir, box, checkpoint } = await fixture(t);
+  assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false,
+      candidates: [modelCandidate] }),
+  })).kind, 'manifested');
+  const target = { sdkId: 'sdk-old', externalId: 'src-' + 'f'.repeat(64), projectId: 'p',
+    status: 'active', text: 'Old rule', metadata: { scope: 'project', source: 'old-message',
+      evidence_at: '2026-09-01T00:00:00Z' } };
+  const deviceId = '11111111-1111-4111-8111-111111111111';
+  await fs.writeFile(path.join(path.dirname(dir), 'device.json'), JSON.stringify({ deviceId }) + '\n',
+    { mode: 0o600 });
+  await fs.mkdir(path.join(dir, 'ledger'), { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(dir, 'ledger', 'writer.json'), JSON.stringify({ projectId: 'p',
+    collection: 'fixture', deviceId, generation: 1 }) + '\n', { mode: 0o600 });
+  const runner = path.join(dir, 'owner-conflict.mjs');
+  await fs.writeFile(runner, `import fs from 'node:fs/promises';\n` +
+    `import { createOutbox } from ${JSON.stringify(new URL('../base/memoria/outbox.mjs', import.meta.url).href)};\n` +
+    `import { reviewCandidateOnTerminal } from ${JSON.stringify(new URL('../base/memoria/candidates.mjs', import.meta.url).href)};\n` +
+    `import { storeMemory } from ${JSON.stringify(new URL('../base/memoria/bridge.mjs', import.meta.url).href)};\n` +
+    `const box = createOutbox(${JSON.stringify(dir)});\n` +
+    `const target = ${JSON.stringify(target)};\n` +
+    `const result = await reviewCandidateOnTerminal(${JSON.stringify(checkpoint.operationId)}, 'fable_review', { outbox: box, ` +
+    `readTarget: async id => id === target.sdkId ? { kind: 'item', item: target } : { kind: 'blocked' }, ` +
+    `store: op => storeMemory('fixture', 's', op, () => 'key', { stateRoot: ${JSON.stringify(path.dirname(dir))}, ` +
+    `resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir: ${JSON.stringify(dir)}, destination: { collection: 'fixture' } }), ` +
+    `authorize: async () => ({ kind: 'authorized', key: 'key', connection: {} }), ` +
+    `control: async () => ({ kind: 'authority', record: { state: 'active', deviceId: ${JSON.stringify(deviceId)}, generation: 1 } }), ` +
+    `run: async (_python, _script, request) => { await fs.appendFile(${JSON.stringify(path.join(dir, 'bridge-ops'))}, request.op + '\\n'); ` +
+    `if (request.op === 'read') return { kind: 'item', item: { ...target, status: 'superseded' } }; ` +
+    `throw new Error('unexpected remote mutation'); } }) });\n` +
+    `console.log('RESULT=' + JSON.stringify(result));\n`);
+  const child = spawn('/usr/bin/script', ['-q', '-e', '-c', `${process.execPath} ${runner}`, '/dev/null'],
+    { stdio: ['pipe', 'pipe', 'pipe'] });
+  let output = '';
+  let step = 0;
+  child.stdout.on('data', chunk => {
+    output += chunk;
+    if (step === 0 && output.includes('Action (accept/reject/duplicate/edit/correct): ')) {
+      step++; child.stdin.write('correct\n');
+    } else if (step === 1 && output.includes('Active memory SDK ID to correct: ')) {
+      step++; child.stdin.write('sdk-old\n');
+    } else if (step === 2 && output.includes('Confirm correct for ')) {
+      step++; child.stdin.write('yes\n');
+    }
+  });
+  const code = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
+  assert.equal(code, 0, output);
+  assert.match(output, /RESULT=\{"kind":"conflict","reason":"target_changed"/);
+  const receipt = await createOutbox(dir).readDisposition(checkpoint.operationId);
+  assert.equal(receipt.operationId, checkpoint.operationId);
+  assert.equal(receipt.projectId, 'p');
+  assert.equal(receipt.candidates[0].status, 'conflict');
+  assert.equal(receipt.candidates[0].reason, 'target_changed');
+  assert.equal(receipt.candidates[0].target.sdkId, 'sdk-old');
+  assert.equal(receipt.candidates[0].target.externalId, target.externalId);
+  assert.match(receipt.candidates[0].reviewDigest, /^[a-f0-9]{64}$/);
+  const review = await fs.readFile(path.join(dir, 'candidates', 'reviews',
+    `${receipt.candidates[0].externalId}.json`), 'utf8');
+  assert.equal(JSON.parse(review).review.decision, 'correct');
+  assert.equal(await fs.readFile(path.join(dir, 'bridge-ops'), 'utf8'), 'read\n');
+  assert.deepEqual(await approveCandidate(checkpoint.operationId, 'fable_review', {
+    outbox: createOutbox(dir), store: () => { throw new Error('replay must not mutate'); } }),
+  { kind: 'conflict', reason: 'target_changed', operationId: receipt.candidates[0].externalId });
+  const reviewFile = path.join(dir, 'candidates', 'reviews',
+    `${receipt.candidates[0].externalId}.json`);
+  const corrupted = JSON.parse(review);
+  corrupted.review.target.version = '0'.repeat(64);
+  await fs.writeFile(reviewFile, JSON.stringify(corrupted) + '\n');
+  assert.equal((await createOutbox(dir).readDisposition(checkpoint.operationId)).reason,
+    'review_mismatch');
 });
 
 test('first child ACK returns success while sibling remains pending', async t => {

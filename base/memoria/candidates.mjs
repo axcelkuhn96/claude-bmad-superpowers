@@ -328,9 +328,13 @@ export async function approveCandidate(operationId, candidateKey, options = {}) 
   if (!context.box) return context;
   const { box, entry, payload, source } = context;
   if (context.processed) return entry.status === 'remote_acked'
-    ? { kind: 'processed', operationId } : blocked('review_conflict');
+    ? { kind: 'processed', operationId } : entry.status === 'conflict'
+      ? { kind: 'conflict', reason: entry.reason, operationId: entry.externalId }
+      : blocked('review_conflict');
   if (entry.status === 'remote_acked') return finishChild(box, operationId, entry,
     { kind: 'acked', operationId: entry.externalId });
+  if (entry.status === 'conflict') return { kind: 'conflict', reason: entry.reason,
+    operationId: entry.externalId };
   if (entry.status !== 'pending') return blocked('review_conflict');
   let sealed = await box.readReview(operationId, candidateKey);
   if (sealed.kind === 'blocked' && sealed.reason !== 'missing_review') return sealed;
@@ -365,6 +369,12 @@ export async function approveCandidate(operationId, candidateKey, options = {}) 
     options.readSecret, { ...options, ackLocal: (id, proof) =>
       id === entry.externalId ? box.ackCandidate(operationId, candidateKey, proof) : blocked('child_id_mismatch') }));
   const result = await store(operation);
+  if (result?.kind === 'conflict' && sealed.review.decision === 'correct') {
+    const conflict = await box.conflictCandidate(operationId, candidateKey, result.reason, sealed.digest);
+    if (conflict.kind !== 'conflict') return conflict;
+    await finishChild(box, operationId, entry, conflict);
+    return conflict;
+  }
   if (!((result?.kind === 'stored' || result?.kind === 'acked') &&
       (result.externalId ?? result.operationId) === entry.externalId)) return pending('store_unconfirmed');
   const saved = await box.readManifest(operationId);

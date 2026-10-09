@@ -220,10 +220,21 @@ export async function completeWriterTransfer(cwd, sessionId, bundle, readSecret,
   return withProjectLock(resolution.stateDir, async () => {
     const remote = await control(resolution, auth, 'read', null, options);
     const handoffDigest = sha(JSON.stringify(bundle));
-    if (remote.kind !== 'authority' || remote.record.state !== 'transferring' ||
-        remote.record.toDeviceId !== device.deviceId || remote.record.handoffDigest !== handoffDigest ||
-        bundle.projectId !== resolution.projectId || bundle.collection !== resolution.destination.collection ||
-        bundle.generation !== remote.record.generation) return blocked('handoff_mismatch');
+    const generation = bundle.generation + 1;
+    const cached = await readCache(resolution.stateDir);
+    const prepared = cached && cached.projectId === resolution.projectId &&
+      cached.collection === resolution.destination.collection && cached.deviceId === device.deviceId &&
+      cached.generation === generation && cached.fromGeneration === bundle.generation &&
+      cached.handoffDigest === handoffDigest;
+    const transferring = remote.kind === 'authority' && remote.record.state === 'transferring' &&
+      remote.record.toDeviceId === device.deviceId && remote.record.handoffDigest === handoffDigest &&
+      remote.record.generation === bundle.generation;
+    const promoted = remote.kind === 'authority' && remote.record.state === 'active' &&
+      remote.record.deviceId === device.deviceId && remote.record.generation === generation && prepared;
+    if (bundle.projectId !== resolution.projectId || bundle.collection !== resolution.destination.collection ||
+        !Number.isSafeInteger(bundle.generation) || bundle.generation < 1 ||
+        !Number.isSafeInteger(generation) || cached && !prepared ||
+        !transferring && !promoted) return blocked('handoff_mismatch');
     const dir = path.join(resolution.stateDir, 'ledger');
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     for (const entry of bundle.entries) {
@@ -244,15 +255,20 @@ export async function completeWriterTransfer(cwd, sessionId, bundle, readSecret,
     }
     const directory = await fs.open(dir, 'r');
     try { await directory.sync(); } finally { await directory.close(); }
-    const generation = remote.record.generation + 1;
-    const written = await control(resolution, auth, 'write', { deviceId: device.deviceId,
-      generation, state: 'active' }, options);
-    if (written.kind !== 'written') return written;
+    if (!prepared) await writeCache(resolution.stateDir, { projectId: resolution.projectId,
+      collection: resolution.destination.collection, deviceId: device.deviceId, generation,
+      fromGeneration: bundle.generation, handoffDigest, revoked: true });
+    if (transferring) {
+      const written = await control(resolution, auth, 'write', { deviceId: device.deviceId,
+        generation, state: 'active' }, options);
+      if (written.kind !== 'written') return written;
+    }
     const checked = await control(resolution, auth, 'read', null, options);
     if (checked.kind !== 'authority' || checked.record.deviceId !== device.deviceId ||
         checked.record.generation !== generation || checked.record.state !== 'active') return blocked('authority_write_unconfirmed');
     await writeCache(resolution.stateDir, { projectId: resolution.projectId,
-      collection: resolution.destination.collection, deviceId: device.deviceId, generation });
+      collection: resolution.destination.collection, deviceId: device.deviceId, generation,
+      fromGeneration: bundle.generation, handoffDigest });
     return { kind: 'transferred', generation, deviceId: device.deviceId };
   });
 }

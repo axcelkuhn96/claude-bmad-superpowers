@@ -76,8 +76,12 @@ export function createMcp({ launchId = process.env.CBS_MEMORIA_LAUNCH_ID,
         { op: 'read', projectId: bound.projectId, sdkId: args.memory_id }, secret, { stateRoot });
       if (result.kind !== 'item' || result.item?.projectId !== bound.projectId) return blocked('source_unavailable');
       const item = result.item;
+      if ((item.metadata?.scope === 'personal' || item.metadata?.owner_id != null) &&
+          (typeof bound.ownerId !== 'string' || !bound.ownerId ||
+            item.metadata?.owner_id !== bound.ownerId)) return blocked('source_unavailable');
       const source = await createOutbox(bound.stateDir).sourceForRemote(item);
       return source.kind === 'local_source' ? source :
+        source.reason !== 'source_unavailable' ? blocked('source_unavailable') :
         { kind: 'remote_metadata', metadata: { source: item.metadata?.source,
           source_offsets: item.metadata?.source_offsets, evidence_at: item.metadata?.evidence_at,
           origin: item.metadata?.origin, actor: item.metadata?.actor },

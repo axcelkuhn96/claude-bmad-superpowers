@@ -31,6 +31,7 @@ async function quiescent(projectRoot, stateDir, stateRoot) {
     }
     const bind = await fs.readFile(path.join(launchDir, `${stem}.bind`), 'utf8')
       .then(JSON.parse, error => error.code === 'ENOENT' ? null : Promise.reject(error));
+    if (closed.outcome === 'pre_spawn_aborted' && bind) return blocked('active_or_ambiguous_session');
     if (bind?.nativeSessionId) closedSessions.add(hash(bind.nativeSessionId));
   }
   const sessionsDir = path.join(stateDir, 'sessions');
