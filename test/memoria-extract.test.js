@@ -610,13 +610,83 @@ test('terminal correction records bridge target_changed and replay stays termina
   assert.deepEqual(await approveCandidate(checkpoint.operationId, 'fable_review', {
     outbox: createOutbox(dir), store: () => { throw new Error('replay must not mutate'); } }),
   { kind: 'conflict', reason: 'target_changed', operationId: receipt.candidates[0].externalId });
+  assert.deepEqual(await fs.readdir(path.join(dir, 'outbox', 'acks')), []);
+  const receiptFile = path.join(dir, 'outbox', 'processed', `${checkpoint.operationId}.json`);
+  for (const [field, value] of [['projectId', 'other-project'], ['candidateKey', 'other_key'],
+    ['sessionId', 'other-session'], ['sliceHash', 'b'.repeat(64)]]) {
+    await t.test(`changed ${field}`, async () => {
+      const changed = structuredClone(receipt);
+      if (field === 'candidateKey') changed.candidates[0].candidateKey = value;
+      else changed[field] = value;
+      await fs.writeFile(receiptFile, JSON.stringify(changed) + '\n');
+      try {
+        const replay = await approveCandidate(checkpoint.operationId, changed.candidates[0].candidateKey, {
+          outbox: createOutbox(dir), store: () => { throw new Error('tampered replay must not mutate'); },
+        });
+        assert.equal(replay.kind, 'blocked');
+        assert.equal((await createOutbox(dir).readDisposition(checkpoint.operationId)).reason,
+          'review_mismatch');
+      } finally { await fs.writeFile(receiptFile, JSON.stringify(receipt) + '\n'); }
+    });
+  }
   const reviewFile = path.join(dir, 'candidates', 'reviews',
     `${receipt.candidates[0].externalId}.json`);
+  await t.test('changed canonical review identity', async () => {
+    const changedIdentity = JSON.parse(review);
+    changedIdentity.review.operation.sourceIdentity.candidateKey = 'other_key';
+    changedIdentity.digest = createHash('sha256').update(JSON.stringify(changedIdentity.review)).digest('hex');
+    await fs.writeFile(reviewFile, JSON.stringify(changedIdentity) + '\n');
+    await fs.writeFile(receiptFile, JSON.stringify({ ...receipt, candidates: [
+      { ...receipt.candidates[0], reviewDigest: changedIdentity.digest }] }) + '\n');
+    try {
+      assert.equal((await createOutbox(dir).readDisposition(checkpoint.operationId)).reason,
+        'review_mismatch');
+    } finally {
+      await fs.writeFile(receiptFile, JSON.stringify(receipt) + '\n');
+      await fs.writeFile(reviewFile, review);
+    }
+  });
   const corrupted = JSON.parse(review);
   corrupted.review.target.version = '0'.repeat(64);
   await fs.writeFile(reviewFile, JSON.stringify(corrupted) + '\n');
   assert.equal((await createOutbox(dir).readDisposition(checkpoint.operationId)).reason,
     'review_mismatch');
+  await fs.writeFile(reviewFile, review);
+  const quotaBox = createOutbox(dir, { maxBytes: 98304 });
+  for (let n = 1; n <= 25; n++) {
+    const queued = await quotaBox.enqueueCheckpoint({ cli: 'claude', sessionId: 's',
+      start: 79 + n, end: 80 + n, sliceHash: n.toString(16).padStart(64, '0'),
+      messages: [] }, { projectId: 'p', policyVersion: 'native-v1' });
+    assert.equal(queued.kind, 'queued', `enqueue after conflict ${n}: ${JSON.stringify(queued)}`);
+    assert.equal((await quotaBox.recordManifest(queued.operationId, [])).kind, 'manifested');
+    assert.equal((await quotaBox.completeCheckpoint(queued.operationId)).kind, 'processed');
+  }
+  const reopened = createOutbox(dir, { maxBytes: 98304 });
+  assert.equal((await reopened.cursor('claude', 's')).processedEnd, 105);
+  assert.deepEqual(await fs.readFile(receiptFile), Buffer.from(JSON.stringify(receipt) + '\n'));
+  assert.equal(await fs.readFile(reviewFile, 'utf8'), review);
+  const payloadSha = receipt.candidates[0].payloadRef.sha256;
+  const payloadBytes = await fs.readFile(path.join(dir, 'candidates', 'payloads',
+    `${receipt.candidates[0].externalId}.${payloadSha}.json`));
+  assert.equal(createHash('sha256').update(payloadBytes).digest('hex'), payloadSha);
+  assert.equal((await reopened.readDisposition(checkpoint.operationId)).candidates[0].status, 'conflict');
+  assert.deepEqual(await approveCandidate(checkpoint.operationId, 'fable_review', {
+    outbox: reopened, store: () => { throw new Error('compacted replay must not mutate'); } }),
+  { kind: 'conflict', reason: 'target_changed', operationId: receipt.candidates[0].externalId });
+  assert.deepEqual(await fs.readdir(path.join(dir, 'outbox', 'acks')), []);
+  assert.ok((await fs.readdir(path.join(dir, 'outbox', 'processed'))).length < 10);
+  assert.ok(await reopened.usage() <= 98304);
+  const unresolved = await reopened.enqueueCheckpoint({ cli: 'claude', sessionId: 's',
+    start: 105, end: 106, sliceHash: 'c'.repeat(64), messages: [] },
+  { projectId: 'p', policyVersion: 'native-v1' });
+  assert.equal(unresolved.kind, 'queued');
+  const later = await reopened.enqueueCheckpoint({ cli: 'claude', sessionId: 's',
+    start: 106, end: 107, sliceHash: 'd'.repeat(64), messages: [] },
+  { projectId: 'p', policyVersion: 'native-v1' });
+  assert.equal(later.kind, 'queued');
+  assert.equal((await reopened.recordManifest(later.operationId, [])).kind, 'manifested');
+  assert.equal((await reopened.completeCheckpoint(later.operationId)).kind, 'processed');
+  assert.equal((await createOutbox(dir, { maxBytes: 98304 }).cursor('claude', 's')).processedEnd, 105);
 });
 
 test('first child ACK returns success while sibling remains pending', async t => {

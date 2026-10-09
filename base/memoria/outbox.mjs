@@ -406,8 +406,16 @@ export function createOutbox(stateDir, options = {}) {
       source ??= row;
       const noFacts = row.disposition === 'no_facts' && !row.candidates?.length;
       const terminalCandidates = row.disposition === 'candidates' && row.candidates?.length > 0 &&
-        row.candidates.every(candidate => ['rejected', 'duplicate', 'remote_acked'].includes(candidate.status));
+        row.candidates.every(candidate => ['rejected', 'duplicate', 'remote_acked', 'conflict'].includes(candidate.status));
       if (!noFacts && !terminalCandidates) break;
+      let validConflict = true;
+      for (const candidate of row.candidates ?? []) {
+        if (candidate.status === 'conflict' && !await conflictProofValid(row.operationId, candidate, row)) {
+          validConflict = false;
+          break;
+        }
+      }
+      if (!validConflict) break;
       digest = hash(JSON.stringify([digest, row.operationId, row.sliceHash, row.start, row.end]));
       end = row.end;
       if (noFacts) removable.push(row);
@@ -1014,6 +1022,9 @@ export function createOutbox(stateDir, options = {}) {
       if (status === 'remote_acked') { candidate.sdkId = proof.sdkId; candidate.qdrantId = proof.qdrantId; }
       else candidate.reason = reason;
       if (status === 'conflict') candidate.reviewDigest = proof.reviewDigest;
+      if (status === 'conflict' && !await conflictProofValid(operationId, candidate, row)) {
+        return blocked('review_mismatch');
+      }
       if (!await fits(manifest)) return { kind: 'full', operationId: candidate.externalId };
       await durable(manifestFile(operationId), manifest);
       return { kind: status === 'remote_acked' ? 'acked' : status === 'conflict' ? 'conflict' : 'disposed',
@@ -1095,18 +1106,40 @@ export function createOutbox(stateDir, options = {}) {
             message.end === candidate.evidence.end) ||
             !['pending', 'remote_acked', 'rejected', 'duplicate', 'conflict'].includes(candidate.status)) return blocked('corrupt_manifest');
         if (!await payloadValid(candidate.payloadRef, row, candidate)) return blocked('candidate_payload_mismatch');
-        if (candidate.status === 'conflict' && !await conflictProofValid(operationId, candidate)) {
+        if (candidate.status === 'conflict' && !await conflictProofValid(operationId, candidate, row)) {
           return blocked('review_mismatch');
         }
       }
       return structuredClone(manifest);
     });
   }
-  async function conflictProofValid(operationId, candidate) {
-    if (!/^[a-z_]{1,64}$/.test(candidate.reason ?? '') ||
-        !/^[a-f0-9]{64}$/.test(candidate.reviewDigest ?? '')) return false;
+  async function conflictProofValid(operationId, candidate, source) {
+    if (!validId(candidate?.externalId) || source?.operationId !== operationId ||
+        !/^[a-z_]{1,64}$/.test(candidate.reason ?? '') ||
+        !/^[a-f0-9]{64}$/.test(candidate.reviewDigest ?? '') ||
+        !/^[a-f0-9]{64}$/.test(candidate.payloadRef?.sha256 ?? '')) return false;
+    const identity = { projectId: source?.projectId, originCli: source?.cli,
+      sessionId: source?.sessionId, start: source?.start, end: source?.end,
+      sliceHash: source?.sliceHash, policyVersion: source?.policyVersion,
+      candidateKey: candidate.candidateKey };
+    let checkpointId, candidateId;
+    try {
+      const { candidateKey, ...checkpoint } = identity;
+      checkpointId = externalIdFor(checkpoint);
+      candidateId = externalIdFor(identity);
+    } catch { return false; }
+    if (checkpointId !== operationId || candidateId !== candidate.externalId) return false;
     const record = await verifiedReviewFile(path.join(reviews, `${candidate.externalId}.json`));
+    let reviewedId;
+    try { reviewedId = externalIdFor(record?.review?.operation?.sourceIdentity); }
+    catch { return false; }
     return record && record.kind !== 'blocked' && record.operationId === operationId &&
+      reviewedId === candidate.externalId &&
+      Object.keys(record.review.operation.sourceIdentity).length === Object.keys(identity).length &&
+      Object.keys(identity).every(key => record.review.operation.sourceIdentity[key] === identity[key]) &&
+      record.review.operation.projectId === source.projectId &&
+      record.review.operation.sessionId === source.sessionId &&
+      record.review.operation.metadata?.checkpoint_id === operationId &&
       record.externalId === candidate.externalId && record.payloadSha256 === candidate.payloadRef.sha256 &&
       record.digest === candidate.reviewDigest && record.digest === hash(JSON.stringify(record.review)) &&
       record.review?.decision === 'correct' &&
@@ -1124,7 +1157,7 @@ export function createOutbox(stateDir, options = {}) {
       if (receipt?.candidates?.some(candidate => candidate.status === 'conflict' &&
           !candidate.reviewDigest)) return blocked('review_mismatch');
       for (const candidate of receipt?.candidates ?? []) {
-        if (candidate.status === 'conflict' && !await conflictProofValid(operationId, candidate)) {
+        if (candidate.status === 'conflict' && !await conflictProofValid(operationId, candidate, receipt)) {
           return blocked('review_mismatch');
         }
       }
