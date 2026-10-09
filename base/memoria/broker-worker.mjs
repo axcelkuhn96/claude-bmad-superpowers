@@ -173,7 +173,7 @@ export function createBrokerWorker(start, { coldMs = 30000, onFatal = () => {} }
     },
     close: async () => {
       closed = true;
-      await stop(current?.child);
+      return stop(current?.child);
     },
   };
 }

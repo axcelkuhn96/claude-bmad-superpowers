@@ -1,12 +1,79 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
+import { claimBrokerWorker } from '../base/memoria/broker.mjs';
 import { createBrokerWorker } from '../base/memoria/broker-worker.mjs';
 import { encodeFrame } from '../base/memoria/frame.mjs';
 
 const fixture = fileURLToPath(new URL('./memoria-broker-worker-fixture.mjs', import.meta.url));
+
+test('uncertain child close keeps the shared guard and rejects a new broker process before spawn', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'memoria-broker-guard-'));
+  await fs.mkdir(path.join(root, 'ledger'), { mode: 0o700 });
+  let starts = 0;
+  const start = () => {
+    starts++;
+    const child = new EventEmitter();
+    child.pid = 1; // In-memory fixture; kill never signals an OS process.
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdout = new EventEmitter();
+    child.stdin = new EventEmitter();
+    child.stdin.write = () => true;
+    child.kill = () => true;
+    queueMicrotask(() => child.stdout.emit('data', encodeFrame({ kind: 'ready' }, undefined, true)));
+    return child;
+  };
+  try {
+    const first = await claimBrokerWorker(root);
+    const bridge = createBrokerWorker(start);
+    assert.deepEqual(await bridge.start(), { kind: 'ready' });
+    assert.equal(await bridge.close(), false);
+    await first.release(false);
+    const moduleUrl = new URL('../base/memoria/broker.mjs', import.meta.url).href;
+    const probe = spawn(process.execPath, ['--input-type=module', '-e',
+      `import { claimBrokerWorker } from ${JSON.stringify(moduleUrl)};
+       try { await claimBrokerWorker(process.argv[1]); process.stdout.write('NUMERIC_STARTED'); }
+       catch (error) { if (error.code !== 'EEXIST') throw error; process.stdout.write('BROKER_BLOCKED'); }`, root],
+    { stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let errors = '';
+    probe.stdout.on('data', chunk => { output += chunk; });
+    probe.stderr.on('data', chunk => { errors += chunk; });
+    const exit = await new Promise(resolve => probe.once('close', resolve));
+    assert.equal(exit, 0, errors);
+    assert.equal(output, 'BROKER_BLOCKED');
+    assert.equal(starts, 1);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test('confirmed child close releases the shared guard for the next broker', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'memoria-broker-guard-'));
+  await fs.mkdir(path.join(root, 'ledger'), { mode: 0o700 });
+  let starts = 0;
+  const start = () => {
+    starts++;
+    return spawn(process.execPath, [fixture], { stdio: ['pipe', 'pipe', 'ignore'] });
+  };
+  try {
+    const first = await claimBrokerWorker(root);
+    const bridge = createBrokerWorker(start);
+    assert.deepEqual(await bridge.start(), { kind: 'ready' });
+    assert.equal(await bridge.close(), true);
+    await first.release(true);
+    const second = await claimBrokerWorker(root);
+    const next = createBrokerWorker(start);
+    try {
+      assert.deepEqual(await next.start(), { kind: 'ready' });
+      assert.equal(starts, 2);
+    } finally { await second.release(await next.close()); }
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
 
 test('a worker deadline kills only its worker and the next request gets a ready replacement', async () => {
   let started = 0;

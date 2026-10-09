@@ -45,6 +45,39 @@ export async function prepareBrokerEndpoint(root) {
   await fs.unlink(file);
   return 'ready';
 }
+
+// encoder.lock serializes claims; the durable guard survives a broker crash or uncertain child stop.
+export async function claimBrokerWorker(root) {
+  const directory = path.join(root, 'ledger');
+  const dirStat = await fs.lstat(directory);
+  if (!dirStat.isDirectory() || dirStat.uid !== process.getuid() || (dirStat.mode & 0o077)) {
+    throw new Error('unsafe_worker_guard');
+  }
+  const file = path.join(directory, 'encoder-worker.guard');
+  const handle = await fs.open(file, 'wx', 0o600);
+  let identity;
+  try {
+    identity = await handle.stat();
+    await handle.writeFile('{"state":"worker_may_be_live"}\n');
+    await handle.sync();
+  } finally { await handle.close(); }
+  const syncDirectory = async () => {
+    const dir = await fs.open(directory, 'r');
+    try { await dir.sync(); } finally { await dir.close(); }
+  };
+  await syncDirectory();
+  return { async release(confirmedClosed) {
+    if (!confirmedClosed) return false;
+    const current = await fs.lstat(file);
+    if (!current.isFile() || current.uid !== process.getuid() ||
+        current.dev !== identity.dev || current.ino !== identity.ino) {
+      throw new Error('worker_guard_changed');
+    }
+    await fs.unlink(file);
+    await syncDirectory();
+    return true;
+  } };
+}
 const script = fileURLToPath(new URL('./python/worker.py', import.meta.url));
 const envAllow = () => Object.fromEntries(['PATH', 'HOME', 'SYSTEMROOT', 'WINDIR', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'CBS_MEMORIA_CA_FILE']
   .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
@@ -131,15 +164,23 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
   if (prepared !== 'ready') return blocked(prepared === 'unsafe' ? 'unsafe_broker' : 'broker_owned');
   const artifacts = await openArtifactIdentity([model, tokenizer]);
   if (artifacts.kind !== 'opened') return blocked(artifacts.reason);
+  let guard;
+  try { guard = await claimBrokerWorker(root); }
+  catch { await artifacts.close(); return blocked('broker_owned'); }
   let server;
   const bridge = createBrokerWorker(() => spawn(runtimePython(resolution.stateDir), [script], {
     stdio: ['pipe', 'pipe', 'ignore'],
     env: { ...envAllow(), CBS_MEMORIA_MODEL: model, CBS_MEMORIA_TOKENIZER: tokenizer,
       OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1', MKL_NUM_THREADS: '1' },
   }), { onFatal: () => { if (server?.listening) server.close(); } });
+  async function closeOwnedWorker() {
+    const confirmedClosed = await bridge.close();
+    try { await guard.release(confirmedClosed); }
+    finally { await artifacts.close(); }
+  }
   const ready = await bridge.start();
   if (ready.kind !== 'ready' || !await artifacts.unchanged()) {
-    await bridge.close(); await artifacts.close(); return ready.kind === 'ready' ? blocked('artifact_changed') : ready;
+    await closeOwnedWorker(); return ready.kind === 'ready' ? blocked('artifact_changed') : ready;
   }
   let queued = 0;
   let chain = Promise.resolve();
@@ -201,11 +242,12 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     await new Promise(resolve => server.once('close', resolve));
   } catch { return blocked('broker_unavailable'); }
   finally {
-    await bridge.close();
-    await artifacts.close();
-    clearTimeout(idle);
-    try { const stat = await fs.lstat(file); if (stat.isSocket() && stat.uid === process.getuid()) await fs.rm(file); }
-    catch { /* no owned endpoint */ }
+    try { await closeOwnedWorker(); }
+    finally {
+      clearTimeout(idle);
+      try { const stat = await fs.lstat(file); if (stat.isSocket() && stat.uid === process.getuid()) await fs.rm(file); }
+      catch { /* no owned endpoint */ }
+    }
   }
   return { kind: 'closed' };
   }, 'encoder.lock'); }
