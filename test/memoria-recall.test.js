@@ -5,6 +5,7 @@ import { recallForPrompt, recordRecallWindow } from '../base/memoria/hook-recall
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { createMcp } from '../base/memoria/mcp.mjs';
 
 const now = '2026-10-01T00:00:00Z';
@@ -179,4 +180,66 @@ test('native hook deadline after selection does not suppress the next prompt', a
     } };
   assert.equal(await recallForPrompt({ ...input, began: performance.now() }), null);
   assert.ok((await recallForPrompt({ ...input, began: performance.now() }))?.hookSpecificOutput);
+});
+
+test('prompt recall reports fixed failure categories without changing its null result', async () => {
+  const baseInput = { cli: 'claude', payload: { cwd: '/checkout', session_id: 's', prompt: 'rule' },
+    result: { kind: 'queued' }, resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir: '/tmp' }) };
+  const observed = [];
+  const onFailure = reason => observed.push(reason);
+  assert.equal(await recallForPrompt({ ...baseInput, search: async () =>
+    ({ kind: 'blocked', reason: 'missing_key' }), onFailure }), null);
+  assert.equal(await recallForPrompt({ ...baseInput, began: performance.now() - 990,
+    search: () => new Promise(() => {}), onFailure }), null);
+  assert.equal(await recallForPrompt({ ...baseInput, result: { kind: 'blocked', reason: 'unsafe_transcript' },
+    onFailure }), null);
+  assert.equal(await recallForPrompt({ ...baseInput, result: { kind: 'blocked', reason: 'trust_changed' },
+    onFailure }), null);
+  assert.equal(await recallForPrompt({ ...baseInput, search: async () =>
+    ({ kind: 'unavailable', reason: 'broker_unavailable' }), onFailure }), null);
+  assert.equal(await recallForPrompt({ ...baseInput, search: async () =>
+    ({ kind: 'items', items: [{ ...base, sdkId: 'one' }] }),
+    recordWindow: async () => ({ kind: 'unavailable', reason: 'unsafe_window' }),
+    now: () => now, onFailure }), null);
+  assert.equal(await recallForPrompt({ ...baseInput, search: async () =>
+    ({ kind: 'blocked', reason: 'secret=/malicious/path' }), onFailure }), null);
+  assert.deepEqual(observed, ['auth', 'deadline', 'capture', 'trust', 'transport', 'selection', 'error']);
+});
+
+test('empty query and no eligible recall remain diagnostically silent', async () => {
+  const observed = [];
+  const input = { cli: 'claude', payload: { cwd: '/checkout', session_id: 's', prompt: '' },
+    result: { kind: 'queued' }, resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir: '/tmp' }),
+    onFailure: reason => observed.push(reason) };
+  assert.equal(await recallForPrompt(input), null);
+  assert.equal(await recallForPrompt({ ...input, payload: { ...input.payload, prompt: 'rule' },
+    search: async () => ({ kind: 'items', items: [] }) }), null);
+  assert.equal(await recallForPrompt({ ...input, resolve: async () => ({ provider: 'claude-mem' }) }), null);
+  assert.deepEqual(observed, []);
+});
+
+test('capture hook stderr is sanitized on malformed input', () => {
+  const hook = path.join(import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname),
+    '../base/memoria/capture-hook.mjs');
+  const child = spawnSync(process.execPath, [hook, 'claude', 'UserPromptSubmit'],
+    { input: '{"private":"SECRET-LEAK",', encoding: 'utf8' });
+  assert.equal(child.status, 0);
+  assert.equal(child.stdout, '');
+  assert.equal(child.stderr, 'CBS Mem0 capture: error\n');
+});
+
+test('capture hook without Mem0 configuration leaves stdout, stderr and state empty', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-default-hook-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const hook = path.join(import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname),
+    '../base/memoria/capture-hook.mjs');
+  const child = spawnSync(process.execPath, [hook, 'claude', 'UserPromptSubmit'], {
+    input: JSON.stringify({ hook_event_name: 'UserPromptSubmit', cwd: root, session_id: 's',
+      transcript_path: path.join(root, 's.jsonl'), prompt: 'rule' }), encoding: 'utf8',
+    env: { ...process.env, CBS_MEMORIA_STATE_ROOT: path.join(root, 'state') },
+  });
+  assert.equal(child.status, 0);
+  assert.equal(child.stdout, '');
+  assert.equal(child.stderr, '');
+  assert.deepEqual(await fs.readdir(root), []);
 });

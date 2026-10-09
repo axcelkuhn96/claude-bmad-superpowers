@@ -11,6 +11,16 @@ import { ensureWindowsPrivateDirectory, readWindowsBinary,
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const validCapture = result => result && !['blocked', 'pass_through', 'full'].includes(result.kind);
+const failureCategory = reason => {
+  if (reason === 'deadline' || reason === 'queue_timeout') return 'deadline';
+  if (reason === 'missing_key') return 'auth';
+  if (['trust_changed', 'session_changed', 'config_changed', 'worktree_config_changed',
+    'fresh_session', 'unsafe_broker'].includes(reason)) return 'trust';
+  if (['broker_unavailable', 'broker_protocol', 'worker_unavailable', 'worker_exited',
+    'worker_protocol', 'worker_cold', 'worker_unstoppable', 'queue_full',
+    'destination_unavailable', 'collection_unavailable'].includes(reason)) return 'transport';
+  return 'error';
+};
 const stateFile = (stateDir, cli, sessionId) => path.join(stateDir, 'sessions',
   `${digest(JSON.stringify([cli, sessionId]))}.recall.json`);
 
@@ -97,15 +107,27 @@ export async function recordRecallWindow({ stateDir, cli, sessionId, eligible, r
 export async function recallForPrompt({ cli, event = 'UserPromptSubmit', payload, result, stateRoot,
   began = performance.now(), resolve = resolveProject, search = searchProject,
   readSecret = name => process.env[name], now = () => new Date().toISOString(),
-  recordWindow = recordRecallWindow } = {}) {
-  if (!validCapture(result) || !['claude', 'codex'].includes(cli) ||
+  recordWindow = recordRecallWindow, onFailure } = {}) {
+  const fail = category => {
+    try { onFailure?.(category); } catch { /* Diagnostics never change native fail-open. */ }
+    return null;
+  };
+  if (!validCapture(result)) {
+    if (result?.kind === 'blocked' && result.reason !== 'not_mem0') {
+      return fail(result.reason === 'trust_changed' ? 'trust' : 'capture');
+    }
+    return result?.kind === 'full' ? fail('capture') : null;
+  }
+  if (!['claude', 'codex'].includes(cli) ||
       typeof payload?.cwd !== 'string' || typeof payload.session_id !== 'string') return null;
   if (event !== 'UserPromptSubmit' && event !== 'PreCompact') return null;
   try {
     const remaining = () => Math.floor(1000 - (performance.now() - began));
     if (remaining() <= 0) return null;
     const current = await resolve(payload.cwd, payload.session_id, { stateRoot });
-    if (current.provider !== 'mem0' || !current.projectId || !current.stateDir) return null;
+    if (current.provider !== 'mem0') return ['claude-mem', 'not_mem0', 'unsupported_git'].includes(
+      current.provider === 'claude-mem' ? current.provider : current.reason) ? null : fail(failureCategory(current.reason));
+    if (!current.projectId || !current.stateDir) return fail('error');
     const file = stateFile(current.stateDir, cli, payload.session_id);
     if (event === 'PreCompact') {
       await withProjectLock(current.stateDir, async () => {
@@ -126,21 +148,26 @@ export async function recallForPrompt({ cli, event = 'UserPromptSubmit', payload
     }
     if (typeof payload.prompt !== 'string' || !payload.prompt.trim() || payload.prompt.length > 4096) return null;
     const deadlineMs = remaining();
-    if (deadlineMs <= 0) return null;
+    if (deadlineMs <= 0) return fail('deadline');
     let timer;
     const answer = await Promise.race([
       search({ cwd: payload.cwd, sessionId: payload.session_id, projectId: current.projectId,
         query: payload.prompt }, readSecret, { stateRoot, deadlineMs, ownerId: current.ownerId }),
-      new Promise(resolveDeadline => { timer = setTimeout(() => resolveDeadline(null), deadlineMs); }),
+      new Promise(resolveDeadline => { timer = setTimeout(() =>
+        resolveDeadline({ kind: 'unavailable', reason: 'deadline' }), deadlineMs); }),
     ]).finally(() => clearTimeout(timer));
-    if (answer?.kind !== 'items' || remaining() <= 0) return null;
+    if (answer?.kind === 'abstain') return null;
+    if (answer?.kind !== 'items') return fail(failureCategory(answer?.reason));
+    if (remaining() <= 0) return fail('deadline');
+    if (!Array.isArray(answer.items)) return fail('error');
     const eligible = selectRecall(answer.items, { projectId: current.projectId,
       ownerId: current.ownerId, now: now() });
     if (!eligible.length) return null;
     const selected = await recordWindow({ stateDir: current.stateDir, cli,
       sessionId: payload.session_id, eligible, remaining });
-    if (selected.kind !== 'items') return null;
-    if (remaining() <= 0) { await selected.rollback(); return null; }
+    if (selected.kind !== 'items') return selected.kind === 'abstain' ? null :
+      fail(selected.reason === 'deadline' ? 'deadline' : 'selection');
+    if (remaining() <= 0) { await selected.rollback(); return fail('deadline'); }
     return { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: selected.text } };
-  } catch { return null; }
+  } catch { return fail('error'); }
 }

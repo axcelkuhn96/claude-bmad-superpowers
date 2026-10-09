@@ -16,12 +16,12 @@ try {
   if (event === 'UserPromptSubmit' || event === 'PreCompact') {
     const { recallForPrompt } = await import('./hook-recall.mjs');
     const recall = await recallForPrompt({ cli, event, payload, result,
-      stateRoot: process.env.CBS_MEMORIA_STATE_ROOT, began });
+      stateRoot: process.env.CBS_MEMORIA_STATE_ROOT, began,
+      onFailure: category => process.stderr.write(`CBS Mem0 recall: ${category}\n`) });
     if (recall) process.stdout.write(JSON.stringify(recall) + '\n');
+  } else if (result.kind === 'full' || result.kind === 'blocked' && result.reason !== 'not_mem0') {
+    process.stderr.write(`CBS Mem0 capture: ${result.reason === 'trust_changed' ? 'trust' : 'capture'}\n`);
   }
-  if (result.kind === 'full' || result.kind === 'blocked' && result.reason !== 'not_mem0') {
-    process.stderr.write(`CBS Mem0 capture: ${result.reason ?? result.kind}\n`);
-  }
-} catch (error) {
-  process.stderr.write(`CBS Mem0 capture: ${error.code ?? error.message}\n`);
+} catch {
+  process.stderr.write('CBS Mem0 capture: error\n');
 }

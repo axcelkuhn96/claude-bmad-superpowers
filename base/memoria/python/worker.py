@@ -14,6 +14,7 @@ for key in ('OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_ORGANIZATION', 'OPENAI_
     os.environ.pop(key, None)
 
 import mem0_adapter as adapter
+from qdrant_client import QdrantClient
 
 MAX_JSON = 4 * 1024 * 1024
 MAX_SECRET = 8 * 1024
@@ -39,7 +40,6 @@ def send(value):
 
 
 def execute_one(request, secret):
-    from qdrant_client import QdrantClient
     if not secret or request.get('op') not in ('search', 'find', 'read', 'add', 'activate'):
         return {'kind': 'blocked', 'reason': 'invalid_operation'}
     state = Path(request['state']).resolve()
