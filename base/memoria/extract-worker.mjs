@@ -59,23 +59,6 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
   if (!trust || Object.entries(trustTuple(current)).some(([key, value]) => trust[key] !== value)) {
     return blocked('trust_changed');
   }
-  const selected = process.env.CLAUDE_CONFIG_DIR;
-  if (!selected || !path.isAbsolute(selected)) return blocked('cli_profile_unselected');
-  let profile;
-  try {
-    profile = await fs.realpath(selected);
-    if (process.platform === 'win32') {
-      const { inspectWindowsPath } = await import('./windows-security.mjs');
-      if (!(await inspectWindowsPath(profile, 'directory')).ok) return blocked('cli_profile_untrusted');
-    } else {
-      const stat = await fs.lstat(profile);
-      if (!stat.isDirectory() || !process.getuid || stat.uid !== process.getuid() || (stat.mode & 0o022)) {
-        return blocked('cli_profile_untrusted');
-      }
-    }
-  } catch { return blocked('cli_profile_untrusted'); }
-  // The extractor's own guard checks main and active checkout; this also rejects third worktrees.
-  if ((await identifyProject(profile)).kind === 'git') return blocked('cli_profile_untrusted');
   const box = createOutbox(current.stateDir);
   const ownerRoot = path.dirname(current.stateDir);
   try {
@@ -101,12 +84,28 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
         if (!sourceTrust || Object.entries(trustTuple(fresh)).some(([key, value]) => sourceTrust[key] !== value)) {
           pending++; continue;
         }
+        const policy = fresh.extractor;
+        if (!policy || policy.route !== 'sonnet' || !path.isAbsolute(policy.profile) ||
+            !path.isAbsolute(policy.executable)) { pending++; continue; }
+        let profile;
+        try {
+          profile = await fs.realpath(policy.profile);
+          if (profile !== policy.profile || (await identifyProject(profile)).kind === 'git') throw new Error('profile');
+          if (process.platform === 'win32') {
+            const { inspectWindowsPath } = await import('./windows-security.mjs');
+            if (!(await inspectWindowsPath(profile, 'directory')).ok) throw new Error('profile');
+          } else {
+            const stat = await fs.lstat(profile);
+            if (!stat.isDirectory() || !process.getuid || stat.uid !== process.getuid() ||
+                (stat.mode & 0o022)) throw new Error('profile');
+          }
+        } catch { pending++; continue; }
         let result;
         const previousCwd = process.cwd();
         try {
           // This dedicated extraction child is serialized by extract.lock; the broker cwd never changes.
           if (!runCli) process.chdir(original.nativeRoot);
-          result = await extractCheckpoint(row, { route: 'sonnet',
+          result = await extractCheckpoint(row, { ...policy,
             embeddingFingerprint: fresh.embeddingFingerprint, stateRoot }, { outbox: box, runCli });
         } finally { if (!runCli) process.chdir(previousCwd); }
         if (result.kind === 'manifested' || result.kind === 'processed') manifested++;

@@ -26,8 +26,8 @@ export function externalIdFor(source) {
   return `src-${hash(JSON.stringify(identity))}`;
 }
 
-export function createLedger(stateDir, writerId) {
-  if (!stateDir || !writerId) throw new Error('ledger_identity_required');
+export function createLedger(stateDir, writerId, generation) {
+  if (!stateDir || !writerId || !Number.isSafeInteger(generation) || generation < 1) throw new Error('ledger_identity_required');
   const dir = path.join(stateDir, 'ledger');
   const file = externalId => path.join(dir, `${hash(externalId)}.json`);
   async function read(externalId) {
@@ -72,12 +72,10 @@ export function createLedger(stateDir, writerId) {
       if (!(await ensureWindowsPrivateDirectory(dir)).ok) throw new Error('unsafe_ledger_dir');
     } else await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     const writerFile = path.join(dir, 'writer.json');
-    try { await exclusive(writerFile, { writerId, projectId: operation.projectId }); }
-    catch (error) { if (process.platform !== 'win32' ? error.code !== 'EEXIST' :
-      error.message !== 'windows_publish_failed') throw error; }
     const owner = process.platform === 'win32' ? await createWindowsState(writerFile).read() :
-      JSON.parse(await fs.readFile(writerFile, 'utf8'));
-    if (owner.writerId !== writerId || owner.projectId !== operation.projectId) return pending('writer_mismatch');
+      await fs.readFile(writerFile, 'utf8').then(JSON.parse, error => error.code === 'ENOENT' ? null : Promise.reject(error));
+    if (!owner || owner.deviceId !== writerId || owner.projectId !== operation.projectId ||
+        owner.generation !== generation || owner.revoked === true) return pending('writer_mismatch');
     if (operation.metadata?.supersedes_id) {
       const correction = path.join(dir, `correction-${hash(operation.metadata.supersedes_id)}.json`);
       try { await exclusive(correction, { externalId: operation.externalId }); }
@@ -132,30 +130,7 @@ export async function withProjectLock(stateDir, callback, lockName = 'writer.loc
 }
 
 export async function transferWriter(stateDir, { projectId, fromWriterId, toWriterId, quiescent }) {
-  if (quiescent !== true || !projectId || !fromWriterId || !toWriterId || fromWriterId === toWriterId) {
-    return pending('quiescent_handoff_required');
-  }
-  return withProjectLock(stateDir, async () => {
-    const dir = path.join(stateDir, 'ledger');
-    const file = path.join(dir, 'writer.json');
-    if (process.platform === 'win32') {
-      const writer = createWindowsState(file);
-      const owner = await writer.read();
-      if (owner?.projectId !== projectId || owner.writerId !== fromWriterId) return pending('writer_mismatch');
-      await writer.write({ projectId, writerId: toWriterId });
-      return { kind: 'transferred', writerId: toWriterId };
-    }
-    const owner = JSON.parse(await fs.readFile(file, 'utf8'));
-    if (owner.projectId !== projectId || owner.writerId !== fromWriterId) return pending('writer_mismatch');
-    const temp = `${file}.${randomUUID()}.tmp`;
-    const handle = await fs.open(temp, 'wx', 0o600);
-    try { await handle.writeFile(JSON.stringify({ projectId, writerId: toWriterId }) + '\n'); await handle.sync(); }
-    finally { await handle.close(); }
-    await fs.rename(temp, file);
-    const directory = await fs.open(dir, 'r');
-    try { await directory.sync(); } finally { await directory.close(); }
-    return { kind: 'transferred', writerId: toWriterId };
-  });
+  return pending('administrative_transfer_required');
 }
 
 function valid(row, operation, status) {
@@ -197,7 +172,7 @@ export async function reconcileStore(operation, deps) {
         try { await deps.addViaSdk(operation); }
         catch (error) {
           if (ledger) { local.attempts++; local.lastError = 'remote_error'; await ledger.save(local); }
-          return pending('remote_error');
+          return error.conflict ? { kind: 'conflict', reason: error.code } : pending('remote_error');
         }
         const refreshed = await deps.findRemote(operation.externalId);
         candidates.push(...(Array.isArray(refreshed) ? refreshed : refreshed ? [refreshed] : [])
@@ -226,6 +201,7 @@ export async function reconcileStore(operation, deps) {
       local.attempts++; local.lastError = error.code ?? 'operation_failed';
       await ledger.save(local);
     }
-    return pending(error.code ?? 'operation_failed');
+    return error.conflict ? { kind: 'conflict', reason: error.code ?? 'operation_failed' } :
+      pending(error.code ?? 'operation_failed');
   }
 }

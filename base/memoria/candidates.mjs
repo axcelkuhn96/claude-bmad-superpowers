@@ -1,7 +1,8 @@
 import { externalIdFor } from './ledger.mjs';
 import { runSonnetExtraction } from './extract-cli.mjs';
 import { validDateTime, validateExtractionOutput } from './extract-contract.mjs';
-import { storeMemory } from './bridge.mjs';
+import { storeMemory, runBridgeOperation } from './bridge.mjs';
+import { targetEligible, targetVersion } from './correction.mjs';
 import os from 'node:os';
 import readline from 'node:readline/promises';
 import { isDeepStrictEqual } from 'node:util';
@@ -257,25 +258,40 @@ export async function reviewCandidateOnTerminal(operationId, candidateKey, optio
         condition: payload.condition,
         evidence_at: payload.evidence_at, valid_from: payload.valid_from,
         valid_to: payload.valid_to })}\nSource ${JSON.stringify(redact(context.source.text))}\n`);
-    const answer = (await prompt.question('Action (accept/reject/duplicate/edit): ')).trim();
+    const answer = (await prompt.question('Action (accept/reject/duplicate/edit/correct): ')).trim();
     const decision = answer === 'accept' || answer === 'edit' ? 'approve' : answer;
-    if (!['approve', 'reject', 'duplicate'].includes(decision)) return blocked('invalid_review_action');
-    let text, reason, duplicateRef;
+    if (!['approve', 'reject', 'duplicate', 'correct'].includes(decision)) return blocked('invalid_review_action');
+    let text, reason, duplicateRef, target;
     if (answer === 'edit') {
       text = await prompt.question('Approved verbatim text: ');
       process.stdout.write(`Final text ${JSON.stringify(text)}\n`);
     }
     if (decision === 'reject') reason = (await prompt.question('Reason code: ')).trim();
     if (decision === 'duplicate') duplicateRef = (await prompt.question('Verified existing external ID: ')).trim();
+    if (decision === 'correct') {
+      const targetId = (await prompt.question('Active memory SDK ID to correct: ')).trim();
+      if (!targetId || targetId.length > 256) return blocked('invalid_target');
+      const result = await (options.readTarget ?? (id => runBridgeOperation(options.cwd,
+        options.sessionId, { op: 'read', projectId: payload.project_id, sdkId: id },
+        options.readSecret, options)))(targetId);
+      if (result.kind !== 'item' || !targetEligible(result.item, payload)) return blocked('target_unavailable');
+      target = { sdkId: result.item.sdkId, externalId: result.item.externalId,
+        version: targetVersion(result.item) };
+      process.stdout.write(`Target ${JSON.stringify({ sdkId: target.sdkId,
+        text: result.item.text, scope: result.item.metadata.scope,
+        owner_id: result.item.metadata.owner_id ?? null,
+        source: result.item.metadata.source, evidence_at: result.item.metadata.evidence_at,
+        valid_from: result.item.metadata.valid_from, valid_to: result.item.metadata.valid_to })}\n`);
+    }
     const confirm = (await prompt.question(`Confirm ${answer} for ${entry.payloadRef.sha256} (yes): `)).trim();
     if (confirm !== 'yes') return blocked('owner_approval_required');
     const reviewGrant = { decision, payloadSha256: entry.payloadRef.sha256,
       actor: process.platform === 'win32' ? options.actor :
         `uid:${process.getuid()}:${os.userInfo().username}`,
-      reviewedAt: new Date().toISOString(), text };
+      reviewedAt: new Date().toISOString(), text, target };
     localGrants.add(reviewGrant);
     const next = { ...options, reviewGrant };
-    if (decision === 'approve') return approveCandidate(operationId, candidateKey, next);
+    if (decision === 'approve' || decision === 'correct') return approveCandidate(operationId, candidateKey, next);
     if (decision === 'reject') return rejectCandidate(operationId, candidateKey, reason, next);
     return markDuplicateCandidate(operationId, candidateKey, duplicateRef, next);
   } catch (error) {
@@ -285,7 +301,7 @@ export async function reviewCandidateOnTerminal(operationId, candidateKey, optio
   finally { prompt.close(); }
 }
 
-function storeOperation(payload, text) {
+function storeOperation(payload, text, target = null) {
   return { externalId: payload.external_id, projectId: payload.project_id,
     sessionId: payload.session_id, text,
     sourceIdentity: { projectId: payload.project_id, originCli: payload.origin_cli,
@@ -299,7 +315,9 @@ function storeOperation(payload, text) {
       ingested_at: payload.ingested_at, valid_from: payload.valid_from,
       valid_to: payload.valid_to, condition: payload.condition,
       logical_key: payload.logical_key, type: payload.type,
-      supersedes_id: payload.supersedes_id,
+      supersedes_id: target?.sdkId ?? null,
+      ...(target ? { correction_target_external_id: target.externalId,
+        correction_target_version: target.version } : {}),
       policy_version: payload.policy_version, extractor_model: payload.extractor_model,
       embedding_fingerprint: payload.embedding_fingerprint },
     approval: { kind: 'approved' } };
@@ -317,7 +335,8 @@ export async function approveCandidate(operationId, candidateKey, options = {}) 
   let sealed = await box.readReview(operationId, candidateKey);
   if (sealed.kind === 'blocked' && sealed.reason !== 'missing_review') return sealed;
   if (sealed.kind === 'blocked') {
-    const decision = granted(options, 'approve', entry.payloadRef.sha256);
+    const decision = granted(options, 'approve', entry.payloadRef.sha256) ??
+      granted(options, 'correct', entry.payloadRef.sha256);
     if (!decision) {
       return blocked('owner_approval_required');
     }
@@ -327,18 +346,21 @@ export async function approveCandidate(operationId, candidateKey, options = {}) 
       valid_to: decision.valid_to ?? payload.valid_to };
     const verdict = validateCandidate(approved, source);
     if (!verdict.eligible) return blocked(verdict.reasons[0]);
-    const operation = storeOperation(approved, approved.text);
+    if (decision.decision === 'correct' && (!decision.target?.sdkId || !decision.target?.externalId ||
+        !/^[a-f0-9]{64}$/.test(decision.target.version ?? ''))) return blocked('target_unavailable');
+    const operation = storeOperation(approved, approved.text, decision.target);
     sealed = await box.sealReview(operationId, candidateKey,
-      { decision: 'approve', actor: decision.actor, reviewedAt: decision.reviewedAt,
-        payloadSha256: entry.payloadRef.sha256, operation });
+      { decision: decision.decision, actor: decision.actor, reviewedAt: decision.reviewedAt,
+        payloadSha256: entry.payloadRef.sha256, target: decision.target ?? null, operation });
     if (sealed.kind !== 'sealed') return sealed;
   }
-  if (sealed.review.decision !== 'approve') return blocked('review_conflict');
+  if (!['approve', 'correct'].includes(sealed.review.decision)) return blocked('review_conflict');
   const operation = sealed.review.operation;
   const approved = { ...payload, text: operation?.text, condition: operation?.metadata?.condition,
     valid_from: operation?.metadata?.valid_from, valid_to: operation?.metadata?.valid_to };
   if (!validateCandidate(approved, source).eligible ||
-      !isDeepStrictEqual(operation, storeOperation(approved, approved.text))) return blocked('review_mismatch');
+      !isDeepStrictEqual(operation, storeOperation(approved, approved.text,
+        sealed.review.target))) return blocked('review_mismatch');
   const store = options.store ?? (op => storeMemory(options.cwd, options.sessionId, op,
     options.readSecret, { ...options, ackLocal: (id, proof) =>
       id === entry.externalId ? box.ackCandidate(operationId, candidateKey, proof) : blocked('child_id_mismatch') }));

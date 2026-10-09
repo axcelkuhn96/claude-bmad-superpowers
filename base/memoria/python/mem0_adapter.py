@@ -259,13 +259,21 @@ def execute(request: dict, client, state: Path) -> dict:
             supersedes = row['metadata'].get('supersedes_id')
             if supersedes:
                 old = _row(memory.get(supersedes), client, collection, memory.embedding_model)
-                if old is None or old['projectId'] != project or old['status'] not in ('active', 'superseded'):
+                if old is None or old['projectId'] != project or \
+                        old['externalId'] != row['metadata'].get('correction_target_external_id') or \
+                        old['metadata'].get('scope') != row['metadata'].get('scope') or \
+                        (row['metadata'].get('scope') == 'personal' and
+                         old['metadata'].get('owner_id') != row['metadata'].get('owner_id')):
                     raise ValueError('superseded_target_invalid')
                 if old['status'] == 'active':
-                    memory.update(supersedes, metadata={'status': 'superseded'})
+                    memory.update(supersedes, metadata={'status': 'superseded',
+                        'superseded_by': identifier, 'superseded_by_external_id': external})
                     old = _row(memory.get(supersedes), client, collection, memory.embedding_model)
-                    if old['status'] != 'superseded':
+                    if old['status'] != 'superseded' or old['metadata'].get('superseded_by') != identifier:
                         raise ValueError('supersede_unverified')
+                elif old['status'] != 'superseded' or old['metadata'].get('superseded_by') != identifier or \
+                        old['metadata'].get('superseded_by_external_id') != external:
+                    raise ValueError('superseded_target_invalid')
             memory.update(identifier, metadata={'status': 'active'})
         return {'kind': 'item', 'item': _row(memory.get(identifier), client, collection, memory.embedding_model)}
     if op == 'search':

@@ -43,7 +43,8 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
     return blocked('trust_changed');
   }
   const session = event === 'SessionStart'
-    ? await initializeSession(payload.cwd, payload.session_id, { ...options, event }) : resolution;
+    ? await initializeSession(payload.cwd, payload.session_id, { ...options, event, cli,
+      profile: cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR }) : resolution;
   if (session.provider !== 'mem0') return blocked(session.reason ?? 'unresolved_session');
   const transcriptPath = payload.transcript_path;
   const basename = path.basename(transcriptPath);
@@ -98,7 +99,9 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
     if (parsed.lastCompleteByte === queuedEnd) return last;
     const sliceHash = createHash('sha256').update(parsed.completeBytes).digest('hex');
     last = await outbox.enqueueCheckpoint({ cli, sessionId: payload.session_id, start: queuedEnd,
-      end: parsed.lastCompleteByte, sliceHash, messages: parsed.messages },
+      end: parsed.lastCompleteByte, sliceHash,
+      messages: parsed.messages.map(message => message.origin === 'human' && session.ownerId
+        ? { ...message, ownerId: session.ownerId } : message) },
     { projectId: session.projectId, policyVersion: POLICY_VERSION });
     if (last.kind !== 'queued' && last.kind !== 'acked') return last;
     queuedEnd = parsed.lastCompleteByte;

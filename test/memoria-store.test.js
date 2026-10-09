@@ -7,9 +7,20 @@ import { createLedger, externalIdFor, reconcileStore, transferWriter, withProjec
 import { runBridgeOperation, searchProject } from '../base/memoria/bridge.mjs';
 import { storeMemory } from '../base/memoria/bridge.mjs';
 
+async function seedLedger(stateDir, writerId = 'writer-a') {
+  await fs.mkdir(path.join(stateDir, 'ledger'), { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(stateDir, 'ledger', 'writer.json'), JSON.stringify({
+    projectId: 'p', deviceId: writerId, collection: 'fixture', generation: 1 }) + '\n', { mode: 0o600 });
+}
+
 test('remote-add observation runs after real bridge add and before local ACK', async t => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-remote-boundary-'));
-  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-remote-boundary-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, 'project');
+  await fs.mkdir(stateDir, { mode: 0o700 });
+  const deviceId = '11111111-1111-4111-8111-111111111111';
+  await fs.writeFile(path.join(root, 'device.json'), JSON.stringify({ deviceId }) + '\n', { mode: 0o600 });
+  await seedLedger(stateDir, deviceId);
   const sourceIdentity = { projectId: 'p', originCli: 'claude', sessionId: 's',
     start: 0, end: 1, sliceHash: 'a'.repeat(64), policyVersion: 'v1' };
   const operation = { externalId: externalIdFor(sourceIdentity), projectId: 'p', sessionId: 's',
@@ -20,10 +31,11 @@ test('remote-add observation runs after real bridge add and before local ACK', a
   let acked = false;
   let boundary = false;
   const result = await storeMemory('fixture', 's', operation, () => 'key', {
-    stateRoot: stateDir, writerId: 'writer',
+    stateRoot: root,
     resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir,
       destination: { collection: 'fixture' } }),
     authorize: async () => ({ kind: 'authorized', key: 'key', connection: { url: 'http://127.0.0.1/' } }),
+    control: async () => ({ kind: 'authority', record: { state: 'active', deviceId, generation: 1 } }),
     run: async (_python, _script, request) => {
       if (request.op === 'find') return { kind: 'items', items: rows };
       if (request.op === 'add') { rows.push({ ...request, sdkId: 'sdk', qdrantId: 'q', status: 'pending' });
@@ -59,7 +71,8 @@ test('verified remote state remains pending without a successful local ACK', asy
   const remote = { ...operation, sdkId: 'uuid-1', qdrantId: 'uuid-1', status: 'active' };
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-ledger-'));
   try {
-    const ledger = createLedger(root, 'writer-a');
+    await seedLedger(root);
+    const ledger = createLedger(root, 'writer-a', 1);
     const deps = { ledger, findRemote: async () => [remote], readRemote: async () => remote };
     assert.deepEqual(await reconcileStore(operation, deps), { kind: 'pending', reason: 'ack_required' });
     assert.notEqual((await ledger.read(operation.externalId)).status, 'acked');
@@ -80,7 +93,8 @@ test('verified remote state remains pending without a successful local ACK', asy
 test('canonical persists before activation and a late pending never replaces it', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-ledger-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const ledger = createLedger(root, 'writer-a');
+  await seedLedger(root);
+  const ledger = createLedger(root, 'writer-a', 1);
   const op = { externalId: 'source-1-policy-1', projectId: 'p', sessionId: 's', text: 'rule', metadata: { origin: 'user_direct', actor: 'owner', source: 'msg1', scope: 'project' } };
   const rows = [];
   let activates = 0;
@@ -103,11 +117,12 @@ test('timeout remains pending and cross writer is blocked', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-ledger-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const op = { externalId: 'source-2-policy-1', projectId: 'p', sessionId: 's', text: 'rule' };
-  const ledger = createLedger(root, 'writer-a');
+  await seedLedger(root);
+  const ledger = createLedger(root, 'writer-a', 1);
   const deps = { ledger, findRemote: async () => [], addViaSdk: async () => { throw new Error('timeout'); } };
   assert.deepEqual(await reconcileStore(op, deps), { kind: 'pending', reason: 'remote_error' });
   assert.equal((await ledger.read(op.externalId)).attempts, 1);
-  assert.deepEqual(await reconcileStore(op, { ...deps, ledger: createLedger(root, 'writer-b') }),
+  assert.deepEqual(await reconcileStore(op, { ...deps, ledger: createLedger(root, 'writer-b', 1) }),
     { kind: 'pending', reason: 'writer_mismatch' });
 });
 
@@ -181,7 +196,8 @@ test('search blocks when session project changes between resolution and bridge',
 test('two corrections of the same version become a conflict', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-ledger-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const ledger = createLedger(root, 'writer-a');
+  await seedLedger(root);
+  const ledger = createLedger(root, 'writer-a', 1);
   const base = { projectId: 'p', sessionId: 's', text: 'corrected', metadata: { supersedes_id: 'old-uuid' } };
   assert.equal((await ledger.begin({ ...base, externalId: 'correction-a' })).externalId, 'correction-a');
   assert.deepEqual(await ledger.begin({ ...base, externalId: 'correction-b' }),
@@ -218,18 +234,20 @@ test('project lock serializes independent writer processes', async (t) => {
   assert.deepEqual(order, ['first', 'second']);
 });
 
-test('writer handoff requires an explicit quiescent transfer and keeps canonical ledger', async (t) => {
+test('legacy local transfer cannot promote a writer', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-ledger-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const operation = { projectId: 'p', externalId: 'source-policy', text: 'fact' };
-  const first = createLedger(root, 'writer-a');
+  await seedLedger(root);
+  const first = createLedger(root, 'writer-a', 1);
   const record = await first.begin(operation);
   record.canonicalId = 'uuid-canonical';
   await first.save(record);
   assert.deepEqual(await transferWriter(root, { projectId: 'p', fromWriterId: 'writer-a', toWriterId: 'writer-b' }),
-    { kind: 'pending', reason: 'quiescent_handoff_required' });
+    { kind: 'pending', reason: 'administrative_transfer_required' });
   assert.deepEqual(await transferWriter(root, { projectId: 'p', fromWriterId: 'writer-a',
-    toWriterId: 'writer-b', quiescent: true }), { kind: 'transferred', writerId: 'writer-b' });
-  assert.deepEqual(await first.begin(operation), { kind: 'pending', reason: 'writer_mismatch' });
-  assert.equal((await createLedger(root, 'writer-b').begin(operation)).canonicalId, 'uuid-canonical');
+    toWriterId: 'writer-b', quiescent: true }), { kind: 'pending', reason: 'administrative_transfer_required' });
+  assert.equal((await first.begin(operation)).canonicalId, 'uuid-canonical');
+  assert.deepEqual(await createLedger(root, 'writer-b', 1).begin(operation),
+    { kind: 'pending', reason: 'writer_mismatch' });
 });

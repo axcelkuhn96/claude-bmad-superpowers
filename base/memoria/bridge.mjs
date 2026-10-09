@@ -5,6 +5,8 @@ import { resolveProject } from './provider.mjs';
 import { runtimePython } from './runtime.mjs';
 import { requestBroker } from './broker.mjs';
 import { createLedger, externalIdFor, reconcileStore, withProjectLock } from './ledger.mjs';
+import { assertWriter } from './authority.mjs';
+import { targetVersion } from './correction.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'python', 'mem0_adapter.py');
@@ -19,6 +21,10 @@ export async function runBridgeOperation(cwd, sessionId, operation, readSecret, 
   const auth = await (options.authorize ?? authorizeCurrentDestination)(cwd, sessionId, readSecret,
     { ...options, deadlineAt });
   if (auth.kind !== 'authorized') return auth;
+  if (['add', 'activate'].includes(operation.op)) {
+    const writer = await assertWriter(resolution, auth, options);
+    if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+  }
   const remaining = deadlineAt === null ? options.deadlineMs : Math.floor(deadlineAt - Date.now());
   if (deadlineAt !== null && remaining <= 0) return blocked('deadline');
   const request = { ...operation, collection: resolution.destination.collection, connection: auth.connection };
@@ -32,7 +38,7 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
   if (!operation?.externalId || !operation?.projectId || !operation?.sessionId ||
       !operation?.text || !operation?.metadata?.source || !operation.metadata.actor ||
       !operation.metadata.origin || !operation.metadata.scope || !operation.metadata.evidence_at ||
-      operation.approval?.kind !== 'approved' || !options.writerId ||
+      operation.approval?.kind !== 'approved' ||
       (operation.metadata.scope === 'personal' && !operation.metadata.owner_id)) return blocked('invalid_store');
   try {
     if (externalIdFor(operation.sourceIdentity) !== operation.externalId ||
@@ -42,8 +48,31 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
   const resolution = await (options.resolve ?? resolveProject)(cwd, sessionId, options);
   if (resolution.provider !== 'mem0' || resolution.projectId !== operation.projectId) return blocked('project_mismatch');
   const bridge = request => runBridgeOperation(cwd, sessionId, request, readSecret, options);
-  const response = await withProjectLock(resolution.stateDir, () => reconcileStore(operation, {
-    ledger: createLedger(resolution.stateDir, options.writerId),
+  const response = await withProjectLock(resolution.stateDir, async () => {
+    const auth = await (options.authorize ?? authorizeCurrentDestination)(cwd, sessionId, readSecret, options);
+    if (auth.kind !== 'authorized') return auth;
+    const writer = await assertWriter(resolution, auth, options);
+    if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+    const checkTarget = async () => {
+      const targetId = operation.metadata.supersedes_id;
+      if (!targetId) return { kind: 'eligible' };
+      const result = await bridge({ op: 'read', projectId: operation.projectId, sdkId: targetId });
+      const target = result.item;
+      if (result.kind !== 'item' || !target || target.projectId !== operation.projectId ||
+          target.externalId !== operation.metadata.correction_target_external_id ||
+          target.metadata?.scope !== operation.metadata.scope ||
+          (operation.metadata.scope === 'personal' &&
+            target.metadata?.owner_id !== operation.metadata.owner_id)) return { kind: 'conflict', reason: 'target_changed' };
+      if (target.status === 'active' &&
+          targetVersion(target) === operation.metadata.correction_target_version) return { kind: 'eligible' };
+      if (target.status === 'superseded' &&
+          target.metadata.superseded_by_external_id === operation.externalId) return { kind: 'eligible' };
+      return { kind: 'conflict', reason: 'target_changed' };
+    };
+    const target = await checkTarget();
+    if (target.kind !== 'eligible') return target;
+    return reconcileStore(operation, {
+    ledger: createLedger(resolution.stateDir, writer.deviceId, writer.generation),
     findRemote: async externalId => {
       const result = await bridge({ op: 'find', projectId: operation.projectId, externalId });
       if (result.kind !== 'items') throw Object.assign(new Error('remote_read_failed'), { code: result.reason ?? 'remote_read_failed' });
@@ -60,12 +89,16 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
       return result.item;
     },
     activateViaSdk: async sdkId => {
+      const target = await checkTarget();
+      if (target.kind !== 'eligible') throw Object.assign(new Error('target_changed'),
+        { code: 'target_changed', conflict: true });
       const result = await bridge({ op: 'activate', projectId: operation.projectId,
         externalId: operation.externalId, sdkId });
       if (result.kind !== 'item') throw Object.assign(new Error('remote_activate_failed'), { code: result.reason ?? 'remote_activate_failed' });
     },
     ackLocal: options.ackLocal,
-  }));
+  });
+  });
   return response;
 }
 

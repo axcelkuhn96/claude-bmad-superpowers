@@ -11,6 +11,7 @@ import { createMcp } from '../base/memoria/mcp.mjs';
 import { scheduleExtraction, consumeCheckpoints } from '../base/memoria/extract-worker.mjs';
 import { recordSessionCheckout } from '../base/memoria/session-checkout.mjs';
 import { createOutbox } from '../base/memoria/outbox.mjs';
+import { configureExtractor } from '../base/memoria/policy.mjs';
 import { withProjectLock } from '../base/memoria/ledger.mjs';
 import { createLaunch, bindLaunch, resolveBoundLaunch, launchCli } from '../base/memoria/launch.mjs';
 import { recallForPrompt } from '../base/memoria/hook-recall.mjs';
@@ -367,7 +368,7 @@ test('bound caller may propose protected historical checkpoints from the same pr
       cwd: '/trusted-checkout' }),
     read: async () => ({ kind: 'item', item: { projectId: 'p', sessionId: 'prior',
       metadata: { source: 'm', checkpoint_id: historical.operationId, policy_version: 'native-v1' } } }) });
-  assert.equal((await sourceMcp.call('source', { memory_id: 'historical' })).kind, 'local_source');
+  assert.equal((await sourceMcp.call('source', { memory_id: 'historical' })).kind, 'remote_metadata');
 });
 
 test('two explicit launches bind interleaved native sessions once', async t => {
@@ -701,6 +702,8 @@ test('consumer processes a protected checkpoint once, then recovery skips its ma
     else process.env.CLAUDE_CONFIG_DIR = prior; });
   const current = await inspectConfiguration(root, { stateRoot });
   await writeLocalTrust(current.stateDir, trustTuple(current));
+  assert.equal((await configureExtractor(current, { route: 'sonnet', profile,
+    executable: process.execPath })).kind, 'selected');
   assert.equal((await applyNativeExclusion(root, { cli: 'claude', stateRoot })).kind, 'applied');
   await initializeSession(root, 's', { event: 'SessionStart', stateRoot });
   assert.equal((await recordSessionCheckout(current, 'claude', 's', root)).kind, 'bound');
@@ -739,8 +742,8 @@ test('consumer processes a protected checkpoint once, then recovery skips its ma
   await fs.mkdir(third);
   git(third, 'init', '-q');
   process.env.CLAUDE_CONFIG_DIR = third;
-  assert.equal((await consumeCheckpoints({ cli: 'claude', cwd: root, sessionId: 's', stateRoot, runCli })).reason,
-    'cli_profile_untrusted');
+  assert.deepEqual(await consumeCheckpoints({ cli: 'claude', cwd: root, sessionId: 's',
+    stateRoot, runCli }), { kind: 'consumed', manifested: 0, pending: 0 });
   assert.equal(calls, 4);
 });
 
@@ -771,6 +774,10 @@ test('consumer binds pending checkpoint to the exact trusted worktree', async t 
   }
   const current = await inspectConfiguration(worktree, { stateRoot });
   await writeLocalTrust(current.stateDir, trustTuple(current));
+  const profile = path.join(dir, 'profile');
+  await fs.mkdir(profile, { mode: 0o700 });
+  assert.equal((await configureExtractor(current, { route: 'sonnet', profile,
+    executable: process.execPath })).kind, 'selected');
   assert.equal((await applyNativeExclusion(worktree,
     { cli: 'codex', stateRoot, installedPlugin: true, projectRoot: root })).kind, 'applied');
   await initializeSession(worktree, 'linked-session', { event: 'SessionStart', stateRoot });
@@ -780,8 +787,6 @@ test('consumer binds pending checkpoint to the exact trusted worktree', async t 
     sliceHash: 'c'.repeat(64), messages: [{ messageId: 'm', role: 'user', speakerRole: 'user',
       actor: 'owner', origin: 'human', text: 'Rule X.', timestamp: '2026-10-01T00:00:00Z', start: 0, end: 10 }] },
   { projectId: 'p', policyVersion: 'native-v1' });
-  const profile = path.join(dir, 'profile');
-  await fs.mkdir(profile, { mode: 0o700 });
   const prior = process.env.CLAUDE_CONFIG_DIR;
   process.env.CLAUDE_CONFIG_DIR = profile;
   t.after(() => { if (prior === undefined) delete process.env.CLAUDE_CONFIG_DIR;

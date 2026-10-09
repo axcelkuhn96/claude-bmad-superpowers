@@ -29,8 +29,10 @@ const modelFact = { candidate_key: 'fable_review', source_message_id: 'm1',
   text: source.text, type: 'fact', scope: 'project' };
 
 async function fixture(t, messages = [source]) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-candidates-'));
-  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-candidates-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const dir = path.join(root, 'state');
+  await fs.mkdir(dir, { mode: 0o700 });
   const box = createOutbox(dir);
   const item = { ...slice, messages };
   const queued = await box.enqueueCheckpoint(item, { projectId: 'p', policyVersion: 'native-v1' });
@@ -429,7 +431,7 @@ test('owner terminal rejection records local UID, username, item hash and decisi
   let step = 0;
   child.stdout.on('data', chunk => {
     output += chunk;
-    if (step === 0 && output.includes('Action (accept/reject/duplicate/edit): ')) {
+    if (step === 0 && output.includes('Action (accept/reject/duplicate/edit/correct): ')) {
       step++; child.stdin.write('reject\n');
     } else if (step === 1 && output.includes('Reason code: ')) {
       step++; child.stdin.write('unsupported_claim\n');
@@ -471,7 +473,7 @@ test('owner terminal acceptance seals review before one verified child ACK', asy
   let step = 0;
   child.stdout.on('data', chunk => {
     output += chunk;
-    if (step === 0 && output.includes('Action (accept/reject/duplicate/edit): ')) {
+    if (step === 0 && output.includes('Action (accept/reject/duplicate/edit/correct): ')) {
       step++; child.stdin.write('accept\n');
     } else if (step === 1 && output.includes('Confirm accept for ')) {
       step++; child.stdin.write('yes\n');
@@ -489,6 +491,54 @@ test('owner terminal acceptance seals review before one verified child ACK', asy
     `${receipt.candidates[0].externalId}.json`)));
   assert.equal(review.review.actor, `uid:${process.getuid()}:${os.userInfo().username}`);
   assert.equal(review.review.operation.text, candidate.text);
+});
+
+test('owner terminal correction seals an active target before ACK', async t => {
+  const { dir, box, checkpoint } = await fixture(t);
+  assert.equal((await extractCheckpoint(checkpoint, { route: 'sonnet', account: 'claude2' }, {
+    outbox: box, runCli: async () => ({ kind: 'success', no_facts: false, candidates: [modelCandidate] }),
+  })).kind, 'manifested');
+  const target = { kind: 'item', item: { sdkId: 'sdk-old', externalId: 'src-' + 'f'.repeat(64),
+    projectId: 'p', status: 'active', text: 'Old rule', metadata: { scope: 'project',
+      source: 'old-message', evidence_at: '2026-09-01T00:00:00Z' } } };
+  const runner = path.join(dir, 'owner-correct.mjs');
+  await fs.writeFile(runner, `import fs from 'node:fs/promises';\n` +
+    `import { createOutbox } from ${JSON.stringify(new URL('../base/memoria/outbox.mjs', import.meta.url).href)};\n` +
+    `import { reviewCandidateOnTerminal } from ${JSON.stringify(new URL('../base/memoria/candidates.mjs', import.meta.url).href)};\n` +
+    `const box = createOutbox(${JSON.stringify(dir)});\n` +
+    `const result = await reviewCandidateOnTerminal(${JSON.stringify(checkpoint.operationId)}, 'fable_review', { outbox: box, ` +
+    `readTarget: async id => id === 'sdk-old' ? ${JSON.stringify(target)} : { kind: 'blocked' }, ` +
+    `store: async op => { await fs.writeFile(${JSON.stringify(path.join(dir, 'correction-operation.json'))}, JSON.stringify(op)); ` +
+    `return box.ackCandidate(${JSON.stringify(checkpoint.operationId)}, 'fable_review', ` +
+    `{ externalId: op.externalId, projectId: op.projectId, status: 'active', sdkId: 'sdk-new', qdrantId: 'q-new' }); } });\n` +
+    `console.log('RESULT=' + JSON.stringify(result));\n`);
+  const child = spawn('/usr/bin/script', ['-q', '-e', '-c', `${process.execPath} ${runner}`, '/dev/null'],
+    { stdio: ['pipe', 'pipe', 'pipe'] });
+  let output = '';
+  let step = 0;
+  child.stdout.on('data', chunk => {
+    output += chunk;
+    if (step === 0 && output.includes('Action (accept/reject/duplicate/edit/correct): ')) {
+      step++; child.stdin.write('correct\n');
+    } else if (step === 1 && output.includes('Active memory SDK ID to correct: ')) {
+      step++; child.stdin.write('sdk-old\n');
+    } else if (step === 2 && output.includes('Confirm correct for ')) {
+      step++; child.stdin.write('yes\n');
+    }
+  });
+  const code = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
+  assert.equal(code, 0, output);
+  assert.match(output, /RESULT=\{"kind":"processed"/);
+  const operation = JSON.parse(await fs.readFile(path.join(dir, 'correction-operation.json')));
+  assert.equal(operation.metadata.supersedes_id, 'sdk-old');
+  assert.equal(operation.metadata.correction_target_external_id, target.item.externalId);
+  const review = JSON.parse(await fs.readFile(path.join(dir, 'candidates', 'reviews', `${operation.externalId}.json`)));
+  assert.equal(review.review.decision, 'correct');
+  assert.equal(review.review.target.sdkId, 'sdk-old');
+  assert.equal((await box.readDisposition(checkpoint.operationId)).candidates[0].status, 'remote_acked');
 });
 
 test('first child ACK returns success while sibling remains pending', async t => {
@@ -768,7 +818,14 @@ test('canonical store reuses remote commit after failed local child ACK', async 
   let adds = 0;
   let ackFails = true;
   assert.equal((await sealFixture(box, checkpoint.operationId, child.candidateKey, 'approve')).kind, 'sealed');
-  const bridge = { writerId: 'writer-a', resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir: dir,
+  const stateRoot = path.dirname(dir);
+  const deviceId = '22222222-2222-4222-8222-222222222222';
+  await fs.writeFile(path.join(stateRoot, 'device.json'), JSON.stringify({ deviceId }) + '\n', { mode: 0o600 });
+  await fs.mkdir(path.join(dir, 'ledger'), { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(dir, 'ledger', 'writer.json'), JSON.stringify({ projectId: 'p',
+    deviceId, generation: 1, collection: 'private' }) + '\n', { mode: 0o600 });
+  const bridge = { control: async () => ({ kind: 'authority', record: { state: 'active', deviceId,
+    generation: 1 } }), resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir: dir,
       destination: { collection: 'private' } }), authorize: async () => ({ kind: 'authorized', key: 'fixture-key',
       connection: { url: 'http://127.0.0.1:6333/' } }),
     run: async (_python, _program, request) => {
@@ -811,6 +868,7 @@ process.stdin.resume(); process.stdin.on('end', () => process.stdout.write(JSON.
 subtype:'success', is_error:false, structured_output:{candidates:[],no_facts:true},
 modelUsage:{'unexpected':{canonicalModel:'unexpected'}}, usage:{input_tokens:1,output_tokens:1}})));`;
   await fs.writeFile(path.join(dir, 'claude'), script, { mode: 0o700 });
+  const policy = { route: 'sonnet', profile, executable: path.join(dir, 'claude') };
   const oldPath = process.env.PATH;
   const oldKey = process.env.CBS_MEMORIA_API_KEY;
   const oldOpenAI = process.env.OPENAI_API_KEY;
@@ -820,11 +878,11 @@ modelUsage:{'unexpected':{canonicalModel:'unexpected'}}, usage:{input_tokens:1,o
     process.env.CLAUDE_CONFIG_DIR = profile;
     process.env.CBS_MEMORIA_API_KEY = 'fixture-secret';
     process.env.OPENAI_API_KEY = 'fixture-secret';
-    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', account: 'claude2' }),
+    assert.deepEqual(await runSonnetExtraction('{}', policy),
       { kind: 'error', reason: 'cli_model_mismatch' });
     await fs.writeFile(path.join(dir, 'claude'), `#!${process.execPath}\nprocess.stdin.resume();\n` +
       `process.stdin.on('end', () => process.stdout.write('null'));`, { mode: 0o700 });
-    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', account: 'claude2' }),
+    assert.deepEqual(await runSonnetExtraction('{}', policy),
       { kind: 'error', reason: 'cli_invalid_schema' });
   } finally {
     process.env.PATH = oldPath;
@@ -995,12 +1053,13 @@ test('CLI keeps available cache-token categories and derives the outbox input to
     `{input_tokens:2,cache_read_input_tokens:7,cache_creation_input_tokens:11,output_tokens:3},\n` +
     `total_cost_usd:0.01})));`;
   await fs.writeFile(path.join(dir, 'claude'), script, { mode: 0o700 });
+  const policy = { route: 'sonnet', profile, executable: path.join(dir, 'claude') };
   const oldPath = process.env.PATH;
   const oldProfile = process.env.CLAUDE_CONFIG_DIR;
   try {
     process.env.PATH = `${dir}:${oldPath}`;
     process.env.CLAUDE_CONFIG_DIR = profile;
-    const result = await runSonnetExtraction('{}', { route: 'sonnet', account: 'claude2' });
+    const result = await runSonnetExtraction('{}', policy);
     assert.equal(result.kind, 'success');
     assert.deepEqual(result.usage, { inputTokens: 20, inputUncachedTokens: 2,
       inputCacheReadTokens: 7, inputCacheCreationTokens: 11, outputTokens: 3, costUsd: 0.01 });
@@ -1011,7 +1070,7 @@ test('CLI keeps available cache-token categories and derives the outbox input to
     assert.equal(extraction.kind, 'processed');
     assert.deepEqual(await box.extractionUsage('claude', 's'),
       { calls: 1, inputTokens: 20, outputTokens: 3, costUsd: 0.01 });
-    const partial = await runSonnetExtraction('uncached-only', { route: 'sonnet', account: 'claude2' });
+    const partial = await runSonnetExtraction('uncached-only', policy);
     assert.deepEqual(partial.usage, { inputTokens: 2, inputUncachedTokens: 2,
       inputCacheReadTokens: null, inputCacheCreationTokens: null, outputTokens: 3, costUsd: 0.01 });
   } finally {
@@ -1031,19 +1090,21 @@ test('CLI requires an explicit trusted local profile and ignores a model or poli
     `process.stdin.resume(); process.stdin.on('end', () => process.stdout.write(JSON.stringify({\n` +
     `subtype:'success',is_error:false,structured_output:{candidates:[],no_facts:true},\n` +
     `modelUsage:{sonnet:{canonicalModel:'claude-sonnet-5-5'}}})));`, { mode: 0o700 });
+  const executable = path.join(dir, 'claude');
   const oldPath = process.env.PATH;
   const oldProfile = process.env.CLAUDE_CONFIG_DIR;
   try {
     process.env.PATH = `${dir}:${oldPath}`;
     delete process.env.CLAUDE_CONFIG_DIR;
     assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', account: 'claude2',
-      profileDir: profile }), { kind: 'error', reason: 'cli_profile_unselected' });
+      profileDir: profile, executable }), { kind: 'error', reason: 'cli_profile_unselected' });
     process.env.CLAUDE_CONFIG_DIR = process.cwd();
-    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', account: 'claude2' }),
+    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', profile: process.cwd(), executable }),
       { kind: 'error', reason: 'cli_profile_untrusted' });
     process.env.CLAUDE_CONFIG_DIR = profile;
-    assert.equal((await runSonnetExtraction('{}', { route: 'sonnet', account: 'claude2' })).kind, 'success');
-    assert.equal((await runSonnetExtraction('{}', { route: 'sonnet', account: 'other-local-profile' })).kind, 'success');
+    assert.equal((await runSonnetExtraction('{}', { route: 'sonnet', profile, executable })).kind, 'success');
+    assert.equal((await runSonnetExtraction('{}', { route: 'sonnet', profile, executable,
+      account: 'other-local-profile' })).kind, 'success');
   } finally {
     process.env.PATH = oldPath;
     if (oldProfile === undefined) delete process.env.CLAUDE_CONFIG_DIR;
@@ -1081,6 +1142,7 @@ test('CLI rejects checkout profiles from external and nested cwd, including syml
     `process.stdin.resume(); process.stdin.on('end', () => process.stdout.write(JSON.stringify({\n` +
     `subtype:'success',is_error:false,structured_output:{candidates:[],no_facts:true},\n` +
     `modelUsage:{sonnet:{canonicalModel:'claude-sonnet-5-5'}}})));`, { mode: 0o700 });
+  const executable = path.join(dir, 'claude');
   const oldCwd = process.cwd();
   const oldPath = process.env.PATH;
   const oldProfile = process.env.CLAUDE_CONFIG_DIR;
@@ -1090,20 +1152,22 @@ test('CLI rejects checkout profiles from external and nested cwd, including syml
     process.env.CLAUDE_CONFIG_DIR = inRepo;
     process.env.GIT_DIR = path.join(repo, '.git');
     process.chdir(outside);
-    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet' }),
+    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', profile: inRepo, executable }),
       { kind: 'error', reason: 'cli_project_unresolved' });
     if (oldGitDir === undefined) delete process.env.GIT_DIR;
     else process.env.GIT_DIR = oldGitDir;
     process.chdir(nested);
-    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet' }),
+    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', profile: inRepo, executable }),
       { kind: 'error', reason: 'cli_profile_untrusted' });
     process.chdir(linkedCwd);
     process.env.CLAUDE_CONFIG_DIR = linkedInRepo;
-    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet' }),
+    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', profile: linkedInRepo, executable }),
       { kind: 'error', reason: 'cli_profile_untrusted' });
     await assert.rejects(fs.access(marker), { code: 'ENOENT' });
     process.env.CLAUDE_CONFIG_DIR = linkedExternal;
-    assert.equal((await runSonnetExtraction('{}', { route: 'sonnet' })).kind, 'success');
+    assert.deepEqual(await runSonnetExtraction('{}', { route: 'sonnet', profile: linkedExternal, executable }),
+      { kind: 'error', reason: 'cli_profile_untrusted' });
+    assert.equal((await runSonnetExtraction('{}', { route: 'sonnet', profile: external, executable })).kind, 'success');
     assert.equal(await fs.readFile(marker, 'utf8'), await fs.realpath(external));
   } finally {
     process.chdir(oldCwd);

@@ -686,6 +686,57 @@ export function createOutbox(stateDir, options = {}) {
       return await payloadValid(candidate.payloadRef, row, candidate) || blocked('candidate_payload_mismatch');
     });
   }
+  async function sourceForRemote(item) {
+    const externalId = item?.externalId;
+    if (!validId(externalId) || typeof item.projectId !== 'string' ||
+        typeof item.sessionId !== 'string' || !item.metadata?.source ||
+        !item.metadata?.checkpoint_id || !item.metadata?.source_offsets) return blocked('source_unavailable');
+    return withLock(async () => {
+      let names;
+      try { names = (await fs.readdir(payloads)).filter(name =>
+        name.startsWith(`${externalId}.`) && /^src-[a-f0-9]{64}\.[a-f0-9]{64}\.json$/.test(name)); }
+      catch (error) { if (error.code === 'ENOENT') return blocked('source_unavailable'); throw error; }
+      if (names.length !== 1) return blocked(names.length ? 'source_ambiguous' : 'source_unavailable');
+      const file = path.join(payloads, names[0]);
+      let bytes;
+      if (windows) {
+        const observed = await readWindowsBinary(file, { length: 1024 * 1024 });
+        if (observed.size !== observed.bytes.length) return blocked('source_corrupt');
+        bytes = observed.bytes;
+      } else {
+        const dir = await fs.lstat(payloads);
+        const stat = await fs.lstat(file);
+        if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o077) ||
+            !stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid() ||
+            (stat.mode & 0o077) || stat.size > 1024 * 1024) return blocked('source_corrupt');
+        const handle = await fs.open(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        try {
+          const opened = await handle.stat();
+          if (opened.dev !== stat.dev || opened.ino !== stat.ino) return blocked('source_corrupt');
+          bytes = await handle.readFile();
+        } finally { await handle.close(); }
+      }
+      if (hash(bytes) !== names[0].slice(externalId.length + 1, -5)) return blocked('source_corrupt');
+      let payload;
+      try { payload = JSON.parse(bytes); } catch { return blocked('source_corrupt'); }
+      const metadata = item.metadata;
+      if (payload.external_id !== externalId || payload.project_id !== item.projectId ||
+          payload.session_id !== item.sessionId || payload.checkpoint_id !== metadata.checkpoint_id ||
+          payload.source_message_id !== metadata.source ||
+          JSON.stringify(payload.source_offsets) !== JSON.stringify(metadata.source_offsets) ||
+          payload.policy_version !== metadata.policy_version ||
+          payload.scope !== metadata.scope || payload.owner_id !== (metadata.owner_id ?? null) ||
+          payload.actor !== metadata.actor || payload.origin !== metadata.origin ||
+          payload.evidence_at !== metadata.evidence_at ||
+          typeof payload.text !== 'string' || !payload.text.includes(item.text) ||
+          payload.text.length > 8192) return blocked('source_mismatch');
+      return { kind: 'local_source', text: item.text,
+        metadata: { source: metadata.source, source_offsets: metadata.source_offsets,
+          checkpoint_id: metadata.checkpoint_id, evidence_at: metadata.evidence_at,
+          origin: metadata.origin, actor: metadata.actor, scope: metadata.scope,
+          owner_id: metadata.owner_id ?? null } };
+    });
+  }
   async function readReview(operationId, candidateKey) {
     if (!validId(operationId) || typeof candidateKey !== 'string') return blocked('invalid_candidate');
     return withLock(async () => {
@@ -738,7 +789,7 @@ export function createOutbox(stateDir, options = {}) {
   }
   async function sealReview(operationId, candidateKey, review) {
     if (!validId(operationId) || typeof candidateKey !== 'string' ||
-        !['approve', 'reject', 'duplicate'].includes(review?.decision)) return blocked('invalid_review');
+        !['approve', 'correct', 'reject', 'duplicate'].includes(review?.decision)) return blocked('invalid_review');
     return withLock(async () => {
       const row = await read(itemFile(operationId));
       const manifest = await read(manifestFile(operationId));
@@ -967,7 +1018,7 @@ export function createOutbox(stateDir, options = {}) {
       return structuredClone(manifest);
     });
   }
-  return { enqueueCheckpoint, ackVerified, recordManifest, persistCandidatePayload,
+  return { enqueueCheckpoint, ackVerified, recordManifest, persistCandidatePayload, sourceForRemote,
     claimExtraction, recordExtractionUsage, extractionUsage, readCandidatePayload, readReview, sealReview,
     readManifest,
     ackCandidate: (id, key, proof) => updateCandidate(id, key, 'remote_acked', null, proof),

@@ -17,6 +17,7 @@ import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
 import { prepareWindowsOverlay, holdWindowsOverlay, removeWindowsOverlay,
   verifyWindowsLaunchOverlay } from './windows-overlay.mjs';
 import { resolveEnrolledWindowsTool } from './windows-enrollment.mjs';
+import { readOwner, readExtractor } from './policy.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const rootDefault = () => path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
@@ -107,14 +108,19 @@ export async function createLaunch(cwd, cli, { stateRoot } = {}) {
   if (!['claude', 'codex'].includes(cli) || (process.platform !== 'win32' && !process.getuid)) return blocked('native_windows_unproved');
   const current = await inspectConfiguration(cwd, { stateRoot });
   if (current.provider !== 'mem0') return blocked(current.reason ?? 'not_mem0');
+  if (await fs.lstat(path.join(current.stateDir, 'deactivating.json')).then(() => true,
+    error => error.code === 'ENOENT' ? false : Promise.reject(error))) return blocked('deactivation_pending');
   const scope = await identifyProject(cwd);
   if (scope.kind !== 'git') return blocked('unsupported_git');
   const nativeRoot = scope.activeRoot;
   const trust = await readLocalTrust(current.stateDir);
   const expected = trustTuple(current);
   if (!trust || Object.entries(expected).some(([key, value]) => trust[key] !== value)) return blocked('trust_changed');
-  let captureSource;
   const profile = cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR;
+  const owner = await readOwner(current, cli, profile);
+  const extractor = await readExtractor(current);
+  if (owner?.kind === 'blocked' || extractor?.kind === 'blocked') return blocked('local_policy_changed');
+  let captureSource;
   if (process.platform === 'win32') {
     const verified = await verifyNativeCapture(nativeRoot, { cli, projectRoot: current.projectRoot,
       stateRoot, profile });
@@ -145,6 +151,7 @@ export async function createLaunch(cwd, cli, { stateRoot } = {}) {
   }
   const record = { cli, nativeRoot, projectRoot: current.projectRoot, projectId: current.projectId,
     destination: current.destination, embeddingFingerprint: current.embeddingFingerprint,
+    ownerId: owner?.ownerId ?? null, extractor: extractor ?? null,
     createdAt: Date.now(), ...(process.platform === 'win32'
       ? { profile, ...(overlay ? { overlay } : {}) } : {}) };
   if (process.platform === 'win32') {
@@ -163,6 +170,9 @@ export async function bindLaunch(token, cli, cwd, nativeSessionId, { stateRoot }
   const scope = await identifyProject(cwd);
   const current = await inspectConfiguration(cwd, { stateRoot });
   if (scope.kind !== 'git' || scope.activeRoot !== saved.nativeRoot || !same(current, saved)) return blocked('launch_changed');
+  const frozen = await resolveProject(cwd, nativeSessionId, { stateRoot });
+  if (frozen.provider !== 'mem0' || frozen.ownerId !== (saved.ownerId ?? null) ||
+      JSON.stringify(frozen.extractor) !== JSON.stringify(saved.extractor ?? null)) return blocked('launch_changed');
   const file = bindingFile(stateRoot, token);
   if (process.platform === 'win32') {
     try {
@@ -209,7 +219,7 @@ export async function resolveBoundLaunch(token, cli, { stateRoot } = {}) {
   const scope = await identifyProject(saved.nativeRoot);
   if (scope.kind !== 'git' || scope.activeRoot !== saved.nativeRoot || !same(current, saved)) return blocked('launch_changed');
   return { kind: 'bound', cwd: saved.nativeRoot, nativeSessionId: bound.nativeSessionId,
-    projectId: saved.projectId, stateDir: current.stateDir, cli };
+    projectId: saved.projectId, stateDir: current.stateDir, ownerId: current.ownerId ?? null, cli };
 }
 
 export async function buildLaunchCommand(cwd, cli, args = [], options = {}, made) {
@@ -312,7 +322,13 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
       child.once('error', () => resolve(blocked('cli_unavailable')));
       child.once('exit', (code, signal) => resolve({ kind: 'exited', code, signal }));
     });
-  } finally { launch.release(); await launch.cleanup(); }
+  } finally {
+    launch.release(); await launch.cleanup();
+    const file = path.join(launchDir(options.stateRoot), `${digest(made.token)}.closed`);
+    await fs.writeFile(file, JSON.stringify({ tokenDigest: digest(made.token),
+      projectId: made.record.projectId, closedAt: new Date().toISOString() }) + '\n',
+    { flag: 'wx', mode: 0o600 });
+  }
 }
 
 function safeClaudeArgs(args) {
@@ -364,11 +380,16 @@ function safeCodexArgs(args) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  if (process.platform !== 'win32') {
+    process.stdout.write('blocked: local_native_gate_failed\n');
+    process.exitCode = 1;
+  } else {
   const [cli, cwd, ...args] = process.argv.slice(2);
   if (!cli || !cwd) { process.stderr.write('Usage: node launch.mjs <claude|codex> <checkout> [cli args...]\n'); process.exitCode = 2; }
   else {
     const result = await launchCli(cwd, cli, args);
     if (result.kind !== 'exited') { process.stderr.write(`CBS Mem0: ${result.reason}\n`); process.exitCode = 1; }
     else process.exitCode = result.code ?? 1;
+  }
   }
 }

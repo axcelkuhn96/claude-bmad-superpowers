@@ -52,7 +52,7 @@ export function createMcp({ launchId = process.env.CBS_MEMORIA_LAUNCH_ID,
       try {
         answer = await Promise.race([
           search({ cwd: bound.cwd, sessionId: bound.nativeSessionId, query: args.query }, secret,
-            { stateRoot, deadlineMs: remaining() }),
+            { stateRoot, deadlineMs: remaining(), ownerId: bound.ownerId }),
           new Promise(resolveDeadline => { searchTimer = setTimeout(() => resolveDeadline(blocked('deadline')), remaining()); }),
         ]);
       } catch { return blocked('search_failed'); }
@@ -76,16 +76,12 @@ export function createMcp({ launchId = process.env.CBS_MEMORIA_LAUNCH_ID,
         { op: 'read', projectId: bound.projectId, sdkId: args.memory_id }, secret, { stateRoot });
       if (result.kind !== 'item' || result.item?.projectId !== bound.projectId) return blocked('source_unavailable');
       const item = result.item;
-      const box = createOutbox(bound.stateDir);
-      const rows = await box.pending();
-      const source = rows.flatMap(row => row.projectId === bound.projectId &&
-        row.sessionId === item.sessionId && row.policyVersion === POLICY_VERSION &&
-        row.operationId === item.metadata?.checkpoint_id &&
-        item.metadata?.policy_version === POLICY_VERSION ? row.messages : [])
-        .find(message => message.messageId === item.metadata?.source);
-      return source ? { kind: 'local_source', text: source.text, metadata: item.metadata } :
-        { kind: 'remote_metadata', metadata: item.metadata,
-          limitation: 'Source transcript is available only from a protected local checkpoint on its owning machine.' };
+      const source = await createOutbox(bound.stateDir).sourceForRemote(item);
+      return source.kind === 'local_source' ? source :
+        { kind: 'remote_metadata', metadata: { source: item.metadata?.source,
+          source_offsets: item.metadata?.source_offsets, evidence_at: item.metadata?.evidence_at,
+          origin: item.metadata?.origin, actor: item.metadata?.actor },
+        limitation: source.reason ?? 'source_unavailable' };
     }
     if (name === 'propose') {
       const box = createOutbox(bound.stateDir);

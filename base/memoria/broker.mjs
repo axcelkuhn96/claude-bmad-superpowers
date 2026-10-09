@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { FrameReader, encodeFrame } from './frame.mjs';
 import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { authorizeCurrentDestination } from './setup.mjs';
+import { assertWriter } from './authority.mjs';
 import { readLocalTrust, trustTuple } from './trust.mjs';
 import { openArtifactIdentity, runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { withProjectLock } from './ledger.mjs';
@@ -389,6 +390,10 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     const authorized = await authorizeCurrentDestination(cwd, sessionId, () => secret.toString('utf8'),
       { stateRoot, deadlineAt, signal });
     if (authorized.kind !== 'authorized') return blocked(authorized.reason);
+    if (['add', 'activate'].includes(operation.op)) {
+      const writer = await assertWriter(current, authorized, { stateRoot });
+      if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+    }
     const request = { ...operation, projectId: current.projectId, state: current.stateDir,
       collection: current.destination.collection, connection: authorized.connection };
     if (deadlineAt <= Date.now()) return blocked('deadline');

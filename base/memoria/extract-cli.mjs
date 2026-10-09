@@ -17,14 +17,20 @@ export async function runSonnetExtraction(prompt, policy = {}) {
       typeof prompt !== 'string' || Buffer.byteLength(prompt) > 1024 * 1024) {
     return { kind: 'error', reason: 'invalid_cli_request' };
   }
-  const configuredProfile = process.env.CLAUDE_CONFIG_DIR;
+  const configuredProfile = policy.profile;
   if (!configuredProfile) return { kind: 'error', reason: 'cli_profile_unselected' };
+  if (typeof policy.executable !== 'string' || !path.isAbsolute(policy.executable)) {
+    return { kind: 'error', reason: 'cli_executable_unselected' };
+  }
   const scope = await identifyProject(process.cwd());
   if (scope.kind !== 'git') return { kind: 'error', reason: 'cli_project_unresolved' };
   let profile;
   try {
     if (!path.isAbsolute(configuredProfile)) throw new Error('relative profile');
     profile = await fs.realpath(configuredProfile);
+    if (profile !== configuredProfile || await fs.realpath(policy.executable) !== policy.executable) {
+      throw new Error('selected paths changed');
+    }
     const metadata = process.platform === 'win32'
       ? await inspectWindowsPath(profile, 'directory') : await fs.stat(profile);
     if ((process.platform === 'win32' ? !metadata.ok :
@@ -58,7 +64,7 @@ export async function runSonnetExtraction(prompt, policy = {}) {
         USERPROFILE: cwd, CLAUDE_CONFIG_DIR: profile } :
         { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: cwd,
           CLAUDE_CONFIG_DIR: profile, LANG: 'C.UTF-8' };
-      const child = spawn(tool?.executable ?? 'claude', args,
+      const child = spawn(tool?.executable ?? policy.executable, args,
         { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
       let output = '';
       let oversized = false;

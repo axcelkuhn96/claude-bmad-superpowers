@@ -130,11 +130,12 @@ export async function recallForPrompt({ cli, event = 'UserPromptSubmit', payload
     let timer;
     const answer = await Promise.race([
       search({ cwd: payload.cwd, sessionId: payload.session_id, projectId: current.projectId,
-        query: payload.prompt }, readSecret, { stateRoot, deadlineMs }),
+        query: payload.prompt }, readSecret, { stateRoot, deadlineMs, ownerId: current.ownerId }),
       new Promise(resolveDeadline => { timer = setTimeout(() => resolveDeadline(null), deadlineMs); }),
     ]).finally(() => clearTimeout(timer));
     if (answer?.kind !== 'items' || remaining() <= 0) return null;
-    const eligible = selectRecall(answer.items, { projectId: current.projectId, now: now() });
+    const eligible = selectRecall(answer.items, { projectId: current.projectId,
+      ownerId: current.ownerId, now: now() });
     if (!eligible.length) return null;
     const selected = await recordWindow({ stateDir: current.stateDir, cli,
       sessionId: payload.session_id, eligible, remaining });

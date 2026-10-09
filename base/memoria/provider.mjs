@@ -6,6 +6,7 @@ import { identifyProject } from './project-id.mjs';
 import { RUNTIME_PINS } from './runtime.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
   writeWindowsPrivateFile, readWindowsBinary } from './windows-security.mjs';
+import { readOwner, readExtractor } from './policy.mjs';
 
 const blocked = (reason) => ({ provider: 'blocked', reason });
 const stateRootDefault = () => path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
@@ -133,7 +134,8 @@ export async function resolveProject(cwd, sessionId, options = {}) {
   if (!found.current) return found;
   if (!found.saved) return blocked('fresh_session');
   return sameSession(found.saved, { ...found.current, embeddingFingerprint: found.embeddingFingerprint })
-    ? found.current : blocked('session_changed');
+    ? Object.freeze({ ...found.current, ownerId: found.saved.ownerId ?? null,
+      extractor: found.saved.extractor ?? null }) : blocked('session_changed');
 }
 
 export async function inspectConfiguration(cwd, options = {}) {
@@ -150,22 +152,32 @@ export async function initializeSession(cwd, sessionId, options = {}) {
   const found = await inspect(cwd, sessionId, options);
   if (!found.current) return found;
   const expected = { ...found.current, embeddingFingerprint: found.embeddingFingerprint };
-  if (found.saved) return sameSession(found.saved, expected) ? found.current : blocked('session_changed');
+  if (found.saved) return sameSession(found.saved, expected)
+    ? Object.freeze({ ...found.current, ownerId: found.saved.ownerId ?? null,
+      extractor: found.saved.extractor ?? null }) : blocked('session_changed');
+  const owner = await readOwner(found.current, options.cli, options.profile);
+  const extractor = await readExtractor(found.current);
+  if (owner?.kind === 'blocked' || extractor?.kind === 'blocked') return blocked('local_policy_changed');
+  expected.ownerId = owner?.ownerId ?? null;
+  expected.extractor = extractor ?? null;
+  if (options.adminSession === true) expected.adminSession = true;
   const file = sessionFile(found.stateDir, sessionId);
   if (process.platform === 'win32') {
     if (!(await ensureWindowsPrivateDirectory(path.dirname(file))).ok) return blocked('unsafe_session_state');
     const written = await writeWindowsPrivateFile(file, JSON.stringify(expected) + '\n');
-    if (written.ok) return found.current;
+    if (written.ok) return Object.freeze({ ...found.current, ownerId: expected.ownerId, extractor: expected.extractor });
     if (written.code !== 'exists') return blocked('unsafe_session_state');
     const raced = await readSession(file);
-    return sameSession(raced, expected) ? found.current : blocked('session_changed');
+    return sameSession(raced, expected) ? Object.freeze({ ...found.current,
+      ownerId: raced.ownerId ?? null, extractor: raced.extractor ?? null }) : blocked('session_changed');
   }
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   try { await fs.writeFile(file, JSON.stringify(expected) + '\n', { flag: 'wx', mode: 0o600 }); }
   catch (error) {
     if (error.code !== 'EEXIST') throw error;
     const raced = await readSession(file);
-    return sameSession(raced, expected) ? found.current : blocked('session_changed');
+    return sameSession(raced, expected) ? Object.freeze({ ...found.current,
+      ownerId: raced.ownerId ?? null, extractor: raced.extractor ?? null }) : blocked('session_changed');
   }
-  return found.current;
+  return Object.freeze({ ...found.current, ownerId: expected.ownerId, extractor: expected.extractor });
 }

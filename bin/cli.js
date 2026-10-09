@@ -30,6 +30,7 @@ Comandos:
   atualizar        Self-update + skills/commands + Superpowers + BMAD nos projetos registrados
   remover          Desinstala skills/commands do pacote (preserva overrides)
   status           Versões (pacote, Superpowers, BMAD por projeto), skills/commands/personas, models.yml
+  memoria          Operações Mem0 locais (cbs memoria help)
 
 Flags do instalar:
   --apenas-global       Não instala BMAD no cwd (skills/commands/Superpowers somente)
@@ -64,6 +65,16 @@ async function main() {
   if (!sub || sub === '--help' || sub === '-h' || sub === 'help') {
     console.log(AJUDA);
     process.exit(0);
+  }
+  if (sub === 'memoria') {
+    try {
+      const { main: memoria } = await import('../base/memoria/cli.mjs');
+      process.exitCode = await memoria(process.argv.slice(3));
+    } catch (err) {
+      console.error(`CBS Mem0: ${err.message}`);
+      process.exitCode = 1;
+    }
+    return;
   }
   const fn = SUBCOMANDOS[sub];
   if (!fn) {
