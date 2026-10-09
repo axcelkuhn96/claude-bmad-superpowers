@@ -11,6 +11,7 @@ import { authorizeCurrentDestination } from './setup.mjs';
 import { readLocalTrust, trustTuple } from './trust.mjs';
 import { openArtifactIdentity, runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { withProjectLock } from './ledger.mjs';
+import { createBrokerWorker } from './broker-worker.mjs';
 
 const blocked = reason => ({ kind: 'unavailable', reason });
 export const brokerPath = (root = path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria')) =>
@@ -130,47 +131,21 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
   if (prepared !== 'ready') return blocked(prepared === 'unsafe' ? 'unsafe_broker' : 'broker_owned');
   const artifacts = await openArtifactIdentity([model, tokenizer]);
   if (artifacts.kind !== 'opened') return blocked(artifacts.reason);
-  const child = spawn(runtimePython(resolution.stateDir), [script], {
+  let server;
+  const bridge = createBrokerWorker(() => spawn(runtimePython(resolution.stateDir), [script], {
     stdio: ['pipe', 'pipe', 'ignore'],
     env: { ...envAllow(), CBS_MEMORIA_MODEL: model, CBS_MEMORIA_TOKENIZER: tokenizer,
       OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1', MKL_NUM_THREADS: '1' },
-  });
-  const parser = new FrameReader({ response: true });
-  let response = null;
-  let pending = null;
-  let dead = false;
-  const stopChild = async () => {
-    if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-    const closed = new Promise(done => child.once('close', done));
-    child.kill();
-    const timer = setTimeout(() => child.kill('SIGKILL'), 3000);
-    try { await closed; } finally { clearTimeout(timer); }
-  };
-  child.stdout.on('data', chunk => {
-    try {
-      for (const frame of parser.push(chunk)) {
-        if (pending) { const finish = pending; pending = null; finish(frame.value); }
-        else response = frame.value;
-      }
-    } catch { dead = true; child.kill(); }
-  });
-  child.once('exit', () => { dead = true; if (pending) { pending(blocked('worker_exited')); pending = null; } });
-  child.once('error', () => { dead = true; if (pending) { pending(blocked('worker_exited')); pending = null; } });
-  const ready = await new Promise(resolve => {
-    const timer = setTimeout(() => { clearInterval(poll); resolve(blocked('worker_cold')); }, 30000);
-    const poll = setInterval(() => {
-      if (response || dead) { clearTimeout(timer); clearInterval(poll); resolve(response ?? blocked('worker_exited')); }
-    }, 10);
-    timer.unref();
-  });
+  }), { onFatal: () => { if (server?.listening) server.close(); } });
+  const ready = await bridge.start();
   if (ready.kind !== 'ready' || !await artifacts.unchanged()) {
-    await stopChild(); await artifacts.close(); return ready.kind === 'ready' ? blocked('artifact_changed') : ready;
+    await bridge.close(); await artifacts.close(); return ready.kind === 'ready' ? blocked('artifact_changed') : ready;
   }
   let queued = 0;
   let chain = Promise.resolve();
   let active = 0;
   let idle;
-  const server = net.createServer(socket => {
+  server = net.createServer(socket => {
     active++;
     clearTimeout(idle);
     const controller = new AbortController();
@@ -200,8 +175,11 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     });
   });
   async function handle(value, secret, signal) {
-    if (dead || !value || typeof value !== 'object' || secret.length === 0) return blocked('worker_unavailable');
-    if (!await artifacts.unchanged()) { dead = true; child.kill(); return blocked('artifact_changed'); }
+    if (!value || typeof value !== 'object' || secret.length === 0) return blocked('worker_unavailable');
+    if (!await artifacts.unchanged()) {
+      if (server.listening) server.close();
+      return blocked('artifact_changed');
+    }
     const { cwd, sessionId, operation } = value;
     if (!cwd || !sessionId || !operation || typeof operation !== 'object') return blocked('invalid_request');
     const current = await resolveProject(cwd, sessionId, { stateRoot });
@@ -213,14 +191,8 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     if (authorized.kind !== 'authorized') return blocked(authorized.reason);
     const request = { ...operation, projectId: current.projectId, state: current.stateDir,
       collection: current.destination.collection, connection: authorized.connection };
-    const deadline = deadlineAt - Date.now();
-    if (!Number.isFinite(deadline) || deadline <= 0) return blocked('deadline');
-    return await new Promise(resolve => {
-      if (dead) { resolve(blocked('worker_unavailable')); return; }
-      const timer = setTimeout(() => { dead = true; child.kill(); pending = null; resolve(blocked('deadline')); }, deadline);
-      pending = result => { clearTimeout(timer); resolve(result); };
-      child.stdin.write(encodeFrame(request, secret));
-    });
+    if (deadlineAt <= Date.now()) return blocked('deadline');
+    return bridge.request(request, secret, deadlineAt);
   }
   try {
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(file, resolve); });
@@ -229,7 +201,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     await new Promise(resolve => server.once('close', resolve));
   } catch { return blocked('broker_unavailable'); }
   finally {
-    await stopChild();
+    await bridge.close();
     await artifacts.close();
     clearTimeout(idle);
     try { const stat = await fs.lstat(file); if (stat.isSocket() && stat.uid === process.getuid()) await fs.rm(file); }
