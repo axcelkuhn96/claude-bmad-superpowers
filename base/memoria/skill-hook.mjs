@@ -14,6 +14,8 @@ import { recordRecallWindow } from './hook-recall.mjs';
 const unavailable = reason => ({ kind: 'unavailable', reason });
 const output = text => ({ hookSpecificOutput: { hookEventName: 'PreToolUse',
   additionalContext: `CBS Mem0: ${text}` } });
+const failure = reason => output(`unavailable:${/^[a-z][a-z0-9_]{0,47}$/.test(reason ?? '')
+  ? reason : 'error'}`);
 
 export function parseSkillTrigger(command) {
   if (command === 'cbs memoria hook start') return { action: 'start' };
@@ -79,20 +81,20 @@ export async function skillHook(cli, payload, { stateRoot, authenticate = authen
   const deadline = Date.now() + 9000;
   try {
     const binding = await authenticate({ cli, payload, stateRoot });
-    if (binding.kind !== 'bound') return output(`unavailable:${binding.reason ?? 'unbound'}`);
+    if (binding.kind !== 'bound') return failure(binding.reason ?? 'unbound');
     const startupMs = Math.min(7000, deadline - Date.now() - 1000);
-    if (startupMs <= 0) return output('unavailable:deadline');
+    if (startupMs <= 0) return failure('deadline');
     const opened = await ready(binding.cwd, { stateRoot,
       bootstrapSessionId: binding.sessionId, deadlineMs: startupMs });
-    if (opened.kind !== 'ready') return output(`unavailable:${opened.reason ?? 'worker_cold'}`);
+    if (opened.kind !== 'ready') return failure(opened.reason ?? 'worker_cold');
     if (trigger.action === 'start') return output('ready');
     const searchMs = Math.min(5000, deadline - Date.now() - 1000);
-    if (searchMs <= 0) return output('unavailable:deadline');
+    if (searchMs <= 0) return failure('deadline');
     const answer = await search({ cwd: binding.cwd, sessionId: binding.sessionId,
       projectId: binding.current.projectId, query: trigger.query }, readSecret,
     { stateRoot, deadlineMs: searchMs, ownerId: binding.current.ownerId });
-    if (answer.kind !== 'items') return output(answer.kind === 'abstain'
-      ? 'abstain' : `unavailable:${answer.reason ?? 'search_failed'}`);
+    if (answer.kind !== 'items') return answer.kind === 'abstain'
+      ? output('abstain') : failure(answer.reason ?? 'search_failed');
     const selected = selectRecall(answer.items, { projectId: binding.current.projectId,
       ownerId: binding.current.ownerId, now: now() });
     if (!selected.length) return output('abstain');
@@ -100,7 +102,7 @@ export async function skillHook(cli, payload, { stateRoot, authenticate = authen
     const window = await recordWindow({ stateDir: binding.current.stateDir, cli,
       sessionId: binding.sessionId, eligible: selected,
       remaining: () => Math.min(1000 - (performance.now() - start), deadline - Date.now()) });
-    return output(window.kind === 'items' ? window.text : window.kind === 'abstain'
-      ? 'abstain' : `unavailable:${window.reason ?? 'selection'}`);
-  } catch { return output('unavailable:error'); }
+    return window.kind === 'items' ? output(window.text) : window.kind === 'abstain'
+      ? output('abstain') : failure(window.reason ?? 'selection');
+  } catch { return failure('error'); }
 }

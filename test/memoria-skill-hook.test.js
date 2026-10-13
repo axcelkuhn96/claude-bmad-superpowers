@@ -48,6 +48,12 @@ test('hook ignores ordinary Bash, rejects unbound and never starts broker for ba
   assert.equal(await skillHook('claude', { ...payload(), tool_use_id: '' }, deps), null);
 });
 
+test('native hook never echoes an untrusted failure reason into model context', async () => {
+  const result = await skillHook('claude', payload(), { authenticate: async () =>
+    ({ kind: 'blocked', reason: 'secret=would-leak' }) });
+  assert.equal(result.hookSpecificOutput.additionalContext, 'CBS Mem0: unavailable:error');
+});
+
 test('two native sessions on one checkout keep search and recall window isolated', async t => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-skill-hook-'));
   t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
