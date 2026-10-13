@@ -760,8 +760,8 @@ export function createOutbox(stateDir, options = {}) {
           payload.scope !== metadata.scope || payload.owner_id !== (metadata.owner_id ?? null) ||
           payload.actor !== metadata.actor || payload.origin !== metadata.origin ||
           payload.evidence_at !== metadata.evidence_at ||
-          payload.type !== metadata.type || payload.speaker_role !== metadata.speaker_role ||
-          payload.format_version === 2 && (metadata.format_version !== 2 ||
+          payload.format_version === 2 && (payload.type !== metadata.type ||
+            payload.speaker_role !== metadata.speaker_role || metadata.format_version !== 2 ||
             payload.source_text_sha256 !== metadata.source_text_sha256 ||
             metadata.claim_sha256 !== hash(JSON.stringify([item.text, metadata.type,
               metadata.scope, metadata.condition ?? null, metadata.valid_from ?? null,

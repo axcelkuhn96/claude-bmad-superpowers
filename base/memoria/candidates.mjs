@@ -114,9 +114,14 @@ export function validateCandidate(candidate, sourceMessage) {
   return { eligible: reasons.length === 0, reasons };
 }
 
+function sourceMessages(row, route) {
+  return row.messages.filter(message =>
+    (route === 'haiku' ? ['human', 'assistant', 'tool'] : ['human', 'assistant']).includes(message.origin) &&
+    (route !== 'haiku' || typeof message.text === 'string' && message.text.trim()));
+}
+
 export function buildExtractionPrompt(row, route = 'sonnet') {
-  const messages = row.messages.filter(message =>
-    (route === 'haiku' ? ['human', 'assistant', 'tool'] : ['human', 'assistant']).includes(message.origin))
+  const messages = sourceMessages(row, route)
     .map(message => ({ message_id: message.messageId, role: message.speakerRole,
       actor: message.actor, origin: message.origin, evidence_at: message.timestamp,
       offsets: { start: message.start, end: message.end }, text: redact(message.text) }));
@@ -142,10 +147,18 @@ async function extractCheckpointInner(checkpoint, cliPolicy, options = {}) {
       row.cli !== checkpoint.cli || row.sessionId !== checkpoint.sessionId ||
       row.start !== checkpoint.start || row.end !== checkpoint.end || row.sliceHash !== checkpoint.sliceHash ||
       JSON.stringify(row.messages) !== JSON.stringify(checkpoint.messages)) return blocked('checkpoint_source_mismatch');
-  const eligible = row.messages.filter(message =>
-    (haiku ? ['human', 'assistant', 'tool'] : ['human', 'assistant']).includes(message.origin) &&
+  const eligible = sourceMessages(row, cliPolicy.route).filter(message =>
     typeof message.text === 'string' && message.text.trim());
-  if (!eligible.length) return pending('no_eligible_source');
+  if (!eligible.length) {
+    if (haiku && row.messages.length && row.messages.every(message =>
+      ['human', 'assistant', 'tool'].includes(message.origin) &&
+      typeof message.text === 'string' && !message.text.trim())) {
+      const manifest = await outbox.recordManifest(checkpoint.operationId, []);
+      if (manifest.kind !== 'manifested') return manifest;
+      return outbox.completeCheckpoint(checkpoint.operationId);
+    }
+    return pending('no_eligible_source');
+  }
   const prompt = buildExtractionPrompt(row, cliPolicy.route);
   if (prompt === null) return pending('unsafe_source_secret');
   const claim = await outbox.claimExtraction(checkpoint.operationId);

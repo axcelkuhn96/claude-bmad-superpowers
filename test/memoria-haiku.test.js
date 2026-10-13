@@ -163,6 +163,50 @@ test('Haiku prompt is project generic and an invalid decision stays pending', as
   assert.doesNotMatch(prompt, /CBS|Mem0|AMD|NVIDIA|Windows|Linux/);
 });
 
+test('Haiku omits blank messages from prompt and accepts decisions for the remaining IDs', async t => {
+  const blank = { ...message, messageId: 'blank', text: '  \n  ' };
+  const { outbox, checkpoint } = await fixture(t, [blank, message]);
+  let supplied;
+  const result = await extractCheckpoint(checkpoint, { route: 'haiku' }, { outbox,
+    runCli: async prompt => {
+      supplied = JSON.parse(prompt).messages;
+      return { kind: 'success', model: 'claude-haiku-5-5', decisions: [decision] };
+    } });
+  assert.deepEqual(supplied.map(item => item.message_id), ['m1']);
+  assert.equal(result.kind, 'manifested');
+  assert.equal((await outbox.readManifest(checkpoint.operationId)).candidates.length, 1);
+});
+
+test('Haiku rejects decisions for blank or unknown source IDs', async t => {
+  const blank = { ...message, messageId: 'blank', text: '' };
+  for (const sourceId of ['blank', 'invented']) {
+    const { outbox, checkpoint } = await fixture(t, [blank, message]);
+    const result = await extractCheckpoint(checkpoint, { route: 'haiku' }, { outbox,
+      runCli: async () => ({ kind: 'success', model: 'claude-haiku-5-5', decisions: [
+        { ...decision, source_message_id: sourceId } ] }) });
+    assert.equal(result.reason, 'extractor_schema_invalid');
+    assert.equal((await outbox.readManifest(checkpoint.operationId)).reason, 'missing_manifest');
+  }
+});
+
+test('Haiku completes an all-blank checkpoint without a model call', async t => {
+  const blank = { ...message, text: ' \n ' };
+  const { outbox, checkpoint } = await fixture(t, [blank]);
+  const result = await extractCheckpoint(checkpoint, { route: 'haiku' }, { outbox,
+    runCli: async () => { throw Error('blank source reached model'); } });
+  assert.equal(result.kind, 'processed');
+  assert.equal((await outbox.readDisposition(checkpoint.operationId)).disposition, 'no_facts');
+});
+
+test('Haiku does not treat missing source text as a no-facts checkpoint', async t => {
+  const invalid = { ...message, text: undefined };
+  const { outbox, checkpoint } = await fixture(t, [invalid]);
+  const result = await extractCheckpoint(checkpoint, { route: 'haiku' }, { outbox,
+    runCli: async () => { throw Error('invalid source reached model'); } });
+  assert.equal(result.reason, 'no_eligible_source');
+  assert.equal((await outbox.readManifest(checkpoint.operationId)).reason, 'missing_manifest');
+});
+
 test('assistant and tool claims stay attributed reports', async t => {
   const assistant = { ...message, messageId: 'a1', origin: 'assistant', actor: 'assistant',
     speakerRole: 'assistant', text: 'Integrei o validador.' };
