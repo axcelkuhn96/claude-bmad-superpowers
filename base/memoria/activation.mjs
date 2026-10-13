@@ -79,7 +79,12 @@ export async function pinDestination(url, deps = {}) {
   if (!['https:', 'http:'].includes(target.protocol) || target.username || target.password ||
       target.pathname !== '/' || target.search || target.hash) return blocked('invalid_destination');
   let addresses;
-  try { addresses = deps.lookup ? await deps.lookup(target.hostname) : await addressesFor(target.hostname, deps); }
+  if (deps.address !== undefined) {
+    if (typeof deps.address !== 'string' || net.isIP(deps.address) !== 4 ||
+        !privateAddress(deps.address) || deps.address.startsWith('127.') ||
+        target.protocol !== 'https:') return blocked('public_destination');
+    addresses = [deps.address];
+  } else try { addresses = deps.lookup ? await deps.lookup(target.hostname) : await addressesFor(target.hostname, deps); }
   catch { return blocked('destination_unavailable'); }
   if (addresses?.kind === 'blocked') return addresses;
   if (deps.deadlineAt != null && Date.now() >= deps.deadlineAt || deps.signal?.aborted) return blocked('deadline');
@@ -99,11 +104,13 @@ export async function validateDestination(resolution, embeddingFingerprint, deps
       typeof deps?.readSecret !== 'function') return blocked('invalid_activation');
   const expected = trustTuple(resolution);
   const approved = await deps.approve(expected);
-  if (!approved || Object.entries(expected).some(([key, value]) => approved[key] !== value)) {
+  if (!approved || Object.entries(expected).some(([key, value]) => approved[key] !== value) ||
+      (Object.hasOwn(approved, 'address') && approved.address !== expected.address)) {
     return blocked('trust_changed');
   }
   if (deps.isCurrent && !await deps.isCurrent()) return blocked('config_changed');
-  const pin = await pinDestination(resolution.destination.url, deps);
+  const pin = await pinDestination(resolution.destination.url,
+    { ...deps, address: resolution.destination.address });
   if (pin.kind !== 'pinned') return pin;
   const { connection } = pin;
   const auth = authorizeDestination(resolution, approved, deps.readSecret);

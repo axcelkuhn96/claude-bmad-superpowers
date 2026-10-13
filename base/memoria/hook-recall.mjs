@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { resolveProject } from './provider.mjs';
+import { readQdrantSecret } from './qdrant-key.mjs';
 import { searchProject } from './bridge.mjs';
 import { renderRecall, selectRecall } from './context.mjs';
 import { withProjectLock } from './ledger.mjs';
@@ -106,7 +107,7 @@ export async function recordRecallWindow({ stateDir, cli, sessionId, eligible, r
 
 export async function recallForPrompt({ cli, event = 'UserPromptSubmit', payload, result, stateRoot,
   began = performance.now(), resolve = resolveProject, search = searchProject,
-  readSecret = name => process.env[name], now = () => new Date().toISOString(),
+  readSecret = readQdrantSecret, now = () => new Date().toISOString(),
   recordWindow = recordRecallWindow, onFailure } = {}) {
   const fail = category => {
     try { onFailure?.(category); } catch { /* Diagnostics never change native fail-open. */ }

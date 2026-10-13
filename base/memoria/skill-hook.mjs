@@ -10,6 +10,7 @@ import { ensureBrokerReady } from './broker-start.mjs';
 import { searchProject } from './bridge.mjs';
 import { selectRecall } from './context.mjs';
 import { recordRecallWindow } from './hook-recall.mjs';
+import { readQdrantSecret } from './qdrant-key.mjs';
 
 const unavailable = reason => ({ kind: 'unavailable', reason });
 const output = text => ({ hookSpecificOutput: { hookEventName: 'PreToolUse',
@@ -74,7 +75,7 @@ export async function authenticateSkillHook({ cli, payload, stateRoot } = {}) {
 
 export async function skillHook(cli, payload, { stateRoot, authenticate = authenticateSkillHook,
   ready = ensureBrokerReady, search = searchProject, recordWindow = recordRecallWindow,
-  now = () => new Date().toISOString(), readSecret = name => process.env[name] } = {}) {
+  now = () => new Date().toISOString(), readSecret = readQdrantSecret } = {}) {
   if (payload?.tool_name !== 'Bash' || payload.hook_event_name !== 'PreToolUse') return null;
   const trigger = parseSkillTrigger(payload.tool_input?.command);
   if (!trigger || typeof payload.tool_use_id !== 'string' || !payload.tool_use_id) return null;

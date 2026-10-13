@@ -7,9 +7,10 @@ import { selectRecall } from './context.mjs';
 import { recordRecallWindow } from './hook-recall.mjs';
 import { createOutbox } from './outbox.mjs';
 import { POLICY_VERSION } from './transcript.mjs';
+import { readQdrantSecret } from './qdrant-key.mjs';
 
 const blocked = reason => ({ kind: 'unavailable', reason });
-const secret = name => process.env[name];
+const secret = readQdrantSecret;
 const definitions = [
   ['search', 'Recall approved project memory.', { query: { type: 'string' } }],
   ['source', 'Show verified local checkpoint source if present, otherwise remote provenance metadata.', { memory_id: { type: 'string' } }],

@@ -6,6 +6,7 @@ import { identifyProject } from './project-id.mjs';
 import { readSessionCheckout } from './session-checkout.mjs';
 import { inspectWindowsPath } from './windows-security.mjs';
 import os from 'node:os';
+import { readQdrantSecret } from './qdrant-key.mjs';
 
 const [cli, cwd, sessionId, operationId, candidateKey] = process.argv.slice(2);
 if (!['claude', 'codex'].includes(cli) || !cwd || !sessionId || !operationId || !candidateKey ||
@@ -36,7 +37,7 @@ if (!['claude', 'codex'].includes(cli) || !cwd || !sessionId || !operationId || 
       outbox: createOutbox(current.stateDir), cwd, sessionId, stateRoot: options.stateRoot,
       writerId: process.platform === 'win32' ? `sid:${sid}` : `uid:${process.getuid()}`,
       ...(sid ? { actor: `sid:${sid}:${os.userInfo().username}` } : {}),
-      readSecret: name => process.env[name],
+      readSecret: readQdrantSecret,
     });
     process.stdout.write(`${result.kind}: ${result.reason ?? result.operationId ?? ''}\n`);
     process.exitCode = ['acked', 'processed'].includes(result.kind) ? 0 : 1;

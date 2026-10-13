@@ -7,7 +7,7 @@ import http from 'node:http';
 import { spawnSync } from 'node:child_process';
 import { initializeSession, resolveProject } from '../base/memoria/provider.mjs';
 import { authorizeDestination, readLocalTrust, writeLocalTrust } from '../base/memoria/trust.mjs';
-import { validateDestination } from '../base/memoria/activation.mjs';
+import { pinDestination, validateDestination } from '../base/memoria/activation.mjs';
 import { activateProject, authorizeCurrentDestination } from '../base/memoria/setup.mjs';
 import { runBridgeOperation } from '../base/memoria/bridge.mjs';
 import { applyNativeExclusion, restoreNativeExclusion } from '../base/memoria/native.mjs';
@@ -182,6 +182,77 @@ test('config inválida bloqueia sem fallback nem estado', async (t) => {
   await putConfig(root, { ...config(), project_id: '' });
   assert.deepEqual(await initializeSession(root, 'bad', options(stateRoot)), { provider: 'blocked', reason: 'invalid_config' });
   await assert.rejects(fs.access(stateRoot), { code: 'ENOENT' });
+});
+
+test('endereço privado explícito entra na sessão e bloqueia mudança de pin', async t => {
+  const { root, stateRoot } = await fixture(t);
+  await putConfig(root, { ...config(), qdrant: { ...config().qdrant, address: '10.8.0.3' } });
+  const started = await initializeSession(root, 'pinned', options(stateRoot));
+  assert.equal(started.destination.address, '10.8.0.3');
+  await putConfig(root, { ...config(), qdrant: { ...config().qdrant, address: '10.8.0.4' } });
+  assert.deepEqual(await resolveProject(root, 'pinned', { stateRoot }),
+    { provider: 'blocked', reason: 'session_changed' });
+});
+
+test('config rejeita address público, loopback com HTTPS e formas não IPv4', async t => {
+  const { root, stateRoot } = await fixture(t);
+  for (const address of ['157.230.226.207', '127.0.0.1', '::1', '10.8.0.3:443', '10.8.0.03']) {
+    await putConfig(root, { ...config(), qdrant: { ...config().qdrant, address } });
+    assert.deepEqual(await initializeSession(root, `invalid-${address}`, options(stateRoot)),
+      { provider: 'blocked', reason: 'invalid_config' });
+  }
+});
+
+test('pin explícito privado usa IP fixo sem DNS e preserva hostname TLS', async () => {
+  const pin = await pinDestination('https://documentos.sigamina.com.br:48677', {
+    address: '10.8.0.3', lookup: () => { throw new Error('DNS must not run'); },
+  });
+  assert.equal(pin.kind, 'pinned');
+  assert.equal(pin.connection.address, '10.8.0.3');
+  assert.equal(pin.connection.servername, 'documentos.sigamina.com.br');
+  assert.equal(pin.connection.port, 48677);
+  assert.deepEqual(await pinDestination('https://documentos.sigamina.com.br:48677',
+    { address: '157.230.226.207' }), { kind: 'blocked', reason: 'public_destination' });
+});
+
+test('ativação e operação posterior propagam pin explícito sem DNS', async t => {
+  const { root, stateRoot } = await fixture(t);
+  await putConfig(root, { ...config(), qdrant: { ...config().qdrant, address: '10.8.0.3' } });
+  const session = await initializeSession(root, 'explicit-pin', options(stateRoot));
+  const tuple = { version: 1, projectRoot: session.projectRoot, projectId: session.projectId,
+    url: session.destination.url, collection: session.destination.collection,
+    apiKeyEnv: session.destination.apiKeyEnv, address: '10.8.0.3' };
+  const fingerprint = config().embedding.fingerprint;
+  const validated = await validateDestination(session, fingerprint, {
+    approve: async () => tuple, readSecret: () => 'fixture-key',
+    lookup: () => { throw new Error('DNS must not run'); },
+    probeCollection: async (_url, _collection, key, address) => {
+      assert.equal(address, '10.8.0.3');
+      return key ? { statusCode: 200, body: { result: { config: {
+        params: { vectors: { size: 384, distance: 'Cosine' } },
+        metadata: { cbs_embedding_fingerprint: fingerprint },
+      } } } } : { statusCode: 401 };
+    },
+  });
+  assert.equal(validated.kind, 'authorized');
+  await writeLocalTrust(session.stateDir, tuple);
+  const later = await authorizeCurrentDestination(root, 'explicit-pin', () => 'fixture-key', {
+    stateRoot, lookup: () => { throw new Error('DNS must not run'); },
+  });
+  assert.equal(later.kind, 'authorized');
+  assert.equal(later.connection.address, '10.8.0.3');
+});
+
+test('trust com pin antigo não autoriza nova configuração sem pin', () => {
+  const resolution = { provider: 'mem0', projectRoot: '/fixture', projectId: 'fixture',
+    destination: { url: 'https://qdrant.example', collection: 'fixture',
+      apiKeyEnv: 'CBS_MEMORIA_TEST_KEY' } };
+  const trust = { version: 1, projectRoot: '/fixture', projectId: 'fixture',
+    url: 'https://qdrant.example', collection: 'fixture',
+    apiKeyEnv: 'CBS_MEMORIA_TEST_KEY', address: '10.8.0.3' };
+  assert.deepEqual(authorizeDestination(resolution, trust, () => {
+    throw new Error('secret read must not run');
+  }), { kind: 'blocked', reason: 'trust_changed' });
 });
 
 test('mudança de provedor, identidade ou destino na sessão bloqueia sem novo segredo', async (t) => {

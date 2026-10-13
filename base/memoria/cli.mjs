@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { inspectConfiguration } from './provider.mjs';
 import { readLocalTrust, trustTuple } from './trust.mjs';
+import { readQdrantSecret } from './qdrant-key.mjs';
 import { registerOwner, configureExtractor, localDevice, readOwner, readExtractor } from './policy.mjs';
 import { administrativeSession, bootstrapWriter, beginWriterTransfer,
   completeWriterTransfer } from './authority.mjs';
@@ -16,9 +17,10 @@ Ações: status, check, provision, activate, launch, review-correct, deactivate,
        writer-transfer-start, writer-transfer-complete, help
 Use --project /caminho/git nas ações de projeto. O cadastro pessoal e a seleção
 do extrator exigem declaração local explícita; a publicação automática permanece off.
+Activate aceita --allow-tracked-native para configuração nativa versionada autorizada.
 `;
 const value = (args, flag) => args.includes(flag) ? args[args.indexOf(flag) + 1] : null;
-const readSecret = name => process.env[name];
+const readSecret = readQdrantSecret;
 
 async function askConfirmation(message, expected) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) return false;

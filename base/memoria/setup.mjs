@@ -48,10 +48,12 @@ export async function authorizeCurrentDestination(cwd, sessionId, readSecret, op
   const current = await inspectConfiguration(cwd, options);
   if (!same(resolution, current)) return blocked('session_changed');
   const expected = trustTuple(resolution);
-  if (!localTrust || Object.entries(expected).some(([key, value]) => localTrust[key] !== value)) {
+  if (!localTrust || Object.entries(expected).some(([key, value]) => localTrust[key] !== value) ||
+      (Object.hasOwn(localTrust, 'address') && localTrust.address !== expected.address)) {
     return blocked('trust_changed');
   }
-  const pin = await pinDestination(resolution.destination.url, options);
+  const pin = await pinDestination(resolution.destination.url,
+    { ...options, address: resolution.destination.address });
   if (pin.kind !== 'pinned') return pin;
   if (!same(resolution, await inspectConfiguration(cwd, options))) return blocked('session_changed');
   if (options.signal?.aborted || options.deadlineAt != null && Date.now() >= options.deadlineAt) {

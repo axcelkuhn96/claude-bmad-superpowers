@@ -2,6 +2,7 @@
 import readline from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import { activateProject } from './setup.mjs';
+import { readQdrantSecret } from './qdrant-key.mjs';
 
 export async function main(args = process.argv.slice(2)) {
   if (process.platform !== 'linux') {
@@ -11,14 +12,15 @@ export async function main(args = process.argv.slice(2)) {
   const cli = args.includes('--cli') ? args[args.indexOf('--cli') + 1] : undefined;
   const cwd = args.includes('--project') ? args[args.indexOf('--project') + 1] : undefined;
   if (!['claude', 'codex'].includes(cli) || !cwd || cwd.startsWith('--')) {
-    process.stderr.write('Uso: node base/memoria/activate.mjs --cli claude|codex --project /caminho/git\n');
+    process.stderr.write('Uso: node base/memoria/activate.mjs --cli claude|codex --project /caminho/git [--allow-tracked-native]\n');
     return 2;
   }
   const input = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const result = await activateProject(cwd, { cli, readSecret: (name) => process.env[name],
+    const result = await activateProject(cwd, { cli, allowTrackedNative: args.includes('--allow-tracked-native'),
+      readSecret: readQdrantSecret,
       approve: async (tuple) => {
-        process.stdout.write(`Projeto: ${tuple.projectRoot}\nID: ${tuple.projectId}\nQdrant: ${tuple.url}\nColeção: ${tuple.collection}\nVariável da chave: ${tuple.apiKeyEnv}\n`);
+        process.stdout.write(`Projeto: ${tuple.projectRoot}\nID: ${tuple.projectId}\nQdrant: ${tuple.url}\n${tuple.address ? `Endereço privado: ${tuple.address}\n` : ''}Coleção: ${tuple.collection}\nVariável da chave: ${tuple.apiKeyEnv}\n`);
         const answer = await input.question(`Para validar este destino local, digite o ID ${tuple.projectId}: `);
         return answer === tuple.projectId ? tuple : null;
       },

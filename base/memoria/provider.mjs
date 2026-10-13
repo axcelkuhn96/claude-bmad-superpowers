@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import net from 'node:net';
 import { createHash } from 'node:crypto';
 import { identifyProject } from './project-id.mjs';
 import { RUNTIME_PINS } from './runtime.mjs';
@@ -13,6 +14,12 @@ const stateRootDefault = () => path.join(os.homedir(), '.local', 'state', 'cbs',
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const isObject = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
 const idValid = (x) => typeof x === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(x);
+function privateStaticIpv4(value) {
+  if (typeof value !== 'string' || net.isIP(value) !== 4 ||
+      value.split('.').some(part => String(Number(part)) !== part)) return false;
+  const [a, b] = value.split('.').map(Number);
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
 function destinationUrlValid(value) {
   if (typeof value !== 'string') return false;
   let url;
@@ -64,6 +71,8 @@ function parseConfig(data) {
   if (c.provider === 'claude-mem') return { provider: 'claude-mem' };
   if (!idValid(c.project_id) || !isObject(c.qdrant) || !isObject(c.embedding) ||
       !destinationUrlValid(c.qdrant.url) ||
+      (c.qdrant.address !== undefined && (!privateStaticIpv4(c.qdrant.address) ||
+        !c.qdrant.url.startsWith('https://'))) ||
       !idValid(c.qdrant.collection) || typeof c.qdrant.api_key_env !== 'string' ||
       !/^[A-Z][A-Z0-9_]*$/.test(c.qdrant.api_key_env) ||
       c.embedding.model !== 'multilingual-e5-small' || c.embedding.dimension !== 384 ||
@@ -71,7 +80,8 @@ function parseConfig(data) {
     return blocked('invalid_config');
   }
   return { provider: 'mem0', project_id: c.project_id,
-    qdrant: { url: c.qdrant.url, collection: c.qdrant.collection, api_key_env: c.qdrant.api_key_env },
+    qdrant: { url: c.qdrant.url, collection: c.qdrant.collection, api_key_env: c.qdrant.api_key_env,
+      ...(c.qdrant.address === undefined ? {} : { address: c.qdrant.address }) },
     embedding: { model: c.embedding.model, dimension: c.embedding.dimension,
       fingerprint: c.embedding.fingerprint } };
 }
@@ -96,7 +106,8 @@ function resolution(scope, config, stateDir) {
   return Object.freeze({ provider: 'mem0', projectRoot: scope.projectRoot,
     projectId: config.project_id,
     destination: Object.freeze({ url: config.qdrant.url, collection: config.qdrant.collection,
-      apiKeyEnv: config.qdrant.api_key_env }), stateDir,
+      apiKeyEnv: config.qdrant.api_key_env,
+      ...(config.qdrant.address === undefined ? {} : { address: config.qdrant.address }) }), stateDir,
     embeddingFingerprint: config.embedding.fingerprint });
 }
 function sameSession(saved, current) {
