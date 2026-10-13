@@ -109,15 +109,14 @@ test('review CLI passes its private state root through to storeMemory', async t 
     `evidence_at: '2026-10-01T00:00:00Z' }, approval: { kind: 'approved' } }, options.readSecret, options);\n` +
     `}\n`;
   const preload = path.join(dir, 'review-import-hook.mjs');
-  await fs.writeFile(preload, `import { registerHooks } from 'node:module';\n` +
-    `const source = ${JSON.stringify(replacement)};\n` +
-    `registerHooks({ load(url, context, nextLoad) {\n` +
+  await fs.writeFile(preload, `const source = ${JSON.stringify(replacement)};\n` +
+    `export async function load(url, context, nextLoad) {\n` +
     `  if (url === ${JSON.stringify(candidateUrl)}) return { format: 'module', shortCircuit: true, source };\n` +
     `  return nextLoad(url, context);\n` +
-    `} });\n`);
+    `}\n`);
   const review = new URL('../base/memoria/review.mjs', import.meta.url).pathname;
   const child = spawnSync('/usr/bin/script', ['-q', '-e', '-c',
-    `${process.execPath} --import ${preload} ${review} claude ${root} s checkpoint rule`, '/dev/null'], {
+    `${process.execPath} --experimental-loader ${preload} ${review} claude ${root} s checkpoint rule`, '/dev/null'], {
     encoding: 'utf8', env: { ...process.env, CBS_MEMORIA_STATE_ROOT: stateRoot },
   });
   assert.equal(child.status, 1, child.stdout + child.stderr);
