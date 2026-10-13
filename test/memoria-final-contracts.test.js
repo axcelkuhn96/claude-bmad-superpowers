@@ -512,7 +512,7 @@ test('CLI do pacote opera de cwd externo e mantém gates públicos tipados', asy
   const activate = spawnSync(process.execPath, [bin, 'memoria', 'activate', '--project', cwd,
     '--cli', 'claude'], { cwd, encoding: 'utf8' });
   assert.equal(activate.status, 1);
-  assert.match(activate.stdout, /local_native_gate_failed/);
+  assert.equal(activate.stdout, 'blocked: unsupported_git\n');
   const standard = spawnSync(process.execPath, [bin, '--help'], { cwd, encoding: 'utf8' });
   assert.equal(standard.status, 0);
 });
