@@ -20,7 +20,7 @@ Se o usuário passou argumentos, trate-os como **descrição do foco da próxima
 
 1. **Referencie, não duplique.** Specs, planos, ADRs, issues, PRDs, commits e diffs que já existem entram como **link/caminho**, não copiados no corpo. O handoff aponta; não reescreve.
 2. **Redija segredos.** Nunca inclua API keys, senhas, tokens, connection strings ou PII. Substitua por `[REDIGIDO]` e diga onde o segredo vive (ex.: "token em `.env` → `STRIPE_KEY`").
-**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+**Roteamento de memória:** `claude-mem` continua sendo o padrão. Só use Mem0 quando este projeto o selecionou explicitamente; nesse caso invoque a skill `memoria`, que usa o hook `PreToolUse` nativo com identidade da sessão. Só o `hookSpecificOutput.additionalContext` com `CBS Mem0:` confirma busca/início. Sem callback ou com indisponibilidade/abstenção, registre “Memória: não disponível”; não use `cbs_memoria.*` MCP sem vínculo nem `claude-mem` como fallback. Não presuma `ready` ou recall sem contexto autoritativo.
 
 3. **Inclua "Skills sugeridas".** Uma seção dizendo quais skills/comandos o próximo agente deve invocar (`/refinar`, `/executar`, `/piloto`, `/revisar`, `/grelhar`, `/mapear`, `mem-search`, etc.) e por quê.
 4. **Consulte a memória** (se disponível) pra referenciar decisões já registradas em vez de reexplicá-las.
@@ -64,7 +64,7 @@ Se o usuário passou argumentos, trate-os como **descrição do foco da próxima
 
 ## Fluxo
 
-1. **Memória primeiro** (se disponível): `mem-search` com o tema, pra não reexplicar o que já está registrado.
+1. **Memória primeiro** (se disponível): use a skill `memoria` com o tema quando o projeto selecionou Mem0; caso contrário, use `mem-search`, pra não reexplicar o que já está registrado.
 2. Levante os artefatos existentes (specs em `docs/`, branch atual via `git`, diff em aberto) — referencie por caminho.
 3. Redija qualquer segredo que apareça.
 4. Escreva o documento no formato acima e salve no local definido.

@@ -12,9 +12,9 @@ Chat enxuto: 1 linha por etapa. O detalhe vai pros arquivos (`docs/prompts/`, pl
 
 ## Etapa 0 — Memória (primeiro de tudo)
 
-**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+**Roteamento de memória:** `claude-mem` continua sendo o padrão. Só use Mem0 quando este projeto o selecionou explicitamente; nesse caso invoque a skill `memoria`, que usa o hook `PreToolUse` nativo com identidade da sessão. Só o `hookSpecificOutput.additionalContext` com `CBS Mem0:` confirma busca/início. Sem callback ou com indisponibilidade/abstenção, registre “Memória: não disponível”; não use `cbs_memoria.*` MCP sem vínculo nem `claude-mem` como fallback. Não presuma `ready` ou recall sem contexto autoritativo.
 
-Invoque `Skill` com `skill: "claude-mem:mem-search"` (fallback `mem-search`) passando a entrada do usuário como query. Sem exceção. Se nenhuma existir, registre "Memória: não disponível" e siga.
+Invoque a skill `memoria` com a entrada se o projeto selecionou Mem0; caso contrário, invoque `claude-mem:mem-search` (fallback `mem-search`). Sem fonte, registre “Memória: não disponível” e siga.
 
 ## Etapa 1 — Grelhar
 

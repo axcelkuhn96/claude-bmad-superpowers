@@ -13,9 +13,9 @@ Chega-se aqui por `/grelhar` direto, pela Etapa 1 do `/piloto` (que `/refinar` e
 
 ## ⚠️ PRIMEIRA AÇÃO — consultar memória (se disponível)
 
-**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+**Roteamento de memória:** `claude-mem` continua sendo o padrão. Só use Mem0 quando este projeto o selecionou explicitamente; nesse caso invoque a skill `memoria`, que usa o hook `PreToolUse` nativo com identidade da sessão. Só o `hookSpecificOutput.additionalContext` com `CBS Mem0:` confirma busca/início. Sem callback ou com indisponibilidade/abstenção, registre “Memória: não disponível”; não use `cbs_memoria.*` MCP sem vínculo nem `claude-mem` como fallback. Não presuma `ready` ou recall sem contexto autoritativo.
 
-Use o resumo que o comando passou. Se não veio, chame `claude-mem:mem-search` (fallback `mem-search`) com o tema como query. Decisões anteriores e padrões já estabelecidos mudam quais perguntas ainda fazem sentido. Se nenhuma skill de memória existir, registre "Memória: não disponível" e siga.
+Use o resumo que o comando passou. Se não veio, invoque a skill `memoria` com o tema em projeto com Mem0 selecionado; caso contrário, use `claude-mem:mem-search` (fallback `mem-search`). Decisões anteriores e padrões já estabelecidos mudam quais perguntas ainda fazem sentido. Sem fonte de memória, registre “Memória: não disponível” e siga.
 
 ## Modo auto (sem interlocutor)
 

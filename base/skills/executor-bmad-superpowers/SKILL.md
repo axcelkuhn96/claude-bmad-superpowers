@@ -79,9 +79,9 @@ Escalonamentos do SDD (não substitutos): **teammate** (subagent persistente, `S
 ### Fase 1 — Intake
 
 1. Leia o prompt/spec inteiro. Se veio do refinador, ele traz `<tipo_de_tarefa>` e `<dominios_previstos>` — use-os na Fase 3.
-**Roteamento de memória:** Na sessão Mem0 iniciada pelo launcher CBS (ou em checkout com `.cbs/memoria.json` `provider: mem0` sem vínculo), use somente `cbs_memoria.search` do MCP. Se a ferramenta estiver indisponível ou responder `unbound`/`unavailable`/`abstain`, registre "Memória: não disponível" e continue sem chamar `claude-mem:mem-search` nem `mem-search`. As instruções de busca Claude abaixo valem somente para sessão `claude-mem` congelada.
+**Roteamento de memória:** `claude-mem` continua sendo o padrão. Só use Mem0 quando este projeto o selecionou explicitamente; nesse caso invoque a skill `memoria`, que usa o hook `PreToolUse` nativo com identidade da sessão. Só o `hookSpecificOutput.additionalContext` com `CBS Mem0:` confirma busca/início. Sem callback ou com indisponibilidade/abstenção, registre “Memória: não disponível”; não use `cbs_memoria.*` MCP sem vínculo nem `claude-mem` como fallback. Não presuma `ready` ou recall sem contexto autoritativo.
 
-2. Memória: se o comando já passou o resumo, use-o; senão chame `claude-mem:mem-search` (fallback `mem-search`) com o tema. Sem skill de memória: `Memória: não disponível`.
+2. Memória: use o resumo recebido; se não veio, invoque a skill `memoria` com o tema em projeto com Mem0 selecionado; caso contrário, use `claude-mem:mem-search` (fallback `mem-search`). Sem fonte: `Memória: não disponível`.
 3. Ambiguidade bloqueante: normal → pergunte (uma por vez, `AskUserQuestion`); auto → assuma, marque `SUPOSIÇÃO`.
 4. Workspace: `git branch --show-current`. Se for `main`/`master`, crie `feat/<slug>` antes de qualquer edição (o SDD exige consentimento pra trabalhar em main — a branch dedicada é o consentimento; em normal, registre-o no gate da Fase 4). **Sem worktree** — trabalhe na branch.
 5. Leia `models.yml` e aplique overrides do argumento.
