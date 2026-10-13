@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
-import { readLocalTrust, trustTuple } from './trust.mjs';
+import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { createBrokerLeaseCredential, openBrokerLease } from './broker.mjs';
 import { ensureBrokerReady } from './broker-start.mjs';
 import { inspectCodexMainHooks, verifyNativeCapture } from './native.mjs';
@@ -116,7 +116,7 @@ export async function createLaunch(cwd, cli, { stateRoot } = {}) {
   const nativeRoot = scope.activeRoot;
   const trust = await readLocalTrust(current.stateDir);
   const expected = trustTuple(current);
-  if (!trust || Object.entries(expected).some(([key, value]) => trust[key] !== value)) return blocked('trust_changed');
+  if (!sameTrustTuple(expected, trust)) return blocked('trust_changed');
   const profile = cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR;
   const owner = await readOwner(current, cli, profile);
   const extractor = await readExtractor(current);

@@ -5,7 +5,7 @@ import { inspectConfiguration, initializeSession, resolveProject } from './provi
 import { verifyNativeCapture } from './native.mjs';
 import { createOutbox } from './outbox.mjs';
 import { parsePersistedSlice, POLICY_VERSION } from './transcript.mjs';
-import { readLocalTrust, trustTuple } from './trust.mjs';
+import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { identifyProject } from './project-id.mjs';
 import { bindLaunch, resolveBoundLaunch } from './launch.mjs';
 import { recordSessionCheckout, readSessionCheckout } from './session-checkout.mjs';
@@ -39,7 +39,7 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
         profile: cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR } : {}) });
   if (native.kind !== 'verified') return blocked(native.reason);
   const trust = await readLocalTrust(current.stateDir);
-  if (!trust || Object.entries(trustTuple(current)).some(([key, value]) => trust[key] !== value)) {
+  if (!sameTrustTuple(trustTuple(current), trust)) {
     return blocked('trust_changed');
   }
   const session = event === 'SessionStart'

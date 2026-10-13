@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { inspectConfiguration } from './provider.mjs';
-import { readLocalTrust, trustTuple } from './trust.mjs';
+import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { runtimeEnvironment, verifyRuntimeArtifacts } from './runtime.mjs';
 import { resolveEnrolledWindowsTool } from './windows-enrollment.mjs';
 import { ensureWindowsPrivateDirectory } from './windows-security.mjs';
@@ -18,14 +18,13 @@ export async function provisionRuntime(cwd, model, tokenizer, options = {}) {
   if (resolution.provider !== 'mem0') return blocked(resolution.reason);
   const localTrust = await readLocalTrust(resolution.stateDir);
   const expected = trustTuple(resolution);
-  if (!localTrust || Object.entries(expected).some(([key, value]) => localTrust[key] !== value)) {
+  if (!sameTrustTuple(expected, localTrust)) {
     return blocked('trust_changed');
   }
   const verified = await verifyRuntimeArtifacts(model, tokenizer);
   if (verified.kind !== 'verified') return verified;
   const current = await inspectConfiguration(cwd, options);
-  if (current.provider !== 'mem0' || Object.entries(expected).some(([key, value]) =>
-    trustTuple(current)[key] !== value)) return blocked('config_changed');
+  if (current.provider !== 'mem0' || !sameTrustTuple(expected, trustTuple(current))) return blocked('config_changed');
   const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'python', 'setup_runtime.py');
   const args = [script, '--state', resolution.stateDir, '--model', model, '--tokenizer', tokenizer];
   let tool;

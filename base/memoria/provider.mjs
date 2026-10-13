@@ -8,6 +8,7 @@ import { RUNTIME_PINS } from './runtime.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
   writeWindowsPrivateFile, readWindowsBinary } from './windows-security.mjs';
 import { readOwner, readExtractor } from './policy.mjs';
+import { publicIpv4, publicTlsName } from './public-destination.mjs';
 
 const blocked = (reason) => ({ provider: 'blocked', reason });
 const stateRootDefault = () => path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
@@ -71,8 +72,11 @@ function parseConfig(data) {
   if (c.provider === 'claude-mem') return { provider: 'claude-mem' };
   if (!idValid(c.project_id) || !isObject(c.qdrant) || !isObject(c.embedding) ||
       !destinationUrlValid(c.qdrant.url) ||
-      (c.qdrant.address !== undefined && (!privateStaticIpv4(c.qdrant.address) ||
-        !c.qdrant.url.startsWith('https://'))) ||
+      (c.qdrant.allow_public !== undefined && typeof c.qdrant.allow_public !== 'boolean') ||
+      (c.qdrant.allow_public === true &&
+        (!publicIpv4(c.qdrant.address) || !publicTlsName(new URL(c.qdrant.url)))) ||
+      (c.qdrant.allow_public !== true && c.qdrant.address !== undefined &&
+        (!privateStaticIpv4(c.qdrant.address) || !c.qdrant.url.startsWith('https://'))) ||
       !idValid(c.qdrant.collection) || typeof c.qdrant.api_key_env !== 'string' ||
       !/^[A-Z][A-Z0-9_]*$/.test(c.qdrant.api_key_env) ||
       c.embedding.model !== 'multilingual-e5-small' || c.embedding.dimension !== 384 ||
@@ -81,7 +85,8 @@ function parseConfig(data) {
   }
   return { provider: 'mem0', project_id: c.project_id,
     qdrant: { url: c.qdrant.url, collection: c.qdrant.collection, api_key_env: c.qdrant.api_key_env,
-      ...(c.qdrant.address === undefined ? {} : { address: c.qdrant.address }) },
+      ...(c.qdrant.address === undefined ? {} : { address: c.qdrant.address }),
+      ...(c.qdrant.allow_public === true ? { allow_public: true } : {}) },
     embedding: { model: c.embedding.model, dimension: c.embedding.dimension,
       fingerprint: c.embedding.fingerprint } };
 }
@@ -107,7 +112,8 @@ function resolution(scope, config, stateDir) {
     projectId: config.project_id,
     destination: Object.freeze({ url: config.qdrant.url, collection: config.qdrant.collection,
       apiKeyEnv: config.qdrant.api_key_env,
-      ...(config.qdrant.address === undefined ? {} : { address: config.qdrant.address }) }), stateDir,
+      ...(config.qdrant.address === undefined ? {} : { address: config.qdrant.address }),
+      ...(config.qdrant.allow_public === true ? { allowPublic: true } : {}) }), stateDir,
     embeddingFingerprint: config.embedding.fingerprint });
 }
 function sameSession(saved, current) {

@@ -6,7 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { identifyProject } from './project-id.mjs';
 import { inspectConfiguration } from './provider.mjs';
-import { readLocalTrust, trustTuple } from './trust.mjs';
+import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { restoreNativeExclusion } from './native.mjs';
 import { withProjectLock } from './ledger.mjs';
 
@@ -56,7 +56,7 @@ export async function deactivateProject(cwd, options = {}) {
   const configured = await inspectConfiguration(cwd, options);
   if (configured.provider === 'mem0') {
     const trust = await readLocalTrust(stateDir);
-    if (!trust || Object.entries(trustTuple(configured)).some(([key, value]) => trust[key] !== value)) {
+    if (!sameTrustTuple(trustTuple(configured), trust)) {
       return blocked('trust_changed');
     }
   } else if (!['not_mem0'].includes(configured.reason)) return blocked(configured.reason ?? 'config_changed');

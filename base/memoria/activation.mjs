@@ -2,7 +2,8 @@ import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
-import { authorizeDestination, trustTuple } from './trust.mjs';
+import { authorizeDestination, sameTrustTuple, trustTuple } from './trust.mjs';
+import { publicIpv4, publicTlsName } from './public-destination.mjs';
 
 const blocked = (reason) => ({ kind: 'blocked', reason });
 
@@ -80,23 +81,28 @@ export async function pinDestination(url, deps = {}) {
       target.pathname !== '/' || target.search || target.hash) return blocked('invalid_destination');
   let addresses;
   if (deps.address !== undefined) {
-    if (typeof deps.address !== 'string' || net.isIP(deps.address) !== 4 ||
+    if (deps.allowPublic === true) {
+      if (!publicIpv4(deps.address) || !publicTlsName(target)) return blocked('public_destination');
+    } else if (deps.allowPublic !== undefined && deps.allowPublic !== false ||
+        typeof deps.address !== 'string' || net.isIP(deps.address) !== 4 ||
         !privateAddress(deps.address) || deps.address.startsWith('127.') ||
         target.protocol !== 'https:') return blocked('public_destination');
     addresses = [deps.address];
-  } else try { addresses = deps.lookup ? await deps.lookup(target.hostname) : await addressesFor(target.hostname, deps); }
+  } else if (deps.allowPublic === true) return blocked('public_destination');
+  else try { addresses = deps.lookup ? await deps.lookup(target.hostname) : await addressesFor(target.hostname, deps); }
   catch { return blocked('destination_unavailable'); }
   if (addresses?.kind === 'blocked') return addresses;
   if (deps.deadlineAt != null && Date.now() >= deps.deadlineAt || deps.signal?.aborted) return blocked('deadline');
   if (!Array.isArray(addresses)) return blocked('destination_unavailable');
   addresses = addresses.map((item) => typeof item === 'string' ? item : item.address);
-  if (!addresses.length || addresses.some((address) => !privateAddress(address)) ||
+  if (!addresses.length || (!deps.allowPublic && addresses.some((address) => !privateAddress(address))) ||
       (target.protocol === 'http:' && addresses.some((address) => !['127.0.0.1', '::1'].includes(address)))) {
     return blocked('public_destination');
   }
   return { kind: 'pinned', connection: Object.freeze({ url: target.toString(),
     hostname: target.hostname, address: addresses[0], port: Number(target.port || (target.protocol === 'https:' ? 443 : 80)),
-    protocol: target.protocol, servername: target.hostname }) };
+    protocol: target.protocol, servername: target.hostname,
+    ...(deps.allowPublic === true ? { allowPublic: true } : {}) }) };
 }
 
 export async function validateDestination(resolution, embeddingFingerprint, deps) {
@@ -104,13 +110,12 @@ export async function validateDestination(resolution, embeddingFingerprint, deps
       typeof deps?.readSecret !== 'function') return blocked('invalid_activation');
   const expected = trustTuple(resolution);
   const approved = await deps.approve(expected);
-  if (!approved || Object.entries(expected).some(([key, value]) => approved[key] !== value) ||
-      (Object.hasOwn(approved, 'address') && approved.address !== expected.address)) {
+  if (!sameTrustTuple(expected, approved)) {
     return blocked('trust_changed');
   }
   if (deps.isCurrent && !await deps.isCurrent()) return blocked('config_changed');
   const pin = await pinDestination(resolution.destination.url,
-    { ...deps, address: resolution.destination.address });
+    { ...deps, address: resolution.destination.address, allowPublic: resolution.destination.allowPublic });
   if (pin.kind !== 'pinned') return pin;
   const { connection } = pin;
   const auth = authorizeDestination(resolution, approved, deps.readSecret);

@@ -12,7 +12,7 @@ import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
 import { authorizeCurrentDestination } from './setup.mjs';
 import { assertWriter } from './authority.mjs';
-import { readLocalTrust, trustTuple } from './trust.mjs';
+import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { openArtifactIdentity, runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { withProjectLock } from './ledger.mjs';
 import { createBrokerWorker } from './broker-worker.mjs';
@@ -198,7 +198,7 @@ export async function authorizeBrokerLease(root, cwd, resolution, digest, secret
     if (currentProject.provider !== 'mem0' ||
         currentProject.embeddingFingerprint !== resolution.embeddingFingerprint) return false;
     const trust = await readLocalTrust(currentProject.stateDir);
-    if (!trust || Object.entries(trustTuple(currentProject)).some(([key, value]) => trust[key] !== value)) return false;
+    if (!sameTrustTuple(trustTuple(currentProject), trust)) return false;
     if (!['claude', 'codex'].includes(record.cli) ||
         record.projectRoot !== currentProject.projectRoot || record.projectId !== currentProject.projectId ||
         record.embeddingFingerprint !== currentProject.embeddingFingerprint ||
@@ -406,7 +406,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
   const resolution = await inspectConfiguration(bootstrapCwd, { stateRoot });
   if (resolution.provider !== 'mem0') return blocked(resolution.reason ?? 'unbound');
   const trust = await readLocalTrust(resolution.stateDir);
-  if (!trust || Object.entries(trustTuple(resolution)).some(([key, value]) => trust[key] !== value)) {
+  if (!sameTrustTuple(trustTuple(resolution), trust)) {
     return blocked('trust_changed');
   }
   const model = path.join(resolution.stateDir, 'artifacts', 'model.onnx');

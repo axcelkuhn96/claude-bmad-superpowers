@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { brokerEndpointStatus } from './broker.mjs';
 import { inspectConfiguration, resolveProject } from './provider.mjs';
-import { readLocalTrust, trustTuple } from './trust.mjs';
+import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const starting = new Set();
@@ -28,7 +28,7 @@ export async function ensureBrokerReady(cwd, { stateRoot, bootstrapSessionId,
     }
   }
   const trust = await readLocalTrust(current.stateDir);
-  if (!trust || Object.entries(trustTuple(current)).some(([key, value]) => trust[key] !== value)) {
+  if (!sameTrustTuple(trustTuple(current), trust)) {
     return blocked('trust_changed');
   }
   let ownsStart = false;

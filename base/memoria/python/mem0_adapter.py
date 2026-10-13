@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import ssl
 import sys
 from urllib.parse import urlsplit
@@ -33,11 +34,31 @@ class PinnedTransport(httpx.BaseTransport):
         if connection['servername'] != target.hostname or target.username or target.password:
             raise ValueError('destination mismatch')
         address = ipaddress.ip_address(connection['address'])
-        if address.version != 4 or not (address.is_loopback or address in ipaddress.ip_network('10.0.0.0/8') or
-            address in ipaddress.ip_network('172.16.0.0/12') or address in ipaddress.ip_network('192.168.0.0/16')):
-            raise ValueError('destination is not private IPv4')
-        if target.scheme == 'http' and connection['address'] != '127.0.0.1':
-            raise ValueError('plaintext destination denied')
+        public = connection.get('allowPublic', False)
+        if type(public) is not bool:
+            raise ValueError('destination mode invalid')
+        if public:
+            labels = (target.hostname or '').split('.')
+            special = (ipaddress.ip_network('192.0.0.0/24'),
+                       ipaddress.ip_network('192.31.196.0/24'),
+                       ipaddress.ip_network('192.52.193.0/24'),
+                       ipaddress.ip_network('192.175.48.0/24'),
+                       ipaddress.ip_network('192.88.99.0/24'))
+            if (target.scheme != 'https' or address.version != 4 or not address.is_global or
+                    address.is_multicast or address.is_reserved or address.is_unspecified or
+                    any(address in network for network in special) or
+                    len(labels) < 2 or len(target.hostname) > 253 or
+                    re.fullmatch(r'(?:\d+\.){3}\d+', target.hostname) or
+                    labels[-1] in ('localhost', 'local') or
+                    any(len(label) > 63 or not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]*[a-z0-9])?', label)
+                        for label in labels)):
+                raise ValueError('public destination invalid')
+        else:
+            if address.version != 4 or not (address.is_loopback or address in ipaddress.ip_network('10.0.0.0/8') or
+                address in ipaddress.ip_network('172.16.0.0/12') or address in ipaddress.ip_network('192.168.0.0/16')):
+                raise ValueError('destination is not private IPv4')
+            if target.scheme == 'http' and connection['address'] != '127.0.0.1':
+                raise ValueError('plaintext destination denied')
         self.connection = connection
         ca = os.environ.get('CBS_MEMORIA_CA_FILE')
         context = ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()

@@ -4,7 +4,7 @@ import readline from 'node:readline/promises';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { inspectConfiguration } from './provider.mjs';
-import { readLocalTrust, trustTuple } from './trust.mjs';
+import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
 import { registerOwner, configureExtractor, localDevice, readOwner, readExtractor } from './policy.mjs';
 import { administrativeSession, bootstrapWriter, beginWriterTransfer,
@@ -82,8 +82,7 @@ export async function main(args = []) {
   if (action === 'status' || action === 'check') {
     const trust = await readLocalTrust(resolution.stateDir);
     const expected = trustTuple(resolution);
-    const trusted = !!trust && Object.entries(expected).every(([key, v]) => trust[key] === v) &&
-      (!Object.hasOwn(trust, 'address') || trust.address === expected.address);
+    const trusted = sameTrustTuple(expected, trust);
     const owner = await readOwner(resolution, value(rest, '--cli'),
       value(rest, '--profile'));
     const extractor = await readExtractor(resolution);

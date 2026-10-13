@@ -20,8 +20,8 @@ export async function main(args = process.argv.slice(2)) {
     const result = await activateProject(cwd, { cli, allowTrackedNative: args.includes('--allow-tracked-native'),
       readSecret: readQdrantSecret,
       approve: async (tuple) => {
-        process.stdout.write(`Projeto: ${tuple.projectRoot}\nID: ${tuple.projectId}\nQdrant: ${tuple.url}\n${tuple.address ? `Endereço privado: ${tuple.address}\n` : ''}Coleção: ${tuple.collection}\nVariável da chave: ${tuple.apiKeyEnv}\n`);
-        const answer = await input.question(`Para validar este destino local, digite o ID ${tuple.projectId}: `);
+        process.stdout.write(`Projeto: ${tuple.projectRoot}\nID: ${tuple.projectId}\nQdrant: ${tuple.url}\n${tuple.address ? `${tuple.allowPublic ? 'Endereço público' : 'Endereço privado'}: ${tuple.address}\n` : ''}Coleção: ${tuple.collection}\nVariável da chave: ${tuple.apiKeyEnv}\n`);
+        const answer = await input.question(`Para validar este destino ${tuple.allowPublic ? 'público via HTTPS' : 'local'}, digite o ID ${tuple.projectId}: `);
         return answer === tuple.projectId ? tuple : null;
       },
     });

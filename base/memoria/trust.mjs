@@ -9,7 +9,15 @@ export function trustTuple(resolution) {
   return { version: TRUST_VERSION, projectRoot: resolution.projectRoot,
     projectId: resolution.projectId, url: resolution.destination.url,
     collection: resolution.destination.collection, apiKeyEnv: resolution.destination.apiKeyEnv,
-    ...(resolution.destination.address === undefined ? {} : { address: resolution.destination.address }) };
+    ...(resolution.destination.address === undefined ? {} : { address: resolution.destination.address }),
+    ...(resolution.destination.allowPublic === true ? { allowPublic: true } : {}) };
+}
+
+export function sameTrustTuple(expected, actual) {
+  return !!actual && Object.entries(expected).every(([key, value]) => actual[key] === value) &&
+    ['address', 'allowPublic'].every(key =>
+      Object.hasOwn(expected, key) === Object.hasOwn(actual, key) &&
+      (!Object.hasOwn(expected, key) || actual[key] === expected[key]));
 }
 
 export function authorizeDestination(resolution, localTrust, readSecret) {
@@ -17,8 +25,7 @@ export function authorizeDestination(resolution, localTrust, readSecret) {
     return { kind: 'blocked', reason: 'trust_changed' };
   }
   const required = trustTuple(resolution);
-  if (Object.entries(required).some(([key, value]) => localTrust[key] !== value) ||
-      (Object.hasOwn(localTrust, 'address') && localTrust.address !== required.address)) {
+  if (!sameTrustTuple(required, localTrust)) {
     return { kind: 'blocked', reason: 'trust_changed' };
   }
   const key = readSecret(required.apiKeyEnv);

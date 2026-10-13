@@ -3,7 +3,7 @@ import path from 'node:path';
 import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
 import { verifyNativeCapture } from './native.mjs';
-import { readLocalTrust, trustTuple } from './trust.mjs';
+import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { readSessionCheckout } from './session-checkout.mjs';
 import { readOwner, readExtractor } from './policy.mjs';
 import { ensureBrokerReady } from './broker-start.mjs';
@@ -50,7 +50,7 @@ export async function authenticateSkillHook({ cli, payload, stateRoot } = {}) {
     { cli, stateRoot, projectRoot: current.projectRoot });
   if (native.kind !== 'verified') return unavailable(native.reason);
   const trust = await readLocalTrust(current.stateDir);
-  if (!trust || Object.entries(trustTuple(current)).some(([key, value]) => trust[key] !== value)) {
+  if (!sameTrustTuple(trustTuple(current), trust)) {
     return unavailable('trust_changed');
   }
   const owner = await readOwner(current, cli, cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR);

@@ -99,6 +99,44 @@ class AdapterTest(unittest.TestCase):
         finally:
             transport.close()
 
+    def test_public_pin_requires_explicit_mode_and_keeps_tls_and_redirect_guards(self):
+        import httpx
+        pin = {'url': 'https://documentos.sigamina.com.br:48677/',
+               'hostname': 'documentos.sigamina.com.br', 'address': '157.230.226.207',
+               'port': 48677, 'protocol': 'https:', 'servername': 'documentos.sigamina.com.br'}
+        with self.assertRaisesRegex(ValueError, 'destination'):
+            adapter.PinnedTransport(pin)
+        for bad in ('100.64.0.1', '169.254.169.254', '203.0.113.1',
+                    '224.0.0.1', '10.0.0.1', '192.31.196.1',
+                    '192.52.193.1', '192.175.48.1', '192.0.0.9'):
+            with self.assertRaisesRegex(ValueError, 'destination'):
+                adapter.PinnedTransport({**pin, 'address': bad, 'allowPublic': True})
+        for bad in ('https://127.0.0.1:48677/', 'https://localhost:48677/',
+                    'http://documentos.sigamina.com.br:48677/'):
+            hostname = __import__('urllib.parse', fromlist=['urlsplit']).urlsplit(bad).hostname
+            with self.assertRaisesRegex(ValueError, 'destination'):
+                adapter.PinnedTransport({**pin, 'url': bad, 'hostname': hostname,
+                                         'servername': hostname,
+                                         'protocol': bad.split(':')[0] + ':', 'allowPublic': True})
+        transport = adapter.PinnedTransport({**pin, 'allowPublic': True})
+        try:
+            self.assertIsInstance(transport.inner, httpx.HTTPTransport)
+            class FakeInner:
+                def handle_request(self, request):
+                    self_test.assertEqual(request.url.host, '157.230.226.207')
+                    self_test.assertEqual(request.extensions['sni_hostname'], pin['hostname'])
+                    return httpx.Response(302, headers={'location': 'https://evil.example/'})
+                def close(self):
+                    pass
+            self_test = self
+            transport.inner.close()
+            transport.inner = FakeInner()
+            with self.assertRaisesRegex(ValueError, 'redirect'):
+                transport.handle_request(httpx.Request('GET', pin['url'],
+                    headers={'host': 'documentos.sigamina.com.br:48677'}))
+        finally:
+            transport.close()
+
     def test_missing_collection_does_not_create_collection(self):
         class FakeClient:
             def get_collection(self, name):

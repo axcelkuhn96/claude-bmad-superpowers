@@ -28,7 +28,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
     return blocked('invalid_consumer_identity');
   }
   const [{ identifyProject }, { resolveProject }, { verifyNativeCapture },
-    { readSessionCheckout }, { readLocalTrust, trustTuple }, { createOutbox },
+    { readSessionCheckout }, { readLocalTrust, sameTrustTuple, trustTuple }, { createOutbox },
     { extractCheckpoint }, { withProjectLock }, { POLICY_VERSION }] = await Promise.all([
     import('./project-id.mjs'), import('./provider.mjs'), import('./native.mjs'),
     import('./session-checkout.mjs'), import('./trust.mjs'), import('./outbox.mjs'),
@@ -56,7 +56,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
     if (bound.kind !== 'bound' || bound.nativeSessionId !== sessionId) return blocked('unbound');
   }
   const trust = await readLocalTrust(current.stateDir);
-  if (!trust || Object.entries(trustTuple(current)).some(([key, value]) => trust[key] !== value)) {
+  if (!sameTrustTuple(trustTuple(current), trust)) {
     return blocked('trust_changed');
   }
   const box = createOutbox(current.stateDir);
@@ -81,7 +81,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
             ...(process.platform === 'win32' ? { profile: original.profile } : {}) });
         if (sourceNative.kind !== 'verified') { pending++; continue; }
         const sourceTrust = await readLocalTrust(fresh.stateDir);
-        if (!sourceTrust || Object.entries(trustTuple(fresh)).some(([key, value]) => sourceTrust[key] !== value)) {
+        if (!sameTrustTuple(trustTuple(fresh), sourceTrust)) {
           pending++; continue;
         }
         const policy = fresh.extractor;
