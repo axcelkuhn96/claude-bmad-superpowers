@@ -85,7 +85,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
           pending++; continue;
         }
         const policy = fresh.extractor;
-        if (!policy || policy.route !== 'sonnet' || !path.isAbsolute(policy.profile) ||
+        if (!policy || !['sonnet', 'haiku'].includes(policy.route) || !path.isAbsolute(policy.profile) ||
             !path.isAbsolute(policy.executable)) { pending++; continue; }
         let profile;
         try {

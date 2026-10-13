@@ -7,6 +7,7 @@ import { requestBroker } from './broker.mjs';
 import { createLedger, externalIdFor, reconcileStore, withProjectLock } from './ledger.mjs';
 import { assertWriter } from './authority.mjs';
 import { targetVersion } from './correction.mjs';
+import { createOutbox } from './outbox.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'python', 'mem0_adapter.py');
@@ -47,6 +48,10 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
   } catch { return blocked('invalid_source_identity'); }
   const resolution = await (options.resolve ?? resolveProject)(cwd, sessionId, options);
   if (resolution.provider !== 'mem0' || resolution.projectId !== operation.projectId) return blocked('project_mismatch');
+  if (operation.metadata.format_version === 2) {
+    const source = await createOutbox(resolution.stateDir).sourceForRemote(operation);
+    if (source.kind !== 'local_source') return blocked('source_review_unproved');
+  }
   const bridge = request => runBridgeOperation(cwd, sessionId, request, readSecret, options);
   const response = await withProjectLock(resolution.stateDir, async () => {
     const auth = await (options.authorize ?? authorizeCurrentDestination)(cwd, sessionId, readSecret, options);

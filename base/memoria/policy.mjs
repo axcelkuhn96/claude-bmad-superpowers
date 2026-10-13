@@ -87,8 +87,8 @@ export async function readOwner(resolution, cli, profilePath) {
 }
 
 export async function configureExtractor(resolution, selection) {
-  if (!selection || !['sonnet', 'sol'].includes(selection.route) ||
-      selection.route === 'sonnet' && (typeof selection.profile !== 'string' ||
+  if (!selection || !['sonnet', 'haiku', 'sol'].includes(selection.route) ||
+      ['sonnet', 'haiku'].includes(selection.route) && (typeof selection.profile !== 'string' ||
       !path.isAbsolute(selection.profile) || typeof selection.executable !== 'string' ||
       !path.isAbsolute(selection.executable))) return blocked('extractor_selection_invalid');
   if (selection.route === 'sol') return blocked('sol_tool_isolation_unproved');
@@ -102,11 +102,11 @@ export async function configureExtractor(resolution, selection) {
   } catch { return blocked('extractor_path_untrusted'); }
   try {
     await writePrivate(path.join(resolution.stateDir, 'extractor.json'), {
-      projectId: resolution.projectId, binding: binding(resolution), route: 'sonnet',
+      projectId: resolution.projectId, binding: binding(resolution), route: selection.route,
       profile, executable, maxCallsPerSession: 4, maxCandidatesPerCheckpoint: 5,
       autoPublish: false, selectedAt: new Date().toISOString() }, true);
   } catch { return blocked('unsafe_extractor_state'); }
-  return { kind: 'selected', route: 'sonnet', cost: 'up to four automatic paid CLI calls per session; five candidates per checkpoint; auto publication off' };
+  return { kind: 'selected', route: selection.route, cost: 'up to four automatic paid CLI calls per session; five candidates per checkpoint; auto publication off' };
 }
 
 export async function readExtractor(resolution) {
@@ -114,7 +114,7 @@ export async function readExtractor(resolution) {
     const value = await readPrivate(path.join(resolution.stateDir, 'extractor.json'));
     if (!value) return null;
     if (value.projectId !== resolution.projectId || value.binding !== binding(resolution) ||
-        value.route !== 'sonnet' || value.maxCallsPerSession !== 4 ||
+        !['sonnet', 'haiku'].includes(value.route) || value.maxCallsPerSession !== 4 ||
         value.maxCandidatesPerCheckpoint !== 5 || value.autoPublish !== false) throw new Error('extractor_binding_changed');
     const [profile, executable] = await Promise.all([fs.realpath(value.profile), fs.realpath(value.executable)]);
     if (profile !== value.profile || executable !== value.executable) throw new Error('extractor_path_changed');

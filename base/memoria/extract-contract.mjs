@@ -24,6 +24,54 @@ export const extractionSchema = { type: 'object', additionalProperties: false,
   },
 };
 
+// The model chooses claims or abstains for each supplied message. Source identity and
+// candidate keys are assigned only by the local extraction process.
+export const haikuExtractionSchema = { type: 'object', additionalProperties: false,
+  required: ['decisions'], properties: { decisions: { type: 'array', items: {
+    type: 'object', additionalProperties: false,
+    required: ['source_message_id', 'candidates', 'abstain_reason'], properties: {
+      source_message_id: { type: 'string' }, abstain_reason: { type: 'string' },
+      candidates: { type: 'array', items: { type: 'object', additionalProperties: false,
+        required: ['text', 'type', 'scope'], properties: {
+          text: { type: 'string' }, type: { type: 'string', enum: types },
+          scope: { type: 'string', enum: scopes }, condition: { type: 'string' },
+        } } },
+    },
+  } } },
+};
+
+export function validateHaikuOutput(output, expectedIds = null) {
+  if (!output || typeof output !== 'object' || Array.isArray(output) ||
+      Object.keys(output).some(key => key !== 'decisions') || !Array.isArray(output.decisions)) return false;
+  if (expectedIds && output.decisions.length !== expectedIds.length) return false;
+  const seen = new Set();
+  let count = 0;
+  for (const decision of output.decisions) {
+    if (!decision || typeof decision !== 'object' || Array.isArray(decision) ||
+        Object.keys(decision).some(key => !['source_message_id', 'candidates', 'abstain_reason'].includes(key)) ||
+        typeof decision.source_message_id !== 'string' || !decision.source_message_id ||
+        seen.has(decision.source_message_id) ||
+        expectedIds && !expectedIds.includes(decision.source_message_id) ||
+        typeof decision.abstain_reason !== 'string' || !Array.isArray(decision.candidates) ||
+        decision.candidates.length > 5 ||
+        decision.candidates.length === 0 && !decision.abstain_reason.trim() ||
+        decision.candidates.length > 0 && decision.abstain_reason !== '') return false;
+    seen.add(decision.source_message_id);
+    count += decision.candidates.length;
+    if (count > 5) return false;
+    for (const item of decision.candidates) {
+      if (!item || typeof item !== 'object' || Array.isArray(item) ||
+          Object.keys(item).some(key => !['text', 'type', 'scope', 'condition'].includes(key)) ||
+          typeof item.text !== 'string' || !item.text.trim() || item.text.length > 8192 ||
+          !types.includes(item.type) || !scopes.includes(item.scope) ||
+          (item.type === 'episode' || item.scope === 'episode') ||
+          Object.hasOwn(item, 'condition') &&
+            (typeof item.condition !== 'string' || !item.condition.trim())) return false;
+    }
+  }
+  return true;
+}
+
 export function validDateTime(value) {
   if (typeof value !== 'string' || !dateTime.test(value) || !Number.isFinite(Date.parse(value))) return false;
   const [hour, minute, second] = value.slice(11, 19).split(':').map(Number);

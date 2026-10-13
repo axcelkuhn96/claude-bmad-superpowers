@@ -15,7 +15,7 @@ Ações: status, check, provision, activate, launch, review-correct, deactivate,
        owner-register, extractor-select, writer-device, writer-bootstrap,
        writer-transfer-start, writer-transfer-complete, help
 Use --project /caminho/git nas ações de projeto. O cadastro pessoal e a seleção
-Sonnet exigem declaração local explícita; a publicação automática permanece off.
+do extrator exigem declaração local explícita; a publicação automática permanece off.
 `;
 const value = (args, flag) => args.includes(flag) ? args[args.indexOf(flag) + 1] : null;
 const readSecret = name => process.env[name];
@@ -99,8 +99,8 @@ export async function main(args = []) {
   if (action === 'extractor-select') {
     const route = value(rest, '--route');
     if (route === 'sol') { process.stdout.write('blocked: sol_tool_isolation_unproved\n'); return 1; }
-    if (route !== 'sonnet' || !await askConfirmation(
-      `Sonnet cobra até quatro chamadas automáticas por sessão, cinco candidatos/checkpoint; publicação automática off. Digite ${resolution.projectId}: `,
+    if (!['sonnet', 'haiku'].includes(route) || !await askConfirmation(
+      `${route} cobra até quatro chamadas automáticas por sessão, cinco candidatos/checkpoint; publicação automática off. Digite ${resolution.projectId}: `,
       resolution.projectId)) return 1;
     const result = await configureExtractor(resolution, { route,
       profile: value(rest, '--profile'), executable: value(rest, '--executable') });

@@ -2,18 +2,26 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { extractionSchema, validateExtractionOutput } from './extract-contract.mjs';
+import { extractionSchema, validateExtractionOutput, haikuExtractionSchema,
+  validateHaikuOutput } from './extract-contract.mjs';
 import { identifyProject } from './project-id.mjs';
 import { ensureWindowsPrivateDirectory, inspectWindowsPath } from './windows-security.mjs';
 import { resolveEnrolledWindowsTool } from './windows-enrollment.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const schema = JSON.stringify(extractionSchema);
 const tokenCount = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
 
 export async function runSonnetExtraction(prompt, policy = {}) {
-  if (policy.route !== 'sonnet' ||
+  return runClaudeExtraction(prompt, policy, 'sonnet');
+}
+
+export async function runHaikuExtraction(prompt, policy = {}) {
+  return runClaudeExtraction(prompt, policy, 'haiku');
+}
+
+async function runClaudeExtraction(prompt, policy, route) {
+  if (policy.route !== route ||
       typeof prompt !== 'string' || Buffer.byteLength(prompt) > 1024 * 1024) {
     return { kind: 'error', reason: 'invalid_cli_request' };
   }
@@ -58,8 +66,10 @@ export async function runSonnetExtraction(prompt, policy = {}) {
     }
     return await new Promise(resolve => {
       const args = ['--safe-mode', '--tools', '', '--print', '--output-format', 'json',
-        '--model', 'sonnet', '--no-session-persistence', '--permission-mode', 'dontAsk',
-        '--max-budget-usd', '0.10', '--json-schema', schema];
+        '--model', route === 'haiku' ? 'claude-haiku-5-5' : 'sonnet',
+        '--no-session-persistence', '--permission-mode', 'dontAsk',
+        '--max-budget-usd', '0.10', '--json-schema',
+        JSON.stringify(route === 'haiku' ? haikuExtractionSchema : extractionSchema)];
       const env = windows ? { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
         USERPROFILE: cwd, CLAUDE_CONFIG_DIR: profile } :
         { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: cwd,
@@ -90,11 +100,14 @@ export async function runSonnetExtraction(prompt, policy = {}) {
         try { result = JSON.parse(output); } catch { return finish({ kind: 'error', reason: 'cli_invalid_json' }); }
         if (!result || typeof result !== 'object' || Array.isArray(result) ||
             result.subtype !== 'success' || result.is_error ||
-            !validateExtractionOutput(result.structured_output)) {
+            !(route === 'haiku' ? validateHaikuOutput(result.structured_output) :
+              validateExtractionOutput(result.structured_output))) {
           return finish({ kind: 'error', reason: 'cli_invalid_schema' });
         }
         const model = Object.values(result.modelUsage ?? {})[0]?.canonicalModel;
-        if (typeof model !== 'string' || !/^claude-sonnet-[a-z0-9-]+$/.test(model)) {
+        if (typeof model !== 'string' || !(route === 'haiku'
+          ? /^claude-haiku-5-5(?:-[a-z0-9-]+)?$/.test(model)
+          : /^claude-sonnet-[a-z0-9-]+$/.test(model))) {
           return finish({ kind: 'error', reason: 'cli_model_mismatch' });
         }
         const inputUncachedTokens = tokenCount(result.usage?.input_tokens);

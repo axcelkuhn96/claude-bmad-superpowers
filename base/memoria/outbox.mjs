@@ -2,6 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import readline from 'node:readline/promises';
+import { isDeepStrictEqual } from 'node:util';
 import { externalIdFor } from './ledger.mjs';
 import { ensureWindowsPrivateDirectory, inspectWindowsPath, readWindowsBinary,
   publishWindowsBinary, deleteWindowsBinary, withWindowsFileLock } from './windows-security.mjs';
@@ -36,6 +38,17 @@ export function createOutbox(stateDir, options = {}) {
   const extractionFile = (cli, sessionId) => path.join(root,
     `extract-${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.json`);
   const hash = value => createHash('sha256').update(value).digest('hex');
+  const v2PayloadValid = (data, original) => data.format_version === undefined ||
+    data.format_version === 2 && typeof original?.text === 'string' &&
+    data.source_text_sha256 === hash(original.text) &&
+    data.claim_sha256 === hash(JSON.stringify([data.text, data.type, data.scope,
+      data.condition ?? null, data.valid_from ?? null, data.valid_to ?? null])) &&
+    data.actor === original.actor && data.speaker_role === original.speakerRole &&
+    data.evidence_at === original.timestamp &&
+    data.origin === (original.origin === 'human' ? 'user_direct' :
+      original.origin === 'assistant' ? 'assistant_report' :
+        original.origin === 'tool' ? 'tool_observation' : null) &&
+    (data.scope !== 'personal' || data.owner_id === original.ownerId);
   const windows = process.platform === 'win32';
   const mutable = file => /(?:^|[\\/])(?:cursor-|extract-)[a-f0-9]{64}\.json$/.test(file) ||
     /\.(?:manifest|retry)\.json$/.test(file);
@@ -528,6 +541,7 @@ export function createOutbox(stateDir, options = {}) {
           data.slice_start === row.start && data.slice_end === row.end && data.slice_hash === row.sliceHash &&
           data.source_offsets?.start === candidate.evidence.start &&
           data.source_offsets?.end === candidate.evidence.end &&
+          v2PayloadValid(data, original) &&
           (data.source_text_sha256 === undefined || typeof original?.text === 'string' &&
             data.source_text_sha256 === hash(original.text)) ? data : false;
       } catch (error) {
@@ -562,7 +576,7 @@ export function createOutbox(stateDir, options = {}) {
           data.source_offsets?.end !== candidate.evidence.end) return false;
       const original = row.messages.find(message => message.messageId === data.source_message_id &&
         message.start === data.source_offsets.start && message.end === data.source_offsets.end);
-      if (data.source_text_sha256 !== undefined &&
+      if (!v2PayloadValid(data, original) || data.source_text_sha256 !== undefined &&
           (typeof original?.text !== 'string' || data.source_text_sha256 !== hash(original.text))) return false;
       await handle.sync();
       const after = await fs.lstat(file);
@@ -746,6 +760,12 @@ export function createOutbox(stateDir, options = {}) {
           payload.scope !== metadata.scope || payload.owner_id !== (metadata.owner_id ?? null) ||
           payload.actor !== metadata.actor || payload.origin !== metadata.origin ||
           payload.evidence_at !== metadata.evidence_at ||
+          payload.type !== metadata.type || payload.speaker_role !== metadata.speaker_role ||
+          payload.format_version === 2 && (metadata.format_version !== 2 ||
+            payload.source_text_sha256 !== metadata.source_text_sha256 ||
+            metadata.claim_sha256 !== hash(JSON.stringify([item.text, metadata.type,
+              metadata.scope, metadata.condition ?? null, metadata.valid_from ?? null,
+              metadata.valid_to ?? null]))) ||
           typeof payload.text !== 'string' || typeof item.text !== 'string' ||
           item.text.length > 8192) return blocked('source_mismatch');
       const record = await verifiedReviewFile(path.join(reviews, `${externalId}.json`));
@@ -764,12 +784,16 @@ export function createOutbox(stateDir, options = {}) {
             operation.metadata?.checkpoint_id !== metadata.checkpoint_id ||
             operation.metadata?.scope !== metadata.scope ||
             (operation.metadata?.owner_id ?? null) !== (metadata.owner_id ?? null) ||
+            payload.format_version === 2 && (Object.entries(operation.metadata ?? {}).some(
+              ([key, value]) => !isDeepStrictEqual(metadata[key], value)) ||
+              item.sourceIdentity && !isDeepStrictEqual(item.sourceIdentity, operation.sourceIdentity)) ||
             proof?.messageId !== metadata.source ||
             proof?.messageSha256 !== payload.source_text_sha256 ||
             proof.approvedTextSha256 !== hash(item.text) ||
-            !Number.isSafeInteger(proof.start) || proof.start < 0 ||
-            proof.end !== proof.start + item.text.length) return blocked('source_mismatch');
-      } else if (!payload.text.includes(item.text)) return blocked('source_mismatch');
+            (payload.format_version === 2 ? proof.claimSha256 !== metadata.claim_sha256 :
+              !Number.isSafeInteger(proof.start) || proof.start < 0 ||
+              proof.end !== proof.start + item.text.length)) return blocked('source_mismatch');
+      } else if (payload.format_version === 2 || !payload.text.includes(item.text)) return blocked('source_mismatch');
       return { kind: 'local_source', text: item.text,
         metadata: { source: metadata.source, source_offsets: metadata.source_offsets,
           checkpoint_id: metadata.checkpoint_id, evidence_at: metadata.evidence_at,
@@ -845,7 +869,8 @@ export function createOutbox(stateDir, options = {}) {
           message.start === payload.source_offsets.start && message.end === payload.source_offsets.end);
         const approved = review.operation?.text;
         const start = typeof approved === 'string' ? source?.text?.indexOf(approved) : -1;
-        if (!source || !approved || approved.length > 8192 || start < 0 ||
+        if (!source || !approved || approved.length > 8192 ||
+            (payload.format_version !== 2 && start < 0) ||
             review.operation.externalId !== candidate.externalId ||
             review.operation.projectId !== row.projectId ||
             review.operation.sessionId !== row.sessionId ||
@@ -854,12 +879,37 @@ export function createOutbox(stateDir, options = {}) {
               JSON.stringify(payload.source_offsets) ||
             review.operation.metadata?.checkpoint_id !== operationId ||
             review.operation.metadata?.scope !== payload.scope ||
+            payload.format_version === 2 && (
+              review.operation.metadata?.type !== payload.type ||
+              review.operation.metadata?.actor !== payload.actor ||
+              review.operation.metadata?.speaker_role !== payload.speaker_role ||
+              review.operation.metadata?.origin !== payload.origin ||
+              review.operation.metadata?.evidence_at !== payload.evidence_at) ||
             (review.operation.metadata?.owner_id ?? null) !== (payload.owner_id ?? null)) {
           return blocked('review_source_mismatch');
         }
+        if (payload.format_version === 2) {
+          const meta = review.operation.metadata;
+          if (meta.format_version !== 2 || meta.source_text_sha256 !== hash(source.text) ||
+              meta.claim_sha256 !== hash(JSON.stringify([approved, meta.type, meta.scope,
+                meta.condition ?? null, meta.valid_from ?? null, meta.valid_to ?? null])) ||
+              !process.stdin.isTTY || !process.stdout.isTTY) return blocked('trusted_review_required');
+          const { redactSource, containsSecret } = await import('./candidates.mjs');
+          const safe = redactSource(source.text);
+          if (safe === null || containsSecret(review.operation)) return blocked('sensitive_content');
+          process.stdout.write(`Review ${candidateKey}\nClaim ${JSON.stringify(approved)}\n` +
+            `Metadata ${JSON.stringify(meta)}\nSource ${JSON.stringify(safe)}\n` +
+            `Payload SHA-256 ${candidate.payloadRef.sha256}\n`);
+          const io = readline.createInterface({ input: process.stdin, output: process.stdout });
+          let confirmed;
+          try { confirmed = (await io.question('Confirm complete claim, metadata and source (yes): ')).trim(); }
+          finally { io.close(); }
+          if (confirmed !== 'yes') return blocked('owner_approval_required');
+        }
         sealedReview = { ...review, sourceProof: { messageId: source.messageId,
           messageSha256: hash(source.text), approvedTextSha256: hash(approved),
-          start, end: start + approved.length } };
+          ...(payload.format_version === 2 ? { claimSha256: review.operation.metadata.claim_sha256 } :
+            { start, end: start + approved.length }) } };
       }
       if (windows) {
         if (!(await ensureWindowsPrivateDirectory(reviews)).ok) return blocked('unsafe_review_dir');
