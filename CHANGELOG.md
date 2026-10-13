@@ -6,17 +6,19 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ### Adicionado
 - **Memória Mem0 opcional por projeto (experimental):** seleção local explícita para novas sessões Claude Code/Codex, exclusiva em relação ao claude-mem padrão. Captura, extração por CLI, SDK Mem0 e embeddings E5 ficam no cliente; o servidor executa somente Qdrant privado e autenticado. Candidatos exigem fonte, ator, data, escopo e revisão; a publicação automática permanece desativada.
-- **Extração Haiku experimental:** nova opção explícita ao lado do Sonnet para selecionar com parcimônia claims curtas e autocontidas, vinculadas à mensagem de origem local e sujeitas à revisão humana antes da gravação.
+- **Extração Haiku opt-in:** seleciona poucas mensagens duráveis; cada candidato deriva `source_note` da citação literal completa e exata da fonte curta (até 512 bytes), com ator, origem, data e IDs locais. O proprietário revisa no TTY antes do envio ao SDK (`infer=False`). A paráfrase do modelo não é usada como fonte.
 - **Instalador privado do Qdrant:** script `.sh` e guia de operação para instalação posterior pelo proprietário, com armazenamento persistente, autenticação e procedimentos de backup/restauração.
 
 ### Corrigido
 - **Broker Mem0 em sessões ociosas:** mantém uma conexão autenticada enquanto a CLI lançada está aberta, para preservar o worker de recall após mais de cinco minutos sem prompts e liberar recursos ao encerrar a sessão.
 - **Probe do plugin claude-mem no Codex:** verifica no JSON da CLI que o plugin está realmente instalado no marketplace esperado, sem confundir "not installed" com instalação.
 - **Gravação manual de memória:** deadline ausente (`null`) não bloqueia a gravação; deadlines `0` ou no passado continuam bloqueados.
+- **Integridade da fonte Haiku:** exige igualdade com a citação literal completa, preservando espaços, caixa e Unicode; não aceita substring editável que possa remover contexto, inclusive uma negação.
 
 ### Limitações conhecidas
 - A ativação pública Mem0 ainda está bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`) até a conclusão das provas nativas e de qualidade. A validação física no Windows caberá a outro responsável.
-- Sonnet permanece disponível; a qualidade semântica da nova rota Haiku e seu uso com a CLI real ainda estão em validação, sem aprovação de ativação pública. A rota Sol segue bloqueada porque o isolamento de ferramentas no Codex CLI 0.162.1 ainda não foi comprovado; o mock mostrou apenas o catálogo exposto, sem observar execução maliciosa ou recursão.
+- A evidência operacional Haiku passou de forma limitada (6 decisões, 3 selecionadas e 3 abstidas); a avaliação de prosa semântica continua reprovada. Isso não aprova benchmark geral, release ou ativação pública. A prova prospectiva RF-19 e o aceite humano em duas máquinas não passaram. O guard público permanece `local_native_gate_failed` em Linux e `windows_release_unproved` no Windows; ativação automática segue desligada.
+- A rota Sol segue bloqueada porque o isolamento de ferramentas não foi comprovado; não executar recursão como prova. Windows físico depende de outro responsável, e o proprietário instalará o script Qdrant futuramente.
 
 ## [0.13.1] - 2026-09-30
 
