@@ -58,7 +58,9 @@ function renderWithItems(items, maxTokens) {
     const item = fields(row);
     const m = item.metadata;
     const condition = typeof m.condition === 'string' && m.condition ? `; condition ${m.condition}` : '';
-    const line = `[${item.id}; source ${m.source}; date ${m.evidence_at}; actor ${m.actor}; origin ${m.origin}; role ${m.speaker_role}${condition}] ${item.text}`;
+    const line = m.type === 'source_note'
+      ? `[${item.id}; date ${m.evidence_at.slice(0, 10)}; actor ${m.actor}; origin ${m.origin}] ${item.text}`
+      : `[${item.id}; source ${m.source}; date ${m.evidence_at}; actor ${m.actor}; origin ${m.origin}; role ${m.speaker_role}${condition}] ${item.text}`;
     if (!append(line)) continue;
     used.push(row);
   }

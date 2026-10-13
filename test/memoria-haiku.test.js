@@ -11,6 +11,8 @@ import { storeMemory } from '../base/memoria/bridge.mjs';
 import { externalIdFor } from '../base/memoria/ledger.mjs';
 import { runHaikuExtraction } from '../base/memoria/extract-cli.mjs';
 import { configureExtractor, readExtractor } from '../base/memoria/policy.mjs';
+import { renderRecall } from '../base/memoria/context.mjs';
+import { createHash } from 'node:crypto';
 
 const message = { origin: 'human', actor: 'user', speakerRole: 'user',
   text: 'Reutilize o orquestrador atual para a revisão.', messageId: 'm1',
@@ -25,7 +27,8 @@ async function fixture(t, messages = [message]) {
   const state = path.join(root, 'state');
   await fs.mkdir(state, { mode: 0o700 });
   const outbox = createOutbox(state);
-  const row = { cli: 'claude', sessionId: 's', start: 0, end: 48,
+  const row = { cli: 'claude', sessionId: 's', start: 0,
+    end: Math.max(48, ...messages.map(item => item.end ?? 0)),
     sliceHash: 'a'.repeat(64), messages };
   const queued = await outbox.enqueueCheckpoint(row, { projectId: 'p', policyVersion: 'native-v1' });
   assert.equal(queued.kind, 'queued');
@@ -127,12 +130,13 @@ test('terminal review seals normalized claim and replay binds remote source to a
   assert.equal(code, 0, output);
   assert.match(output, /RESULT=\{"kind":"processed"/);
   assert.ok(output.includes(message.text));
-  assert.ok(output.includes(decision.candidates[0].text));
+  assert.ok(output.includes('Citação do usuário:'));
   const receipt = await outbox.readDisposition(checkpoint.operationId);
   const review = JSON.parse(await fs.readFile(path.join(state, 'candidates', 'reviews',
     `${receipt.candidates[0].externalId}.json`), 'utf8'));
   assert.equal(review.review.operation.metadata.format_version, 2);
   const op = review.review.operation;
+  assert.equal(op.text, `Citação do usuário: ${JSON.stringify(message.text)}`);
   const variants = [
     { ...op, text: `${op.text} alterado` },
     { ...op, metadata: { ...op.metadata, source: 'other-message' } },
@@ -226,8 +230,8 @@ test('assistant and tool claims stay attributed reports', async t => {
     outbox.readCandidatePayload(checkpoint.operationId, item.candidateKey)));
   assert.deepEqual(payloads.map(item => item.origin), ['assistant_report', 'tool_observation']);
   assert.deepEqual(payloads.map(item => item.type), ['report', 'report']);
-  assert.match(payloads[0].text, /^O assistente relatou:/);
-  assert.match(payloads[1].text, /^A ferramenta observou:/);
+  assert.equal(payloads[0].text, `O assistente relatou: ${JSON.stringify(assistant.text)}`);
+  assert.equal(payloads[1].text, `A ferramenta observou: ${JSON.stringify(tool.text)}`);
 });
 
 test('normalized Haiku claim remains draft and rejects source or claim tampering', async t => {
@@ -238,8 +242,15 @@ test('normalized Haiku claim remains draft and rejects source or claim tampering
   const entry = (await outbox.readManifest(checkpoint.operationId)).candidates[0];
   const payload = await outbox.readCandidatePayload(checkpoint.operationId, entry.candidateKey);
   assert.equal(payload.format_version, 2);
+  assert.equal(payload.type, 'source_note');
+  assert.equal(payload.text, `Citação do usuário: ${JSON.stringify(message.text)}`);
   assert.equal(validateCandidate(payload, message).eligible, true);
   assert.equal(validateCandidate({ ...payload, text: 'O código já reutiliza o orquestrador.' }, message).eligible, false);
+  const forged = { ...payload, text: 'Citação do usuário: "O usuário desenvolve com Linux."' };
+  forged.claim_sha256 = createHash('sha256').update(JSON.stringify([
+    forged.text, forged.type, forged.scope, forged.condition, forged.valid_from, forged.valid_to,
+  ])).digest('hex');
+  assert.equal(validateCandidate(forged, message).eligible, false);
   assert.equal(validateCandidate({ ...payload, type: 'fact' }, message).eligible, false);
   assert.equal(validateCandidate({ ...payload, source_text_sha256: '0'.repeat(64) }, message).eligible, false);
   assert.equal((await approveCandidate(checkpoint.operationId, entry.candidateKey,
@@ -248,6 +259,85 @@ test('normalized Haiku claim remains draft and rejects source or claim tampering
   assert.equal((await outbox.sealReview(checkpoint.operationId, entry.candidateKey,
     { decision: 'approve', actor: 'caller', reviewedAt: new Date().toISOString(),
       payloadSha256: entry.payloadRef.sha256, operation: { approval: { kind: 'approved' } } })).kind, 'blocked');
+});
+
+test('frozen Haiku decisions select three exact source quotations and abstain on three messages', async t => {
+  const root = new URL('../.superpowers/sdd/2026-10-01-cbs-memoria-mem0/private/haiku-final-1013/', import.meta.url);
+  let input, receipt;
+  try {
+    input = JSON.parse(await fs.readFile(new URL('input.json', root), 'utf8'));
+    receipt = JSON.parse(await fs.readFile(new URL('direct-receipt.json', root), 'utf8'));
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    t.skip('private frozen Haiku receipt unavailable');
+    return;
+  }
+  const sources = input.messages.map(item => ({ messageId: item.message_id, text: item.text,
+    timestamp: item.evidence_at, start: item.offsets.start, end: item.offsets.end,
+    origin: item.origin, actor: item.actor, speakerRole: item.role, ownerId: item.owner_id }));
+  const { outbox, checkpoint } = await fixture(t, sources);
+  const result = await extractCheckpoint(checkpoint, { route: 'haiku' }, { outbox,
+    runCli: async () => receipt.response });
+  assert.equal(result.kind, 'manifested');
+  const entries = (await outbox.readManifest(checkpoint.operationId)).candidates;
+  assert.equal(entries.length, 3);
+  assert.equal(receipt.response.decisions.filter(item => item.candidates.length === 0).length, 3);
+  const payloads = await Promise.all(entries.map(entry =>
+    outbox.readCandidatePayload(checkpoint.operationId, entry.candidateKey)));
+  for (const payload of payloads) {
+    const source = sources.find(item => item.messageId === payload.source_message_id);
+    assert.equal(payload.type, 'source_note');
+    assert.equal(payload.text, `Citação do usuário: ${JSON.stringify(source.text)}`);
+    assert.equal(validateCandidate(payload, source).eligible, true);
+    assert.equal(validateCandidate({ ...payload, text: 'O projeto já usa o orquestrador.' }, source).eligible, false);
+  }
+  const r7 = payloads.find(item => item.scope === 'personal');
+  assert.ok(r7);
+  assert.doesNotMatch(r7.text, /develops|desenvolve/);
+  const q1 = payloads.find(item => item.text.includes('outras llm'));
+  assert.ok(q1.text.includes('orquestrador?'));
+  assert.ok(q1.text.includes('voce tá implememntado'));
+  assert.doesNotMatch(q1.text, /The project has|O projeto já/);
+  const recall = renderRecall([{
+    id: q1.external_id, projectId: 'p', status: 'active', text: q1.text,
+    metadata: { source: q1.source_message_id, type: q1.type, actor: q1.actor, origin: q1.origin,
+      speaker_role: q1.speaker_role, evidence_at: q1.evidence_at },
+  }], 500);
+  assert.equal(recall.used.length, 1);
+  assert.ok(Buffer.byteLength(recall.text, 'utf8') <= 500);
+  assert.ok(recall.text.includes(q1.external_id));
+  assert.ok(recall.text.includes('actor user'));
+  assert.ok(recall.text.includes('2026-10-09'));
+});
+
+test('selected long or secret Haiku source remains pending without a manifest', async t => {
+  for (const text of ['x'.repeat(513), 'Minha chave api_key: synthetic1234567890']) {
+    const source = { ...message, text };
+    const { outbox, checkpoint } = await fixture(t, [source]);
+    const result = await extractCheckpoint(checkpoint, { route: 'haiku' }, { outbox,
+      runCli: async () => ({ kind: 'success', model: 'claude-haiku-5-5', decisions: [decision] }) });
+    assert.equal(result.kind, 'pending');
+    assert.equal((await outbox.readManifest(checkpoint.operationId)).reason, 'missing_manifest');
+  }
+});
+
+test('multiple equivalent selections from one source make one note; conflicting scope stays pending', async t => {
+  const equivalent = { ...decision, candidates: [decision.candidates[0],
+    { ...decision.candidates[0], text: 'Another phrasing.' }] };
+  const first = await fixture(t);
+  assert.equal((await extractCheckpoint(first.checkpoint, { route: 'haiku' }, { outbox: first.outbox,
+    runCli: async () => ({ kind: 'success', model: 'claude-haiku-5-5', decisions: [equivalent] }) })).kind,
+  'manifested');
+  assert.equal((await first.outbox.readManifest(first.checkpoint.operationId)).candidates.length, 1);
+  for (const changed of [{ scope: 'personal' }, { condition: 'only on Fridays' }]) {
+    const conflict = await fixture(t);
+    const disputed = { ...equivalent, candidates: [equivalent.candidates[0],
+      { ...equivalent.candidates[1], ...changed }] };
+    const result = await extractCheckpoint(conflict.checkpoint, { route: 'haiku' }, { outbox: conflict.outbox,
+      runCli: async () => ({ kind: 'success', model: 'claude-haiku-5-5', decisions: [disputed] }) });
+    assert.equal(result.kind, 'pending');
+    assert.equal((await conflict.outbox.readManifest(conflict.checkpoint.operationId)).reason, 'missing_manifest');
+  }
 });
 
 test('store rejects a forged v2 approval before destination access', async t => {
