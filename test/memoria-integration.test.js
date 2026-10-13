@@ -21,7 +21,7 @@ import { applyNativeExclusion, restoreNativeExclusion, verifyNativeCapture } fro
 import { RUNTIME_PINS, runtimePython, openArtifactIdentity } from '../base/memoria/runtime.mjs';
 import { pinDestination } from '../base/memoria/activation.mjs';
 import net from 'node:net';
-import { readBrokerRequest, manageBrokerConnection, brokerEndpointStatus, prepareBrokerEndpoint, brokerPath } from '../base/memoria/broker.mjs';
+import { readBrokerRequest, manageBrokerConnection, brokerEndpointStatus, prepareBrokerEndpoint, brokerPath, authorizeBrokerLease } from '../base/memoria/broker.mjs';
 
 test('broker connection survives disconnect before and after late response, then serves next client', async t => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-broker-disconnect-'));
@@ -517,22 +517,26 @@ test('trusted linked Codex launch carries only its verified hooks as session con
   let idle;
   let expireWhenIdle = false;
   let rejectLease = false;
+  const subdir = path.join(linked, 'nested');
+  await fs.mkdir(subdir);
   const server = net.createServer(socket => {
     active++;
     clearTimeout(idle);
     onProbe?.();
     let lease = false;
-    readBrokerRequest(socket, frame => {
-      frame.secret.fill(0);
+    readBrokerRequest(socket, async frame => {
       if (frame.value.kind === 'launch_lease') {
-        if (rejectLease) {
+        const authorized = !rejectLease && await authorizeBrokerLease(stateRoot,
+          frame.value.cwd, current, frame.value.launchDigest, frame.secret);
+        frame.secret.fill(0);
+        if (!authorized) {
           socket.end(encodeFrame({ kind: 'unavailable', reason: 'lease_invalid' }, undefined, true));
           return;
         }
         lease = true;
         held++;
         socket.write(encodeFrame({ kind: 'leased' }, undefined, true));
-      } else socket.end();
+      } else { frame.secret.fill(0); socket.end(); }
     });
     socket.once('close', () => {
       active--;
@@ -558,10 +562,10 @@ test('trusted linked Codex launch carries only its verified hooks as session con
     if (oldCapture === undefined) delete process.env.CBS_TEST_LAUNCH_CAPTURE;
     else process.env.CBS_TEST_LAUNCH_CAPTURE = oldCapture;
   });
-  assert.deepEqual(await launchCli(linked, 'codex', ['--model', 'safe-model'], { stateRoot }),
+  assert.deepEqual(await launchCli(subdir, 'codex', ['--model', 'safe-model'], { stateRoot }),
     { kind: 'exited', code: 0, signal: null });
   const seen = JSON.parse(await fs.readFile(capture, 'utf8'));
-  assert.equal(seen.cwd, linked);
+  assert.equal(seen.cwd, subdir);
   assert.match(seen.launchId, /^[a-f0-9]{64}$/);
   for (const [event, groups] of Object.entries(expected)) {
     const command = groups[0].hooks[0].command;

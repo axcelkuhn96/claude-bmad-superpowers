@@ -9,6 +9,7 @@ import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypt
 import { fileURLToPath } from 'node:url';
 import { FrameReader, encodeFrame } from './frame.mjs';
 import { inspectConfiguration, resolveProject } from './provider.mjs';
+import { identifyProject } from './project-id.mjs';
 import { authorizeCurrentDestination } from './setup.mjs';
 import { assertWriter } from './authority.mjs';
 import { readLocalTrust, trustTuple } from './trust.mjs';
@@ -191,10 +192,17 @@ export async function authorizeBrokerLease(root, cwd, resolution, digest, secret
       if (!privateFile(stat) || stat.size > 8192) return false;
       record = JSON.parse(await recordHandle.readFile('utf8'));
     } finally { await recordHandle.close(); }
-    if (!['claude', 'codex'].includes(record.cli) || record.nativeRoot !== cwd ||
-        record.projectRoot !== resolution.projectRoot || record.projectId !== resolution.projectId ||
-        record.embeddingFingerprint !== resolution.embeddingFingerprint ||
-        JSON.stringify(record.destination) !== JSON.stringify(resolution.destination) ||
+    const scope = await identifyProject(cwd);
+    if (scope.kind !== 'git' || record.nativeRoot !== scope.activeRoot) return false;
+    const currentProject = await inspectConfiguration(cwd, { stateRoot: root });
+    if (currentProject.provider !== 'mem0' ||
+        currentProject.embeddingFingerprint !== resolution.embeddingFingerprint) return false;
+    const trust = await readLocalTrust(currentProject.stateDir);
+    if (!trust || Object.entries(trustTuple(currentProject)).some(([key, value]) => trust[key] !== value)) return false;
+    if (!['claude', 'codex'].includes(record.cli) ||
+        record.projectRoot !== currentProject.projectRoot || record.projectId !== currentProject.projectId ||
+        record.embeddingFingerprint !== currentProject.embeddingFingerprint ||
+        JSON.stringify(record.destination) !== JSON.stringify(currentProject.destination) ||
         !Number.isSafeInteger(record.createdAt) || record.createdAt > Date.now() + 5000 ||
         Date.now() - record.createdAt > 120000) return false;
     if (await fs.lstat(closedFile).then(() => true, error => error.code === 'ENOENT' ? false : true)) return false;
