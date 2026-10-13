@@ -33,7 +33,7 @@ if (!['claude', 'codex'].includes(cli) || !cwd || !sessionId || !operationId || 
       process.exitCode = 1;
     } else {
     const result = await reviewCandidateOnTerminal(operationId, candidateKey, {
-      outbox: createOutbox(current.stateDir), cwd, sessionId,
+      outbox: createOutbox(current.stateDir), cwd, sessionId, stateRoot: options.stateRoot,
       writerId: process.platform === 'win32' ? `sid:${sid}` : `uid:${process.getuid()}`,
       ...(sid ? { actor: `sid:${sid}:${os.userInfo().username}` } : {}),
       readSecret: name => process.env[name],

@@ -82,6 +82,48 @@ async function fixture(t) {
   return { dir, root, stateRoot };
 }
 
+test('review CLI passes its private state root through to storeMemory', async t => {
+  const { dir, root, stateRoot } = await fixture(t);
+  await fs.mkdir(path.join(root, '.cbs'));
+  await fs.writeFile(path.join(root, '.cbs', 'memoria.json'), JSON.stringify({
+    provider: 'mem0', project_id: 'p',
+    qdrant: { url: 'https://qdrant.internal', collection: 'cbs-p', api_key_env: 'CBS_TEST_KEY' },
+    embedding: { model: 'multilingual-e5-small', dimension: 384,
+      fingerprint: `${RUNTIME_PINS.modelSha256}:${RUNTIME_PINS.tokenizerSha256}` },
+  }));
+  const current = await initializeSession(root, 's', { event: 'SessionStart', stateRoot });
+  assert.equal(current.provider, 'mem0');
+  assert.equal((await recordSessionCheckout(current, 'claude', 's', root)).kind, 'bound');
+
+  const candidateUrl = new URL('../base/memoria/candidates.mjs', import.meta.url).href;
+  const bridgeUrl = new URL('../base/memoria/bridge.mjs', import.meta.url).href;
+  const ledgerUrl = new URL('../base/memoria/ledger.mjs', import.meta.url).href;
+  const replacement = `import { storeMemory } from ${JSON.stringify(bridgeUrl)};\n` +
+    `import { externalIdFor } from ${JSON.stringify(ledgerUrl)};\n` +
+    `export async function reviewCandidateOnTerminal(_checkpoint, _key, options) {\n` +
+    `  const sourceIdentity = { projectId: 'p', originCli: 'claude', sessionId: 's', ` +
+    `start: 0, end: 1, sliceHash: 'a'.repeat(64), policyVersion: 'native-v1', candidateKey: 'rule' };\n` +
+    `  return storeMemory(options.cwd, options.sessionId, { externalId: externalIdFor(sourceIdentity), ` +
+    `projectId: 'p', sessionId: 's', sourceIdentity, text: 'A release checklist is required.', ` +
+    `metadata: { source: 'm1', actor: 'owner', origin: 'user_direct', scope: 'project', ` +
+    `evidence_at: '2026-10-01T00:00:00Z' }, approval: { kind: 'approved' } }, options.readSecret, options);\n` +
+    `}\n`;
+  const preload = path.join(dir, 'review-import-hook.mjs');
+  await fs.writeFile(preload, `import { registerHooks } from 'node:module';\n` +
+    `const source = ${JSON.stringify(replacement)};\n` +
+    `registerHooks({ load(url, context, nextLoad) {\n` +
+    `  if (url === ${JSON.stringify(candidateUrl)}) return { format: 'module', shortCircuit: true, source };\n` +
+    `  return nextLoad(url, context);\n` +
+    `} });\n`);
+  const review = new URL('../base/memoria/review.mjs', import.meta.url).pathname;
+  const child = spawnSync('/usr/bin/script', ['-q', '-e', '-c',
+    `${process.execPath} --import ${preload} ${review} claude ${root} s checkpoint rule`, '/dev/null'], {
+    encoding: 'utf8', env: { ...process.env, CBS_MEMORIA_STATE_ROOT: stateRoot },
+  });
+  assert.equal(child.status, 1, child.stdout + child.stderr);
+  assert.match(child.stdout, /blocked: trust_changed/, child.stderr);
+});
+
 test('outbox observation fires after a real durable item is readable', async t => {
   const { stateRoot } = await fixture(t);
   const stateDir = path.join(stateRoot, 'observed');
