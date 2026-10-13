@@ -9,6 +9,7 @@ import { initializeSession, resolveProject } from '../base/memoria/provider.mjs'
 import { authorizeDestination, readLocalTrust, writeLocalTrust } from '../base/memoria/trust.mjs';
 import { validateDestination } from '../base/memoria/activation.mjs';
 import { activateProject, authorizeCurrentDestination } from '../base/memoria/setup.mjs';
+import { runBridgeOperation } from '../base/memoria/bridge.mjs';
 import { applyNativeExclusion, restoreNativeExclusion } from '../base/memoria/native.mjs';
 import { runtimeEnvironment, verifyRuntimeArtifacts } from '../base/memoria/runtime.mjs';
 import { provisionRuntime } from '../base/memoria/provision.mjs';
@@ -315,6 +316,32 @@ test('autorização posterior bloqueia DNS público antes de ler chave e entrega
     { stateRoot, lookup: async () => ['8.8.8.8'] });
   assert.deepEqual(publicNow, { kind: 'blocked', reason: 'public_destination' });
   assert.equal(reads, 1);
+});
+
+test('operação de store sem deadline chega ao SDK; deadline numérico vencido bloqueia', async (t) => {
+  const { root, stateRoot } = await fixture(t);
+  await putConfig(root);
+  const session = await initializeSession(root, 'manual-review', options(stateRoot));
+  await writeLocalTrust(session.stateDir, { version: 1, projectRoot: session.projectRoot,
+    projectId: session.projectId, url: session.destination.url,
+    collection: session.destination.collection, apiKeyEnv: session.destination.apiKeyEnv });
+  const requests = [];
+  const base = { stateRoot, lookup: async () => ['10.1.2.3'],
+    run: async (_python, _script, request) => { requests.push(request); return { kind: 'items', items: [] }; } };
+  const request = { op: 'find', projectId: session.projectId, externalId: 'reviewed-candidate' };
+  for (const deadlineAt of [undefined, null]) {
+    const result = await runBridgeOperation(root, 'manual-review', request, () => 'fixture-key',
+      { ...base, deadlineAt });
+    assert.equal(result.kind, 'items', JSON.stringify(result));
+  }
+  assert.equal(requests.length, 2);
+  assert.deepEqual(await runBridgeOperation(root, 'manual-review', request, () => 'fixture-key',
+    { ...base, deadlineAt: 0 }), { kind: 'blocked', reason: 'deadline' });
+  assert.deepEqual(await runBridgeOperation(root, 'manual-review', request, () => 'fixture-key',
+    { ...base, deadlineMs: 0 }), { kind: 'blocked', reason: 'deadline' });
+  assert.equal(requests.length, 2);
+  assert.deepEqual(await authorizeCurrentDestination(root, 'manual-review', () => 'fixture-key',
+    { ...base, deadlineAt: Date.now() - 1 }), { kind: 'blocked', reason: 'deadline' });
 });
 
 test('mudança de config ou trust durante DNS bloqueia antes de ler chave', async (t) => {

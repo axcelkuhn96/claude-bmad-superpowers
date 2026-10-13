@@ -54,7 +54,7 @@ export async function authorizeCurrentDestination(cwd, sessionId, readSecret, op
   const pin = await pinDestination(resolution.destination.url, options);
   if (pin.kind !== 'pinned') return pin;
   if (!same(resolution, await inspectConfiguration(cwd, options))) return blocked('session_changed');
-  if (options.signal?.aborted || options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) {
+  if (options.signal?.aborted || options.deadlineAt != null && Date.now() >= options.deadlineAt) {
     return blocked('deadline');
   }
   const auth = authorizeDestination(resolution, await readLocalTrust(resolution.stateDir), readSecret);

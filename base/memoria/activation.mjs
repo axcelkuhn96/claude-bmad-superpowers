@@ -82,7 +82,7 @@ export async function pinDestination(url, deps = {}) {
   try { addresses = deps.lookup ? await deps.lookup(target.hostname) : await addressesFor(target.hostname, deps); }
   catch { return blocked('destination_unavailable'); }
   if (addresses?.kind === 'blocked') return addresses;
-  if (deps.deadlineAt !== undefined && Date.now() >= deps.deadlineAt || deps.signal?.aborted) return blocked('deadline');
+  if (deps.deadlineAt != null && Date.now() >= deps.deadlineAt || deps.signal?.aborted) return blocked('deadline');
   if (!Array.isArray(addresses)) return blocked('destination_unavailable');
   addresses = addresses.map((item) => typeof item === 'string' ? item : item.address);
   if (!addresses.length || addresses.some((address) => !privateAddress(address)) ||

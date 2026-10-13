@@ -12,7 +12,7 @@ const blocked = reason => ({ kind: 'blocked', reason });
 const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'python', 'mem0_adapter.py');
 
 export async function runBridgeOperation(cwd, sessionId, operation, readSecret, options = {}) {
-  const deadlineAt = options.deadlineAt ?? (options.deadlineMs ? Date.now() + options.deadlineMs : null);
+  const deadlineAt = options.deadlineAt ?? (options.deadlineMs != null ? Date.now() + options.deadlineMs : null);
   if (deadlineAt !== null && deadlineAt <= Date.now()) return blocked('deadline');
   const resolution = await (options.resolve ?? resolveProject)(cwd, sessionId, options);
   if (resolution.provider !== 'mem0' || operation.projectId !== resolution.projectId) {
@@ -25,7 +25,7 @@ export async function runBridgeOperation(cwd, sessionId, operation, readSecret, 
     const writer = await assertWriter(resolution, auth, options);
     if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
   }
-  const remaining = deadlineAt === null ? options.deadlineMs : Math.floor(deadlineAt - Date.now());
+  const remaining = deadlineAt === null ? options.deadlineMs ?? undefined : Math.floor(deadlineAt - Date.now());
   if (deadlineAt !== null && remaining <= 0) return blocked('deadline');
   const request = { ...operation, collection: resolution.destination.collection, connection: auth.connection };
   const env = { OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1', MKL_NUM_THREADS: '1' };
