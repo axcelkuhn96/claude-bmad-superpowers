@@ -14,10 +14,16 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 - **Probe do plugin claude-mem no Codex:** verifica no JSON da CLI que o plugin está realmente instalado no marketplace esperado, sem confundir "not installed" com instalação.
 - **Gravação manual de memória:** deadline ausente (`null`) não bloqueia a gravação; deadlines `0` ou no passado continuam bloqueados.
 - **Integridade da fonte Haiku:** exige igualdade com a citação literal completa, preservando espaços, caixa e Unicode; não aceita substring editável que possa remover contexto, inclusive uma negação.
+- **Revisão Mem0 com estado isolado:** propaga a raiz de estado escolhida até a gravação no SDK, permitindo concluir a revisão de uma sessão preparada nesse estado.
+- **Captura na TUI nativa do Codex:** reconhece a mensagem humana autenticada pelos eventos da sessão, preservando a rejeição de contexto injetado como fonte humana.
+
+### Validado em QA local
+- Ciclo automático de captura, checkpoint, extração Haiku, revisão no terminal, gravação e recuperação em sessão nova, uma vez em Claude Code e uma vez na TUI do Codex. No Codex, a própria CLI foi interrompida após o checkpoint durável, antes da revisão.
+- Correção e replay do mesmo checkpoint após interrupção de worker próprio e indisponibilidade temporária do Qdrant: uma versão ativa recuperável, sem perda ou duplicação no ensaio. A revisão no terminal foi automatizada para QA e a fonte desse ensaio era sintética.
 
 ### Limitações conhecidas
 - A ativação pública Mem0 ainda está bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`) até a conclusão das provas nativas e de qualidade. A validação física no Windows caberá a outro responsável.
-- A prova operacional Haiku confirmou seleção e abstenção no pequeno conjunto real avaliado. Um comparativo contextual com fontes reais e quatro respostas nativas de Claude/Codex demonstrou lembrança útil da regra nos braços com memória, sem ferramentas ou dano material observado. Auditoria Astra: PASS limitado ao caso; os controles também eram seguros. O julgamento do proprietário, RF-19 completo e operação entre duas máquinas permanecem pendentes.
+- A prova operacional Haiku confirmou seleção e abstenção no pequeno conjunto real avaliado. Um comparativo contextual com fontes reais e quatro respostas nativas de Claude/Codex demonstrou lembrança útil da regra nos braços com memória, sem ferramentas ou dano material observado. Auditoria Astra: PASS limitado ao caso; os controles também eram seguros. O julgamento do proprietário e RF-19 completo permanecem pendentes. A prova entre duas máquinas foi adiada pelo proprietário para depois da implantação.
 - A rota Sol aguarda prova de isolamento de ferramentas. O proprietário instalará o Qdrant posteriormente.
 
 ## [0.13.1] - 2026-09-30

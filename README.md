@@ -284,7 +284,9 @@ A extração oferece Sonnet e Haiku como opções explícitas. Na rota Haiku, o 
 
 Uma avaliação contextual pequena usou uma instrução humana real e uma nova tarefa em sessões nativas de Claude Code e Codex. Nos dois CLIs, a memória lembrou a restrição que os controles omitiram; os controles também permaneceram seguros. As quatro respostas não executaram ferramentas. A auditoria Astra validou esse benefício mínimo, limitado ao caso avaliado.
 
-**Experimental:** o julgamento do proprietário, a validação completa RF-19 e a operação entre duas máquinas ainda exigem aceite. A ativação pública permanece bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`). A rota Sol aguarda prova de isolamento de ferramentas. A validação física do Windows será feita por outro responsável; o proprietário instalará o Qdrant posteriormente.
+Um ensaio local isolado completou o ciclo automático em ambas as CLIs: hooks capturaram a fonte, o checkpoint acionou Haiku, a revisão no terminal gravou pelo SDK e uma sessão nova recuperou a memória. Outro ensaio validou correção de memória, indisponibilidade do Qdrant, interrupção de worker próprio e repetição do mesmo checkpoint; a recuperação retornou somente a versão ativa, sem perda ou duplicação no ensaio. A revisão desses ensaios foi automatizada para QA e não substitui o aceite humano do proprietário. O Qdrant de teste era local; a instalação no servidor real ainda será feita pelo proprietário.
+
+**Experimental:** o julgamento do proprietário e a validação completa RF-19 ainda exigem aceite. A operação entre duas máquinas foi adiada pelo proprietário para depois da implantação. A ativação pública permanece bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`). A rota Sol aguarda prova de isolamento de ferramentas. A validação física do Windows será feita por outro responsável.
 
 ---
 
