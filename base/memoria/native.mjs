@@ -370,16 +370,25 @@ function codexEdit(raw, prior) {
   return { raw: lines.join('\n') };
 }
 
-async function supportedCodex(root, options) {
+async function supportedCodex(root, options, allowDisabled = false) {
   if (process.platform === 'win32') {
     const probe = await probeWindowsCodexPlugin(root, path.resolve(path.dirname(captureScript), '..', '..'));
     return probe.ok && probe.installed === true;
   }
   if (options.installedPlugin === true) return true;
   try {
-    const { stdout } = await run('codex', ['plugin', 'list'], { cwd: root, timeout: 5000 });
-    return stdout.split('\n').some((line) => line.includes(plugins.codex) &&
-      /installed/.test(line) && !/workspace.managed/i.test(line));
+    const { stdout } = await run('codex', ['plugin', 'list', '--marketplace', 'claude-mem-local', '--json'],
+      { cwd: root, timeout: 5000 });
+    const listed = JSON.parse(stdout);
+    if (!Array.isArray(listed?.installed)) return false;
+    const matching = listed.installed.filter(row => row?.pluginId === plugins.codex);
+    if (matching.length !== 1) return false;
+    const plugin = matching[0];
+    return plugin.name === 'claude-mem' && plugin.marketplaceName === 'claude-mem-local' &&
+      /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(plugin.version) &&
+      plugin.installed === true && (plugin.enabled === true || (allowDisabled && plugin.enabled === false)) &&
+      plugin.installPolicy === 'AVAILABLE' && plugin.source?.source === 'local' &&
+      plugin.marketplaceSource?.sourceType === 'local';
   } catch { return false; }
 }
 
@@ -412,7 +421,6 @@ export async function applyNativeExclusion(root, options = {}) {
       return { kind: 'applied', existing: false, source: 'session' };
     } catch (error) { return blocked(error.message); }
   }
-  if (cli === 'codex' && !await supportedCodex(root, options)) return blocked('unsupported_plugin');
   const file = configFile(root, cli);
   if (!await safeParent(file) || !await safeFile(file)) return blocked('unsafe_native_config');
   if (await tracked(root, file)) return blocked('tracked_native_config');
@@ -421,6 +429,7 @@ export async function applyNativeExclusion(root, options = {}) {
   const versionsPath = versionFile(snapshot);
   if (process.platform === 'win32' && !await safeFile(versionsPath, true)) return blocked('unsafe_snapshot');
   const priorSnapshot = await readOptional(snapshot, true);
+  if (cli === 'codex' && !await supportedCodex(root, options, priorSnapshot !== null)) return blocked('unsupported_plugin');
   if (priorSnapshot !== null) {
     let saved;
     try { saved = JSON.parse(priorSnapshot); } catch { return blocked('unsafe_snapshot'); }
