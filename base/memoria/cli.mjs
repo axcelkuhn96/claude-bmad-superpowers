@@ -81,7 +81,9 @@ export async function main(args = []) {
   }
   if (action === 'status' || action === 'check') {
     const trust = await readLocalTrust(resolution.stateDir);
-    const trusted = !!trust && Object.entries(trustTuple(resolution)).every(([key, v]) => trust[key] === v);
+    const expected = trustTuple(resolution);
+    const trusted = !!trust && Object.entries(expected).every(([key, v]) => trust[key] === v) &&
+      (!Object.hasOwn(trust, 'address') || trust.address === expected.address);
     const owner = await readOwner(resolution, value(rest, '--cli'),
       value(rest, '--profile'));
     const extractor = await readExtractor(resolution);
