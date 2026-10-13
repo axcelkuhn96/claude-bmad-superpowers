@@ -13,6 +13,22 @@ const DEFAULT_MAX = 256 * 1024 * 1024;
 const blocked = reason => ({ kind: 'blocked', reason });
 const validId = id => typeof id === 'string' && /^src-[a-f0-9]{64}$/.test(id);
 const proofDigest = proof => createHash('sha256').update(JSON.stringify([proof.sdkId, proof.qdrantId])).digest('hex');
+const quotedV2Source = (text, metadata, sourceSha256) => {
+  const prefix = metadata?.origin === 'user_direct' ? 'Citação do usuário: ' :
+    metadata?.origin === 'assistant_report' ? 'O assistente relatou: ' :
+      metadata?.origin === 'tool_observation' ? 'A ferramenta observou: ' : null;
+  if (!prefix || metadata?.format_version !== 2 ||
+      metadata.type !== (metadata.origin === 'user_direct' ? 'source_note' : 'report') ||
+      metadata.condition != null || metadata.valid_from != null || metadata.valid_to != null ||
+      typeof text !== 'string' || !text.startsWith(prefix)) return false;
+  let source;
+  try { source = JSON.parse(text.slice(prefix.length)); }
+  catch { return false; }
+  return typeof source === 'string' && !!source.trim() &&
+    Buffer.byteLength(source, 'utf8') <= 512 &&
+    text === prefix + JSON.stringify(source) &&
+    createHash('sha256').update(source).digest('hex') === sourceSha256;
+};
 
 export function createOutbox(stateDir, options = {}) {
   if (typeof stateDir !== 'string' || !path.isAbsolute(stateDir)) throw new Error('invalid_state_dir');
@@ -768,6 +784,20 @@ export function createOutbox(stateDir, options = {}) {
               metadata.valid_to ?? null]))) ||
           typeof payload.text !== 'string' || typeof item.text !== 'string' ||
           item.text.length > 8192) return blocked('source_mismatch');
+      if (payload.format_version === 2 &&
+          (!quotedV2Source(payload.text, payload, payload.source_text_sha256) ||
+            !quotedV2Source(item.text, metadata, payload.source_text_sha256) ||
+            payload.claim_sha256 !== hash(JSON.stringify([payload.text, payload.type,
+              payload.scope, payload.condition ?? null, payload.valid_from ?? null,
+              payload.valid_to ?? null])))) {
+        return blocked('source_mismatch');
+      }
+      if (payload.format_version === 2) {
+        const { redactSource, containsSecret } = await import('./candidates.mjs');
+        if (containsSecret(item.text) || redactSource(item.text) !== item.text) {
+          return blocked('source_mismatch');
+        }
+      }
       const record = await verifiedReviewFile(path.join(reviews, `${externalId}.json`));
       const processed = await read(processedFile(metadata.checkpoint_id));
       if (processed || item.status === 'active' || record) {
@@ -890,7 +920,9 @@ export function createOutbox(stateDir, options = {}) {
         }
         if (payload.format_version === 2) {
           const meta = review.operation.metadata;
-          if (meta.format_version !== 2 || meta.source_text_sha256 !== hash(source.text) ||
+          if (!quotedV2Source(payload.text, payload, hash(source.text)) ||
+              !quotedV2Source(approved, meta, hash(source.text)) ||
+              meta.source_text_sha256 !== hash(source.text) ||
               meta.claim_sha256 !== hash(JSON.stringify([approved, meta.type, meta.scope,
                 meta.condition ?? null, meta.valid_from ?? null, meta.valid_to ?? null])) ||
               !process.stdin.isTTY || !process.stdout.isTTY) return blocked('trusted_review_required');

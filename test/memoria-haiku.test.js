@@ -285,6 +285,80 @@ test('normalized Haiku quote must retain the complete source when negation or co
   }
 });
 
+test('direct review and remote source reject truncated v2 quotations with valid hashes', async t => {
+  for (const [label, sourceText, excerpt] of [
+    ['negation', 'não ative X automaticamente.', 'ative X automaticamente.'],
+    ['condition', 'ative Y somente se usuário autorizar.', 'ative Y'],
+    ['complete', 'mantenha a citação completa.', 'mantenha a citação completa.'],
+  ]) {
+    await t.test(label, async subtest => {
+      const source = { ...message, text: sourceText };
+      const { state, outbox, checkpoint } = await fixture(subtest, [source]);
+      assert.equal((await extractCheckpoint(checkpoint, { route: 'haiku' }, { outbox,
+        runCli: async () => ({ kind: 'success', model: 'claude-haiku-5-5', decisions: [decision] }) })).kind,
+      'manifested');
+      const entry = (await outbox.readManifest(checkpoint.operationId)).candidates[0];
+      const runner = path.join(state, `direct-review-${label}.mjs`);
+      await fs.writeFile(runner, `import { createHash } from 'node:crypto';\n` +
+        `import { createOutbox } from ${JSON.stringify(new URL('../base/memoria/outbox.mjs', import.meta.url).href)};\n` +
+        `const box = createOutbox(${JSON.stringify(state)});\n` +
+        `const payload = await box.readCandidatePayload(${JSON.stringify(checkpoint.operationId)}, ${JSON.stringify(entry.candidateKey)});\n` +
+        `const text = 'Citação do usuário: ' + JSON.stringify(${JSON.stringify(excerpt)});\n` +
+        `const hash = value => createHash('sha256').update(value).digest('hex');\n` +
+        `const metadata = { source: payload.source_message_id, source_offsets: payload.source_offsets,\n` +
+        ` checkpoint_id: payload.checkpoint_id, scope: payload.scope, owner_id: payload.owner_id,\n` +
+        ` type: payload.type, actor: payload.actor, speaker_role: payload.speaker_role,\n` +
+        ` origin: payload.origin, evidence_at: payload.evidence_at, format_version: 2,\n` +
+        ` policy_version: payload.policy_version, source_text_sha256: payload.source_text_sha256,\n` +
+        ` condition: null, valid_from: null, valid_to: null,\n` +
+        ` claim_sha256: hash(JSON.stringify([text, payload.type, payload.scope, null, null, null])) };\n` +
+        `const operation = { externalId: payload.external_id, projectId: payload.project_id,\n` +
+        ` sessionId: payload.session_id, text, metadata };\n` +
+        `const sealed = await box.sealReview(payload.checkpoint_id, payload.candidate_key, {\n` +
+        ` decision: 'approve', payloadSha256: ${JSON.stringify(entry.payloadRef.sha256)}, operation });\n` +
+        `console.log('RESULT=' + JSON.stringify(sealed));\n`);
+      const child = spawn('/usr/bin/script', ['-q', '-e', '-c', `${process.execPath} ${runner}`, '/dev/null'],
+        { stdio: ['pipe', 'pipe', 'pipe'] });
+      let output = '';
+      child.stdout.on('data', chunk => {
+        output += chunk;
+        if (output.includes('Confirm complete claim, metadata and source (yes): ')) {
+          output = output.replace('Confirm complete claim, metadata and source (yes): ', 'CONFIRMED: ');
+          child.stdin.write('yes\n');
+        }
+      });
+      const code = await new Promise((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', resolve);
+      });
+      assert.equal(code, 0, output);
+      const result = JSON.parse(output.match(/RESULT=(\{[^\r\n]+\})/)?.[1] ?? '{}');
+      if (label === 'complete') {
+        assert.equal(result.kind, 'sealed');
+        const reviewFile = path.join(state, 'candidates', 'reviews', `${entry.externalId}.json`);
+        const record = JSON.parse(await fs.readFile(reviewFile, 'utf8'));
+        assert.equal((await outbox.sourceForRemote({ ...record.review.operation })).kind, 'local_source');
+        for (const forgedExcerpt of ['citação completa.', 'mantenha a citação']) {
+          const forgedText = `Citação do usuário: ${JSON.stringify(forgedExcerpt)}`;
+          record.review.operation.text = forgedText;
+          record.review.operation.metadata.claim_sha256 = createHash('sha256').update(JSON.stringify([
+            forgedText, record.review.operation.metadata.type, record.review.operation.metadata.scope,
+            null, null, null,
+          ])).digest('hex');
+          record.review.sourceProof.approvedTextSha256 = createHash('sha256').update(forgedText).digest('hex');
+          record.review.sourceProof.claimSha256 = record.review.operation.metadata.claim_sha256;
+          record.digest = createHash('sha256').update(JSON.stringify(record.review)).digest('hex');
+          await fs.writeFile(reviewFile, JSON.stringify(record) + '\n');
+          const remote = await outbox.sourceForRemote({ ...record.review.operation });
+          assert.equal(remote.reason, 'source_mismatch');
+        }
+      } else {
+        assert.equal(result.kind, 'blocked');
+      }
+    });
+  }
+});
+
 test('frozen Haiku decisions select three exact source quotations and abstain on three messages', async t => {
   const root = new URL('../.superpowers/sdd/2026-10-01-cbs-memoria-mem0/private/haiku-final-1013/', import.meta.url);
   let input, receipt;
