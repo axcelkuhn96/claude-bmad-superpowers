@@ -23,6 +23,9 @@ const gitArgs = (root, ...args) => process.platform === 'win32'
 const plugins = { claude: 'claude-mem@thedotmack', codex: 'claude-mem@claude-mem-local' };
 const blocked = (reason) => ({ kind: 'blocked', reason });
 const hash = (value) => createHash('sha256').update(value).digest('hex');
+const trackedRollbackSeal = (receipt, plan) => hash(JSON.stringify([
+  receipt.seal, plan.config, plan.capture,
+]));
 const stateRoot = (options) => options.stateRoot ?? path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
 const snapshotFile = (root, cli, options) => path.join(stateRoot(options), hash(options.projectRoot ?? root),
   (options.projectRoot && options.projectRoot !== root ? `native-${cli}-${hash(root)}.json` : `native-${cli}.json`));
@@ -720,6 +723,15 @@ export async function restoreNativeExclusion(root, options = {}) {
   if (saved.trackedNative && !await validTrackedReceipt(root, cli, saved, file, capturePath, snapshot).catch(() => false)) {
     return blocked('native_snapshot_changed');
   }
+  if (saved.trackedNative && saved.rollback &&
+      (Object.keys(saved.rollback).length !== 3 ||
+       !['config', 'capture', 'seal'].every(key => Object.hasOwn(saved.rollback, key)) ||
+       ![saved.rollback.config, saved.rollback.capture].every(value => value === null || typeof value === 'string') ||
+       saved.rollback.seal !== trackedRollbackSeal(saved.trackedNative, saved.rollback) ||
+       saved.trackedNative.paths.some(row => row.index &&
+         (row.file === file ? saved.rollback.config : saved.rollback.capture) !== row.original))) {
+    return blocked('native_snapshot_changed');
+  }
   if (cli === 'codex' && hasCapture && await tracked(root, capturePath) && !saved.trackedNative) {
     return blocked('unsafe_capture_hooks');
   }
@@ -727,8 +739,12 @@ export async function restoreNativeExclusion(root, options = {}) {
   const raw = rawVersion?.text ?? null;
   const captureVersion = hasCapture ? await readOptionalVersion(capturePath) : null;
   const captureRaw = captureVersion?.text ?? null;
-  if (saved.trackedNative && saved.trackedNative.paths.some(row =>
-    row.index && (row.installedHash !== hash(row.file === file ? raw ?? '' : captureRaw ?? '')))) {
+  if (saved.trackedNative && saved.trackedNative.paths.some(row => {
+    if (!row.index) return false;
+    const currentHash = hash(row.file === file ? raw ?? '' : captureRaw ?? '');
+    return currentHash !== row.installedHash &&
+      !(saved.rollback && currentHash === row.originalHash);
+  })) {
     return blocked('native_config_changed');
   }
   if (process.platform === 'win32') {
@@ -812,8 +828,10 @@ export async function restoreNativeExclusion(root, options = {}) {
        (cli === 'codex' && hasCapture && captureRaw !== plan.capture && plan.capture !== null))) {
     return blocked('unsupported_windows_replace');
   }
+  let restoringFiles = true;
   try {
-    if (!saved.rollback) await writeAtomic(snapshot, JSON.stringify({ ...saved, rollback: plan }) + '\n');
+    if (!saved.rollback) await writeAtomic(snapshot, JSON.stringify({ ...saved,
+      rollback: saved.trackedNative ? { ...plan, seal: trackedRollbackSeal(saved.trackedNative, plan) } : plan }) + '\n');
     if (raw !== plan.config) {
       if (plan.config === null) await removeIfCurrent(file,
         process.platform === 'win32' ? rawVersion : raw);
@@ -824,6 +842,7 @@ export async function restoreNativeExclusion(root, options = {}) {
         process.platform === 'win32' ? captureVersion : captureRaw);
       else await writeAtomic(capturePath, plan.capture, false, captureRaw ?? '');
     }
+    restoringFiles = false;
     if (saved.leased) {
       if (!await leaseExclude(saved.exclude, root, { ...options, projectRoot: scope.projectRoot },
         true, manifest?.data.exclude) ||
@@ -837,8 +856,9 @@ export async function restoreNativeExclusion(root, options = {}) {
       }
     }
   } catch (error) {
-    return blocked(process.platform === 'win32' && error.message === 'changed'
-      ? 'native_config_changed' : 'git_exclude_changed');
+    return blocked(error.message === 'native_config_changed' ||
+      (process.platform === 'win32' && error.message === 'changed')
+      ? 'native_config_changed' : restoringFiles ? 'native_write_failed' : 'git_exclude_changed');
   }
   if (process.platform === 'win32') {
     try { await removeIfCurrent(versionFile(snapshot), manifest.observed, true); }

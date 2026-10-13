@@ -66,6 +66,45 @@ test('tracked Codex config and hooks preserve existing hooks and index on restor
   assert.deepEqual(f.paths.map(file => git(f.root, 'ls-files', '--stage', '--', path.relative(f.root, file))), f.index);
 });
 
+test('tracked Codex restore resumes after the second config write fails', async t => {
+  const f = await fixture(t, 'codex');
+  const originalHooks = await fs.readFile(f.hooks, 'utf8');
+  const options = { cli: 'codex', stateRoot: f.stateRoot, installedPlugin: true };
+  assert.equal((await applyNativeExclusion(f.root, { ...options, allowTrackedNative: true })).kind, 'applied');
+  const rename = fs.rename;
+  let failed;
+  fs.rename = async (from, to) => {
+    if (to === f.hooks) throw new Error('injected second write failure');
+    return rename(from, to);
+  };
+  try { failed = await restoreNativeExclusion(f.root, options); }
+  finally { fs.rename = rename; }
+  assert.deepEqual(failed, { kind: 'blocked', reason: 'native_write_failed' });
+  assert.equal(await fs.readFile(f.config, 'utf8'), f.initial);
+  assert.notEqual(await fs.readFile(f.hooks, 'utf8'), originalHooks);
+  const installedHooks = await fs.readFile(f.hooks, 'utf8');
+  const [scope] = await fs.readdir(f.stateRoot);
+  const snapshot = path.join(f.stateRoot, scope, 'native-codex.json');
+  const saved = await fs.readFile(snapshot, 'utf8');
+  const missingRollback = JSON.parse(saved);
+  delete missingRollback.rollback;
+  await fs.writeFile(snapshot, JSON.stringify(missingRollback) + '\n');
+  assert.equal((await restoreNativeExclusion(f.root, options)).reason, 'native_config_changed');
+  const tamperedRollback = JSON.parse(saved);
+  tamperedRollback.rollback.config = 'tampered';
+  await fs.writeFile(snapshot, JSON.stringify(tamperedRollback) + '\n');
+  assert.equal((await restoreNativeExclusion(f.root, options)).reason, 'native_snapshot_changed');
+  await fs.writeFile(snapshot, saved);
+  await fs.writeFile(f.hooks, installedHooks.replace('echo existing', 'echo user edit'));
+  assert.equal((await restoreNativeExclusion(f.root, options)).reason, 'native_config_changed');
+  assert.match(await fs.readFile(f.hooks, 'utf8'), /echo user edit/);
+  await fs.writeFile(f.hooks, installedHooks);
+  assert.equal((await restoreNativeExclusion(f.root, options)).kind, 'restored');
+  assert.equal(await fs.readFile(f.config, 'utf8'), f.initial);
+  assert.equal(await fs.readFile(f.hooks, 'utf8'), originalHooks);
+  assert.deepEqual(f.paths.map(file => git(f.root, 'ls-files', '--stage', '--', path.relative(f.root, file))), f.index);
+});
+
 test('tracked Codex hooks alone still require opt-in', async t => {
   const f = await fixture(t, 'codex');
   git(f.root, 'rm', '--cached', '-q', '.codex/config.toml');
