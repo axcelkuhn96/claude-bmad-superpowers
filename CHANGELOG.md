@@ -17,8 +17,8 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ### Limitações conhecidas
 - A ativação pública Mem0 ainda está bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`) até a conclusão das provas nativas e de qualidade. A validação física no Windows caberá a outro responsável.
-- A evidência operacional Haiku passou de forma limitada (6 decisões, 3 selecionadas e 3 abstidas); a avaliação de prosa semântica continua reprovada. Isso não aprova benchmark geral, release ou ativação pública. A prova prospectiva RF-19 e o aceite humano em duas máquinas não passaram. O guard público permanece `local_native_gate_failed` em Linux e `windows_release_unproved` no Windows; ativação automática segue desligada.
-- A rota Sol segue bloqueada porque o isolamento de ferramentas não foi comprovado; não executar recursão como prova. Windows físico depende de outro responsável, e o proprietário instalará o script Qdrant futuramente.
+- A prova operacional Haiku confirmou seleção e abstenção no pequeno conjunto real avaliado. O código conserva citações literais da fonte; a qualidade prospectiva RF-19 e a operação entre duas máquinas ainda exigem aceite.
+- A rota Sol aguarda prova de isolamento de ferramentas. O proprietário instalará o Qdrant posteriormente.
 
 ## [0.13.1] - 2026-09-30
 
