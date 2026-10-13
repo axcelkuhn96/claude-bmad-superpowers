@@ -4,6 +4,16 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ## [Unreleased]
 
+### Adicionado
+- **Memória Mem0 opcional por projeto (experimental):** seleção local explícita para novas sessões Claude Code/Codex, exclusiva em relação ao claude-mem padrão. Captura, extração por CLI, SDK Mem0 e embeddings E5 ficam no cliente; o servidor executa somente Qdrant privado e autenticado. Candidatos exigem fonte, ator, data, escopo e revisão; a publicação automática permanece desativada.
+- **Instalador privado do Qdrant:** script `.sh` e guia de operação para instalação posterior pelo proprietário, com armazenamento persistente, autenticação e procedimentos de backup/restauração.
+
+### Corrigido
+- **Broker Mem0 em sessões ociosas:** mantém uma conexão autenticada enquanto a CLI lançada está aberta, para preservar o worker de recall após mais de cinco minutos sem prompts e liberar recursos ao encerrar a sessão.
+
+### Limitações conhecidas
+- A ativação pública Mem0 ainda está bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`) até a conclusão das provas nativas e de qualidade. A validação física no Windows caberá a outro responsável.
+
 ## [0.13.1] - 2026-09-30
 
 ### Corrigido
