@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import fs from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { FrameReader, encodeFrame } from './frame.mjs';
 import { inspectConfiguration, resolveProject } from './provider.mjs';
@@ -134,6 +135,88 @@ const script = fileURLToPath(new URL('./python/worker.py', import.meta.url));
 const envAllow = () => Object.fromEntries(['PATH', 'HOME', 'SYSTEMROOT', 'WINDIR', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'CBS_MEMORIA_CA_FILE']
   .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
 
+const launchDigest = token => createHash('sha256').update(token).digest('hex');
+const leaseFile = (root, digest) => path.join(root, 'launches', `${digest}.lease`);
+const privateFile = stat => stat.isFile() && stat.uid === process.getuid() && !(stat.mode & 0o077);
+
+export async function createBrokerLeaseCredential(root, token) {
+  if (process.platform === 'win32' || !/^[a-f0-9]{64}$/.test(token ?? '')) throw new Error('unsafe_lease');
+  const directory = path.join(root, 'launches');
+  const dir = await fs.lstat(directory);
+  if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o077)) throw new Error('unsafe_lease');
+  const digest = launchDigest(token);
+  const secret = randomBytes(32);
+  let identity;
+  try {
+    const handle = await fs.open(leaseFile(root, digest), 'wx', 0o600);
+    try {
+      identity = await handle.stat();
+      await handle.writeFile(secret);
+      await handle.sync();
+    } finally { await handle.close(); }
+  } catch (error) {
+    secret.fill(0);
+    if (identity) {
+      const current = await fs.lstat(leaseFile(root, digest)).catch(() => null);
+      if (current && privateFile(current) && current.dev === identity.dev && current.ino === identity.ino) {
+        await fs.unlink(leaseFile(root, digest)).catch(() => {});
+      }
+    }
+    throw error;
+  }
+  return { digest, secret, async release() {
+    secret.fill(0);
+    const current = await fs.lstat(leaseFile(root, digest)).catch(() => null);
+    if (current && privateFile(current) && current.dev === identity.dev && current.ino === identity.ino) {
+      await fs.unlink(leaseFile(root, digest));
+    }
+  } };
+}
+
+// A one-use secret belongs to the launcher, never to the CLI environment or a worker request.
+export async function authorizeBrokerLease(root, cwd, resolution, digest, secret) {
+  if (process.platform === 'win32' || !/^[a-f0-9]{64}$/.test(digest ?? '') ||
+      !Buffer.isBuffer(secret) || secret.length !== 32 || typeof cwd !== 'string') return false;
+  const directory = path.join(root, 'launches');
+  const recordFile = path.join(directory, `${digest}.json`);
+  const sidecar = leaseFile(root, digest);
+  const closedFile = path.join(directory, `${digest}.closed`);
+  try {
+    const dir = await fs.lstat(directory);
+    if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o077)) return false;
+    const recordHandle = await fs.open(recordFile, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    let record;
+    try {
+      const stat = await recordHandle.stat();
+      if (!privateFile(stat) || stat.size > 8192) return false;
+      record = JSON.parse(await recordHandle.readFile('utf8'));
+    } finally { await recordHandle.close(); }
+    if (!['claude', 'codex'].includes(record.cli) || record.nativeRoot !== cwd ||
+        record.projectRoot !== resolution.projectRoot || record.projectId !== resolution.projectId ||
+        record.embeddingFingerprint !== resolution.embeddingFingerprint ||
+        JSON.stringify(record.destination) !== JSON.stringify(resolution.destination) ||
+        !Number.isSafeInteger(record.createdAt) || record.createdAt > Date.now() + 5000 ||
+        Date.now() - record.createdAt > 120000) return false;
+    if (await fs.lstat(closedFile).then(() => true, error => error.code === 'ENOENT' ? false : true)) return false;
+    const sidecarHandle = await fs.open(sidecar, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    let identity;
+    let expected;
+    try {
+      identity = await sidecarHandle.stat();
+      if (!privateFile(identity) || identity.size !== 32) return false;
+      expected = await sidecarHandle.readFile();
+    } finally { await sidecarHandle.close(); }
+    const matched = expected.length === 32 && timingSafeEqual(expected, secret);
+    expected.fill(0);
+    if (!matched || await fs.lstat(closedFile).then(() => true,
+      error => error.code === 'ENOENT' ? false : true)) return false;
+    const current = await fs.lstat(sidecar);
+    if (!privateFile(current) || current.dev !== identity.dev || current.ino !== identity.ino) return false;
+    await fs.unlink(sidecar);
+    return true;
+  } catch { return false; }
+}
+
 export function readBrokerRequest(socket, accept, { receptionMs = 1000 } = {}) {
   const input = new FrameReader();
   let received = false;
@@ -180,12 +263,59 @@ export function manageBrokerConnection(socket, onClose) {
   });
   return {
     signal: controller.signal,
+    acknowledge(value) {
+      if (disconnected || socket.destroyed || socket.writableEnded) return false;
+      try { socket.write(encodeFrame(value, undefined, true)); return true; }
+      catch { disconnected = true; controller.abort(); socket.destroy(); return false; }
+    },
     respond(value) {
       if (disconnected || socket.destroyed || socket.writableEnded) return false;
       try { socket.end(encodeFrame(value, undefined, true)); return true; }
       catch { disconnected = true; controller.abort(); socket.destroy(); return false; }
     },
   };
+}
+
+export async function openBrokerLease(cwd, digest, secret, { stateRoot, deadlineMs = 1000 } = {}) {
+  if (process.platform === 'win32' || !/^[a-f0-9]{64}$/.test(digest ?? '') ||
+      !Buffer.isBuffer(secret) || secret.length !== 32) return blocked('lease_invalid');
+  const file = brokerPath(stateRoot);
+  let socket;
+  try {
+    const [dir, endpoint] = await Promise.all([fs.lstat(path.dirname(file)), fs.lstat(file)]);
+    if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o077) ||
+        !endpoint.isSocket() || endpoint.uid !== process.getuid() || (endpoint.mode & 0o077)) {
+      return blocked('unsafe_broker');
+    }
+    socket = net.createConnection(file);
+    const parser = new FrameReader({ response: true });
+    const result = await new Promise(resolve => {
+      let settled = false;
+      const finish = value => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (value.kind !== 'leased') socket.destroy();
+        resolve(value);
+      };
+      const timer = setTimeout(() => finish(blocked('broker_unavailable')), deadlineMs);
+      socket.once('connect', () => socket.write(encodeFrame({ kind: 'launch_lease', cwd,
+        launchDigest: digest }, secret)));
+      socket.on('data', chunk => {
+        try {
+          const frames = parser.push(chunk);
+          if (frames.length > 1 || frames.length && parser.buffer.length) {
+            finish(blocked('broker_protocol'));
+          } else if (frames.length) finish(frames[0].value);
+        } catch { finish(blocked('broker_protocol')); }
+      });
+      socket.once('error', () => finish(blocked('broker_unavailable')));
+      socket.once('close', () => finish(blocked('broker_unavailable')));
+    });
+    if (result.kind !== 'leased') return result;
+    let released = false;
+    return { kind: 'leased', release() { if (!released) { released = true; socket.destroy(); } } };
+  } catch { socket?.destroy(); return blocked('broker_unavailable'); }
 }
 
 export async function requestBroker(request, secret, { stateRoot, deadlineMs = 120000 } = {}) {
@@ -319,6 +449,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
   try { guard ??= await claimBrokerWorker(root); }
   catch { await artifacts.close(); return blocked('broker_owned'); }
   let server;
+  const leaseSockets = new Set();
   const bridge = createBrokerWorker(() => spawn(runtimePython(resolution.stateDir), [script], {
     stdio: ['pipe', 'pipe', 'ignore'],
     env: { ...envAllow(), ...(process.platform === 'win32' ? {
@@ -326,7 +457,10 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
         path.join(windowsSystem.windows, 'System32')].join(path.delimiter),
     } : {}), CBS_MEMORIA_MODEL: model, CBS_MEMORIA_TOKENIZER: tokenizer,
       OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1', MKL_NUM_THREADS: '1' },
-  }), { onFatal: () => { if (server?.listening) server.close(); } });
+  }), { onFatal: () => {
+    for (const socket of leaseSockets) socket.destroy();
+    if (server?.listening) server.close();
+  } });
   async function closeOwnedWorker() {
     const confirmedClosed = await bridge.close();
     try { await guard.release(confirmedClosed); }
@@ -339,17 +473,42 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
   let queued = 0;
   let chain = Promise.resolve();
   let active = 0;
+  let leases = 0;
   let idle;
   let discovery;
   let discoveryIdentity;
   server = net.createServer(socket => {
     active++;
     clearTimeout(idle);
+    let leased = false;
     const connection = manageBrokerConnection(socket, () => {
       active--;
+      if (leased) { leases--; leaseSockets.delete(socket); }
       if (!active) idle = setTimeout(() => server.close(), idleMs);
     });
     const accept = frame => {
+      if (frame.value?.kind === 'launch_lease') {
+        if (leases >= 16) {
+          frame.secret.fill(0);
+          connection.respond(blocked('lease_full'));
+          return;
+        }
+        leases++;
+        (async () => {
+          try {
+            const accepted = await authorizeBrokerLease(root, frame.value.cwd, resolution,
+              frame.value.launchDigest, frame.secret);
+            if (!accepted || connection.signal.aborted) {
+              connection.respond(blocked('lease_invalid'));
+            } else {
+              leased = connection.acknowledge({ kind: 'leased' });
+              if (leased) leaseSockets.add(socket);
+            }
+          } catch { connection.respond(blocked('lease_invalid')); }
+          finally { frame.secret.fill(0); if (!leased) leases--; }
+        })();
+        return;
+      }
       if (queued >= 2) {
         frame.secret.fill(0);
         connection.respond(blocked('queue_full'));
@@ -378,6 +537,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
   async function handle(value, secret, signal) {
     if (!value || typeof value !== 'object' || secret.length === 0) return blocked('worker_unavailable');
     if (!await artifacts.unchanged()) {
+      for (const socket of leaseSockets) socket.destroy();
       if (server.listening) server.close();
       return blocked('artifact_changed');
     }

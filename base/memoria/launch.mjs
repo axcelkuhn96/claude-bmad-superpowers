@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
 import { readLocalTrust, trustTuple } from './trust.mjs';
-import { brokerEndpointStatus } from './broker.mjs';
+import { brokerEndpointStatus, createBrokerLeaseCredential, openBrokerLease } from './broker.mjs';
 import { inspectCodexMainHooks, verifyNativeCapture } from './native.mjs';
 import { codexHookOverride, codexTomlString } from './codex-config-toml.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
@@ -307,6 +307,8 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
   const root = options.stateRoot ?? rootDefault();
   const brokerScript = fileURLToPath(new URL('./broker.mjs', import.meta.url));
   let launch;
+  let credential;
+  let lease;
   let cliMayBeLive = false;
   let cliSettled = false;
   try {
@@ -320,6 +322,22 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
     }
     launch = await buildLaunchCommand(cwd, cli, args, options, made);
     if (launch.kind !== 'ready') return launch;
+    try { credential = await createBrokerLeaseCredential(root, made.token); }
+    catch { return blocked('broker_lease_unavailable'); }
+    const leaseDeadline = Date.now() + 30000;
+    while (Date.now() < leaseDeadline) {
+      const status = await brokerEndpointStatus(root);
+      if (status === 'unsafe') return blocked('unsafe_broker');
+      if (status === 'live') {
+        const opened = await openBrokerLease(cwd, credential.digest, credential.secret,
+          { stateRoot: root, deadlineMs: Math.min(1000, Math.max(1, leaseDeadline - Date.now())) });
+        if (opened.kind === 'leased') { lease = opened; credential.secret.fill(0); break; }
+        if (opened.reason !== 'broker_unavailable') return blocked(opened.reason);
+      }
+      await new Promise(resolve => setTimeout(resolve, Math.min(250,
+        Math.max(1, leaseDeadline - Date.now()))));
+    }
+    if (!lease) return blocked('broker_lease_unavailable');
     const child = spawn(launch.command, launch.args, { cwd, stdio: 'inherit', env: launch.env });
     cliMayBeLive = !!child.pid;
     return await new Promise(resolve => {
@@ -328,20 +346,27 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
     });
   } finally {
     try {
-      if (launch?.kind === 'ready') { launch.release(); await launch.cleanup(); }
+      lease?.release();
     } finally {
-      if (!cliMayBeLive || cliSettled) {
-        const dir = launchDir(options.stateRoot);
-        const file = path.join(dir, `${digest(made.token)}.closed`);
-        const handle = await fs.open(file, 'wx', 0o600);
+      try { await credential?.release(); }
+      finally {
         try {
-          await handle.writeFile(JSON.stringify({ tokenDigest: digest(made.token),
-            projectId: made.record.projectId, outcome: cliMayBeLive ? 'exited' : 'pre_spawn_aborted',
-            closedAt: new Date().toISOString() }) + '\n');
-          await handle.sync();
-        } finally { await handle.close(); }
-        const directory = await fs.open(dir, 'r');
-        try { await directory.sync(); } finally { await directory.close(); }
+          if (launch?.kind === 'ready') { launch.release(); await launch.cleanup(); }
+        } finally {
+          if (!cliMayBeLive || cliSettled) {
+            const dir = launchDir(options.stateRoot);
+            const file = path.join(dir, `${digest(made.token)}.closed`);
+            const handle = await fs.open(file, 'wx', 0o600);
+            try {
+              await handle.writeFile(JSON.stringify({ tokenDigest: digest(made.token),
+                projectId: made.record.projectId, outcome: cliMayBeLive ? 'exited' : 'pre_spawn_aborted',
+                closedAt: new Date().toISOString() }) + '\n');
+              await handle.sync();
+            } finally { await handle.close(); }
+            const directory = await fs.open(dir, 'r');
+            try { await directory.sync(); } finally { await directory.close(); }
+          }
+        }
       }
     }
   }

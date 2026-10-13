@@ -512,15 +512,42 @@ test('trusted linked Codex launch carries only its verified hooks as session con
   const expected = JSON.parse(await fs.readFile(path.join(linked, '.codex', 'hooks.json'), 'utf8')).hooks;
   await fs.mkdir(stateRoot, { recursive: true, mode: 0o700 });
   let onProbe;
-  const server = net.createServer(socket => { onProbe?.(); socket.end(); });
-  t.after(() => server.close());
+  let held = 0;
+  let active = 0;
+  let idle;
+  let expireWhenIdle = false;
+  let rejectLease = false;
+  const server = net.createServer(socket => {
+    active++;
+    clearTimeout(idle);
+    onProbe?.();
+    let lease = false;
+    readBrokerRequest(socket, frame => {
+      frame.secret.fill(0);
+      if (frame.value.kind === 'launch_lease') {
+        if (rejectLease) {
+          socket.end(encodeFrame({ kind: 'unavailable', reason: 'lease_invalid' }, undefined, true));
+          return;
+        }
+        lease = true;
+        held++;
+        socket.write(encodeFrame({ kind: 'leased' }, undefined, true));
+      } else socket.end();
+    });
+    socket.once('close', () => {
+      active--;
+      if (lease) held--;
+      if (!active && expireWhenIdle) idle = setTimeout(() => server.close(), 50);
+    });
+  });
+  t.after(() => { clearTimeout(idle); server.close(); });
   await new Promise(resolve => server.listen(brokerPath(stateRoot), resolve));
   await fs.chmod(brokerPath(stateRoot), 0o600);
   const bin = path.join(dir, 'bin');
   await fs.mkdir(bin);
   const capture = path.join(dir, 'cli-args.json');
   const script = path.join(bin, 'codex');
-  await fs.writeFile(script, `#!${process.execPath}\nrequire('node:fs').writeFileSync(process.env.CBS_TEST_LAUNCH_CAPTURE, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd(), launchId: process.env.CBS_MEMORIA_LAUNCH_ID }));\n`);
+  await fs.writeFile(script, `#!${process.execPath}\nrequire('node:fs').writeFileSync(process.env.CBS_TEST_LAUNCH_CAPTURE, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd(), launchId: process.env.CBS_MEMORIA_LAUNCH_ID, leaseSecret: process.env.CBS_MEMORIA_LEASE_SECRET }));\nif (process.env.CBS_TEST_LAUNCH_DELAY) setTimeout(() => {}, Number(process.env.CBS_TEST_LAUNCH_DELAY));\n`);
   await fs.chmod(script, 0o700);
   const oldPath = process.env.PATH;
   const oldCapture = process.env.CBS_TEST_LAUNCH_CAPTURE;
@@ -543,7 +570,40 @@ test('trusted linked Codex launch carries only its verified hooks as session con
   assert.equal(seen.args.filter(arg => arg.startsWith('hooks.')).length, Object.keys(expected).length);
   assert.ok(seen.args.some(arg => arg.startsWith('mcp_servers.cbs_memoria.command=')));
   assert.equal(seen.args.includes('CBS_TEST_KEY'), false);
+  assert.equal(seen.leaseSecret, undefined);
   await assert.rejects(fs.readFile(path.join(root, '.codex', 'hooks.json'), 'utf8'), { code: 'ENOENT' });
+
+  const oldDelay = process.env.CBS_TEST_LAUNCH_DELAY;
+  process.env.CBS_TEST_LAUNCH_DELAY = '250';
+  await fs.rm(capture);
+  expireWhenIdle = true;
+  let running;
+  try {
+    running = launchCli(linked, 'codex', [], { stateRoot });
+    for (let i = 0; i < 100 && !await fs.access(capture).then(() => true, () => false); i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(await fs.access(capture).then(() => true, () => false), true);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(server.listening, true);
+    assert.equal(held, 1);
+    expireWhenIdle = false;
+    assert.deepEqual(await running, { kind: 'exited', code: 0, signal: null });
+  } finally {
+    expireWhenIdle = false;
+    clearTimeout(idle);
+    if (oldDelay === undefined) delete process.env.CBS_TEST_LAUNCH_DELAY;
+    else process.env.CBS_TEST_LAUNCH_DELAY = oldDelay;
+    await running?.catch(() => {});
+  }
+
+  await fs.rm(capture);
+  rejectLease = true;
+  try {
+    assert.equal((await launchCli(linked, 'codex', [], { stateRoot })).reason, 'lease_invalid');
+    await assert.rejects(fs.readFile(capture, 'utf8'), { code: 'ENOENT' });
+    assert.equal((await fs.readdir(path.join(stateRoot, 'launches'))).some(name => name.endsWith('.lease')), false);
+  } finally { rejectLease = false; }
 
   assert.deepEqual(await launchCli(linked, 'codex', ['--model', 'safe-model', 'Qual regra?'], { stateRoot }),
     { kind: 'exited', code: 0, signal: null });
@@ -608,6 +668,7 @@ test('trusted linked Codex launch carries only its verified hooks as session con
   for (const name of launchFiles.filter(file => /^[a-f0-9]{64}\.json$/.test(file))) {
     assert.ok(launchFiles.includes(name.replace(/\.json$/, '.closed')), name);
   }
+  assert.equal(launchFiles.some(name => name.endsWith('.lease')), false);
 });
 
 test('native rollback retries after Git exclude write failure on final shared lease', async t => {
