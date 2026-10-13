@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
 import { readLocalTrust, trustTuple } from './trust.mjs';
-import { brokerEndpointStatus, createBrokerLeaseCredential, openBrokerLease } from './broker.mjs';
+import { createBrokerLeaseCredential, openBrokerLease } from './broker.mjs';
+import { ensureBrokerReady } from './broker-start.mjs';
 import { inspectCodexMainHooks, verifyNativeCapture } from './native.mjs';
 import { codexHookOverride, codexTomlString } from './codex-config-toml.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
@@ -305,35 +306,25 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
   const made = await createLaunch(cwd, cli, options);
   if (made.kind !== 'created') return made;
   const root = options.stateRoot ?? rootDefault();
-  const brokerScript = fileURLToPath(new URL('./broker.mjs', import.meta.url));
   let launch;
   let credential;
   let lease;
   let cliMayBeLive = false;
   let cliSettled = false;
   try {
-    const endpoint = await brokerEndpointStatus(root);
-    if (endpoint === 'unsafe') return blocked('unsafe_broker');
-    if (endpoint === 'missing' || endpoint === 'orphan') {
-      const broker = spawn(process.execPath, [brokerScript, root, cwd], { detached: true,
-        stdio: 'ignore', env: { PATH: process.env.PATH, HOME: process.env.HOME,
-          ...(process.env.CBS_MEMORIA_CA_FILE ? { CBS_MEMORIA_CA_FILE: process.env.CBS_MEMORIA_CA_FILE } : {}) } });
-      broker.unref();
-    }
+    const leaseDeadline = Date.now() + 30000;
+    const ready = await ensureBrokerReady(cwd, { stateRoot: root,
+      deadlineMs: Math.max(1, leaseDeadline - Date.now()) });
+    if (ready.kind !== 'ready') return ready;
     launch = await buildLaunchCommand(cwd, cli, args, options, made);
     if (launch.kind !== 'ready') return launch;
     try { credential = await createBrokerLeaseCredential(root, made.token); }
     catch { return blocked('broker_lease_unavailable'); }
-    const leaseDeadline = Date.now() + 30000;
     while (Date.now() < leaseDeadline) {
-      const status = await brokerEndpointStatus(root);
-      if (status === 'unsafe') return blocked('unsafe_broker');
-      if (status === 'live') {
-        const opened = await openBrokerLease(cwd, credential.digest, credential.secret,
-          { stateRoot: root, deadlineMs: Math.min(1000, Math.max(1, leaseDeadline - Date.now())) });
-        if (opened.kind === 'leased') { lease = opened; credential.secret.fill(0); break; }
-        if (opened.reason !== 'broker_unavailable') return blocked(opened.reason);
-      }
+      const opened = await openBrokerLease(cwd, credential.digest, credential.secret,
+        { stateRoot: root, deadlineMs: Math.min(1000, Math.max(1, leaseDeadline - Date.now())) });
+      if (opened.kind === 'leased') { lease = opened; credential.secret.fill(0); break; }
+      if (opened.reason !== 'broker_unavailable') return blocked(opened.reason);
       await new Promise(resolve => setTimeout(resolve, Math.min(250,
         Math.max(1, leaseDeadline - Date.now()))));
     }
