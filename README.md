@@ -282,7 +282,9 @@ A extração oferece Sonnet e Haiku como opções explícitas. Na rota Haiku, o 
 
 `cbs memoria help` lista as ações. `cbs memoria check --project /raiz/git` e `cbs memoria status --project /raiz/git` mostram o estado local. A publicação automática de memórias está desativada: candidatos exigem fonte, ator, data, escopo e revisão antes da gravação.
 
-**Experimental:** há provas funcionais limitadas em Claude Code e Codex; a qualidade prospectiva RF-19 e a operação entre duas máquinas ainda exigem aceite. A ativação pública permanece bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`). A rota Sol aguarda prova de isolamento de ferramentas. A validação física do Windows será feita por outro responsável; o proprietário instalará o Qdrant posteriormente.
+Uma avaliação contextual pequena usou uma instrução humana real e uma nova tarefa em sessões nativas de Claude Code e Codex. Nos dois CLIs, a memória lembrou a restrição que os controles omitiram; os controles também permaneceram seguros. As quatro respostas não executaram ferramentas. A auditoria Astra validou esse benefício mínimo, limitado ao caso avaliado.
+
+**Experimental:** o julgamento do proprietário, a validação completa RF-19 e a operação entre duas máquinas ainda exigem aceite. A ativação pública permanece bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`). A rota Sol aguarda prova de isolamento de ferramentas. A validação física do Windows será feita por outro responsável; o proprietário instalará o Qdrant posteriormente.
 
 ---
 

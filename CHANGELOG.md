@@ -17,7 +17,7 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ### Limitações conhecidas
 - A ativação pública Mem0 ainda está bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`) até a conclusão das provas nativas e de qualidade. A validação física no Windows caberá a outro responsável.
-- A prova operacional Haiku confirmou seleção e abstenção no pequeno conjunto real avaliado. O código conserva citações literais da fonte; a qualidade prospectiva RF-19 e a operação entre duas máquinas ainda exigem aceite.
+- A prova operacional Haiku confirmou seleção e abstenção no pequeno conjunto real avaliado. Um comparativo contextual com fontes reais e quatro respostas nativas de Claude/Codex demonstrou lembrança útil da regra nos braços com memória, sem ferramentas ou dano material observado. Auditoria Astra: PASS limitado ao caso; os controles também eram seguros. O julgamento do proprietário, RF-19 completo e operação entre duas máquinas permanecem pendentes.
 - A rota Sol aguarda prova de isolamento de ferramentas. O proprietário instalará o Qdrant posteriormente.
 
 ## [0.13.1] - 2026-09-30
