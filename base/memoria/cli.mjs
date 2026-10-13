@@ -39,6 +39,15 @@ async function subprocess(script, args) {
 export async function main(args = []) {
   const [action, ...rest] = args;
   if (!action || action === 'help' || action === '--help') { process.stdout.write(help); return 0; }
+  if (action === 'hook') {
+    const [operation, encoded] = rest;
+    if ((operation === 'start' && rest.length === 1) ||
+        (operation === 'search' && rest.length === 2 && /^[A-Za-z0-9_-]{2,5462}$/.test(encoded))) {
+      process.stdout.write('typed_trigger_only\n');
+      return 0;
+    }
+    return 2;
+  }
   const project = value(rest, '--project');
   if (!project || project.startsWith('--')) { process.stderr.write(help); return 2; }
   if (['provision', 'activate', 'launch', 'review-correct', 'deactivate'].includes(action)) {

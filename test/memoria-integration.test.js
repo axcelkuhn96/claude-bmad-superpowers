@@ -610,7 +610,8 @@ test('trusted linked Codex launch carries only its verified hooks as session con
   assert.match(seen.launchId, /^[a-f0-9]{64}$/);
   for (const [event, groups] of Object.entries(expected)) {
     const command = groups[0].hooks[0].command;
-    assert.ok(seen.args.includes(`hooks.${event}=[{hooks=[{type="command",command=${JSON.stringify(command)},timeout=10}]}]`), event);
+    const matcher = event === 'PreToolUse' ? 'matcher="Bash",' : '';
+    assert.ok(seen.args.includes(`hooks.${event}=[{${matcher}hooks=[{type="command",command=${JSON.stringify(command)},timeout=10}]}]`), event);
   }
   assert.equal(seen.args.filter(arg => arg.startsWith('hooks.')).length, Object.keys(expected).length);
   assert.ok(seen.args.some(arg => arg.startsWith('mcp_servers.cbs_memoria.command=')));
@@ -665,13 +666,13 @@ test('trusted linked Codex launch carries only its verified hooks as session con
   assert.deepEqual(await launchCli(linked, 'codex', [], { stateRoot }),
     { kind: 'exited', code: 0, signal: null });
   assert.equal(JSON.parse(await fs.readFile(capture, 'utf8')).args.filter(arg =>
-    arg.startsWith('hooks.')).length, 4);
+    arg.startsWith('hooks.')).length, Object.keys(expected).length);
   await fs.rm(mainHooksFile);
 
   assert.equal((await applyNativeExclusion(root,
     { cli: 'codex', stateRoot, installedPlugin: true, projectRoot: root })).kind, 'applied');
   const mainHooks = JSON.parse(await fs.readFile(mainHooksFile, 'utf8'));
-  mainHooks.hooks.PreToolUse = custom;
+  mainHooks.hooks.PreToolUse.push(...custom);
   await fs.writeFile(mainHooksFile, JSON.stringify(mainHooks));
   for (const checkout of [root, linked]) {
     assert.deepEqual(await launchCli(checkout, 'codex', [], { stateRoot }),
@@ -701,7 +702,7 @@ test('trusted linked Codex launch carries only its verified hooks as session con
   const changed = JSON.parse(await fs.readFile(hooksFile, 'utf8'));
   changed.hooks.PreToolUse = [{ hooks: [{ type: 'command', command: 'echo custom' }] }];
   await fs.writeFile(hooksFile, JSON.stringify(changed));
-  assert.equal((await launchCli(linked, 'codex', [], { stateRoot })).reason, 'unmerged_capture_hooks');
+  assert.equal((await launchCli(linked, 'codex', [], { stateRoot })).reason, 'skill_hooks_changed');
   await assert.rejects(fs.readFile(capture, 'utf8'), { code: 'ENOENT' });
   assert.equal((await launchCli(linked, 'codex', ['-c', 'hooks.SessionStart=[]'], { stateRoot })).reason,
     'unsafe_cli_args');

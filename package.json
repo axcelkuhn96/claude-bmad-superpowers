@@ -17,7 +17,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test --test-concurrency=1 test/smoke.js test/gate-gitleaks.test.js test/gate-achados-revisados.test.js test/gate-agentshield.test.js test/settings-merge.test.js test/hooks.test.js test/memoria-provider.test.js test/memoria-store.test.js test/memoria-recovery.test.js test/memoria-extract.test.js test/memoria-haiku.test.js test/memoria-recall.test.js test/memoria-integration.test.js test/memoria-broker-worker.test.js test/memoria-broker-lease.test.js test/memoria-codex-config-toml.test.js test/memoria-windows-security.test.js test/memoria-windows-state.test.js test/memoria-windows-transport.test.js test/memoria-final-contracts.test.js"
+    "test": "node --test --test-concurrency=1 test/smoke.js test/gate-gitleaks.test.js test/gate-achados-revisados.test.js test/gate-agentshield.test.js test/settings-merge.test.js test/hooks.test.js test/memoria-provider.test.js test/memoria-store.test.js test/memoria-recovery.test.js test/memoria-extract.test.js test/memoria-haiku.test.js test/memoria-recall.test.js test/memoria-integration.test.js test/memoria-broker-worker.test.js test/memoria-broker-lease.test.js test/memoria-broker-start.test.js test/memoria-skill-hook.test.js test/memoria-codex-config-toml.test.js test/memoria-windows-security.test.js test/memoria-windows-state.test.js test/memoria-windows-transport.test.js test/memoria-final-contracts.test.js"
   },
   "keywords": [
     "claude-code",

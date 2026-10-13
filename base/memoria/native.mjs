@@ -37,6 +37,7 @@ const configFile = (root, cli) => path.join(root, cli === 'claude' ? '.claude/se
 const captureEvents = { claude: ['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'SessionEnd'],
   codex: ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'] };
 const captureScript = fileURLToPath(new URL('./capture-hook.mjs', import.meta.url));
+const skillScript = fileURLToPath(new URL('./skill-hook-cli.mjs', import.meta.url));
 const hookFile = root => path.join(root, '.codex', 'hooks.json');
 function captureCommand(cli, event) {
   if (process.platform === 'win32') {
@@ -44,6 +45,11 @@ function captureCommand(cli, event) {
         /[%!^&|<>"\r\n]/.test(value))) return null;
   } else if ([process.execPath, captureScript].some(value => /[$`"\r\n]/.test(value))) return null;
   return `"${process.execPath}" "${captureScript}" ${cli} ${event}`;
+}
+function skillCommand(cli) {
+  if (process.platform === 'win32' ||
+      [process.execPath, skillScript].some(value => /[$`"\r\n]/.test(value))) return null;
+  return `"${process.execPath}" "${skillScript}" ${cli}`;
 }
 function editCaptureHooks(raw, cli, remove = false) {
   let value;
@@ -62,6 +68,18 @@ function editCaptureHooks(raw, cli, remove = false) {
       groups.some(ours) ? groups : [...groups, { hooks: [{ type: 'command', command, timeout: 10 }] }];
     if (!hooks[event].length) delete hooks[event];
   }
+  if (process.platform !== 'win32') {
+    const command = skillCommand(cli);
+    if (!command || (hooks.PreToolUse !== undefined && !Array.isArray(hooks.PreToolUse))) return null;
+    const groups = hooks.PreToolUse ?? [];
+    const ours = group => group?.hooks?.some(h => h?.command === command);
+    if (groups.some(group => group?.hooks?.some(h => typeof h?.command === 'string' &&
+        h.command.includes('skill-hook-cli.mjs') && h.command !== command))) return null;
+    hooks.PreToolUse = remove ? groups.filter(group => !ours(group)) :
+      groups.some(ours) ? groups : [...groups, { matcher: 'Bash',
+        hooks: [{ type: 'command', command, timeout: 10 }] }];
+    if (!hooks.PreToolUse.length) delete hooks.PreToolUse;
+  }
   if (Object.keys(hooks).length) value.hooks = hooks;
   else delete value.hooks;
   return JSON.stringify(value, null, 2) + '\n';
@@ -75,30 +93,34 @@ function windowsSessionHooks(cli) {
 
 function exactCodexHooks(hooks, allowUnrelated = false) {
   if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) return null;
-  if (!allowUnrelated && Object.keys(hooks).length !== captureEvents.codex.length) return null;
+  const expectedEvents = process.platform === 'win32' ? captureEvents.codex :
+    [...captureEvents.codex, 'PreToolUse'];
+  if (!allowUnrelated && Object.keys(hooks).length !== expectedEvents.length) return null;
   const selected = {};
   for (const [event, groups] of Object.entries(hooks)) {
     if (!Array.isArray(groups)) return null;
     for (const group of groups) {
       if (!Array.isArray(group?.hooks)) return null;
-      const ours = group.hooks.filter(handler =>
-        typeof handler?.command === 'string' && handler.command.includes('capture-hook.mjs'));
+      const ours = group.hooks.filter(handler => typeof handler?.command === 'string' &&
+        (handler.command.includes('capture-hook.mjs') || handler.command.includes('skill-hook-cli.mjs')));
       if (!ours.length) {
         if (!allowUnrelated) return null;
         continue;
       }
       const handler = ours[0];
-      if (!captureEvents.codex.includes(event) || ours.length !== 1 ||
-          group.hooks.length !== 1 || Object.keys(group).length !== 1 ||
+      if (!expectedEvents.includes(event) || ours.length !== 1 ||
+          group.hooks.length !== 1 || Object.keys(group).length !== (event === 'PreToolUse' ? 2 : 1) ||
+          (event === 'PreToolUse' && group.matcher !== 'Bash') ||
           Object.keys(handler).length !== 3 || handler.type !== 'command' ||
-          handler.command !== captureCommand('codex', event) || handler.timeout !== 10 ||
+          handler.command !== (event === 'PreToolUse' ? skillCommand('codex') : captureCommand('codex', event)) ||
+          handler.timeout !== 10 ||
           selected[event]) return null;
       selected[event] = [group];
     }
   }
   const count = Object.keys(selected).length;
   if (!count) return { kind: 'absent' };
-  return count === captureEvents.codex.length ? { kind: 'exact', hooks: selected } : null;
+  return count === expectedEvents.length ? { kind: 'exact', hooks: selected } : null;
 }
 
 async function safeFile(file, privateState = false) {
@@ -440,7 +462,20 @@ export async function applyNativeExclusion(root, options = {}) {
       return blocked('native_config_changed');
     }
     const verification = await verifyNativeCapture(root, { ...options, projectRoot: scope.projectRoot });
-    return verification.kind === 'verified' ? { kind: 'applied', existing: true } : blocked(verification.reason);
+    if (verification.kind === 'verified') return { kind: 'applied', existing: true };
+    if (process.platform !== 'win32' && verification.reason === 'skill_hooks_changed') {
+      const capturePath = cli === 'claude' ? file : hookFile(root);
+      if (!await safeParent(capturePath) || !await safeFile(capturePath) ||
+          (cli === 'codex' && await tracked(root, capturePath))) return blocked('unsafe_capture_hooks');
+      const captureRaw = cli === 'claude' ? raw : await readOptional(capturePath);
+      const edited = editCaptureHooks(captureRaw, cli);
+      if (!edited || captureRaw === null || edited === captureRaw) return blocked('capture_hooks_changed');
+      try { await writeAtomic(capturePath, edited, false, captureRaw); }
+      catch { return blocked('capture_hooks_changed'); }
+      const upgraded = await verifyNativeCapture(root, { ...options, projectRoot: scope.projectRoot });
+      return upgraded.kind === 'verified' ? { kind: 'applied', existing: true } : blocked(upgraded.reason);
+    }
+    return blocked(verification.reason);
   }
   if (process.platform === 'win32' && await readOptional(versionsPath, true) !== null) {
     return blocked('native_recovery_required');
@@ -776,6 +811,11 @@ export async function verifyNativeCapture(root, options = {}) {
   try { hooks = JSON.parse(captureRaw).hooks; } catch { return blocked('capture_hooks_changed'); }
   if (!captureEvents[cli].every(event => hooks?.[event]?.some(group =>
     group?.hooks?.some(h => h?.command === captureCommand(cli, event))))) return blocked('capture_hooks_changed');
+  if (process.platform !== 'win32' && !hooks?.PreToolUse?.some(group =>
+    group?.matcher === 'Bash' && group.hooks?.some(h =>
+      h?.type === 'command' && h.command === skillCommand(cli) && h.timeout === 10))) {
+    return blocked('skill_hooks_changed');
+  }
   if (cli === 'codex' && options.includeLaunchHooks) {
     // Only CBS definitions may be copied to argv. Unknown hooks in this otherwise
     // undiscovered linked-worktree file require a separate merge decision.

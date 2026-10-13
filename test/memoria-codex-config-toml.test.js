@@ -10,6 +10,13 @@ test('Codex session hook override is a TOML sequence with escaped Windows paths'
     String.raw`hooks.SessionStart=[{hooks=[{type="command",command="\"C:\\Users\\Ana\\Node\\node.exe\" \"C:\\memória\\capture-hook.mjs\" codex SessionStart",timeout=10}]}]`);
 });
 
+test('Codex carries the verified Bash-only skill trigger into linked sessions', () => {
+  const command = '"/usr/bin/node" "/pkg/skill-hook-cli.mjs" codex';
+  assert.equal(codexHookOverride('PreToolUse', [{ matcher: 'Bash',
+    hooks: [{ type: 'command', command, timeout: 10 }] }]),
+  `hooks.PreToolUse=[{matcher="Bash",hooks=[{type="command",command=${JSON.stringify(command)},timeout=10}]}]`);
+});
+
 test('Codex session hook override accepts only the verified CBS group shape', () => {
   for (const [event, groups] of [
     ['PreToolUse', group('echo fixture')],
