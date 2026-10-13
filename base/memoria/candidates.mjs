@@ -62,7 +62,7 @@ function quotedSource(candidate, source) {
   try { excerpt = JSON.parse(candidate.text.slice(prefix.length)); }
   catch { return false; }
   return typeof excerpt === 'string' && !!excerpt.trim() &&
-    typeof source.text === 'string' && source.text.includes(excerpt) &&
+    typeof source.text === 'string' && source.text === excerpt &&
     Buffer.byteLength(source.text, 'utf8') <= 512 && !sensitive(source.text);
 }
 function groundedValidity(candidate, source, value, kind) {

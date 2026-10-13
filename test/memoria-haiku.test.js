@@ -261,6 +261,30 @@ test('normalized Haiku claim remains draft and rejects source or claim tampering
       payloadSha256: entry.payloadRef.sha256, operation: { approval: { kind: 'approved' } } })).kind, 'blocked');
 });
 
+test('normalized Haiku quote must retain the complete source when negation or condition is omitted', async t => {
+  for (const [omission, sourceText, excerpt] of [
+    ['negation', '  não ative X automaticamente.\n', 'ative X automaticamente.'],
+    ['condition', 'ative Y somente se usuário autorizar.', 'ative Y'],
+  ]) {
+    await t.test(`omitted ${omission}`, async subtest => {
+      const source = { ...message, text: sourceText };
+      const { outbox, checkpoint } = await fixture(subtest, [source]);
+      assert.equal((await extractCheckpoint(checkpoint, { route: 'haiku' }, { outbox,
+        runCli: async () => ({ kind: 'success', model: 'claude-haiku-5-5', decisions: [decision] }) })).kind,
+      'manifested');
+      const entry = (await outbox.readManifest(checkpoint.operationId)).candidates[0];
+      const payload = await outbox.readCandidatePayload(checkpoint.operationId, entry.candidateKey);
+      assert.equal(payload.text, `Citação do usuário: ${JSON.stringify(sourceText)}`);
+      assert.equal(validateCandidate(payload, source).eligible, true);
+      const forged = { ...payload, text: `Citação do usuário: ${JSON.stringify(excerpt)}` };
+      forged.claim_sha256 = createHash('sha256').update(JSON.stringify([
+        forged.text, forged.type, forged.scope, forged.condition, forged.valid_from, forged.valid_to,
+      ])).digest('hex');
+      assert.ok(validateCandidate(forged, source).reasons.includes('unsupported_claim'));
+    });
+  }
+});
+
 test('frozen Haiku decisions select three exact source quotations and abstain on three messages', async t => {
   const root = new URL('../.superpowers/sdd/2026-10-01-cbs-memoria-mem0/private/haiku-final-1013/', import.meta.url);
   let input, receipt;
