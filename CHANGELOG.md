@@ -18,11 +18,12 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 - **Captura na TUI nativa do Codex:** reconhece a mensagem humana autenticada pelos eventos da sessão, preservando a rejeição de contexto injetado como fonte humana.
 
 ### Validado em QA local
+- Gatilho de skill em sessões normais de Claude Code e Codex alcançou o contexto nativo Mem0 e recuperou a regra congelada nas duas CLIs. A ativação Linux fica experimental, com as verificações locais de confiança e propriedade mantidas; a prova não cobre recall antes do primeiro gatilho nem constitui aceite de qualidade geral.
 - Ciclo automático de captura, checkpoint, extração Haiku, revisão no terminal, gravação e recuperação em sessão nova, uma vez em Claude Code e uma vez na TUI do Codex. No Codex, a própria CLI foi interrompida após o checkpoint durável, antes da revisão.
 - Correção e replay do mesmo checkpoint após interrupção de worker próprio e indisponibilidade temporária do Qdrant: uma versão ativa recuperável, sem perda ou duplicação no ensaio. A revisão no terminal foi automatizada para QA e a fonte desse ensaio era sintética.
 
 ### Limitações conhecidas
-- A ativação pública Mem0 ainda está bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`) até a conclusão das provas nativas e de qualidade. A validação física no Windows caberá a outro responsável.
+- Windows permanece sem prova de release (`windows_release_unproved`); a validação física caberá a outro responsável. Julgamento do proprietário, RF-19 completo e operação no Qdrant remoto seguem pendentes.
 - A prova operacional Haiku confirmou seleção e abstenção no pequeno conjunto real avaliado. Um comparativo contextual com fontes reais e quatro respostas nativas de Claude/Codex demonstrou lembrança útil da regra nos braços com memória, sem ferramentas ou dano material observado. Auditoria Astra: PASS limitado ao caso; os controles também eram seguros. O julgamento do proprietário e RF-19 completo permanecem pendentes. A prova entre duas máquinas foi adiada pelo proprietário para depois da implantação.
 - A rota Sol aguarda prova de isolamento de ferramentas. O proprietário instalará o Qdrant posteriormente.
 
