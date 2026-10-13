@@ -47,7 +47,24 @@ function claudeMessage(row) {
     timestamp: row.timestamp, nativeSessionId: row.sessionId ?? null };
 }
 
-function codexMessage(row, directUser) {
+function codexTuiSource(meta, sessionId) {
+  return meta?.source === 'cli' && meta?.originator === 'codex-tui' &&
+    meta?.thread_source === 'user' && meta?.session_id === sessionId && meta?.id === sessionId;
+}
+
+function codexMessage(row, directUser, tuiUser, sessionId) {
+  if (tuiUser && row.type === 'event_msg' && row.payload?.type === 'item_completed') {
+    const { thread_id, turn_id, item } = row.payload;
+    if (thread_id === sessionId && typeof turn_id === 'string' && turn_id &&
+        item?.type === 'UserMessage' && typeof item.id === 'string' && item.id &&
+        typeof item.client_id === 'string' && item.client_id &&
+        Array.isArray(item.content) && item.content.length === 1 &&
+        item.content[0]?.type === 'text' && typeof item.content[0].text === 'string' &&
+        item.content[0].text && typeof row.timestamp === 'string' && row.timestamp) {
+      return { origin: 'human', actor: 'user', speakerRole: 'user', text: item.content[0].text,
+        messageId: item.id, timestamp: row.timestamp, nativeSessionId: thread_id };
+    }
+  }
   if (row.type !== 'response_item' || !object(row.payload)) return null;
   const payload = row.payload;
   if (['custom_tool_call', 'custom_tool_call_output', 'function_call', 'function_call_output'].includes(payload.type)) {
@@ -82,6 +99,7 @@ export async function parsePersistedSlice({ cli, transcriptPath, start = 0, end,
       throw new Error('oversized_transcript_record');
     }
     let directUser = false;
+    let tuiUser = false;
     if (cli === 'codex') {
       let first = parsed.records[0]?.value;
       if (start > 0) {
@@ -99,10 +117,12 @@ export async function parsePersistedSlice({ cli, transcriptPath, start = 0, end,
           (meta.id && meta.id !== sessionId))) throw new Error('transcript_session_mismatch');
       directUser = ['exec', 'vscode'].includes(meta?.source) && meta?.thread_source === 'user' &&
         meta?.session_id === sessionId && meta?.id === sessionId;
+      tuiUser = codexTuiSource(meta, sessionId);
     }
     const messages = [];
     for (const record of parsed.records) {
-      const mapped = cli === 'claude' ? claudeMessage(record.value) : codexMessage(record.value, directUser);
+      const mapped = cli === 'claude' ? claudeMessage(record.value) :
+        codexMessage(record.value, directUser, tuiUser, sessionId);
       if (!mapped) continue;
       if (!mapped.messageId || !mapped.timestamp ||
           (mapped.nativeSessionId && mapped.nativeSessionId !== sessionId)) throw new Error('invalid_native_message');
@@ -140,6 +160,7 @@ export async function parsePersistedSlice({ cli, transcriptPath, start = 0, end,
       throw new Error('oversized_transcript_record');
     }
     let directUser = false;
+    let tuiUser = false;
     if (cli === 'codex') {
       let first = parsed.records[0]?.value;
       if (start > 0) {
@@ -156,10 +177,12 @@ export async function parsePersistedSlice({ cli, transcriptPath, start = 0, end,
           (meta.id && meta.id !== sessionId))) throw new Error('transcript_session_mismatch');
       directUser = ['exec', 'vscode'].includes(meta?.source) && meta?.thread_source === 'user' &&
         meta?.session_id === sessionId && meta?.id === sessionId;
+      tuiUser = codexTuiSource(meta, sessionId);
     }
     const messages = [];
     for (const record of parsed.records) {
-      const mapped = cli === 'claude' ? claudeMessage(record.value) : codexMessage(record.value, directUser);
+      const mapped = cli === 'claude' ? claudeMessage(record.value) :
+        codexMessage(record.value, directUser, tuiUser, sessionId);
       if (!mapped) continue;
       if (!mapped.messageId || !mapped.timestamp ||
           (mapped.nativeSessionId && mapped.nativeSessionId !== sessionId)) throw new Error('invalid_native_message');

@@ -72,6 +72,109 @@ test('native Codex VS Code root user is human only with matching session metadat
   await assert.rejects(parsePersistedSlice({ cli: 'codex', transcriptPath: file, sessionId: 'native-session' }), /transcript_session_mismatch/);
 });
 
+test('native Codex TUI trusts only a completed user item, preserving its own ID and byte offsets', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'codex-tui.jsonl');
+  const sessionId = 'native-session';
+  const text = 'Nunca apagar cache local.';
+  const rows = [
+    { timestamp: '2026-10-13T21:18:58.843Z', type: 'session_meta', payload: {
+      source: 'cli', originator: 'codex-tui', thread_source: 'user', id: sessionId, session_id: sessionId } },
+    { timestamp: '2026-10-13T21:18:59.109Z', type: 'response_item', payload: {
+      type: 'message', id: 'synthetic-context', role: 'user', content: [{ type: 'input_text', text }] } },
+    { timestamp: '2026-10-13T21:18:59.706Z', type: 'response_item', payload: {
+      type: 'message', id: 'mirrored-user', role: 'user', content: [{ type: 'input_text', text }] } },
+    { timestamp: '2026-10-13T21:18:59.707Z', type: 'event_msg', payload: {
+      type: 'item_completed', thread_id: sessionId, turn_id: 'turn-1', item: {
+        type: 'UserMessage', id: 'human-item-1', client_id: 'client-1',
+        content: [{ type: 'text', text }] } } },
+  ];
+  const lines = rows.map(row => JSON.stringify(row) + '\n');
+  await fs.writeFile(file, lines.join(''));
+  const parsed = await parsePersistedSlice({ cli: 'codex', transcriptPath: file, sessionId });
+  assert.deepEqual(parsed.messages.map(message => [message.origin, message.messageId]), [
+    ['unknown', 'synthetic-context'], ['unknown', 'mirrored-user'], ['human', 'human-item-1'],
+  ]);
+  assert.equal(parsed.messages[2].text, text);
+  assert.equal(parsed.messages[2].actor, 'user');
+  assert.equal(parsed.messages[2].speakerRole, 'user');
+  assert.equal(parsed.messages[2].nativeSessionId, sessionId);
+  assert.equal(parsed.messages[2].timestamp, rows[3].timestamp);
+  assert.equal(parsed.messages[2].start, Buffer.byteLength(lines.slice(0, 3).join('')));
+  assert.equal(parsed.messages[2].end, Buffer.byteLength(lines.join('')));
+  const fromMidpoint = await parsePersistedSlice({ cli: 'codex', transcriptPath: file,
+    start: Buffer.byteLength(lines.slice(0, 3).join('')), sessionId });
+  assert.deepEqual(fromMidpoint.messages.map(message => message.messageId), ['human-item-1']);
+});
+
+test('Codex TUI user item needs complete trusted metadata and one text block', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'codex-tui.jsonl');
+  const sessionId = 'native-session';
+  const header = { timestamp: '2026-10-13T21:18:58.843Z', type: 'session_meta', payload: {
+    source: 'cli', originator: 'codex-tui', thread_source: 'user', id: sessionId, session_id: sessionId } };
+  const event = { timestamp: '2026-10-13T21:18:59.707Z', type: 'event_msg', payload: {
+    type: 'item_completed', thread_id: sessionId, turn_id: 'turn-1', item: {
+      type: 'UserMessage', id: 'human-item-1', client_id: 'client-1',
+      content: [{ type: 'text', text: '  preservar espaços  ' }] } } };
+  const cases = [
+    ['source', 'exec', header, event],
+    ['originator', 'codex-subagent', header, event],
+    ['originator', undefined, header, event],
+    ['thread_source', 'subagent', header, event],
+    ['thread_id', 'other-session', header, event],
+    ['turn_id', '', header, event],
+    ['turn_id', undefined, header, event],
+    ['id', '', header, event],
+    ['client_id', '', header, event],
+    ['client_id', undefined, header, event],
+    ['content', [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }], header, event],
+    ['content', [{ type: 'image', text: 'a' }], header, event],
+    ['content', [{ type: 'text' }], header, event],
+  ];
+  for (const [field, value, baseHeader, baseEvent] of cases) {
+    const changedHeader = structuredClone(baseHeader);
+    const changedEvent = structuredClone(baseEvent);
+    const target = ['source', 'originator', 'thread_source'].includes(field)
+      ? changedHeader.payload : ['thread_id', 'turn_id'].includes(field)
+        ? changedEvent.payload : changedEvent.payload.item;
+    if (value === undefined) delete target[field];
+    else target[field] = value;
+    await fs.writeFile(file, [changedHeader, changedEvent].map(row => JSON.stringify(row) + '\n').join(''));
+    const parsed = await parsePersistedSlice({ cli: 'codex', transcriptPath: file, sessionId });
+    assert.equal(parsed.messages.some(message => message.origin === 'human'), false, field);
+  }
+  await fs.writeFile(file, [header, event].map(row => JSON.stringify(row) + '\n').join(''));
+  const trusted = await parsePersistedSlice({ cli: 'codex', transcriptPath: file, sessionId });
+  assert.equal(trusted.messages[0].text, '  preservar espaços  ');
+  await fs.writeFile(file, JSON.stringify(event) + '\n');
+  assert.deepEqual((await parsePersistedSlice({ cli: 'codex', transcriptPath: file,
+    sessionId })).messages, []);
+});
+
+test('incomplete Codex TUI event is recovered once after its newline arrives', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'codex-tui.jsonl');
+  const sessionId = 'native-session';
+  const header = JSON.stringify({ timestamp: '2026-10-13T21:18:58.843Z', type: 'session_meta', payload: {
+    source: 'cli', originator: 'codex-tui', thread_source: 'user', id: sessionId, session_id: sessionId } }) + '\n';
+  const event = JSON.stringify({ timestamp: '2026-10-13T21:18:59.707Z', type: 'event_msg', payload: {
+    type: 'item_completed', thread_id: sessionId, turn_id: 'turn-1', item: {
+      type: 'UserMessage', id: 'human-item-1', client_id: 'client-1',
+      content: [{ type: 'text', text: 'Lembrar a regra.' }] } } });
+  await fs.writeFile(file, header + event);
+  const first = await parsePersistedSlice({ cli: 'codex', transcriptPath: file, sessionId });
+  assert.equal(first.lastCompleteByte, Buffer.byteLength(header));
+  assert.deepEqual(first.messages, []);
+  await fs.appendFile(file, '\n');
+  const second = await parsePersistedSlice({ cli: 'codex', transcriptPath: file,
+    start: first.lastCompleteByte, sessionId });
+  assert.deepEqual(second.messages.map(message => message.messageId), ['human-item-1']);
+  const third = await parsePersistedSlice({ cli: 'codex', transcriptPath: file,
+    start: second.lastCompleteByte, sessionId });
+  assert.deepEqual(third.messages, []);
+});
+
 test('parser rejects transcript symlink and bounded window resumes over 4 MiB', async t => {
   const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const file = path.join(dir, 'native-session.jsonl');
