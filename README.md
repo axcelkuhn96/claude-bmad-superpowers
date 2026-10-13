@@ -278,6 +278,8 @@ O **claude-mem continua sendo o padrão**. O CBS também contém uma opção Mem
 
 Captura, extração por CLI, SDK Mem0 e embeddings E5 rodam no computador de quem desenvolve pela rota CPU; GPU não é requisito e ainda não foi validada. O servidor executa somente Qdrant privado, autenticado e persistente. O instalador `base/memoria/deploy/install-qdrant.sh` foi preparado para instalação posterior pelo proprietário; o guia operacional está em `/home/axcel/cbs-lab/docs/operacao/qdrant-memoria.md` neste workspace.
 
+A extração comprovada hoje exige seleção explícita do Sonnet. A rota Sol continua bloqueada: o isolamento de ferramentas no Codex CLI 0.162.1 ainda não foi comprovado. O teste com mock mostrou somente o catálogo de ferramentas exposto, sem observar execução maliciosa ou recursão.
+
 `cbs memoria help` lista as ações. `cbs memoria check --project /raiz/git` e `cbs memoria status --project /raiz/git` mostram o estado local. A publicação automática de memórias está desativada: candidatos exigem fonte, ator, data, escopo e revisão antes da gravação.
 
 **Experimental:** a ativação pública Mem0 permanece bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`) até a conclusão das provas nativas e de qualidade. A validação física no Windows será feita por outro responsável. A prova funcional limitada em Claude Code não certifica Codex, Windows ou qualidade prospectiva.

@@ -10,9 +10,12 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ### Corrigido
 - **Broker Mem0 em sessões ociosas:** mantém uma conexão autenticada enquanto a CLI lançada está aberta, para preservar o worker de recall após mais de cinco minutos sem prompts e liberar recursos ao encerrar a sessão.
+- **Probe do Codex instalado:** lê o JSON da versão exata da CLI, evitando o falso diagnóstico de "não instalado".
+- **Gravação manual de memória:** deadline ausente (`null`) não bloqueia a gravação; deadlines `0` ou no passado continuam bloqueados.
 
 ### Limitações conhecidas
 - A ativação pública Mem0 ainda está bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`) até a conclusão das provas nativas e de qualidade. A validação física no Windows caberá a outro responsável.
+- A extração comprovada exige seleção explícita do Sonnet. A rota Sol segue bloqueada porque o isolamento de ferramentas no Codex CLI 0.162.1 ainda não foi comprovado; o mock mostrou apenas o catálogo exposto, sem observar execução maliciosa ou recursão.
 
 ## [0.13.1] - 2026-09-30
 
