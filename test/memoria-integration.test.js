@@ -517,6 +517,31 @@ process.stdout.write(JSON.stringify(await captureEvent(JSON.parse(process.argv[1
   assert.equal((await createOutbox(current.stateDir).pending()).length, 1);
 });
 
+test('native restore preserves user handlers sharing CBS PreToolUse matcher', async t => {
+  const { root, stateRoot } = await fixture(t);
+  const hooksPath = path.join(root, '.codex', 'hooks.json');
+  await fs.mkdir(path.dirname(hooksPath));
+  const userHandler = { type: 'command', command: 'user-hook', timeout: 7 };
+  const original = { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [userHandler] }] }, other: true };
+  await fs.writeFile(hooksPath, JSON.stringify(original, null, 2) + '\n');
+  const options = { cli: 'codex', stateRoot, installedPlugin: true };
+
+  assert.equal((await applyNativeExclusion(root, options)).kind, 'applied');
+  const active = JSON.parse(await fs.readFile(hooksPath, 'utf8'));
+  const cbsGroup = active.hooks.PreToolUse.find(group =>
+    group.hooks.some(handler => handler.command?.includes('skill-hook-cli.mjs')));
+  cbsGroup.hooks.push({ ...userHandler, command: 'user-hook-added-after-activation' });
+  await fs.writeFile(hooksPath, JSON.stringify(active, null, 2) + '\n');
+  assert.equal((await verifyNativeCapture(root, options)).kind, 'verified');
+  assert.equal((await restoreNativeExclusion(root, options)).kind, 'restored');
+  const restored = JSON.parse(await fs.readFile(hooksPath, 'utf8'));
+  assert.deepEqual(restored.hooks.PreToolUse, [
+    original.hooks.PreToolUse[0],
+    { matcher: 'Bash', hooks: [{ ...userHandler, command: 'user-hook-added-after-activation' }] },
+  ]);
+  assert.equal(restored.other, true);
+});
+
 test('Codex worktrees own native config independently and share exclude safely', async t => {
   const { dir, root, stateRoot } = await fixture(t);
   const worktree = path.join(dir, 'worktree');

@@ -75,7 +75,11 @@ function editCaptureHooks(raw, cli, remove = false) {
     const ours = group => group?.hooks?.some(h => h?.command === command);
     if (groups.some(group => group?.hooks?.some(h => typeof h?.command === 'string' &&
         h.command.includes('skill-hook-cli.mjs') && h.command !== command))) return null;
-    hooks.PreToolUse = remove ? groups.filter(group => !ours(group)) :
+    hooks.PreToolUse = remove ? groups.flatMap(group => {
+      if (!ours(group)) return [group];
+      const remaining = group.hooks.filter(h => h?.command !== command);
+      return remaining.length ? [{ ...group, hooks: remaining }] : [];
+    }) :
       groups.some(ours) ? groups : [...groups, { matcher: 'Bash',
         hooks: [{ type: 'command', command, timeout: 10 }] }];
     if (!hooks.PreToolUse.length) delete hooks.PreToolUse;
