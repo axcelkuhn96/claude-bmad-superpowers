@@ -6,16 +6,17 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
 ### Adicionado
 - **Memória Mem0 opcional por projeto (experimental):** seleção local explícita para novas sessões Claude Code/Codex, exclusiva em relação ao claude-mem padrão. Captura, extração por CLI, SDK Mem0 e embeddings E5 ficam no cliente; o servidor executa somente Qdrant privado e autenticado. Candidatos exigem fonte, ator, data, escopo e revisão; a publicação automática permanece desativada.
+- **Extração Haiku experimental:** nova opção explícita ao lado do Sonnet para selecionar com parcimônia claims curtas e autocontidas, vinculadas à mensagem de origem local e sujeitas à revisão humana antes da gravação.
 - **Instalador privado do Qdrant:** script `.sh` e guia de operação para instalação posterior pelo proprietário, com armazenamento persistente, autenticação e procedimentos de backup/restauração.
 
 ### Corrigido
 - **Broker Mem0 em sessões ociosas:** mantém uma conexão autenticada enquanto a CLI lançada está aberta, para preservar o worker de recall após mais de cinco minutos sem prompts e liberar recursos ao encerrar a sessão.
-- **Probe do Codex instalado:** lê o JSON da versão exata da CLI, evitando o falso diagnóstico de "não instalado".
+- **Probe do plugin claude-mem no Codex:** verifica no JSON da CLI que o plugin está realmente instalado no marketplace esperado, sem confundir "not installed" com instalação.
 - **Gravação manual de memória:** deadline ausente (`null`) não bloqueia a gravação; deadlines `0` ou no passado continuam bloqueados.
 
 ### Limitações conhecidas
 - A ativação pública Mem0 ainda está bloqueada em Linux (`local_native_gate_failed`) e Windows (`windows_release_unproved`) até a conclusão das provas nativas e de qualidade. A validação física no Windows caberá a outro responsável.
-- A extração comprovada exige seleção explícita do Sonnet. A rota Sol segue bloqueada porque o isolamento de ferramentas no Codex CLI 0.162.1 ainda não foi comprovado; o mock mostrou apenas o catálogo exposto, sem observar execução maliciosa ou recursão.
+- Sonnet permanece disponível; a qualidade semântica da nova rota Haiku e seu uso com a CLI real ainda estão em validação, sem aprovação de ativação pública. A rota Sol segue bloqueada porque o isolamento de ferramentas no Codex CLI 0.162.1 ainda não foi comprovado; o mock mostrou apenas o catálogo exposto, sem observar execução maliciosa ou recursão.
 
 ## [0.13.1] - 2026-09-30
 
