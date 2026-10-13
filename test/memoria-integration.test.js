@@ -937,3 +937,24 @@ test('consumer binds pending checkpoint to the exact trusted worktree', async t 
     stateRoot, runCli })).manifested, 1);
   assert.equal(calls, 1);
 });
+
+test('Linux public activation reaches config validation and status reports experimental release', async t => {
+  if (process.platform !== 'linux') return t.skip('Linux release gate');
+  const { root } = await fixture(t);
+  await fs.mkdir(path.join(root, '.cbs'));
+  await fs.writeFile(path.join(root, '.cbs', 'memoria.json'), JSON.stringify({ provider: 'mem0',
+    project_id: 'fixture', qdrant: { url: 'https://qdrant.invalid', collection: 'fixture',
+      api_key_env: 'CBS_TEST_KEY' }, embedding: { model: 'multilingual-e5-small', dimension: 384,
+      fingerprint: `${RUNTIME_PINS.modelSha256}:${RUNTIME_PINS.tokenizerSha256}` } }));
+  const cli = new URL('../bin/cli.js', import.meta.url).pathname;
+  const status = spawnSync(process.execPath, [cli, 'memoria', 'status', '--project', root], { encoding: 'utf8' });
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).release, 'linux_experimental');
+  assert.equal(JSON.parse(status.stdout).trusted, false);
+  await fs.writeFile(path.join(root, '.cbs', 'memoria.json'), '{invalid');
+  const activated = spawnSync(process.execPath, [cli, 'memoria', 'activate', '--cli', 'claude',
+    '--project', root], { encoding: 'utf8' });
+  assert.equal(activated.status, 1, activated.stdout + activated.stderr);
+  assert.match(activated.stdout, /blocked: invalid_config/);
+  assert.doesNotMatch(activated.stdout, /local_native_gate_failed/);
+});

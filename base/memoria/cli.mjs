@@ -54,7 +54,7 @@ export async function main(args = []) {
     if (['activate', 'launch'].includes(action) && /[/\\]_npx[/\\]/.test(here)) {
       process.stderr.write('blocked: durable_package_install_required\n'); return 1;
     }
-    if (['activate', 'launch'].includes(action) && process.platform !== 'win32') {
+    if (action === 'launch' && process.platform !== 'win32') {
       process.stdout.write('blocked: local_native_gate_failed\n'); return 1;
     }
     if (action === 'provision') return subprocess('provision.mjs', rest);
@@ -86,7 +86,7 @@ export async function main(args = []) {
     process.stdout.write(JSON.stringify({ projectId: resolution.projectId,
       collection: resolution.destination.collection, trusted,
       owner: owner?.ownerId ?? null, extractor: extractor?.route ?? null,
-      autoPublish: false, release: 'blocked' }) + '\n');
+      autoPublish: false, release: process.platform === 'linux' ? 'linux_experimental' : 'blocked' }) + '\n');
     return 0;
   }
   if (action === 'writer-device') {

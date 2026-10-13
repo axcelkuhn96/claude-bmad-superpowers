@@ -4,8 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { activateProject } from './setup.mjs';
 
 export async function main(args = process.argv.slice(2)) {
-  if (process.platform !== 'win32') {
-    process.stdout.write('blocked: local_native_gate_failed\n');
+  if (process.platform !== 'linux') {
+    process.stdout.write(`blocked: ${process.platform === 'win32' ? 'windows_release_unproved' : 'platform_unproved'}\n`);
     return 1;
   }
   const cli = args.includes('--cli') ? args[args.indexOf('--cli') + 1] : undefined;
