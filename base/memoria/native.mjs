@@ -154,6 +154,70 @@ async function tracked(root, file) {
     return !!stdout.trim();
   } catch { return true; }
 }
+async function gitIndexEntry(root, file) {
+  const relative = path.relative(root, file);
+  if (!relative || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) throw new Error('unsafe_native_config');
+  const { stdout } = await run(await gitCommand(root), gitArgs(root, 'ls-files', '--stage', '-z', '--', relative),
+    { env: gitEnv(), timeout: 5000, encoding: 'buffer' });
+  const entries = stdout.toString('utf8').split('\0').filter(Boolean);
+  if (!entries.length) return null;
+  if (entries.length !== 1) throw new Error('unsafe_native_index');
+  const match = /^(100644|100755) ([a-f0-9]{40}|[a-f0-9]{64}) 0\t(.+)$/.exec(entries[0]);
+  if (!match || match[3] !== relative.split(path.sep).join('/')) throw new Error('unsafe_native_index');
+  return { mode: match[1], blob: match[2] };
+}
+async function trackedReceipt(root, files, original, installed) {
+  const rootStat = await fs.stat(root);
+  const gitStat = await fs.lstat(path.join(root, '.git'));
+  const paths = [];
+  for (const file of files) {
+    const index = await gitIndexEntry(root, file);
+    const before = original.get(file);
+    if (index && before === null) throw new Error('unsafe_native_config');
+    if (before !== null && !Buffer.from(before, 'utf8').equals(await fs.readFile(file))) {
+      throw new Error('native_config_changed');
+    }
+    paths.push({ file, index, original: before, originalHash: before === null ? null : hash(before),
+      installedHash: hash(installed.get(file)) });
+  }
+  return { rootIdentity: [rootStat.dev, rootStat.ino, gitStat.dev, gitStat.ino], paths };
+}
+async function validTrackedReceipt(root, cli, saved, file, capturePath, snapshot) {
+  const receipt = saved.trackedNative;
+  const files = cli === 'claude' ? [file] : [file, capturePath];
+  const { rollback, ...sealed } = saved;
+  const snapshotStat = await fs.lstat(snapshot);
+  const rootStat = await fs.stat(root);
+  const gitStat = await fs.lstat(path.join(root, '.git'));
+  if (!snapshotStat.isFile() || (snapshotStat.mode & 0o077) !== 0 ||
+      (process.getuid && snapshotStat.uid !== process.getuid()) ||
+      !receipt || !Array.isArray(receipt.paths) || receipt.paths.length !== files.length ||
+      receipt.seal !== hash(JSON.stringify({ ...sealed,
+        trackedNative: { rootIdentity: receipt.rootIdentity, paths: receipt.paths } })) ||
+      JSON.stringify(receipt.rootIdentity) !== JSON.stringify([rootStat.dev, rootStat.ino, gitStat.dev, gitStat.ino]) ||
+      saved.projectRoot !== (await identifyProject(root)).projectRoot || saved.nativeRoot !== root) return false;
+  const original = new Map();
+  for (let i = 0; i < files.length; i++) {
+    const row = receipt.paths[i];
+    if (row?.file !== files[i] || (row.original !== null && typeof row.original !== 'string') ||
+        row.originalHash !== (row.original === null ? null : hash(row.original)) ||
+        !/^[a-f0-9]{64}$/.test(row.installedHash ?? '') ||
+        (row.index !== null && (!row.index || !['100644', '100755'].includes(row.index.mode) ||
+          !/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(row.index.blob))) ||
+        (row.index && row.original === null)) return false;
+    const current = await gitIndexEntry(root, files[i]);
+    if (JSON.stringify(current) !== JSON.stringify(row.index)) return false;
+    original.set(files[i], row.original);
+  }
+  if (!receipt.paths.some(row => row.index)) return false;
+  const edit = (cli === 'claude' ? claudeEdit : codexEdit)(original.get(file));
+  if (!edit || edit.had !== saved.had || edit.previous !== saved.previous ||
+      edit.hadSection !== saved.hadSection || edit.old !== saved.old) return false;
+  const capture = editCaptureHooks(cli === 'claude' ? edit.raw : original.get(capturePath), cli);
+  if (!capture) return false;
+  return receipt.paths.every(row => row.installedHash === hash(row.file === file
+    ? (cli === 'claude' ? capture : edit.raw) : capture));
+}
 async function excludePlan(root, cli, target = configFile(root, cli)) {
   const relative = process.platform === 'win32' ? windowsGitPattern(root, target).slice(1) : path.relative(root, target);
   const block = `# cbs-memoria ${cli}\n/${relative}\n`;
@@ -323,7 +387,16 @@ async function writeAtomic(file, contents, privateState = true, expectedText) {
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
   try {
-    await fs.writeFile(temp, contents, { flag: 'wx', mode: 0o600 });
+    const matchesExpected = current => current === expectedText || (expectedText === '' && current === null);
+    if (expectedText !== undefined && !matchesExpected(await readOptional(file))) {
+      throw new Error('native_config_changed');
+    }
+    const mode = !privateState && expectedText !== undefined && expectedText !== ''
+      ? (await fs.stat(file)).mode & 0o777 : 0o600;
+    await fs.writeFile(temp, contents, { flag: 'wx', mode });
+    if (expectedText !== undefined && !matchesExpected(await readOptional(file))) {
+      throw new Error('native_config_changed');
+    }
     await fs.rename(temp, file);
   } catch (error) { await fs.rm(temp, { force: true }); throw error; }
 }
@@ -449,7 +522,8 @@ export async function applyNativeExclusion(root, options = {}) {
   }
   const file = configFile(root, cli);
   if (!await safeParent(file) || !await safeFile(file)) return blocked('unsafe_native_config');
-  if (await tracked(root, file)) return blocked('tracked_native_config');
+  const configTracked = await tracked(root, file);
+  if (configTracked && options.allowTrackedNative !== true) return blocked('tracked_native_config');
   const snapshot = snapshotFile(root, cli, options);
   if (!await safeParent(snapshot, true) || !await safeFile(snapshot, true)) return blocked('unsafe_snapshot');
   const versionsPath = versionFile(snapshot);
@@ -460,6 +534,9 @@ export async function applyNativeExclusion(root, options = {}) {
     let saved;
     try { saved = JSON.parse(priorSnapshot); } catch { return blocked('unsafe_snapshot'); }
     const raw = await readOptional(file);
+    if (saved.trackedNative && !await validTrackedReceipt(root, cli, saved, file,
+      cli === 'claude' ? file : hookFile(root), snapshot).catch(() => false)) return blocked('native_snapshot_changed');
+    if (configTracked !== !!saved.trackedNative?.paths?.[0]?.index) return blocked('native_snapshot_changed');
     if (saved.cli !== cli || saved.file !== file || (saved.nativeRoot && saved.nativeRoot !== root) ||
         (saved.projectRoot && saved.projectRoot !== scope.projectRoot) || raw === null ||
         !(cli === 'claude' ? claudeEdit(raw, saved) : codexEdit(raw, saved))) {
@@ -470,7 +547,7 @@ export async function applyNativeExclusion(root, options = {}) {
     if (process.platform !== 'win32' && verification.reason === 'skill_hooks_changed') {
       const capturePath = cli === 'claude' ? file : hookFile(root);
       if (!await safeParent(capturePath) || !await safeFile(capturePath) ||
-          (cli === 'codex' && await tracked(root, capturePath))) return blocked('unsafe_capture_hooks');
+          (cli === 'codex' && await tracked(root, capturePath) && !saved.trackedNative)) return blocked('unsafe_capture_hooks');
       const captureRaw = cli === 'claude' ? raw : await readOptional(capturePath);
       const edited = editCaptureHooks(captureRaw, cli);
       if (!edited || captureRaw === null || edited === captureRaw) return blocked('capture_hooks_changed');
@@ -488,14 +565,17 @@ export async function applyNativeExclusion(root, options = {}) {
   const edit = (cli === 'claude' ? claudeEdit : codexEdit)(raw);
   if (!edit) return blocked('invalid_native_config');
   const capturePath = cli === 'claude' ? file : hookFile(root);
-  if (!await safeParent(capturePath) || !await safeFile(capturePath) ||
-      (cli === 'codex' && await tracked(root, capturePath))) return blocked('unsafe_capture_hooks');
+  if (!await safeParent(capturePath) || !await safeFile(capturePath)) return blocked('unsafe_capture_hooks');
+  const captureTracked = cli === 'codex' && await tracked(root, capturePath);
+  if (captureTracked && options.allowTrackedNative !== true) return blocked('unsafe_capture_hooks');
   const captureRaw = cli === 'claude' ? edit.raw : await readOptional(capturePath);
   const captureEdit = editCaptureHooks(captureRaw, cli);
   if (!captureEdit) return blocked('invalid_capture_hooks');
   const exclude = await excludePlan(root, cli);
   const captureExclude = cli === 'codex' ? await excludePlan(root, cli, capturePath) : { added: false };
   if (!exclude || !captureExclude) return blocked('unsafe_git_exclude');
+  if (configTracked) exclude.added = false;
+  if (captureTracked) captureExclude.added = false;
   if (process.platform === 'win32' && (raw !== null ||
       (cli === 'codex' && captureRaw !== null) || exclude.added || captureExclude.added)) {
     return blocked('unsupported_windows_replace');
@@ -506,6 +586,14 @@ export async function applyNativeExclusion(root, options = {}) {
     hadSection: edit.hadSection, old: edit.old, exclude,
     capturePath, captureExisted: cli === 'codex' && captureRaw !== null, captureExclude,
     pluginChecked: cli === 'codex' };
+  if (configTracked || captureTracked) {
+    try {
+      save.trackedNative = await trackedReceipt(root, cli === 'claude' ? [file] : [file, capturePath],
+        new Map([[file, raw], [capturePath, cli === 'claude' ? raw : captureRaw]]),
+        new Map([[file, cli === 'claude' ? captureEdit : edit.raw], [capturePath, captureEdit]]));
+    } catch { return blocked('unsafe_native_index'); }
+    save.trackedNative.seal = hash(JSON.stringify(save));
+  }
   if (process.platform === 'win32') {
     save.rollback = { config: null, capture: null };
     save.nonce = randomUUID();
@@ -623,15 +711,26 @@ export async function restoreNativeExclusion(root, options = {}) {
   if (scope.kind !== 'git' || scope.projectRoot !== (options.projectRoot ?? scope.projectRoot) ||
       (saved.projectRoot && saved.projectRoot !== scope.projectRoot) ||
       (saved.nativeRoot && saved.nativeRoot !== root) ||
-      saved.cli !== cli || saved.file !== file || !await safeFile(file) || await tracked(root, file)) return blocked('unsafe_native_config');
+      saved.cli !== cli || saved.file !== file || !await safeFile(file) ||
+      (await tracked(root, file) && !saved.trackedNative)) return blocked('unsafe_native_config');
   const hasCapture = Object.hasOwn(saved, 'capturePath');
   const capturePath = saved.capturePath;
   if (hasCapture && (capturePath !== (cli === 'claude' ? file : hookFile(root)) ||
       !await safeFile(capturePath))) return blocked('unsafe_capture_hooks');
+  if (saved.trackedNative && !await validTrackedReceipt(root, cli, saved, file, capturePath, snapshot).catch(() => false)) {
+    return blocked('native_snapshot_changed');
+  }
+  if (cli === 'codex' && hasCapture && await tracked(root, capturePath) && !saved.trackedNative) {
+    return blocked('unsafe_capture_hooks');
+  }
   const rawVersion = await readOptionalVersion(file);
   const raw = rawVersion?.text ?? null;
   const captureVersion = hasCapture ? await readOptionalVersion(capturePath) : null;
   const captureRaw = captureVersion?.text ?? null;
+  if (saved.trackedNative && saved.trackedNative.paths.some(row =>
+    row.index && (row.installedHash !== hash(row.file === file ? raw ?? '' : captureRaw ?? '')))) {
+    return blocked('native_config_changed');
+  }
   if (process.platform === 'win32') {
     const leaseVersions = [];
     try {
@@ -668,24 +767,39 @@ export async function restoreNativeExclusion(root, options = {}) {
       !configText.trim()) ? null : configText,
     capture: cli === 'codex' && hasCapture ?
       !saved.captureExisted && Object.keys(JSON.parse(captureEdit)).length === 0 ? null : captureEdit : null };
+    if (saved.trackedNative) {
+      for (const row of saved.trackedNative.paths) {
+        if (!row.index) continue;
+        if (row.file === file) plan.config = row.original;
+        else plan.capture = row.original;
+      }
+    }
   } else if (!Object.hasOwn(plan, 'config') || !Object.hasOwn(plan, 'capture') ||
       ![plan.config, plan.capture].every(value => value === null || typeof value === 'string')) {
     return blocked('unsafe_snapshot');
   }
+  if (saved.trackedNative && saved.trackedNative.paths.some(row => row.index &&
+      (row.file === file ? plan.config : plan.capture) !== row.original)) {
+    return blocked('native_snapshot_changed');
+  }
   if (raw !== plan.config) {
     if (raw === null) return blocked('native_config_changed');
-    const edit = (cli === 'claude' ? claudeEdit : codexEdit)(raw, saved);
-    const restored = edit && (cli === 'claude' ? editCaptureHooks(edit.raw, cli, true) : edit.raw);
-    if (!restored) return blocked('native_config_changed');
-    const target = !saved.existed && (cli === 'claude' ? Object.keys(JSON.parse(restored)).length === 0 :
-      !restored.trim()) ? null : restored;
-    if (plan.config !== target) return blocked('native_config_changed');
+    if (!saved.trackedNative?.paths?.find(row => row.file === file && row.index)) {
+      const edit = (cli === 'claude' ? claudeEdit : codexEdit)(raw, saved);
+      const restored = edit && (cli === 'claude' ? editCaptureHooks(edit.raw, cli, true) : edit.raw);
+      if (!restored) return blocked('native_config_changed');
+      const target = !saved.existed && (cli === 'claude' ? Object.keys(JSON.parse(restored)).length === 0 :
+        !restored.trim()) ? null : restored;
+      if (plan.config !== target) return blocked('native_config_changed');
+    }
   }
   if (cli === 'codex' && hasCapture && captureRaw !== plan.capture) {
-    const restored = captureRaw && editCaptureHooks(captureRaw, cli, true);
-    if (!restored) return blocked('capture_hooks_changed');
-    const target = !saved.captureExisted && Object.keys(JSON.parse(restored)).length === 0 ? null : restored;
-    if (plan.capture !== target) return blocked('capture_hooks_changed');
+    if (!saved.trackedNative?.paths?.find(row => row.file === capturePath && row.index)) {
+      const restored = captureRaw && editCaptureHooks(captureRaw, cli, true);
+      if (!restored) return blocked('capture_hooks_changed');
+      const target = !saved.captureExisted && Object.keys(JSON.parse(restored)).length === 0 ? null : restored;
+      if (plan.capture !== target) return blocked('capture_hooks_changed');
+    }
   }
   if (!saved.rollback && saved.exclude?.added && !(await readOptional(saved.exclude.file))?.includes(saved.exclude.block)) {
     return blocked('git_exclude_changed');
@@ -763,12 +877,12 @@ export async function verifyNativeCapture(root, options = {}) {
   }
   const file = configFile(root, cli);
   const capturePath = cli === 'claude' ? file : hookFile(root);
-  if (!await safeFile(file) || !await safeFile(capturePath) || await tracked(root, file) ||
-      (cli === 'codex' && await tracked(root, capturePath))) return blocked('unsafe_native_config');
+  if (!await safeFile(file) || !await safeFile(capturePath)) return blocked('unsafe_native_config');
   let saved;
   const snapshot = snapshotFile(root, cli, options);
   let snapshotVersion;
   try {
+    if (!await safeFile(snapshot, true)) return blocked('unsafe_snapshot');
     if (process.platform === 'win32') {
       snapshotVersion = await readOptionalVersion(snapshot, true);
       saved = JSON.parse(snapshotVersion?.text);
@@ -779,6 +893,13 @@ export async function verifyNativeCapture(root, options = {}) {
       (saved.projectRoot && saved.projectRoot !== scope.projectRoot) ||
       (saved.nativeRoot && saved.nativeRoot !== root) ||
       (cli === 'codex' && saved.pluginChecked !== true)) return blocked('native_snapshot_changed');
+  if (saved.trackedNative) {
+    if (!await validTrackedReceipt(root, cli, saved, file, capturePath, snapshot).catch(() => false)) {
+      return blocked('native_snapshot_changed');
+    }
+  } else if (await tracked(root, file) || (cli === 'codex' && await tracked(root, capturePath))) {
+    return blocked('unsafe_native_config');
+  }
   if (process.platform === 'win32' && (!await actuallyIgnored(root, windowsGitPattern(root, file).slice(1)) ||
       (cli === 'codex' && !await actuallyIgnored(root, windowsGitPattern(root, capturePath).slice(1))))) {
     return blocked('git_exclude_unverified');
@@ -795,6 +916,10 @@ export async function verifyNativeCapture(root, options = {}) {
   const raw = process.platform === 'win32' ? rawVersion?.text : await readOptional(file);
   const captureRaw = process.platform === 'win32' ?
     (cli === 'claude' ? raw : captureVersion?.text) : await readOptional(capturePath);
+  if (saved.trackedNative && saved.trackedNative.paths.some(row => row.index &&
+      row.installedHash !== hash(row.file === file ? raw ?? '' : captureRaw ?? ''))) {
+    return blocked('native_config_changed');
+  }
   if (process.platform === 'win32' && (!sameVersion(rawVersion, manifest.data.config) ||
       (cli === 'codex' && !sameVersion(captureVersion, manifest.data.capture)))) {
     return blocked('native_config_changed');
