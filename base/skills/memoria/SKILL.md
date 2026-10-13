@@ -12,12 +12,12 @@ Use esta skill apenas quando o usuário pedir memória, quando um fluxo CBS exig
 A primeira busca autenticada inicia o broker local sob demanda quando necessário; não peça ao usuário para abrir uma sessão por launcher.
 
 1. Prepare uma consulta curta em UTF-8. Se precisar gerar a codificação, use um comando local que imprima Base64 URL-safe sem `=` no final; não inclua esse gerador junto com o gatilho.
-2. Use a ferramenta `Bash` com o comando exatamente `cbs memoria hook search <consulta-base64url>`. O diretório de trabalho deve ser a raiz do projeto atual. Não acrescente flags, redirecionamentos, encadeamentos ou outros comandos.
-3. Considere a busca executada somente se o retorno do hook incluir `hookSpecificOutput.additionalContext` com o prefixo `CBS Mem0:`. Esse contexto é a única fonte autoritativa do resultado.
+2. Execute exatamente `cbs memoria hook search <consulta-base64url>`, com a raiz do projeto como diretório de trabalho. No Claude Code, use `Bash` com esse comando. No Codex, use `exec_command` diretamente (ou por `functions.exec`): `const r=await tools.exec_command({cmd:'cbs memoria hook search <consulta-base64url>', workdir:'<raiz-do-projeto>', login:false});text(r.output);`. Não acrescente flags, redirecionamentos, encadeamentos ou outros comandos.
+3. Considere a busca executada somente quando o contexto nativo retornado pelo hook trouxer o prefixo `CBS Mem0:`. Esse contexto é a única fonte autoritativa do resultado; não exija que o envelope JSON `hookSpecificOutput.additionalContext` esteja visível ao modelo.
 4. Se o contexto não vier, ou trouxer indisponibilidade/abstenção, informe “Memória: não disponível” e siga sem inventar recall. Não use `cbs_memoria.*`, MCP sem vínculo nem `claude-mem` como fallback quando Mem0 está selecionado.
 
 ## Iniciar
 
-Quando o projeto já selecionou explicitamente Mem0 e a sessão precisar iniciar o serviço local, use `Bash` com o comando exatamente `cbs memoria hook start`, na raiz do projeto. Só considere o início confirmado se o contexto de retorno do hook trouxer `CBS Mem0:`. A saída da CLI `typed_trigger_only`, por si só, não confirma execução. Em ausência ou indisponibilidade do contexto, informe “Memória: não disponível”.
+Quando o projeto já selecionou explicitamente Mem0 e a sessão precisar iniciar o serviço local, execute exatamente `cbs memoria hook start`, na raiz do projeto. No Claude Code, use `Bash`; no Codex, use `exec_command` diretamente (ou por `functions.exec`): `const r=await tools.exec_command({cmd:'cbs memoria hook start', workdir:'<raiz-do-projeto>', login:false});text(r.output);`. Só considere o início confirmado se o contexto nativo retornado pelo hook trouxer `CBS Mem0:`. A saída da CLI `typed_trigger_only`, por si só, não confirma execução. Em ausência ou indisponibilidade do contexto, informe “Memória: não disponível”.
 
 Não inicie serviço por atividade comum da CLI. Não selecione ou promova provider, não configure owner e não transfira memória entre projetos. Nunca trate contexto ausente, ferramenta sem vínculo ou callback não confiável como `ready` ou `recall`.
