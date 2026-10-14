@@ -2,6 +2,13 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.14.0] - 2026-10-14
+
+### Adicionado
+- **Curadoria por conversa em lotes:** após cada cinco trocas completas entre pessoa e resposta final visível da LLM, Haiku avalia a conversa e pode selecionar zero ou mais decisões, regras, correções e soluções duráveis, mantendo referências verificáveis à fonte. Resumos brutos não são publicados como memória. O cronograma `cbs memoria extractor-schedule --mode conversation --turns 5 --max-calls 100` preserva consentimento, proprietário e escritor; o limite de 100 chamadas e os contadores persistem entre reinícios e retomadas.
+- **Flush nos limites de ciclo de vida:** `PreCompact` e `SessionEnd` processam lotes restantes menores que cinco. No Codex, checkpoints e flush assíncrono acompanham interrupções disponíveis; o fechamento abrupto pode deixar dados pendentes para a próxima atividade.
+- **Proveniência de conversa:** payload v4 identifica resumos de conversa e registra referências com papel, hash, posição e trecho. A resposta do assistente não é atribuída à pessoa, tratada como revisão humana ou fato verificado. Análise, raciocínio, sidechains e subagentes internos são excluídos.
+
 ## [0.13.3] - 2026-10-14
 
 ### Corrigido

@@ -278,6 +278,14 @@ Sem claude-mem, as skills marcam "Memória: não disponível" e seguem normalmen
 
 O **claude-mem continua sendo o padrão**. O CBS também contém uma opção Mem0 por projeto, com seleção e confiança locais explícitas para sessões novas de Claude Code ou Codex. Cada sessão usa um provedor de memória; uma sessão Mem0 não consulta o claude-mem. A importação opcional do histórico claude-mem é manual e fica numa coleção separada, sem alimentar o recall automático.
 
+Na curadoria por conversa, o extrator avalia a conversa inteira a cada cinco trocas completas — uma fala humana e a resposta final visível da LLM — e pode selecionar zero ou várias decisões, regras, correções ou soluções duráveis. Referências verificáveis acompanham cada seleção; resumos brutos não são obrigatórios nem publicados, e respostas da LLM nunca são tratadas como fala humana, revisão humana ou fato verificado. `PreCompact` e `SessionEnd` fazem flush do lote restante com menos de cinco trocas. Checkpoints do Codex salvam progresso e permitem flush assíncrono quando a interrupção é observada; encerramento abrupto pode deixar dados para a próxima atividade. O teto de 100 chamadas e os contadores persistem ao reiniciar ou retomar a sessão.
+
+Para configurar o cronograma pelo CLI, mantendo a adesão Mem0 e as identidades locais já configuradas:
+
+```sh
+cbs memoria extractor-schedule --mode conversation --turns 5 --max-calls 100
+```
+
 Em um projeto já configurado e ativado para Mem0, abra `claude` ou `codex` normalmente. A ativação registra o MCP somente de leitura `cbs_memoria` no perfil da CLI escolhida; as ferramentas `search`, `get` e `status` aparecem no catálogo da **nova sessão**: peça em linguagem natural para consultar a memória e a busca usa `search` diretamente; `get` lê um resultado completo e `status` verifica a disponibilidade. Não é necessário `cbs memoria launch`. O Claude Code usa `CLAUDE_CONFIG_DIR` quando definido; o Codex usa `CODEX_HOME` quando definido. Abra uma nova sessão após a ativação ou troca do provedor. O MCP é vinculado ao projeto Git confiável e não dá permissão de gravação.
 
 Execute a ativação na raiz Git para cada CLI que usará a memória. Ela registra Claude Code com escopo local por projeto e perfil; no Codex, registra um único servidor global por perfil, que usa a raiz da sessão atual. Para perfis adicionais, execute novamente com `CLAUDE_CONFIG_DIR` ou `CODEX_HOME` apropriado. Uma entrada `cbs_memoria` divergente bloqueia o registro sem sobrescrevê-la; a CLI informa a ação necessária. Os comandos `mcp get` ajudam a diagnosticar o registro:
