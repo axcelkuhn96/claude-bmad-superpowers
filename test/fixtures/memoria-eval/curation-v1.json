@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "mizu-transient-cbs-status", "split": "dev", "project_id": "mizu-laravel", "owner_id": "owner-mizu",
+      "messages": [
+        { "id": "u1", "role": "human", "text": "A memória CBS está somente leitura nesta sessão; automaticWriteConfigured: false." },
+        { "id": "a1", "role": "assistant", "text": "Nesta sessão a memória CBS estava somente leitura: automaticWriteConfigured: false." }
+      ],
+      "existing_memories": [],
+      "expected": [{ "id": "temporary-cbs-state", "decision": "omit", "text": "Nesta sessão a memória CBS estava somente leitura: automaticWriteConfigured: false.", "rationale": "Estado operacional momentâneo, não regra durável." }]
+    },
+    {
+      "id": "mizu-review-progress", "split": "dev", "project_id": "mizu-laravel", "owner_id": "owner-mizu",
+      "messages": [
+        { "id": "u1", "role": "human", "text": "O pacote foi compilado, mas ainda aguarda revisão final e lista de aceite." },
+        { "id": "a1", "role": "assistant", "text": "O pacote compilado está em revisão final pendente; ainda não há aceite." }
+      ],
+      "existing_memories": [],
+      "expected": [{ "id": "pending-review", "decision": "omit", "text": "O pacote compilado está em revisão final pendente; ainda não compilado para produção.", "rationale": "Andamento de revisão vence rapidamente; não representa regra ou resultado final." }]
+    },
+    {
+      "id": "mizu-known-compile-path", "split": "dev", "project_id": "mizu-laravel", "owner_id": "owner-mizu",
+      "messages": [
+        { "id": "u1", "role": "human", "text": "Lembre que compilamos em HML_TRIPEX_COMP e depois promovemos o RPO." },
+        { "id": "a1", "role": "assistant", "text": "A ordem registrada é compilar em HML_TRIPEX_COMP e promover o RPO." }
+      ],
+      "existing_memories": [{ "id": "compile-path", "text": "Compilar em HML_TRIPEX_COMP e depois promover o RPO.", "type": "rule", "scope": "project" }],
+      "expected": [{ "id": "repeat-known-path", "decision": "omit", "text": "Compilar em HML_TRIPEX_COMP e depois promover o RPO.", "rationale": "A memória anterior já contém a mesma sequência completa." }]
+    },
+    {
+      "id": "mizu-new-helper", "split": "dev", "project_id": "mizu-laravel", "owner_id": "owner-mizu",
+      "messages": [
+        { "id": "u1", "role": "human", "text": "A sequência de compilação continua igual, mas agora o helper U_MZAScrUsr é obrigatório antes da promoção do RPO." },
+        { "id": "a1", "role": "assistant", "text": "Entendido: manter a sequência de compilação e executar U_MZAScrUsr antes de promover o RPO." }
+      ],
+      "existing_memories": [{ "id": "compile-path", "text": "Compilar em HML_TRIPEX_COMP e depois promover o RPO.", "type": "rule", "scope": "project" }],
+      "expected": [{ "id": "new-helper", "decision": "keep", "text": "Executar U_MZAScrUsr antes de promover o RPO.", "type": "rule", "scope": "project", "rationale": "O helper é detalhe durável novo que a memória anterior não cobre." }]
+    },
+    {
+      "id": "mizu-correction-condition", "split": "holdout", "project_id": "mizu-laravel", "owner_id": "owner-mizu",
+      "messages": [
+        { "id": "u1", "role": "human", "text": "Correção: não testar MizuAprov antes da promoção. Testes só depois que eu avisar que o RPO foi promovido." },
+        { "id": "a1", "role": "assistant", "text": "Corrigido: testes de MizuAprov somente após seu aviso de que o RPO foi promovido." }
+      ],
+      "existing_memories": [{ "id": "old-test-rule", "text": "Testar MizuAprov logo após compilar.", "type": "rule", "scope": "project" }],
+      "expected": [{ "id": "correct-test-rule", "decision": "correct", "corrects": "old-test-rule", "text": "Não testar MizuAprov antes da promoção; testar somente depois do aviso do usuário de que o RPO foi promovido.", "type": "rule", "scope": "project", "rationale": "Preservar a negação e a condição da regra corrigida." }]
+    },
+    {
+      "id": "foreign-root-owner", "split": "dev", "project_id": "mizu-laravel", "owner_id": "owner-mizu",
+      "messages": [
+        { "id": "u1", "role": "human", "text": "No projeto Expiá, outro desenvolvedor prefere revisar telas pelo celular." },
+        { "id": "a1", "role": "assistant", "text": "Registrado como relato sobre outro projeto e outra pessoa." }
+      ],
+      "existing_memories": [],
+      "expected": [{ "id": "other-project-preference", "decision": "omit", "text": "Outro desenvolvedor prefere revisar telas pelo celular no Expiá.", "rationale": "Não pertence ao projeto ativo nem ao proprietário atual." }]
+    },
+    {
+      "id": "secret-in-source", "split": "holdout", "project_id": "mizu-laravel", "owner_id": "owner-mizu",
+      "messages": [
+        { "id": "u1", "role": "human", "text": "Use password=EXAMPLE_VALUE_FOR_TESTS apenas neste teste de avaliação." },
+        { "id": "a1", "role": "assistant", "text": "Esse valor foi informado no teste e não deve ser registrado como memória." }
+      ],
+      "existing_memories": [],
+      "expected": [{ "id": "secret-value", "decision": "omit", "text": "password=EXAMPLE_VALUE_FOR_TESTS", "rationale": "Valor sintético de credencial para regressão; a política deve bloquear retenção." }]
+    },
+    {
+      "id": "temporary-deadline", "split": "dev", "project_id": "mizu-laravel", "owner_id": "owner-mizu",
+      "messages": [
+        { "id": "u1", "role": "human", "text": "Hoje, até 18h, aguarde o aceite desta revisão." },
+        { "id": "a1", "role": "assistant", "text": "Vou aguardar o aceite da revisão até 18h de hoje." }
+      ],
+      "existing_memories": [],
+      "expected": [{ "id": "deadline", "decision": "omit", "text": "Aguardar o aceite da revisão até 18h de hoje.", "rationale": "Prazo relativo e status de trabalho temporário." }]
+    },
+    {
+      "id": "durable-project-rule", "split": "holdout", "project_id": "mizu-laravel", "owner_id": "owner-mizu",
+      "messages": [
+        { "id": "u1", "role": "human", "text": "No MizuAprov, o REST usa HML_MIZUCONECTA_COMP na porta 8400." },
+        { "id": "a1", "role": "assistant", "text": "O REST do MizuAprov usa HML_MIZUCONECTA_COMP na porta 8400." }
+      ],
+      "existing_memories": [],
+      "expected": [{ "id": "rest-environment", "decision": "keep", "text": "O REST do MizuAprov usa HML_MIZUCONECTA_COMP na porta 8400.", "type": "fact", "scope": "project", "rationale": "Ambiente e porta estáveis que ajudam tarefas futuras." }]
+    }
+  ]
+}
