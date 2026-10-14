@@ -20,7 +20,8 @@ const sameAutoConsent = (frozen, live, resolution) => frozen?.version === 1 &&
   resolution.ownerId === frozen.ownerId &&
   frozen.projectId === resolution.projectId && live.projectId === resolution.projectId &&
   ['consentHash', 'destinationHash', 'ownerId', 'deviceId', 'enabledAt']
-    .every(key => typeof frozen[key] === 'string' && frozen[key] && frozen[key] === live[key]);
+    .every(key => typeof frozen[key] === 'string' && frozen[key] &&
+      frozen[key] === live[key] && frozen[key] === resolution.extractor.autoPublishConsent?.[key]);
 async function autoConsentCurrent(resolution, frozen, options) {
   const read = options.readAutoPublish ?? (await import('./policy.mjs')).readAutoPublish;
   return sameAutoConsent(frozen, await read(resolution), resolution);
