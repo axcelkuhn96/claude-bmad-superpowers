@@ -68,10 +68,12 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
   }
   const [{ identifyProject }, { resolveProject }, { verifyNativeCapture },
     { readSessionCheckout }, { readLocalTrust, sameTrustTuple, trustTuple }, { createOutbox },
-    { extractCheckpoint }, { withProjectLock }, { POLICY_VERSION }] = await Promise.all([
+    { extractCheckpoint }, { withProjectLock }, { POLICY_VERSION },
+    { readOwner, readAutoPublish }] = await Promise.all([
     import('./project-id.mjs'), import('./provider.mjs'), import('./native.mjs'),
     import('./session-checkout.mjs'), import('./trust.mjs'), import('./outbox.mjs'),
     import('./candidates.mjs'), import('./ledger.mjs'), import('./transcript.mjs'),
+    import('./policy.mjs'),
   ]);
   const scope = await identifyProject(cwd);
   const current = await resolveProject(cwd, sessionId, { stateRoot });
@@ -86,7 +88,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
   if (process.platform === 'win32' && checkout.profile !== nativeProfile(cli)) {
     return blocked('session_checkout_changed');
   }
-  const native = await verifyNativeCapture(cli === 'codex' ? scope.activeRoot : current.projectRoot,
+  const native = await verifyNativeCapture(scope.activeRoot,
     { cli, stateRoot, projectRoot: current.projectRoot,
       ...(process.platform === 'win32' ? { profile: checkout.profile } : {}) });
   if (native.kind !== 'verified') return native;
@@ -119,7 +121,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
         if (sourceScope.kind !== 'git' || sourceScope.activeRoot !== original.nativeRoot ||
             sourceScope.projectRoot !== current.projectRoot || fresh.provider !== 'mem0' ||
             fresh.projectId !== current.projectId || fresh.stateDir !== current.stateDir) { pending++; continue; }
-        const sourceNative = await verifyNativeCapture(row.cli === 'codex' ? original.nativeRoot : current.projectRoot,
+        const sourceNative = await verifyNativeCapture(original.nativeRoot,
           { cli: row.cli, stateRoot, projectRoot: current.projectRoot,
             ...(process.platform === 'win32' ? { profile: original.profile } : {}) });
         if (sourceNative.kind !== 'verified') { pending++; continue; }
@@ -130,6 +132,18 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
         const policy = fresh.extractor;
         if (!policy || !['sonnet', 'haiku'].includes(policy.route) || !path.isAbsolute(policy.profile) ||
             !path.isAbsolute(policy.executable)) { pending++; continue; }
+        if (policy.autoPublish === true) {
+          const consent = await readAutoPublish(fresh);
+          const owner = original.profile && await readOwner(fresh, row.cli, original.profile);
+          if (!consent || consent.ownerId !== fresh.ownerId ||
+              owner?.ownerId !== fresh.ownerId ||
+              consent.consentHash !== policy.autoPublishConsent?.consentHash ||
+              (await box.futureSourceAllowed(row, { cli: row.cli, sessionId: row.sessionId,
+                projectId: row.projectId, ownerId: fresh.ownerId,
+                consentHash: consent.consentHash })).kind !== 'allowed') {
+            pending++; continue;
+          }
+        }
         if (policy.autoPublish === true && !ready.has(row.operationId)) {
           pending++;
           if (row.automatic === true && Number.isSafeInteger(row.retryAt)) {

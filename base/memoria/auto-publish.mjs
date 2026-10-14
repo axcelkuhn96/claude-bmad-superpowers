@@ -20,8 +20,25 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
   if (resolution.ownerId !== frozen?.ownerId) return blocked('auto_publish_owner_mismatch');
   const readConsent = options.readAutoPublish ??
     (await import('./policy.mjs')).readAutoPublish;
-  const checkConsent = async () => sameConsent(frozen, await readConsent(resolution), row.projectId);
+  const checkConsent = async () => {
+    try { return sameConsent(frozen, await readConsent(resolution), row.projectId); }
+    catch { return false; }
+  };
+  const checkOriginOwner = async () => {
+    try {
+      if (options.readOriginOwner) {
+        return await options.readOriginOwner(resolution, row) === frozen.ownerId;
+      }
+      const [{ readSessionCheckout }, { readOwner }] = await Promise.all([
+        import('./session-checkout.mjs'), import('./policy.mjs')]);
+      const checkout = await readSessionCheckout(resolution.stateDir, row.cli, row.sessionId);
+      if (checkout.kind !== 'bound' || checkout.projectId !== row.projectId ||
+          checkout.projectRoot !== resolution.projectRoot || !checkout.profile) return false;
+      return (await readOwner(resolution, row.cli, checkout.profile))?.ownerId === frozen.ownerId;
+    } catch { return false; }
+  };
   if (!await checkConsent()) return blocked('auto_publish_revoked');
+  if (!await checkOriginOwner()) return blocked('auto_publish_owner_mismatch');
   const outbox = options.outbox ?? createOutbox(resolution.stateDir);
   const checkpointRow = (await outbox.pending()).find(item => item.operationId === row.operationId);
   if (!checkpointRow) {
@@ -39,6 +56,10 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
       JSON.stringify(checkpointRow.messages) !== JSON.stringify(row.messages)) {
     return blocked('source_policy_unproved');
   }
+  const source = await outbox.futureSourceAllowed(checkpointRow, { cli: row.cli,
+    sessionId: row.sessionId, projectId: row.projectId, ownerId: frozen.ownerId,
+    consentHash: frozen.consentHash });
+  if (source.kind !== 'allowed') return blocked('source_policy_unproved');
   const manifest = await outbox.readManifest(row.operationId);
   if (manifest.kind === 'blocked') {
     const receipt = await outbox.readDisposition(row.operationId);
@@ -62,6 +83,8 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
       continue;
     }
     if (!await checkConsent()) return { kind: 'blocked', published, pending, reason: 'auto_publish_revoked' };
+    if (!await checkOriginOwner()) return { kind: 'blocked', published, pending,
+      reason: 'auto_publish_owner_mismatch' };
     const operation = storeOperation(payload, payload.text);
     operation.metadata.review_mode = 'automatic';
     operation.metadata.auto_actor = 'project_auto_publisher';
@@ -83,6 +106,8 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
       return { kind: 'blocked', published, pending, reason: 'review_mismatch' };
     }
     if (!await checkConsent()) return { kind: 'blocked', published, pending, reason: 'auto_publish_revoked' };
+    if (!await checkOriginOwner()) return { kind: 'blocked', published, pending,
+      reason: 'auto_publish_owner_mismatch' };
     const ackLocal = (id, proof) => id === entry.externalId
       ? outbox.ackCandidate(row.operationId, entry.candidateKey, proof)
       : blocked('child_id_mismatch');

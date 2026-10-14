@@ -13,6 +13,7 @@ const consent = { version: 1, enabled: true, projectId: 'p', destinationHash: 'a
   ownerId: 'owner-123', deviceId: 'device-123', consentHash: 'b'.repeat(64),
   enabledAt: '2026-10-13T09:00:00Z' };
 const base = { origin: 'human', actor: 'user', speakerRole: 'user', messageId: 'm1',
+  ownerId: consent.ownerId,
   timestamp: '2026-10-13T10:00:00Z', start: 0, end: 900 };
 
 async function fixture(t, text, origin = 'human') {
@@ -21,6 +22,9 @@ async function fixture(t, text, origin = 'human') {
   const stateDir = path.join(root, 'state');
   await fs.mkdir(stateDir, { mode: 0o700 });
   const outbox = createOutbox(stateDir);
+  assert.equal((await outbox.ensureFutureBaseline({ cli: 'claude', sessionId: 'session',
+    projectId: 'p', ownerId: consent.ownerId, consentHash: consent.consentHash,
+    policyVersion: POLICY_VERSION, cutoffEnd: 0 })).kind, 'baselined');
   const source = { ...base, text, origin };
   const row = { cli: 'claude', sessionId: 'session', start: 0, end: 900,
     sliceHash: 'c'.repeat(64), messages: [source] };
@@ -81,6 +85,7 @@ test('two durable facts from one message become distinct publishable candidates'
     projectId: 'p', stateDir, ownerId: consent.ownerId,
     extractor: { autoPublish: true, autoPublishConsent: consent } }, {
     outbox, readAutoPublish: async () => consent,
+    readOriginOwner: async () => consent.ownerId,
     store: async (operation, ackLocal) => {
       stored.push(operation.text);
       const ack = await ackLocal(operation.externalId, { externalId: operation.externalId,

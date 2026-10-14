@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { createOutbox } from '../base/memoria/outbox.mjs';
 import { extractCheckpoint, storeOperation, validateCandidate } from '../base/memoria/candidates.mjs';
 import { publishCheckpointAutomatically } from '../base/memoria/auto-publish.mjs';
@@ -11,6 +12,7 @@ import { storeMemory } from '../base/memoria/bridge.mjs';
 import { POLICY_VERSION } from '../base/memoria/transcript.mjs';
 
 const source = { origin: 'human', actor: 'user', speakerRole: 'user',
+  ownerId: 'owner-123',
   text: 'No projeto, use PostgreSQL para persistência.', messageId: 'm1',
   timestamp: '2026-10-13T10:00:00Z', start: 0, end: 44 };
 const consent = { version: 1, enabled: true, projectId: 'p', destinationHash: 'a'.repeat(64),
@@ -22,6 +24,11 @@ async function fixture(t, messages = [source], policyVersion = POLICY_VERSION) {
   const stateDir = path.join(root, 'state');
   await fs.mkdir(stateDir, { mode: 0o700 });
   const outbox = createOutbox(stateDir);
+  if (policyVersion === POLICY_VERSION) {
+    assert.equal((await outbox.ensureFutureBaseline({ cli: 'claude', sessionId: 'session',
+      projectId: 'p', ownerId: consent.ownerId, consentHash: consent.consentHash,
+      policyVersion, cutoffEnd: 0 })).kind, 'baselined');
+  }
   const row = { cli: 'claude', sessionId: 'session', start: 0, end: 100,
     sliceHash: 'c'.repeat(64), messages };
   const queued = await outbox.enqueueCheckpoint(row, { projectId: 'p', policyVersion });
@@ -33,6 +40,8 @@ const choice = text => ({ source_message_id: 'm1', abstain_reason: '', candidate
   { text, type: 'rule', scope: 'project' }] });
 const resolution = stateDir => ({ provider: 'mem0', projectId: 'p', stateDir, ownerId: consent.ownerId,
   extractor: { autoPublish: true, autoPublishConsent: consent } });
+const publish = (row, current, options = {}) => publishCheckpointAutomatically(row, current,
+  { readOriginOwner: async () => consent.ownerId, ...options });
 async function extract(row, outbox, decisions) {
   return extractCheckpoint(row, { route: 'haiku', autoPublish: true,
     autoPublishConsent: consent }, { outbox, runCli: async () =>
@@ -111,12 +120,64 @@ test('automatic publisher refuses a caller row that differs from the persisted c
   const { outbox, stateDir, row } = await fixture(t);
   assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
   const changed = { ...row, messages: [{ ...source, text: 'A different source.' }] };
-  const result = await publishCheckpointAutomatically(changed, resolution(stateDir), {
+  const result = await publish(changed, resolution(stateDir), {
     outbox, readAutoPublish: async () => consent,
     store: async () => { throw Error('must not store'); },
   });
   assert.deepEqual(result, { kind: 'blocked', published: 0, pending: 0,
     reason: 'source_policy_unproved' });
+});
+
+test('automatic publisher refuses persisted ownerless source before store', async t => {
+  const { outbox, stateDir, row } = await fixture(t, [{ ...source, ownerId: null }]);
+  assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
+  let stores = 0;
+  const result = await publish(row, resolution(stateDir), {
+    outbox, readAutoPublish: async () => consent,
+    store: async () => { stores++; },
+  });
+  assert.equal(result.reason, 'source_policy_unproved');
+  assert.equal(stores, 0);
+});
+
+test('ownerless historical source cannot seal an automatic review directly', async t => {
+  const { outbox, row } = await fixture(t, [{ ...source, ownerId: null }]);
+  assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
+  const entry = (await outbox.readManifest(row.operationId)).candidates[0];
+  const payload = await outbox.readCandidatePayload(row.operationId, entry.candidateKey);
+  const operation = storeOperation(payload, payload.text);
+  operation.metadata.review_mode = 'automatic';
+  operation.metadata.auto_actor = 'project_auto_publisher';
+  operation.metadata.auto_consent_hash = consent.consentHash;
+  operation.approval.mode = 'automatic';
+  const seal = await outbox.sealReview(row.operationId, entry.candidateKey, {
+    decision: 'approve', mode: 'automatic', actor: 'project_auto_publisher',
+    consentHash: consent.consentHash, payloadSha256: entry.payloadRef.sha256,
+    reviewedAt: '2026-10-13T11:00:00Z', operation,
+  });
+  assert.deepEqual(seal, { kind: 'blocked', reason: 'automatic_review_unproved' });
+});
+
+test('remote source proof rejects an old sealed automatic row whose human owner is absent', async t => {
+  const { outbox, stateDir, row } = await fixture(t);
+  assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
+  const entry = (await outbox.readManifest(row.operationId)).candidates[0];
+  const payload = await outbox.readCandidatePayload(row.operationId, entry.candidateKey);
+  const operation = storeOperation(payload, payload.text);
+  operation.metadata.review_mode = 'automatic';
+  operation.metadata.auto_actor = 'project_auto_publisher';
+  operation.metadata.auto_consent_hash = consent.consentHash;
+  operation.approval.mode = 'automatic';
+  assert.equal((await outbox.sealReview(row.operationId, entry.candidateKey, {
+    decision: 'approve', mode: 'automatic', actor: 'project_auto_publisher',
+    consentHash: consent.consentHash, payloadSha256: entry.payloadRef.sha256,
+    reviewedAt: '2026-10-13T11:00:00Z', operation,
+  })).kind, 'sealed');
+  const itemFile = path.join(stateDir, 'outbox', 'items', `${row.operationId}.json`);
+  const historical = JSON.parse(await fs.readFile(itemFile, 'utf8'));
+  historical.messages[0].ownerId = null;
+  await fs.writeFile(itemFile, JSON.stringify(historical) + '\n', { mode: 0o600 });
+  assert.equal((await outbox.sourceForRemote(operation)).kind, 'blocked');
 });
 
 test('persisted native-v1 checkpoint never becomes an automatic memory, even with valid consent', async t => {
@@ -141,7 +202,7 @@ test('persisted native-v1 checkpoint never becomes an automatic memory, even wit
     evidence: modernEntry.evidence, payloadRef: persisted.payloadRef,
   }])).kind, 'manifested');
   let stores = 0;
-  const result = await publishCheckpointAutomatically({ ...row, policyVersion: POLICY_VERSION },
+  const result = await publish({ ...row, policyVersion: POLICY_VERSION },
     resolution(stateDir), { outbox, readAutoPublish: async () => consent,
       store: async () => { stores++; } });
   assert.deepEqual(result, { kind: 'blocked', published: 0, pending: 0,
@@ -194,7 +255,7 @@ test('automatic review is sealed as automatic and ACK follows remote confirmatio
       await ackLocal(operation.externalId, proof);
       return { kind: 'stored', externalId: operation.externalId };
     } };
-  const result = await publishCheckpointAutomatically(row, resolution(stateDir), options);
+  const result = await publish(row, resolution(stateDir), options);
   assert.equal(result.kind, 'published');
   assert.equal(stores, 1);
   const entry = (await outbox.readDisposition(row.operationId)).candidates[0];
@@ -205,9 +266,47 @@ test('automatic review is sealed as automatic and ACK follows remote confirmatio
   assert.equal(review.review.reviewedHuman, undefined);
   assert.equal((await outbox.readDisposition(row.operationId)).candidates[0].status, 'remote_acked');
   assert.equal((await outbox.sourceForRemote(storedOperation)).kind, 'local_source');
-  const again = await publishCheckpointAutomatically(row, resolution(stateDir), options);
+  const again = await publish(row, resolution(stateDir), options);
   assert.equal(again.kind, 'published');
   assert.equal(stores, 1);
+});
+
+test('legacy remote ACK keeps local source readable without a new baseline', async t => {
+  const { outbox, stateDir, row } = await fixture(t);
+  assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
+  const rowFile = path.join(stateDir, 'outbox', 'items', `${row.operationId}.json`);
+  const originalRow = await fs.readFile(rowFile);
+  let storedOperation;
+  assert.equal((await publish(row, resolution(stateDir), { outbox,
+    readAutoPublish: async () => consent,
+    store: async (operation, ackLocal) => {
+      storedOperation = operation;
+      await ackLocal(operation.externalId, { externalId: operation.externalId,
+        projectId: 'p', status: 'active', sdkId: 'sdk-legacy', qdrantId: 'qdrant-legacy' });
+      return { kind: 'stored', externalId: operation.externalId };
+    },
+  })).kind, 'published');
+  const baselineName = `baseline-${createHash('sha256').update(JSON.stringify(['claude', 'session']))
+    .digest('hex')}.json`;
+  await fs.rm(path.join(stateDir, 'outbox', baselineName));
+  const reviewFile = path.join(stateDir, 'candidates', 'reviews', `${storedOperation.externalId}.json`);
+  const review = JSON.parse(await fs.readFile(reviewFile, 'utf8'));
+  delete review.review.sourceProof.ownerId;
+  review.digest = createHash('sha256').update(JSON.stringify(review.review)).digest('hex');
+  await fs.writeFile(reviewFile, JSON.stringify(review) + '\n', { mode: 0o600 });
+  assert.equal((await outbox.sourceForRemote(storedOperation)).kind, 'blocked');
+  assert.equal((await outbox.sourceForRemote(storedOperation,
+    { allowLegacyReadOnly: true })).kind, 'local_source');
+  const receiptFile = path.join(stateDir, 'outbox', 'processed', `${row.operationId}.json`);
+  const receipt = JSON.parse(await fs.readFile(receiptFile, 'utf8'));
+  await fs.writeFile(rowFile, originalRow, { mode: 0o600 });
+  await fs.writeFile(path.join(stateDir, 'outbox', 'items', `${row.operationId}.manifest.json`),
+    JSON.stringify({ operationId: row.operationId, projectId: 'p', disposition: 'candidates',
+      candidates: receipt.candidates }) + '\n', { mode: 0o600 });
+  await fs.rm(receiptFile);
+  assert.equal((await outbox.sourceForRemote(storedOperation)).kind, 'blocked');
+  assert.equal((await outbox.sourceForRemote(storedOperation,
+    { allowLegacyReadOnly: true })).kind, 'local_source');
 });
 
 test('revocation and changed destination block automatic store', async t => {
@@ -215,15 +314,32 @@ test('revocation and changed destination block automatic store', async t => {
   assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
   let stores = 0;
   for (const live of [null, { ...consent, destinationHash: 'd'.repeat(64) }]) {
-    const result = await publishCheckpointAutomatically(row, resolution(stateDir),
+    const result = await publish(row, resolution(stateDir),
       { outbox, readAutoPublish: async () => live, store: async () => { stores++; } });
     assert.equal(result.kind, 'blocked');
   }
+  assert.equal((await publish(row, resolution(stateDir), {
+    outbox, readAutoPublish: async () => { throw new Error('policy_unavailable'); },
+    store: async () => { stores++; },
+  })).reason, 'auto_publish_revoked');
   assert.equal(stores, 0);
-  assert.equal((await publishCheckpointAutomatically(row,
+  assert.equal((await publish(row,
     { ...resolution(stateDir), ownerId: 'other-owner' },
     { outbox, readAutoPublish: async () => consent, store: async () => { stores++; } })).kind,
   'blocked');
+});
+
+test('origin owner changed after sealing blocks automatic store', async t => {
+  const { outbox, stateDir, row } = await fixture(t);
+  assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
+  let checks = 0;
+  let stores = 0;
+  const result = await publish(row, resolution(stateDir), { outbox,
+    readAutoPublish: async () => consent,
+    readOriginOwner: async () => ++checks < 3 ? consent.ownerId : 'different-owner',
+    store: async () => { stores++; } });
+  assert.equal(result.reason, 'auto_publish_owner_mismatch');
+  assert.equal(stores, 0);
 });
 
 test('temporary DNS failure retries sealed automatic operation; destination policy rejection stays blocked', async t => {
@@ -239,16 +355,16 @@ test('temporary DNS failure retries sealed automatic operation; destination poli
       await ackLocal(operation.externalId, proof);
       return { kind: 'stored', externalId: operation.externalId };
     } };
-  const first = await publishCheckpointAutomatically(row, resolution(stateDir), options);
+  const first = await publish(row, resolution(stateDir), options);
   assert.deepEqual(first, { kind: 'retry', published: 0, pending: 0,
     reason: 'destination_unavailable' });
-  assert.equal((await publishCheckpointAutomatically(row, resolution(stateDir), options)).kind,
+  assert.equal((await publish(row, resolution(stateDir), options)).kind,
     'published');
   assert.equal(stores, 2);
 
   const refused = await fixture(t);
   assert.equal((await extract(refused.row, refused.outbox, [choice(source.text)])).kind, 'manifested');
-  const policy = await publishCheckpointAutomatically(refused.row, resolution(refused.stateDir), {
+  const policy = await publish(refused.row, resolution(refused.stateDir), {
     outbox: refused.outbox, readAutoPublish: async () => consent,
     store: async () => ({ kind: 'blocked', reason: 'public_destination' }),
   });
@@ -260,7 +376,7 @@ test('temporary broker startup failure retries the same sealed operation without
   const { outbox, stateDir, row } = await fixture(t);
   assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
   let calls = 0;
-  const result = await publishCheckpointAutomatically(row, resolution(stateDir), {
+  const result = await publish(row, resolution(stateDir), {
     outbox, readAutoPublish: async () => consent,
     store: async () => { calls++; return { kind: 'blocked', reason: 'broker_unavailable' }; },
   });
@@ -274,7 +390,7 @@ test('real store refuses revoked consent and an unassigned writer before remote 
   const { outbox, stateDir, row } = await fixture(t);
   assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
   let operation;
-  await publishCheckpointAutomatically(row, resolution(stateDir), {
+  await publish(row, resolution(stateDir), {
     outbox, readAutoPublish: async () => consent,
     store: async op => { operation = op; return { kind: 'pending', reason: 'test_pause' }; },
   });
@@ -316,10 +432,10 @@ test('missing local ACK retries sealed operation without a second remote add or 
     ackLocal: async (id, proof) => failAck ? { kind: 'pending' } : ack(id, proof),
   });
   const options = { outbox, readAutoPublish: async () => consent, store };
-  const first = await publishCheckpointAutomatically(row, resolution(stateDir), options);
+  const first = await publish(row, resolution(stateDir), options);
   assert.equal(first.kind, 'retry');
   failAck = false;
-  const second = await publishCheckpointAutomatically(row, resolution(stateDir), options);
+  const second = await publish(row, resolution(stateDir), options);
   assert.equal(second.kind, 'published');
   assert.equal(adds, 1);
   assert.equal(extractions, 1);

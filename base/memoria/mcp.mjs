@@ -80,7 +80,8 @@ export function createMcp({ launchId = process.env.CBS_MEMORIA_LAUNCH_ID,
       if ((item.metadata?.scope === 'personal' || item.metadata?.owner_id != null) &&
           (typeof bound.ownerId !== 'string' || !bound.ownerId ||
             item.metadata?.owner_id !== bound.ownerId)) return blocked('source_unavailable');
-      const source = await createOutbox(bound.stateDir).sourceForRemote(item);
+      const source = await createOutbox(bound.stateDir).sourceForRemote(item,
+        { allowLegacyReadOnly: true });
       return source.kind === 'local_source' ? source :
         source.reason !== 'source_unavailable' ? blocked('source_unavailable') :
         { kind: 'remote_metadata', metadata: { source: item.metadata?.source,

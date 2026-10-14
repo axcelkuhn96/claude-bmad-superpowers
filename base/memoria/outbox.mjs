@@ -52,6 +52,8 @@ export function createOutbox(stateDir, options = {}) {
   const retryFile = id => path.join(items, `${id}.retry.json`);
   const summaryFile = (cli, sessionId) => path.join(root,
     `cursor-${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.json`);
+  const baselineFile = (cli, sessionId) => path.join(root,
+    `baseline-${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.json`);
   const extractionFile = (cli, sessionId) => path.join(root,
     `extract-${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.json`);
   const hash = value => createHash('sha256').update(value).digest('hex');
@@ -369,10 +371,10 @@ export function createOutbox(stateDir, options = {}) {
       return { ...row, ...(retry ?? { attempts: 0, retryAt: 0, lastError: null }) };
     }));
   }
-  function cursorFrom(rows, cli, sessionId, summary = null) {
+  function cursorFrom(rows, cli, sessionId, summary = null, baseline = null) {
     rows = rows.filter(row => row.cli === cli && row.sessionId === sessionId)
       .sort((a, b) => a.start - b.start);
-    let queuedEnd = summary?.queuedEnd ?? 0;
+    let queuedEnd = Math.max(summary?.queuedEnd ?? 0, baseline?.cutoffEnd ?? 0);
     let ackedEnd = summary?.ackedEnd ?? 0;
     let processedEnd = summary?.processedEnd ?? 0;
     for (const row of rows) {
@@ -383,7 +385,66 @@ export function createOutbox(stateDir, options = {}) {
     return { queuedEnd, ackedEnd, processedEnd };
   }
   async function cursorUnlocked(cli, sessionId) {
-    return cursorFrom(unique(await records()), cli, sessionId, await read(summaryFile(cli, sessionId)));
+    return cursorFrom(unique(await records()), cli, sessionId,
+      await read(summaryFile(cli, sessionId)), await read(baselineFile(cli, sessionId)));
+  }
+  async function ensureFutureBaseline(binding) {
+    const { cli, sessionId, projectId, ownerId, consentHash, policyVersion, cutoffEnd } = binding ?? {};
+    const initialSize = binding?.initialSize ?? cutoffEnd;
+    if (!['claude', 'codex'].includes(cli) || typeof sessionId !== 'string' || !sessionId ||
+        typeof projectId !== 'string' || !projectId || typeof ownerId !== 'string' || !ownerId ||
+        !/^[a-f0-9]{64}$/.test(consentHash ?? '') || policyVersion !== POLICY_VERSION ||
+        !Number.isSafeInteger(cutoffEnd) || cutoffEnd < 0 ||
+        !Number.isSafeInteger(initialSize) || initialSize < cutoffEnd) {
+      return blocked('invalid_future_baseline');
+    }
+    return withLock(async () => {
+      const file = baselineFile(cli, sessionId);
+      const prior = await read(file);
+      if (prior) return prior.cli === cli && prior.sessionId === sessionId &&
+        prior.projectId === projectId && prior.ownerId === ownerId &&
+        prior.consentHash === consentHash && prior.policyVersion === policyVersion &&
+        Number.isSafeInteger(prior.cutoffEnd) && prior.cutoffEnd >= 0 &&
+        Number.isSafeInteger(prior.initialSize ?? prior.cutoffEnd) &&
+        (prior.initialSize ?? prior.cutoffEnd) >= prior.cutoffEnd
+        ? { kind: 'baselined', cutoffEnd: prior.cutoffEnd,
+          initialSize: prior.initialSize ?? prior.cutoffEnd } : blocked('future_baseline_changed');
+      const cursor = cursorFrom(unique(await records()), cli, sessionId,
+        await read(summaryFile(cli, sessionId)));
+      if (cutoffEnd < cursor.queuedEnd) return blocked('future_baseline_before_cursor');
+      await durable(file, { cli, sessionId, projectId, ownerId, consentHash,
+        policyVersion, cutoffEnd, initialSize });
+      return { kind: 'baselined', cutoffEnd, initialSize };
+    });
+  }
+  function futureSourceValid(source, baseline, binding) {
+    return source && baseline && typeof binding?.ownerId === 'string' && !!binding.ownerId &&
+      /^[a-f0-9]{64}$/.test(binding.consentHash ?? '') &&
+      source.projectId === binding.projectId && source.cli === binding.cli &&
+      source.sessionId === binding.sessionId && source.policyVersion === POLICY_VERSION &&
+      baseline.projectId === binding.projectId && baseline.cli === binding.cli &&
+      baseline.sessionId === binding.sessionId && baseline.ownerId === binding.ownerId &&
+      baseline.consentHash === binding.consentHash && baseline.policyVersion === POLICY_VERSION &&
+      Number.isSafeInteger(baseline.cutoffEnd) && source.start >= baseline.cutoffEnd &&
+      source.messages?.some(message => message.origin === 'human' &&
+        message.ownerId === binding.ownerId) &&
+      !source.messages.some(message => message.origin === 'human' &&
+        message.ownerId !== binding.ownerId);
+  }
+  async function futureSourceAllowed(row, binding) {
+    if (!validId(row?.operationId)) return blocked('source_policy_unproved');
+    return withLock(async () => {
+      const source = await read(itemFile(row.operationId)) ?? await read(ackFile(row.operationId)) ??
+        await read(processedFile(row.operationId));
+      const baseline = await read(baselineFile(row.cli, row.sessionId));
+      if (!futureSourceValid(source, baseline, binding) ||
+          source.operationId !== row.operationId || source.start !== row.start ||
+          source.end !== row.end || source.sliceHash !== row.sliceHash ||
+          JSON.stringify(source.messages) !== JSON.stringify(row.messages)) {
+        return blocked('source_policy_unproved');
+      }
+      return { kind: 'allowed' };
+    });
   }
   async function compactAcksUnlocked(cli, sessionId) {
     const prior = await read(summaryFile(cli, sessionId));
@@ -488,7 +549,8 @@ export function createOutbox(stateDir, options = {}) {
       if (summary && start < summary.queuedEnd) return summary.entries?.some(([id]) => id === operationId)
         ? { kind: 'acked', operationId } : blocked('compacted_checkpoint');
       const rows = unique(await records());
-      const position = cursorFrom(rows, cli, sessionId, summary);
+      const baseline = await read(baselineFile(cli, sessionId));
+      const position = cursorFrom(rows, cli, sessionId, summary, baseline);
       if (start !== position.queuedEnd) return blocked('cursor_gap');
       const row = { operationId, projectId, cli, sessionId, start, end, sliceHash, policyVersion, messages };
       const size = allocated(JSON.stringify(row) + '\n');
@@ -746,7 +808,7 @@ export function createOutbox(stateDir, options = {}) {
     return source?.origin === 'human' && typeof source.text === 'string' &&
       hash(source.text) === payload.source_text_sha256 && source.text.includes(text);
   }
-  async function sourceForRemote(item) {
+  async function sourceForRemote(item, { allowLegacyReadOnly = false } = {}) {
     const externalId = item?.externalId;
     if (!validId(externalId) || typeof item.projectId !== 'string' ||
         typeof item.sessionId !== 'string' || !item.metadata?.source ||
@@ -805,10 +867,35 @@ export function createOutbox(stateDir, options = {}) {
         return blocked('source_mismatch');
       }
       const sourceRow = await read(itemFile(metadata.checkpoint_id));
+      const manifest = sourceRow && await read(manifestFile(metadata.checkpoint_id));
       const processed = await read(processedFile(metadata.checkpoint_id));
+      const acknowledgedChild = (manifest ?? processed)?.candidates?.find(candidate =>
+        candidate.externalId === externalId && candidate.payloadRef?.sha256 ===
+          names[0].slice(externalId.length + 1, -5) && candidate.status === 'remote_acked');
       const processedChild = processed?.candidates?.find(candidate =>
         candidate.externalId === externalId && candidate.payloadRef?.sha256 ===
           names[0].slice(externalId.length + 1, -5) && candidate.status === 'remote_acked');
+      const record = await verifiedReviewFile(path.join(reviews, `${externalId}.json`));
+      if (payload.format_version === 3) {
+        const proven = sourceRow ?? processed;
+        const baseline = proven && await read(baselineFile(proven.cli, proven.sessionId));
+        const binding = { cli: proven?.cli,
+          sessionId: proven?.sessionId, projectId: item.projectId,
+          ownerId: baseline?.ownerId, consentHash: metadata.auto_consent_hash };
+        const legacyRemoteRead = allowLegacyReadOnly && acknowledgedChild &&
+          (sourceRow ?? processed)?.policyVersion === POLICY_VERSION &&
+          record?.review?.sourceProof?.ownerId == null;
+        if (!legacyRemoteRead && !(sourceRow ? futureSourceValid(sourceRow, baseline, binding) :
+          processed && baseline && processed.projectId === binding.projectId &&
+          processed.cli === binding.cli && processed.sessionId === binding.sessionId &&
+          processed.policyVersion === POLICY_VERSION && processed.start >= baseline.cutoffEnd &&
+          baseline.projectId === binding.projectId && baseline.cli === binding.cli &&
+          baseline.sessionId === binding.sessionId && baseline.policyVersion === POLICY_VERSION &&
+          baseline.consentHash === binding.consentHash &&
+          record?.review?.sourceProof?.ownerId === baseline.ownerId)) {
+          return blocked('source_mismatch');
+        }
+      }
       if (payload.format_version === 3 && (payload.policy_version !== POLICY_VERSION ||
           payload.origin !== 'user_direct' ||
           !(sourceRow ? sourceRow.policyVersion === POLICY_VERSION &&
@@ -823,7 +910,6 @@ export function createOutbox(stateDir, options = {}) {
           return blocked('source_mismatch');
         }
       }
-      const record = await verifiedReviewFile(path.join(reviews, `${externalId}.json`));
       if (processed || item.status === 'active' || record || payload.format_version === 3) {
         const proof = record?.review?.sourceProof;
         const operation = record?.review?.operation;
@@ -968,6 +1054,7 @@ export function createOutbox(stateDir, options = {}) {
         if (payload.format_version === 3) {
           const meta = review.operation.metadata;
           const { redactSource, containsSecret } = await import('./candidates.mjs');
+          const baseline = await read(baselineFile(row.cli, row.sessionId));
           if (row.policyVersion !== POLICY_VERSION || payload.policy_version !== POLICY_VERSION ||
               review.decision !== 'approve' || review.mode !== 'automatic' ||
               review.actor !== 'project_auto_publisher' ||
@@ -976,6 +1063,9 @@ export function createOutbox(stateDir, options = {}) {
               meta.review_mode !== 'automatic' || meta.auto_actor !== review.actor ||
               meta.format_version !== 3 || approved !== payload.text ||
               source.origin !== 'human' || !source.text.includes(approved) ||
+              !futureSourceValid(row, baseline, { cli: row.cli, sessionId: row.sessionId,
+                projectId: row.projectId, ownerId: baseline?.ownerId,
+                consentHash: review.consentHash }) ||
               meta.source_text_sha256 !== hash(source.text) ||
               meta.claim_sha256 !== hash(JSON.stringify([approved, meta.type, meta.scope,
                 meta.condition ?? null, meta.valid_from ?? null, meta.valid_to ?? null])) ||
@@ -985,6 +1075,7 @@ export function createOutbox(stateDir, options = {}) {
         }
         sealedReview = { ...review, sourceProof: { messageId: source.messageId,
           messageSha256: hash(source.text), approvedTextSha256: hash(approved),
+          ...(payload.format_version === 3 ? { ownerId: source.ownerId } : {}),
           ...([2, 3].includes(payload.format_version) ? { claimSha256: review.operation.metadata.claim_sha256 } :
             { start, end: start + approved.length }) } };
       }
@@ -1297,7 +1388,8 @@ export function createOutbox(stateDir, options = {}) {
       return receipt;
     });
   }
-  return { enqueueCheckpoint, ackVerified, recordManifest, persistCandidatePayload, sourceForRemote,
+  return { enqueueCheckpoint, ensureFutureBaseline, futureSourceAllowed,
+    ackVerified, recordManifest, persistCandidatePayload, sourceForRemote,
     claimExtraction, recordExtractionUsage, extractionUsage, readCandidatePayload, readReview, sealReview,
     readManifest,
     ackCandidate: (id, key, proof) => updateCandidate(id, key, 'remote_acked', null, proof),

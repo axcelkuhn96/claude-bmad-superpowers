@@ -1,20 +1,57 @@
 import fs from 'node:fs/promises';
+import { constants } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { inspectConfiguration, initializeSession, resolveProject } from './provider.mjs';
+import { inspectConfiguration, initializeSession, resolveProject,
+  refreshSessionPolicyForCapture } from './provider.mjs';
 import { verifyNativeCapture } from './native.mjs';
 import { createOutbox } from './outbox.mjs';
 import { parsePersistedSlice, POLICY_VERSION } from './transcript.mjs';
 import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { identifyProject } from './project-id.mjs';
 import { bindLaunch, resolveBoundLaunch } from './launch.mjs';
-import { recordSessionCheckout, readSessionCheckout } from './session-checkout.mjs';
+import { bindSessionCheckoutProfile, recordSessionCheckout,
+  readSessionCheckout } from './session-checkout.mjs';
 import { readWindowsBinary } from './windows-security.mjs';
 import { nativeProfile } from './native-profile.mjs';
 
 const events = { claude: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'SessionEnd']),
   codex: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd']) };
 const blocked = reason => ({ kind: 'blocked', reason });
+
+async function completeTranscriptEnd(transcriptPath, stat) {
+  if (!stat) return 0;
+  if (process.platform === 'win32') {
+    for (let end = stat.size; end > 0;) {
+      const start = Math.max(0, end - 4 * 1024 * 1024);
+      const observed = await readWindowsBinary(transcriptPath,
+        { offset: start, length: end - start, privateState: false });
+      if (observed.fileId !== stat.fileId || observed.size < stat.size ||
+          observed.bytes.length !== end - start) throw new Error('unsafe_transcript');
+      const newline = observed.bytes.lastIndexOf(10);
+      if (newline >= 0) return start + newline + 1;
+      break;
+    }
+    return 0;
+  }
+  const handle = await fs.open(transcriptPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat();
+    if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size < stat.size) {
+      throw new Error('unsafe_transcript');
+    }
+    for (let end = stat.size; end > 0;) {
+      const start = Math.max(0, end - 4 * 1024 * 1024);
+      const bytes = Buffer.alloc(end - start);
+      const { bytesRead } = await handle.read(bytes, 0, bytes.length, start);
+      if (bytesRead !== bytes.length) throw new Error('unsafe_transcript');
+      const newline = bytes.lastIndexOf(10);
+      if (newline >= 0) return start + newline + 1;
+      break;
+    }
+    return 0;
+  } finally { await handle.close(); }
+}
 
 export async function captureEvent({ cli, event, payload, stateRoot, installedPlugin } = {}) {
   if (!events[cli]?.has(event) || payload?.hook_event_name !== event ||
@@ -34,7 +71,7 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   if (current.provider !== 'mem0') return blocked(current.reason ?? 'unresolved_session');
   const scope = await identifyProject(payload.cwd);
   if (scope.kind !== 'git' || scope.projectRoot !== current.projectRoot) return blocked('unsupported_git');
-  const native = await verifyNativeCapture(cli === 'codex' ? scope.activeRoot : current.projectRoot,
+  const native = await verifyNativeCapture(scope.activeRoot,
     { cli, stateRoot, installedPlugin, projectRoot: current.projectRoot,
       ...(process.platform === 'win32' ? { launchToken: process.env.CBS_MEMORIA_LAUNCH_ID,
         profile: nativeProfile(cli) } : {}) });
@@ -43,7 +80,7 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   if (!sameTrustTuple(trustTuple(current), trust)) {
     return blocked('trust_changed');
   }
-  const session = event === 'SessionStart'
+  let session = event === 'SessionStart'
     ? await initializeSession(payload.cwd, payload.session_id, { ...options, event, cli,
       profile: nativeProfile(cli) }) : resolution;
   if (session.provider !== 'mem0') return blocked(session.reason ?? 'unresolved_session');
@@ -68,12 +105,15 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
     } catch { return blocked('unsafe_transcript'); }
   } else if (stat && (!stat.isFile() || stat.uid !== process.getuid())) return blocked('unsafe_transcript');
   const checkout = event === 'SessionStart'
-    ? await recordSessionCheckout(session, cli, payload.session_id, scope.activeRoot)
+    ? await recordSessionCheckout(session, cli, payload.session_id, scope.activeRoot, nativeProfile(cli))
     : await readSessionCheckout(session.stateDir, cli, payload.session_id);
   if (checkout.kind !== 'bound' || checkout.nativeRoot !== scope.activeRoot ||
       checkout.projectRoot !== session.projectRoot || checkout.projectId !== session.projectId) {
     return blocked(checkout.reason ?? 'session_checkout_changed');
   }
+  const profiled = await bindSessionCheckoutProfile(session.stateDir, cli,
+    payload.session_id, nativeProfile(cli));
+  if (profiled.kind !== 'bound') return blocked(profiled.reason ?? 'session_checkout_changed');
   if (event === 'SessionStart' && process.env.CBS_MEMORIA_LAUNCH_ID) {
     const binding = await bindLaunch(process.env.CBS_MEMORIA_LAUNCH_ID, cli, payload.cwd, payload.session_id, { stateRoot });
     if (binding.kind !== 'bound') return blocked(binding.reason);
@@ -84,7 +124,27 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
       return blocked(binding.reason ?? 'unbound');
     }
   }
+  session = await refreshSessionPolicyForCapture(payload.cwd, payload.session_id,
+    { stateRoot, cli, profile: nativeProfile(cli) });
+  if (session.provider !== 'mem0') return blocked(session.reason ?? 'local_policy_changed');
   const outbox = createOutbox(session.stateDir);
+  if (session.extractor?.autoPublish === true && !stat) {
+    const { queuedEnd } = await outbox.cursor(cli, payload.session_id);
+    return { kind: 'no_complete_bytes', queuedEnd };
+  }
+  let baseline;
+  if (session.extractor?.autoPublish === true) {
+    let cutoffEnd;
+    try { cutoffEnd = await completeTranscriptEnd(transcriptPath, stat); }
+    catch { return blocked('unsafe_transcript'); }
+    try {
+      baseline = await outbox.ensureFutureBaseline({ cli, sessionId: payload.session_id,
+        projectId: session.projectId, ownerId: session.ownerId,
+        consentHash: session.extractor.autoPublishConsent?.consentHash,
+        policyVersion: POLICY_VERSION, cutoffEnd, initialSize: stat.size });
+    } catch { return blocked('future_baseline_unavailable'); }
+    if (baseline.kind !== 'baselined') return baseline;
+  }
   let { queuedEnd } = await outbox.cursor(cli, payload.session_id);
   let last = { kind: 'no_complete_bytes', queuedEnd };
   while (stat && queuedEnd < stat.size) {
@@ -101,8 +161,9 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
     const sliceHash = createHash('sha256').update(parsed.completeBytes).digest('hex');
     last = await outbox.enqueueCheckpoint({ cli, sessionId: payload.session_id, start: queuedEnd,
       end: parsed.lastCompleteByte, sliceHash,
-      messages: parsed.messages.map(message => message.origin === 'human' && session.ownerId
-        ? { ...message, ownerId: session.ownerId } : message) },
+      messages: parsed.messages.filter(message => !baseline || message.start >= baseline.initialSize)
+        .map(message => message.origin === 'human' && session.ownerId
+          ? { ...message, ownerId: session.ownerId } : message) },
     { projectId: session.projectId, policyVersion: POLICY_VERSION });
     if (last.kind !== 'queued' && last.kind !== 'acked') return last;
     queuedEnd = parsed.lastCompleteByte;

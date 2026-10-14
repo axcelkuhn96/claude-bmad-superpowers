@@ -2,12 +2,14 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
-import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { identifyProject } from './project-id.mjs';
 import { RUNTIME_PINS } from './runtime.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
   writeWindowsPrivateFile, readWindowsBinary } from './windows-security.mjs';
 import { readOwner, readExtractor } from './policy.mjs';
+import { withProjectLock } from './ledger.mjs';
 import { nativeProfile } from './native-profile.mjs';
 import { publicIpv4, publicTlsName } from './public-destination.mjs';
 
@@ -157,7 +159,91 @@ export async function resolveProject(cwd, sessionId, options = {}) {
   if (!found.saved) return blocked('fresh_session');
   return sameSession(found.saved, { ...found.current, embeddingFingerprint: found.embeddingFingerprint })
     ? Object.freeze({ ...found.current, ownerId: found.saved.ownerId ?? null,
-      extractor: found.saved.extractor ?? null }) : blocked('session_changed');
+      extractor: found.saved.extractor ?? null,
+      ...(found.saved.captureEpoch ? { captureEpoch: found.saved.captureEpoch } : {}) })
+    : blocked('session_changed');
+}
+
+// Called only after a native hook, trust, transcript, and checkout have been verified.
+export async function refreshSessionPolicyForCapture(cwd, sessionId, options = {}) {
+  const found = await inspect(cwd, sessionId, options);
+  if (!found.current || !found.saved || !sameSession(found.saved, found.current)) {
+    return blocked(found.reason ?? 'session_changed');
+  }
+  const file = sessionFile(found.stateDir, sessionId);
+  try {
+    return await withProjectLock(found.stateDir, async () => {
+      const saved = await readSession(file);
+      if (!sameSession(saved, found.current)) return blocked('session_changed');
+      const profile = options.profile === undefined ? nativeProfile(options.cli) : options.profile;
+      const owner = await readOwner(found.current, options.cli, profile);
+      const extractor = await readExtractor(found.current);
+      if (owner?.kind === 'blocked' || extractor?.kind === 'blocked') return blocked('local_policy_changed');
+      const liveOwner = owner?.ownerId ?? null;
+      const frozenOwner = saved.ownerId ?? null;
+      if (frozenOwner && frozenOwner !== liveOwner) return blocked('owner_binding_changed');
+      if (saved.extractor?.autoPublish === true &&
+          (extractor?.autoPublish !== true ||
+           extractor.autoPublishConsent?.consentHash !==
+             saved.extractor.autoPublishConsent?.consentHash)) return blocked('auto_publish_revoked');
+      if (!liveOwner || extractor?.autoPublish !== true ||
+          extractor.autoPublishConsent?.ownerId !== liveOwner ||
+          saved.extractor?.autoPublish === true) {
+        return Object.freeze({ ...found.current, ownerId: frozenOwner,
+          extractor: saved.extractor ?? null,
+          ...(saved.captureEpoch ? { captureEpoch: saved.captureEpoch } : {}) });
+      }
+      if (saved.captureEpoch) return blocked('session_changed');
+      const next = { ...saved, ownerId: liveOwner,
+        extractor: extractorForOwner(extractor, liveOwner),
+        captureEpoch: extractor.autoPublishConsent.consentHash };
+      if (process.platform === 'win32') {
+        const previous = await readWindowsPrivateFile(file);
+        if (!previous.ok || JSON.stringify(JSON.parse(previous.text)) !== JSON.stringify(saved)) {
+          return blocked('session_changed');
+        }
+        const written = await writeWindowsPrivateFile(file, JSON.stringify(next) + '\n',
+          { replace: true, expectedText: previous.text });
+        if (!written.ok) return blocked('session_changed');
+      } else {
+        const directoryStat = await fs.lstat(path.dirname(file));
+        const fileStat = await fs.lstat(file);
+        if (!process.getuid || !directoryStat.isDirectory() ||
+            directoryStat.uid !== process.getuid() || (directoryStat.mode & 0o077) ||
+            !fileStat.isFile() || fileStat.uid !== process.getuid() ||
+            (fileStat.mode & 0o077)) return blocked('unsafe_session_state');
+        const existing = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+        let previous;
+        try {
+          const opened = await existing.stat();
+          if (opened.dev !== fileStat.dev || opened.ino !== fileStat.ino) {
+            return blocked('session_changed');
+          }
+          previous = await existing.readFile('utf8');
+        } finally { await existing.close(); }
+        if (JSON.stringify(JSON.parse(previous)) !== JSON.stringify(saved)) {
+          return blocked('session_changed');
+        }
+        const temporary = `${file}.${randomUUID()}.tmp`;
+        const handle = await fs.open(temporary, 'wx', 0o600);
+        try { await handle.writeFile(JSON.stringify(next) + '\n'); await handle.sync(); }
+        finally { await handle.close(); }
+        try {
+          const beforeRename = await fs.lstat(file);
+          if (beforeRename.dev !== fileStat.dev || beforeRename.ino !== fileStat.ino) {
+            await fs.rm(temporary, { force: true });
+            return blocked('session_changed');
+          }
+          await fs.rename(temporary, file);
+        }
+        catch (error) { await fs.rm(temporary, { force: true }); throw error; }
+        const directory = await fs.open(path.dirname(file), 'r');
+        try { await directory.sync(); } finally { await directory.close(); }
+      }
+      return Object.freeze({ ...found.current, ownerId: liveOwner,
+        extractor: next.extractor, captureEpoch: next.captureEpoch });
+    }, 'capture-policy.lock');
+  } catch { return blocked('unsafe_session_state'); }
 }
 
 export async function inspectConfiguration(cwd, options = {}) {

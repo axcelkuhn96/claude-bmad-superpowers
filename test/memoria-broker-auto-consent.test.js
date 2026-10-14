@@ -6,7 +6,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { authorizeAutomaticBrokerWrite, brokerPath, readBrokerRequest } from '../base/memoria/broker.mjs';
+import { authorizeAutomaticBrokerWrite, authorizeAutomaticOrigin,
+  brokerPath, readBrokerRequest } from '../base/memoria/broker.mjs';
 import { createBrokerWorker } from '../base/memoria/broker-worker.mjs';
 import { runBridgeOperation } from '../base/memoria/bridge.mjs';
 import { encodeFrame } from '../base/memoria/frame.mjs';
@@ -50,6 +51,32 @@ test('broker gate rejects revoked or mismatched automatic consent and preserves 
   assert.deepEqual(await authorizeAutomaticBrokerWrite(resolution,
     { op: 'activate' }, consent, async () => null),
   { kind: 'blocked', reason: 'auto_publish_revoked' });
+});
+
+test('broker checks the private origin checkout again before automatic dispatch', async () => {
+  const current = { ...resolution, stateDir: '/state', projectRoot: '/project' };
+  const checkout = { kind: 'bound', nativeRoot: '/worktree', projectRoot: '/project',
+    projectId: 'project', profile: '/profiles/origin' };
+  let ownerId = 'owner-123';
+  const readCheckout = async (_state, cli) => cli === 'claude' ? checkout :
+    { kind: 'blocked', reason: 'missing_session_checkout' };
+  const readProfileOwner = async () => ({ ownerId });
+  const options = { readCheckout, readProfileOwner };
+  const sourceIdentity = { originCli: 'claude', sessionId: 'session', projectId: 'project' };
+  assert.equal((await authorizeAutomaticOrigin(current, '/worktree', 'session',
+    { ...add, sourceIdentity }, options)).kind, 'allowed');
+  assert.equal((await authorizeAutomaticOrigin(current, '/worktree', 'session',
+    { op: 'activate' }, options)).kind, 'allowed');
+  ownerId = 'other-owner';
+  assert.deepEqual(await authorizeAutomaticOrigin(current, '/worktree', 'session',
+    { op: 'activate' }, options), { kind: 'blocked', reason: 'auto_origin_changed' });
+  assert.deepEqual(await authorizeAutomaticOrigin(current, '/worktree', 'session',
+    { ...add, sourceIdentity: { ...sourceIdentity, originCli: 'codex' } }, options),
+  { kind: 'blocked', reason: 'auto_origin_changed' });
+  ownerId = 'owner-123';
+  assert.deepEqual(await authorizeAutomaticOrigin(current, '/worktree', 'session',
+    { op: 'activate' }, { ...options, readCheckout: async () => checkout }),
+  { kind: 'blocked', reason: 'auto_origin_changed' });
 });
 
 test('bridge carries consent proof for both SDK writes and omits it for manual writes', async t => {

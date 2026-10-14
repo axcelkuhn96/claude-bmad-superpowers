@@ -17,6 +17,7 @@ const consent = { version: 1, enabled: true, projectId: 'project',
   destinationHash: 'a'.repeat(64), ownerId: 'owner-123', deviceId: 'device-123',
   consentHash: 'b'.repeat(64), enabledAt: '2026-10-13T09:00:00Z' };
 const message = { origin: 'human', actor: 'user', speakerRole: 'user',
+  ownerId: consent.ownerId,
   text: 'No projeto, use PostgreSQL para persistência.', messageId: 'm1',
   timestamp: '2026-10-13T10:00:00Z', start: 0, end: 44 };
 
@@ -32,6 +33,9 @@ async function fixture(t) {
     projectId: 'project', collection: 'collection', deviceId: device.deviceId, generation: 1,
   }) + '\n', { mode: 0o600 });
   const outbox = createOutbox(stateDir);
+  assert.equal((await outbox.ensureFutureBaseline({ cli: 'claude', sessionId: 'session',
+    projectId: 'project', ownerId: consent.ownerId, consentHash: consent.consentHash,
+    policyVersion: POLICY_VERSION, cutoffEnd: 0 })).kind, 'baselined');
   const row = { cli: 'claude', sessionId: 'session', start: 0, end: 100,
     sliceHash: 'c'.repeat(64), messages: [message] };
   const queued = await outbox.enqueueCheckpoint(row,
@@ -51,6 +55,7 @@ async function fixture(t) {
   let operation;
   await publishCheckpointAutomatically(checkpoint, resolution, {
     outbox, readAutoPublish: async () => consent,
+    readOriginOwner: async () => consent.ownerId,
     store: async value => { operation = value; return { kind: 'pending', reason: 'fixture_pause' }; },
   });
   assert.ok(operation);

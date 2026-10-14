@@ -12,7 +12,8 @@ import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
 import { authorizeCurrentDestination } from './setup.mjs';
 import { assertWriter } from './authority.mjs';
-import { readAutoPublish } from './policy.mjs';
+import { readAutoPublish, readOwner } from './policy.mjs';
+import { readSessionCheckout } from './session-checkout.mjs';
 import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { openArtifactIdentity, runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { withProjectLock } from './ledger.mjs';
@@ -53,6 +54,24 @@ export async function authorizeAutomaticBrokerWrite(current, operation, consent,
     return sameAutoConsent(consent, await readConsent(current), current)
       ? { kind: 'allowed' } : denied('auto_publish_revoked');
   } catch { return denied('auto_publish_revoked'); }
+}
+export async function authorizeAutomaticOrigin(current, cwd, sessionId, operation,
+  { readCheckout = readSessionCheckout, readProfileOwner = readOwner } = {}) {
+  try {
+    const checkouts = await Promise.all(['claude', 'codex'].map(async cli => ({ cli,
+      checkout: await readCheckout(current.stateDir, cli, sessionId) })));
+    const matches = checkouts.filter(({ checkout }) => checkout.kind === 'bound' &&
+      checkout.nativeRoot === cwd && checkout.projectRoot === current.projectRoot &&
+      checkout.projectId === current.projectId && path.isAbsolute(checkout.profile ?? ''));
+    if (matches.length !== 1 || operation.op === 'add' &&
+        (operation.sourceIdentity?.originCli !== matches[0].cli ||
+          operation.sourceIdentity?.projectId !== current.projectId ||
+          operation.sourceIdentity?.sessionId !== sessionId)) return denied('auto_origin_changed');
+    const { cli, checkout } = matches[0];
+    const owner = await readProfileOwner(current, cli, checkout.profile);
+    return owner?.ownerId === current.ownerId ? { kind: 'allowed' } :
+      denied('auto_origin_changed');
+  } catch { return denied('auto_origin_changed'); }
 }
 export const brokerPath = (root = path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria')) =>
   path.join(root, process.platform === 'win32' ? 'encoder.discovery.json' : 'encoder.sock');
@@ -591,17 +610,22 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     if (authorized.kind !== 'authorized') return blocked(authorized.reason);
     const writing = ['add', 'activate'].includes(operation.op);
     const autoConsent = value.autoPublishConsent;
+    const automatic = writing && (autoConsent || operation.approval?.mode === 'automatic' ||
+      operation.metadata?.review_mode === 'automatic' || operation.metadata?.auto_consent_hash != null);
     if (writing) {
       const writer = await assertWriter(current, authorized, { stateRoot });
       if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
       const consent = await authorizeAutomaticBrokerWrite(current, operation, autoConsent);
       if (consent.kind !== 'allowed') return consent;
+      if (automatic) {
+        const origin = await authorizeAutomaticOrigin(current, cwd, sessionId, operation);
+        if (origin.kind !== 'allowed') return origin;
+      }
     }
     const request = { ...operation, projectId: current.projectId, state: current.stateDir,
       collection: current.destination.collection, connection: authorized.connection };
     if (deadlineAt <= Date.now()) return blocked('deadline');
-    const beforeDispatch = writing && (autoConsent || operation.approval?.mode === 'automatic' ||
-      operation.metadata?.review_mode === 'automatic' || operation.metadata?.auto_consent_hash != null)
+    const beforeDispatch = automatic
       ? async () => {
         if (signal.aborted || deadlineAt <= Date.now()) return denied('deadline');
         const live = await resolveProject(cwd, sessionId, { stateRoot });
@@ -609,7 +633,9 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
             live.embeddingFingerprint !== current.embeddingFingerprint) return denied('project_mismatch');
         const writer = await assertWriter(live, authorized, { stateRoot });
         if (writer.kind !== 'writer') return denied(writer.reason ?? 'writer_not_designated');
-        return authorizeAutomaticBrokerWrite(live, operation, autoConsent);
+        const consent = await authorizeAutomaticBrokerWrite(live, operation, autoConsent);
+        return consent.kind === 'allowed'
+          ? authorizeAutomaticOrigin(live, cwd, sessionId, operation) : consent;
       } : undefined;
     return bridge.request(request, secret, deadlineAt, beforeDispatch);
   }

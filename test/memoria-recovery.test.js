@@ -13,6 +13,8 @@ import { applyNativeExclusion, restoreNativeExclusion, verifyNativeCapture } fro
 import { reconcileStore } from '../base/memoria/ledger.mjs';
 import { externalIdFor } from '../base/memoria/ledger.mjs';
 import { inspectConfiguration } from '../base/memoria/provider.mjs';
+import { configureExtractor } from '../base/memoria/policy.mjs';
+import { consumeCheckpoints } from '../base/memoria/extract-worker.mjs';
 import { trustTuple, writeLocalTrust } from '../base/memoria/trust.mjs';
 
 const fixture = name => path.join(import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname), 'fixtures', name);
@@ -1022,6 +1024,69 @@ test('unconfigured capture is a default pass-through and never starts optional s
   }, stateRoot });
   assert.equal(result.kind, 'pass_through');
   await assert.rejects(fs.stat(stateRoot), { code: 'ENOENT' });
+});
+
+test('future baseline skips historical bytes, survives replay, and preserves extraction usage', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const box = createOutbox(dir);
+  const identity = { projectId: 'p', policyVersion: 'native-v2' };
+  const old = await box.enqueueCheckpoint({ cli: 'claude', sessionId: 's', start: 0, end: 8,
+    sliceHash: 'a'.repeat(64), messages: [{ origin: 'human', text: 'old', start: 0, end: 8 }] }, identity);
+  assert.equal(old.kind, 'queued');
+  assert.equal((await box.claimExtraction(old.operationId)).kind, 'claimed');
+  const binding = { cli: 'claude', sessionId: 's', projectId: 'p', ownerId: 'fixture-owner',
+    consentHash: 'b'.repeat(64), policyVersion: 'native-v2' };
+  const first = await box.ensureFutureBaseline({ ...binding, cutoffEnd: 16 });
+  assert.equal(first.kind, 'baselined');
+  assert.deepEqual(await box.cursor('claude', 's'), { queuedEnd: 16, ackedEnd: 0, processedEnd: 0 });
+  assert.equal((await box.ensureFutureBaseline({ ...binding, cutoffEnd: 40 })).cutoffEnd, 16);
+  assert.equal((await createOutbox(dir).extractionUsage('claude', 's')).calls, 1);
+  assert.equal((await box.futureSourceAllowed(old, binding)).kind, 'blocked');
+  const next = await box.enqueueCheckpoint({ cli: 'claude', sessionId: 's', start: 16, end: 24,
+    sliceHash: 'c'.repeat(64), messages: [{ origin: 'human', ownerId: 'fixture-owner',
+      text: 'new', start: 16, end: 24 }] }, identity);
+  assert.equal(next.kind, 'queued');
+  const row = (await box.pending()).find(item => item.operationId === next.operationId);
+  assert.equal((await box.futureSourceAllowed(row, binding)).kind, 'allowed');
+  assert.equal((await box.cursor('claude', 's')).queuedEnd, 24);
+  assert.equal((await box.ensureFutureBaseline({ ...binding, ownerId: 'other-owner', cutoffEnd: 40 })).kind, 'blocked');
+});
+
+test('Claude capture verifies the active worktree native hook', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const root = path.join(dir, 'project'); await fs.mkdir(root); await run('git', ['init', '-q', root]);
+  const config = { provider: 'mem0', project_id: 'worktree-project',
+    qdrant: { url: 'https://qdrant.internal', collection: 'worktree-project',
+      api_key_env: 'CBS_MEMORIA_TEST_KEY' },
+    embedding: { model: 'multilingual-e5-small', dimension: 384,
+      fingerprint: 'ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665:0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39' } };
+  await fs.mkdir(path.join(root, '.cbs'));
+  await fs.writeFile(path.join(root, '.cbs', 'memoria.json'), JSON.stringify(config));
+  await run('git', ['-C', root, 'add', '.cbs/memoria.json']);
+  await run('git', ['-C', root, '-c', 'user.name=Fixture', '-c',
+    'user.email=fixture@example.test', 'commit', '-qm', 'config']);
+  const worktree = path.join(dir, 'worktree');
+  await run('git', ['-C', root, 'worktree', 'add', '-q', '-b', 'fixture', worktree]);
+  const stateRoot = path.join(dir, 'state');
+  const applied = await applyNativeExclusion(worktree, { cli: 'claude', stateRoot,
+    projectRoot: root,
+    installedPlugin: true });
+  assert.equal(applied.kind, 'applied', JSON.stringify(applied));
+  const resolution = await inspectConfiguration(worktree, { stateRoot });
+  await writeLocalTrust(resolution.stateDir, trustTuple(resolution));
+  const profile = path.join(dir, 'profile'); await fs.mkdir(profile, { mode: 0o700 });
+  assert.equal((await configureExtractor(resolution, { route: 'sonnet', profile,
+    executable: process.execPath })).kind, 'selected');
+  const transcriptPath = path.join(dir, 'native-session.jsonl');
+  await fs.copyFile(fixture('memoria-native-claude.jsonl'), transcriptPath);
+  const result = await captureEvent({ cli: 'claude', event: 'SessionStart', payload: {
+    cwd: worktree, session_id: 'native-session', transcript_path: transcriptPath,
+    hook_event_name: 'SessionStart' }, stateRoot, installedPlugin: true });
+  assert.equal(result.kind, 'queued', JSON.stringify(result));
+  let calls = 0;
+  await consumeCheckpoints({ cli: 'claude', cwd: worktree, sessionId: 'native-session',
+    stateRoot, runCli: async () => { calls++; return { kind: 'error', reason: 'cli_unavailable' }; } });
+  assert.equal(calls, 1);
 });
 
 for (const cli of ['claude', 'codex']) {
