@@ -9,6 +9,42 @@ const blocked = reason => ({ kind: 'blocked', reason });
 const script = fileURLToPath(import.meta.url);
 const boundaryEvents = new Set(['SessionStart', 'Stop', 'PreCompact', 'SessionEnd']);
 
+export async function runScheduledConsumer({ consume, now = Date.now,
+  wait = ms => new Promise(resolve => setTimeout(resolve, ms)), maxDurationMs = 30 * 60 * 1000 } = {}) {
+  const deadline = now() + maxDurationMs;
+  let result;
+  do {
+    result = await consume();
+    if (result?.kind !== 'consumed' || !Number.isSafeInteger(result.nextRetryAt)) break;
+    const delay = Math.max(1000, result.nextRetryAt - now());
+    if (now() + delay > deadline) break;
+    await wait(delay);
+  } while (true);
+  return result;
+}
+
+export async function runExclusiveConsumer({ ownerRoot, lockTimeoutMs = 1000, ...options } = {}) {
+  if (!ownerRoot || !path.isAbsolute(ownerRoot)) return blocked('invalid_consumer_identity');
+  const { withProjectLock } = await import('./ledger.mjs');
+  try {
+    return await withProjectLock(ownerRoot, () => runScheduledConsumer(options),
+      'consumer.lock', lockTimeoutMs);
+  } catch (error) {
+    return blocked(['writer_lock_timeout', 'windows_file_lock_busy'].includes(error?.message)
+      ? 'consumer_busy' : 'consumer_unavailable');
+  }
+}
+
+export async function publishManifestIfEnabled(row, resolution, { outbox, publishCheckpoint, cwd } = {}) {
+  if (resolution.extractor?.autoPublish !== true || !resolution.extractor.autoPublishConsent) return null;
+  const publish = publishCheckpoint ?? (await import('./auto-publish.mjs')).publishCheckpointAutomatically;
+  const result = await publish(row, resolution, { outbox, cwd });
+  if (result.kind !== 'retry') return result;
+  const reason = /^[a-z_]{1,64}$/.test(result.reason ?? '') ? result.reason : 'publication_unavailable';
+  const marked = await outbox.markFailed(row.operationId, reason, { automatic: true });
+  return marked.kind === 'pending' ? { kind: 'retry', nextRetryAt: marked.retryAt } : marked;
+}
+
 export function scheduleExtraction({ cli, event, payload, result, stateRoot, spawnChild = spawn } = {}) {
   if (!boundaryEvents.has(event) || !['claude', 'codex'].includes(cli) ||
       result?.kind === 'blocked' || result?.kind === 'pass_through' || !result ||
@@ -23,7 +59,8 @@ export function scheduleExtraction({ cli, event, payload, result, stateRoot, spa
   return true;
 }
 
-export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCli } = {}) {
+export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCli,
+  publishCheckpoint } = {}) {
   if (!['claude', 'codex'].includes(cli) || !cwd || !sessionId) {
     return blocked('invalid_consumer_identity');
   }
@@ -65,8 +102,11 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
     return await withProjectLock(ownerRoot, async () => {
       const rows = (await box.pending()).filter(row => row.projectId === current.projectId &&
         row.policyVersion === POLICY_VERSION);
+      const ready = new Set((await box.ready(Date.now(), { automatic: true }))
+        .map(row => row.operationId));
       let manifested = 0;
       let pending = 0;
+      let nextRetryAt;
       for (const row of rows) {
         const original = await readSessionCheckout(current.stateDir, row.cli, row.sessionId);
         if (original.kind !== 'bound' || original.projectId !== current.projectId ||
@@ -87,6 +127,13 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
         const policy = fresh.extractor;
         if (!policy || !['sonnet', 'haiku'].includes(policy.route) || !path.isAbsolute(policy.profile) ||
             !path.isAbsolute(policy.executable)) { pending++; continue; }
+        if (policy.autoPublish === true && !ready.has(row.operationId)) {
+          pending++;
+          if (row.automatic === true && Number.isSafeInteger(row.retryAt)) {
+            nextRetryAt = Math.min(nextRetryAt ?? Infinity, row.retryAt);
+          }
+          continue;
+        }
         let profile;
         try {
           profile = await fs.realpath(policy.profile);
@@ -108,15 +155,34 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
           result = await extractCheckpoint(row, { ...policy,
             embeddingFingerprint: fresh.embeddingFingerprint, stateRoot }, { outbox: box, runCli });
         } finally { if (!runCli) process.chdir(previousCwd); }
-        if (result.kind === 'manifested' || result.kind === 'processed') manifested++;
-        else pending++;
+        if (result.kind === 'manifested' || result.kind === 'processed') {
+          manifested++;
+          if (result.kind === 'manifested') {
+            const publication = await publishManifestIfEnabled(row, fresh, { outbox: box,
+              publishCheckpoint, cwd: original.nativeRoot });
+            if (publication && publication.kind !== 'published') pending++;
+            if (publication?.kind === 'retry' && Number.isSafeInteger(publication.nextRetryAt)) {
+              nextRetryAt = Math.min(nextRetryAt ?? Infinity, publication.nextRetryAt);
+            }
+          }
+        } else pending++;
       }
-      return { kind: 'consumed', manifested, pending };
+      return { kind: 'consumed', manifested, pending,
+        ...(nextRetryAt === undefined ? {} : { nextRetryAt }) };
     }, 'extract.lock');
   } catch { return blocked('consumer_unavailable'); }
 }
 
 if (process.argv[1] === script) {
   const [cli, cwd, sessionId, rawStateRoot] = process.argv.slice(2);
-  await consumeCheckpoints({ cli, cwd, sessionId, stateRoot: rawStateRoot || undefined });
+  try { os.setPriority(os.constants.priority.PRIORITY_BELOW_NORMAL); } catch { /* best effort */ }
+  const stateRoot = rawStateRoot || undefined;
+  const consume = () => consumeCheckpoints({ cli, cwd, sessionId, stateRoot });
+  try {
+    const { resolveProject } = await import('./provider.mjs');
+    const current = await resolveProject(cwd, sessionId, { stateRoot });
+    if (current?.provider === 'mem0' && current.stateDir) {
+      await runExclusiveConsumer({ ownerRoot: path.dirname(current.stateDir), consume });
+    } else await consume();
+  } catch { await consume(); }
 }
