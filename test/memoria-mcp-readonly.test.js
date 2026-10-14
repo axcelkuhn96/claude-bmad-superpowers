@@ -4,7 +4,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { createReadonlyMcp } from '../base/memoria/mcp-readonly.mjs';
+import { EventEmitter } from 'node:events';
+import { createReadonlyMcp, installReadonlyShutdown } from '../base/memoria/mcp-readonly.mjs';
 import { inspectConfiguration } from '../base/memoria/provider.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
@@ -88,4 +89,17 @@ test('standalone MCP freezes initial project binding before first tool call', as
   await fs.writeFile(f.configFile, JSON.stringify(f.config));
   assert.equal((await mcp.call('status')).reason, 'project_changed');
   await mcp.close();
+});
+
+
+test('SIGTERM closes only the owned MCP worker before process exit', async () => {
+  const emitter = new EventEmitter();
+  const events = [];
+  const removed = installReadonlyShutdown({ close: async () => { events.push('close'); } },
+    emitter, code => { events.push(`exit:${code}`); });
+  emitter.emit('SIGTERM');
+  emitter.emit('SIGINT');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(events, ['close', 'exit:0']);
+  removed();
 });

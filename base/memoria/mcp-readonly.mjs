@@ -145,6 +145,18 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
   return { definitions, ready: initial, call, close: async () => { closed = true; await worker?.close(); } };
 }
 
+export function installReadonlyShutdown(instance, emitter = process, exit = code => process.exit(code)) {
+  let ending = false;
+  const stop = () => {
+    if (ending) return;
+    ending = true;
+    Promise.resolve().then(() => instance.close()).then(() => exit(0), () => exit(1));
+  };
+  emitter.once('SIGTERM', stop);
+  emitter.once('SIGINT', stop);
+  return () => { emitter.removeListener('SIGTERM', stop); emitter.removeListener('SIGINT', stop); };
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const argv = process.argv.slice(2);
   const cli = argv[0] === '--cli' ? argv[1] : null;
@@ -154,7 +166,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   if (!valid) process.exitCode = 2;
   else {
     const instance = createReadonlyMcp({ cwd: root, cli });
+    const removeShutdown = installReadonlyShutdown(instance);
     try { await instance.ready; await serveMcp(instance); }
-    finally { await instance.close(); }
+    finally { removeShutdown(); await instance.close(); }
   }
 }
