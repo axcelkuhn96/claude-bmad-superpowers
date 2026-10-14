@@ -2,6 +2,13 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.13.2] - 2026-10-14
+
+### Adicionado
+- **Gravação automática Mem0 com adesão explícita por projeto:** os hooks nativos de Claude Code e Codex capturam mensagens humanas; checkpoints acionam até quatro chamadas Haiku por sessão e geram no máximo cinco candidatos por checkpoint. O cliente valida fonte literal, tipo, escopo, consentimento e escritor ativo antes de gerar embeddings locais e gravar no Qdrant. A proveniência distingue validação automática de revisão humana.
+- **Retomada da publicação:** checkpoints persistidos são retomados após falha transitória, sem repetir a extração já concluída. O processo de retentativa nasce sob demanda, tem duração limitada e não instala serviço no startup do computador. A adesão vale para sessões novas; outros projetos mantêm a gravação automática desligada.
+- **Perfis independentes:** o registro do proprietário de um perfil Claude Code não substitui o de outro. O MCP de sessões normais permanece somente de leitura (`search`, `get`, `status`); a gravação automática é feita pelos hooks e pelo escritor local autorizado.
+
 ## [0.13.1] - 2026-10-13
 
 ### Adicionado
