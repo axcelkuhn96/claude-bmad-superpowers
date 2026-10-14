@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { createOutbox } from '../base/memoria/outbox.mjs';
 import { extractCheckpoint, validateCandidate } from '../base/memoria/candidates.mjs';
 import { publishCheckpointAutomatically } from '../base/memoria/auto-publish.mjs';
+import { POLICY_VERSION } from '../base/memoria/transcript.mjs';
 
 const consent = { version: 1, enabled: true, projectId: 'p', destinationHash: 'a'.repeat(64),
   ownerId: 'owner-123', deviceId: 'device-123', consentHash: 'b'.repeat(64),
@@ -14,19 +15,19 @@ const consent = { version: 1, enabled: true, projectId: 'p', destinationHash: 'a
 const base = { origin: 'human', actor: 'user', speakerRole: 'user', messageId: 'm1',
   timestamp: '2026-10-13T10:00:00Z', start: 0, end: 900 };
 
-async function fixture(t, text) {
+async function fixture(t, text, origin = 'human') {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-auto-candidates-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const stateDir = path.join(root, 'state');
   await fs.mkdir(stateDir, { mode: 0o700 });
   const outbox = createOutbox(stateDir);
-  const source = { ...base, text };
+  const source = { ...base, text, origin };
   const row = { cli: 'claude', sessionId: 'session', start: 0, end: 900,
     sliceHash: 'c'.repeat(64), messages: [source] };
-  const queued = await outbox.enqueueCheckpoint(row, { projectId: 'p', policyVersion: 'native-v1' });
+  const queued = await outbox.enqueueCheckpoint(row, { projectId: 'p', policyVersion: POLICY_VERSION });
   assert.equal(queued.kind, 'queued');
   return { outbox, stateDir, source, row: { ...row, operationId: queued.operationId,
-    projectId: 'p', policyVersion: 'native-v1' } };
+    projectId: 'p', policyVersion: POLICY_VERSION } };
 }
 
 async function extract(row, outbox, candidates) {
@@ -109,4 +110,15 @@ test('repeated identical Haiku selections produce one candidate', async t => {
   const item = { text, type: 'rule', scope: 'project' };
   assert.equal((await extract(row, outbox, [item, item])).kind, 'manifested');
   assert.equal((await outbox.readManifest(row.operationId)).candidates.length, 1);
+});
+
+test('automatic checkpoint with only unknown origin completes without a paid extraction', async t => {
+  const { outbox, row } = await fixture(t, 'Internal summary: use PostgreSQL.', 'unknown');
+  let calls = 0;
+  const result = await extractCheckpoint(row, { route: 'haiku', autoPublish: true,
+    autoPublishConsent: consent }, { outbox, runCli: async () => { calls++; throw Error('unexpected'); } });
+  assert.equal(result.kind, 'processed');
+  assert.equal(calls, 0);
+  assert.equal((await outbox.readDisposition(row.operationId)).disposition, 'no_facts');
+  assert.equal((await outbox.extractionUsage(row.cli, row.sessionId)).calls, 0);
 });

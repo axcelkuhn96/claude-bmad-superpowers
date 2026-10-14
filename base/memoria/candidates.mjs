@@ -7,6 +7,7 @@ import os from 'node:os';
 import readline from 'node:readline/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
+import { POLICY_VERSION } from './transcript.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const pending = reason => ({ kind: 'pending', reason });
@@ -144,7 +145,7 @@ function sourceMessages(row, route) {
 }
 
 export function buildExtractionPrompt(row, route = 'sonnet', autoPublish = false) {
-  const messages = sourceMessages(row, route)
+  const messages = sourceMessages(row, route).filter(message => !autoPublish || message.origin === 'human')
     .map(message => ({ message_id: message.messageId, role: message.speakerRole,
       actor: message.actor, origin: message.origin, evidence_at: message.timestamp,
       offsets: { start: message.start, end: message.end }, text: redact(message.text) }));
@@ -171,10 +172,13 @@ async function extractCheckpointInner(checkpoint, cliPolicy, options = {}) {
       row.cli !== checkpoint.cli || row.sessionId !== checkpoint.sessionId ||
       row.start !== checkpoint.start || row.end !== checkpoint.end || row.sliceHash !== checkpoint.sliceHash ||
       JSON.stringify(row.messages) !== JSON.stringify(checkpoint.messages)) return blocked('checkpoint_source_mismatch');
+  const automatic = haiku && cliPolicy.autoPublish === true && !!cliPolicy.autoPublishConsent;
+  if (automatic && row.policyVersion !== POLICY_VERSION) return pending('source_policy_unproved');
   const eligible = sourceMessages(row, cliPolicy.route).filter(message =>
+    (!automatic || message.origin === 'human') &&
     typeof message.text === 'string' && message.text.trim());
   if (!eligible.length) {
-    if (haiku && row.messages.length && row.messages.every(message =>
+    if (automatic || haiku && row.messages.length && row.messages.every(message =>
       ['human', 'assistant', 'tool'].includes(message.origin) &&
       typeof message.text === 'string' && !message.text.trim())) {
       const manifest = await outbox.recordManifest(checkpoint.operationId, []);
@@ -214,7 +218,6 @@ async function extractCheckpointInner(checkpoint, cliPolicy, options = {}) {
   if (!valid) {
     return { ...pending('extractor_schema_invalid'), diagnostic };
   }
-  const automatic = haiku && cliPolicy.autoPublish === true && !!cliPolicy.autoPublishConsent;
   if (haiku && !automatic && response.decisions.some(decision => decision.candidates.some(item =>
     item.scope !== decision.candidates[0].scope ||
     (item.condition ?? null) !== (decision.candidates[0].condition ?? null)))) {

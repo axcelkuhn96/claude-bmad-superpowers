@@ -8,6 +8,7 @@ import { externalIdFor } from './ledger.mjs';
 import { ensureWindowsPrivateDirectory, inspectWindowsPath, readWindowsBinary,
   publishWindowsBinary, deleteWindowsBinary, withWindowsFileLock } from './windows-security.mjs';
 import { createWindowsState } from './windows-state.mjs';
+import { POLICY_VERSION } from './transcript.mjs';
 
 const DEFAULT_MAX = 256 * 1024 * 1024;
 const blocked = reason => ({ kind: 'blocked', reason });
@@ -808,8 +809,11 @@ export function createOutbox(stateDir, options = {}) {
       const processedChild = processed?.candidates?.find(candidate =>
         candidate.externalId === externalId && candidate.payloadRef?.sha256 ===
           names[0].slice(externalId.length + 1, -5) && candidate.status === 'remote_acked');
-      if (payload.format_version === 3 && (payload.origin !== 'user_direct' ||
-          !(sourceRow ? rowSourceValid(sourceRow, payload, item.text) : processedChild) ||
+      if (payload.format_version === 3 && (payload.policy_version !== POLICY_VERSION ||
+          payload.origin !== 'user_direct' ||
+          !(sourceRow ? sourceRow.policyVersion === POLICY_VERSION &&
+            rowSourceValid(sourceRow, payload, item.text) :
+            processed?.policyVersion === POLICY_VERSION && processedChild) ||
           item.text !== payload.text || metadata.review_mode !== 'automatic' ||
           !/^[a-f0-9]{64}$/.test(metadata.auto_consent_hash ?? '') ||
           metadata.auto_actor !== 'project_auto_publisher')) return blocked('source_mismatch');
@@ -964,7 +968,8 @@ export function createOutbox(stateDir, options = {}) {
         if (payload.format_version === 3) {
           const meta = review.operation.metadata;
           const { redactSource, containsSecret } = await import('./candidates.mjs');
-          if (review.decision !== 'approve' || review.mode !== 'automatic' ||
+          if (row.policyVersion !== POLICY_VERSION || payload.policy_version !== POLICY_VERSION ||
+              review.decision !== 'approve' || review.mode !== 'automatic' ||
               review.actor !== 'project_auto_publisher' ||
               review.consentHash !== meta.auto_consent_hash ||
               !/^[a-f0-9]{64}$/.test(review.consentHash ?? '') ||

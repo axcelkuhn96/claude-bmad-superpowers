@@ -14,6 +14,7 @@ import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { applyNativeExclusion } from '../base/memoria/native.mjs';
 import { recordSessionCheckout } from '../base/memoria/session-checkout.mjs';
 import { createOutbox } from '../base/memoria/outbox.mjs';
+import { POLICY_VERSION } from '../base/memoria/transcript.mjs';
 
 test('detached consumer retries a transient publish until it succeeds without a new hook', async () => {
   let clock = 1000;
@@ -162,7 +163,7 @@ async function automaticConsumerFixture(t) {
     sliceHash: 'a'.repeat(64), messages: [{ messageId: 'm1', role: 'user', speakerRole: 'user',
       actor: 'fixture-owner', origin: 'human', text: 'A release checklist is required.',
       timestamp: '2026-10-01T00:00:00Z', start: 0, end: 32 }] },
-  { projectId: 'fixture-project', policyVersion: 'native-v1' })).kind, 'queued');
+  { projectId: 'fixture-project', policyVersion: POLICY_VERSION })).kind, 'queued');
   return { project, stateRoot, box };
 }
 

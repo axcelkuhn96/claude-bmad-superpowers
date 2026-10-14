@@ -11,6 +11,7 @@ import { storeMemory } from '../base/memoria/bridge.mjs';
 import { brokerEndpointStatus, brokerPath, readBrokerRequest } from '../base/memoria/broker.mjs';
 import { encodeFrame } from '../base/memoria/frame.mjs';
 import { localDevice } from '../base/memoria/policy.mjs';
+import { POLICY_VERSION } from '../base/memoria/transcript.mjs';
 
 const consent = { version: 1, enabled: true, projectId: 'project',
   destinationHash: 'a'.repeat(64), ownerId: 'owner-123', deviceId: 'device-123',
@@ -34,10 +35,10 @@ async function fixture(t) {
   const row = { cli: 'claude', sessionId: 'session', start: 0, end: 100,
     sliceHash: 'c'.repeat(64), messages: [message] };
   const queued = await outbox.enqueueCheckpoint(row,
-    { projectId: 'project', policyVersion: 'native-v1' });
+    { projectId: 'project', policyVersion: POLICY_VERSION });
   assert.equal(queued.kind, 'queued');
   const checkpoint = { ...row, operationId: queued.operationId,
-    projectId: 'project', policyVersion: 'native-v1' };
+    projectId: 'project', policyVersion: POLICY_VERSION };
   const extracted = await extractCheckpoint(checkpoint,
     { route: 'haiku', autoPublish: true, autoPublishConsent: consent },
     { outbox, runCli: async () => ({ kind: 'success', model: 'claude-haiku-5-5',

@@ -4,10 +4,11 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createOutbox } from '../base/memoria/outbox.mjs';
-import { extractCheckpoint, validateCandidate } from '../base/memoria/candidates.mjs';
+import { extractCheckpoint, storeOperation, validateCandidate } from '../base/memoria/candidates.mjs';
 import { publishCheckpointAutomatically } from '../base/memoria/auto-publish.mjs';
-import { reconcileStore } from '../base/memoria/ledger.mjs';
+import { externalIdFor, reconcileStore } from '../base/memoria/ledger.mjs';
 import { storeMemory } from '../base/memoria/bridge.mjs';
+import { POLICY_VERSION } from '../base/memoria/transcript.mjs';
 
 const source = { origin: 'human', actor: 'user', speakerRole: 'user',
   text: 'No projeto, use PostgreSQL para persistência.', messageId: 'm1',
@@ -15,7 +16,7 @@ const source = { origin: 'human', actor: 'user', speakerRole: 'user',
 const consent = { version: 1, enabled: true, projectId: 'p', destinationHash: 'a'.repeat(64),
   ownerId: 'owner-123', deviceId: 'device-123', consentHash: 'b'.repeat(64),
   enabledAt: '2026-10-13T09:00:00Z' };
-async function fixture(t, messages = [source]) {
+async function fixture(t, messages = [source], policyVersion = POLICY_VERSION) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-auto-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const stateDir = path.join(root, 'state');
@@ -23,10 +24,10 @@ async function fixture(t, messages = [source]) {
   const outbox = createOutbox(stateDir);
   const row = { cli: 'claude', sessionId: 'session', start: 0, end: 100,
     sliceHash: 'c'.repeat(64), messages };
-  const queued = await outbox.enqueueCheckpoint(row, { projectId: 'p', policyVersion: 'native-v1' });
+  const queued = await outbox.enqueueCheckpoint(row, { projectId: 'p', policyVersion });
   assert.equal(queued.kind, 'queued');
   return { outbox, stateDir, row: { ...row, operationId: queued.operationId,
-    projectId: 'p', policyVersion: 'native-v1' } };
+    projectId: 'p', policyVersion } };
 }
 const choice = text => ({ source_message_id: 'm1', abstain_reason: '', candidates: [
   { text, type: 'rule', scope: 'project' }] });
@@ -63,6 +64,23 @@ test('automatic Haiku prompt asks for a literal durable span', async t => {
   assert.match(prompt, /automatic/i);
 });
 
+test('automatic Haiku prompt excludes assistant and unknown messages in a mixed checkpoint', async t => {
+  const assistant = { ...source, origin: 'assistant', actor: 'assistant',
+    speakerRole: 'assistant', messageId: 'm2', start: 45, end: 70,
+    text: 'PostgreSQL was deployed.' };
+  const unknown = { ...assistant, origin: 'unknown', messageId: 'm3', start: 71, end: 90,
+    text: 'Internal summary: deployment complete.' };
+  const { outbox, row } = await fixture(t, [source, assistant, unknown]);
+  let messages;
+  const result = await extractCheckpoint(row, { route: 'haiku', autoPublish: true,
+    autoPublishConsent: consent }, { outbox, runCli: async input => {
+    messages = JSON.parse(input).messages;
+    return { kind: 'success', model: 'claude-haiku-5-5', decisions: [choice(source.text)] };
+  } });
+  assert.equal(result.kind, 'manifested');
+  assert.deepEqual(messages.map(item => item.message_id), ['m1']);
+});
+
 test('automatic gate leaves invented text and assistant source unpromoted', async t => {
   const first = await fixture(t);
   const invented = await extract(first.row, first.outbox,
@@ -71,7 +89,8 @@ test('automatic gate leaves invented text and assistant source unpromoted', asyn
   assert.equal((await first.outbox.readManifest(first.row.operationId)).reason, 'missing_manifest');
   const assistant = { ...source, origin: 'assistant', actor: 'assistant', speakerRole: 'assistant' };
   const second = await fixture(t, [assistant]);
-  assert.equal((await extract(second.row, second.outbox, [choice(source.text)])).kind, 'pending');
+  assert.equal((await extract(second.row, second.outbox, [choice(source.text)])).kind, 'processed');
+  assert.equal((await second.outbox.readDisposition(second.row.operationId)).disposition, 'no_facts');
 });
 
 test('automatic gate quarantines question, status and mixed speaker text', async t => {
@@ -88,7 +107,7 @@ test('automatic gate quarantines question, status and mixed speaker text', async
   }
 });
 
-test('automatic source mismatch is labeled as validation quarantine, without promising manual approval', async t => {
+test('automatic publisher refuses a caller row that differs from the persisted checkpoint', async t => {
   const { outbox, stateDir, row } = await fixture(t);
   assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
   const changed = { ...row, messages: [{ ...source, text: 'A different source.' }] };
@@ -96,8 +115,49 @@ test('automatic source mismatch is labeled as validation quarantine, without pro
     outbox, readAutoPublish: async () => consent,
     store: async () => { throw Error('must not store'); },
   });
-  assert.deepEqual(result, { kind: 'pending', published: 0, pending: 1,
-    reason: 'automatic_validation_failed' });
+  assert.deepEqual(result, { kind: 'blocked', published: 0, pending: 0,
+    reason: 'source_policy_unproved' });
+});
+
+test('persisted native-v1 checkpoint never becomes an automatic memory, even with valid consent', async t => {
+  const { outbox, stateDir, row } = await fixture(t, [source], 'native-v1');
+  const extracted = await extract(row, outbox, [choice(source.text)]);
+  assert.equal(extracted.kind, 'pending');
+  assert.equal((await outbox.readManifest(row.operationId)).reason, 'missing_manifest');
+  const current = await fixture(t);
+  assert.equal((await extract(current.row, current.outbox, [choice(source.text)])).kind, 'manifested');
+  const modernEntry = (await current.outbox.readManifest(current.row.operationId)).candidates[0];
+  const modernPayload = await current.outbox.readCandidatePayload(current.row.operationId,
+    modernEntry.candidateKey);
+  const externalId = externalIdFor({ projectId: 'p', originCli: row.cli,
+    sessionId: row.sessionId, start: row.start, end: row.end, sliceHash: row.sliceHash,
+    policyVersion: row.policyVersion, candidateKey: modernEntry.candidateKey });
+  const legacyPayload = { ...modernPayload, external_id: externalId,
+    checkpoint_id: row.operationId, policy_version: row.policyVersion };
+  const persisted = await outbox.persistCandidatePayload(row.operationId, legacyPayload);
+  assert.equal(persisted.kind, 'persisted');
+  assert.equal((await outbox.recordManifest(row.operationId, [{
+    candidateKey: modernEntry.candidateKey, externalId,
+    evidence: modernEntry.evidence, payloadRef: persisted.payloadRef,
+  }])).kind, 'manifested');
+  let stores = 0;
+  const result = await publishCheckpointAutomatically({ ...row, policyVersion: POLICY_VERSION },
+    resolution(stateDir), { outbox, readAutoPublish: async () => consent,
+      store: async () => { stores++; } });
+  assert.deepEqual(result, { kind: 'blocked', published: 0, pending: 0,
+    reason: 'source_policy_unproved' });
+  assert.equal(stores, 0);
+  const operation = storeOperation(legacyPayload, legacyPayload.text);
+  operation.metadata.review_mode = 'automatic';
+  operation.metadata.auto_actor = 'project_auto_publisher';
+  operation.metadata.auto_consent_hash = consent.consentHash;
+  operation.approval.mode = 'automatic';
+  const sealed = await outbox.sealReview(row.operationId, modernEntry.candidateKey, {
+    decision: 'approve', mode: 'automatic', actor: 'project_auto_publisher',
+    consentHash: consent.consentHash, payloadSha256: persisted.payloadRef.sha256,
+    reviewedAt: '2026-10-13T11:00:00Z', operation,
+  });
+  assert.deepEqual(sealed, { kind: 'blocked', reason: 'automatic_review_unproved' });
 });
 
 test('automatic retry remains ready after five transient failures', async t => {

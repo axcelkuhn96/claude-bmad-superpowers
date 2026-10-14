@@ -2,6 +2,7 @@ import { createOutbox } from './outbox.mjs';
 import { storeMemory } from './bridge.mjs';
 import { storeOperation, validateCandidate, containsSecret, redactSource } from './candidates.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
+import { POLICY_VERSION } from './transcript.mjs';
 
 const blocked = reason => ({ kind: 'blocked', published: 0, pending: 0, reason });
 const sameConsent = (frozen, live, projectId) => frozen?.version === 1 &&
@@ -22,6 +23,22 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
   const checkConsent = async () => sameConsent(frozen, await readConsent(resolution), row.projectId);
   if (!await checkConsent()) return blocked('auto_publish_revoked');
   const outbox = options.outbox ?? createOutbox(resolution.stateDir);
+  const checkpointRow = (await outbox.pending()).find(item => item.operationId === row.operationId);
+  if (!checkpointRow) {
+    const receipt = await outbox.readDisposition(row.operationId);
+    return receipt?.policyVersion === POLICY_VERSION && row.policyVersion === POLICY_VERSION &&
+      receipt.projectId === row.projectId && receipt.cli === row.cli &&
+      receipt.sessionId === row.sessionId && receipt.start === row.start &&
+      receipt.end === row.end && receipt.sliceHash === row.sliceHash
+      ? { kind: 'published', published: 0, pending: 0 } : blocked('source_policy_unproved');
+  }
+  if (checkpointRow.policyVersion !== POLICY_VERSION || row.policyVersion !== POLICY_VERSION ||
+      checkpointRow.projectId !== row.projectId || checkpointRow.cli !== row.cli ||
+      checkpointRow.sessionId !== row.sessionId || checkpointRow.start !== row.start ||
+      checkpointRow.end !== row.end || checkpointRow.sliceHash !== row.sliceHash ||
+      JSON.stringify(checkpointRow.messages) !== JSON.stringify(row.messages)) {
+    return blocked('source_policy_unproved');
+  }
   const manifest = await outbox.readManifest(row.operationId);
   if (manifest.kind === 'blocked') {
     const receipt = await outbox.readDisposition(row.operationId);
@@ -34,9 +51,10 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
     if (entry.status === 'remote_acked') continue;
     if (entry.status !== 'pending') { pending++; continue; }
     const payload = await outbox.readCandidatePayload(row.operationId, entry.candidateKey);
-    const source = row.messages?.find(message => message.messageId === payload.source_message_id &&
+    const source = checkpointRow.messages?.find(message => message.messageId === payload.source_message_id &&
       message.start === payload.source_offsets?.start && message.end === payload.source_offsets?.end);
-    if (payload.kind === 'blocked' || payload.format_version !== 3 || source?.origin !== 'human' ||
+    if (payload.kind === 'blocked' || payload.policy_version !== POLICY_VERSION ||
+        payload.format_version !== 3 || source?.origin !== 'human' ||
         !validateCandidate(payload, source).eligible ||
         containsSecret(payload) || redactSource(source.text) !== source.text ||
         !source.text.includes(payload.text) || /\?/.test(payload.text)) {
