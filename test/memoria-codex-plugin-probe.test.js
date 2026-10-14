@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { applyNativeExclusion } from '../base/memoria/native.mjs';
+import { applyNativeExclusion, restoreNativeExclusion } from '../base/memoria/native.mjs';
 
 const installed = {
   pluginId: 'claude-mem@claude-mem-local', name: 'claude-mem', marketplaceName: 'claude-mem-local',
@@ -12,7 +12,7 @@ const installed = {
   source: { source: 'local' }, marketplaceSource: { sourceType: 'local' },
 };
 
-async function probe(t, output) {
+async function probe(t, output, restore = false) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-codex-plugin-probe-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const root = path.join(dir, 'project');
@@ -37,7 +37,11 @@ async function probe(t, output) {
       results.push(await applyNativeExclusion(root, { cli: 'codex', stateRoot: path.join(dir, 'state') }));
     }
     const args = (await fs.readFile(process.env.CBS_TEST_PLUGIN_ARGS, 'utf8')).trimEnd().split('\n');
-    return { result: results.at(-1), results, args, config: await fs.readFile(config, 'utf8') };
+    const appliedConfig = await fs.readFile(config, 'utf8');
+    const restored = restore ? await restoreNativeExclusion(root,
+      { cli: 'codex', stateRoot: path.join(dir, 'state') }) : null;
+    return { result: results.at(-1), results, args, config: appliedConfig, restored,
+      restoredConfig: restore ? await fs.readFile(config, 'utf8') : null };
   } finally {
     process.env.PATH = priorPath;
     if (priorOutput === undefined) delete process.env.CBS_TEST_PLUGIN_OUTPUT;
@@ -66,18 +70,29 @@ test('Codex native exclusion reuses its owned snapshot after disabling the insta
   assert.deepEqual(results, [{ kind: 'applied' }, { kind: 'applied', existing: true }]);
 });
 
-test('Codex native exclusion ignores available, disabled, foreign and malformed plugin rows', async t => {
+test('Codex native exclusion accepts an already-disabled installed local plugin and restores project config', async t => {
+  const disabled = JSON.stringify({ installed: [{ ...installed, enabled: false }], available: [] });
+  const { result, config, restored, restoredConfig } = await probe(t, disabled, true);
+  assert.deepEqual(result, { kind: 'applied' });
+  assert.match(config, /enabled = false/);
+  assert.deepEqual(restored, { kind: 'restored' });
+  assert.equal(restoredConfig, '[plugins."claude-mem@claude-mem-local"]\nenabled = true\n');
+});
+
+test('Codex native exclusion rejects available, uninstalled, foreign and malformed plugin rows', async t => {
   const blocked = { kind: 'blocked', reason: 'unsupported_plugin' };
   for (const output of [
     JSON.stringify({ installed: [], available: [installed] }),
-    JSON.stringify({ installed: [{ ...installed, enabled: false }], available: [] }),
     JSON.stringify({ installed: [{ ...installed, installed: false }], available: [] }),
+    JSON.stringify({ installed: [{ ...installed, enabled: null }], available: [] }),
     JSON.stringify({ installed: [{ ...installed, pluginId: 'other@claude-mem-local' }], available: [] }),
     JSON.stringify({ installed: [{ ...installed, name: 'other' }], available: [] }),
     JSON.stringify({ installed: [{ ...installed, marketplaceName: 'other' }], available: [] }),
     JSON.stringify({ installed: [{ ...installed, version: null }], available: [] }),
+    JSON.stringify({ installed: [{ ...installed, version: 'invalid' }], available: [] }),
     JSON.stringify({ installed: [{ ...installed, installPolicy: 'WORKSPACE_MANAGED' }], available: [] }),
     JSON.stringify({ installed: [{ ...installed, source: { source: 'remote' } }], available: [] }),
+    JSON.stringify({ installed: [{ ...installed, marketplaceSource: { sourceType: 'remote' } }], available: [] }),
     JSON.stringify({ installed: [installed, installed], available: [] }),
     '{invalid',
   ]) {
