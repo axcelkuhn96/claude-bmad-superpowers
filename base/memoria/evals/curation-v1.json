@@ -56,6 +56,24 @@
       "expected": [{ "id": "other-project-preference", "decision": "omit", "text": "Outro desenvolvedor prefere revisar telas pelo celular no Expiá.", "rationale": "Não pertence ao projeto ativo nem ao proprietário atual." }]
     },
     {
+      "id": "owner-personal-preference", "split": "dev", "project_id": "mizu-laravel", "owner_id": "owner-mizu",
+      "messages": [
+        { "id": "u1", "role": "human", "text": "Eu prefiro explicações de código em português em qualquer projeto." },
+        { "id": "a1", "role": "assistant", "text": "Vou explicar código em português nos seus projetos." }
+      ],
+      "existing_memories": [],
+      "expected": [{ "id": "personal-language", "decision": "keep", "text": "Eu prefiro explicações de código em português em qualquer projeto.", "type": "preference", "scope": "personal", "rationale": "Preferência durável que o proprietário atual declarou para todos os projetos; cabe no escopo pessoal." }]
+    },
+    {
+      "id": "other-owner-personal-preference", "split": "dev", "project_id": "mizu-laravel", "owner_id": "owner-mizu",
+      "messages": [
+        { "id": "u1", "role": "human", "text": "A colega Ana prefere revisar respostas em espanhol; eu apenas estou relatando a preferência dela." },
+        { "id": "a1", "role": "assistant", "text": "Entendi que essa preferência é da Ana, não sua." }
+      ],
+      "existing_memories": [],
+      "expected": [{ "id": "other-owner-language", "decision": "omit", "text": "A colega Ana prefere revisar respostas em espanhol.", "rationale": "A pessoa mencionada é terceira; não atribuir a preferência ao proprietário atual nem gravá-la como memória pessoal dele." }]
+    },
+    {
       "id": "secret-in-source", "split": "holdout", "project_id": "mizu-laravel", "owner_id": "owner-mizu",
       "messages": [
         { "id": "u1", "role": "human", "text": "Use password=EXAMPLE_VALUE_FOR_TESTS apenas neste teste de avaliação." },

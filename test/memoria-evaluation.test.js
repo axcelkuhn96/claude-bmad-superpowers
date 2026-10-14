@@ -16,8 +16,10 @@ const candidateFor = (entry, text, type = 'rule', scope = 'project') => ({ text,
 test('versioned corpus has both partitions, human/assistant turns and reasoned labels', async () => {
   const { corpus, sha256 } = await loadMemoryCorpus(fixturePath);
   assert.match(sha256, /^[a-f0-9]{64}$/);
-  assert.equal(corpus.cases.length, 9);
+  assert.equal(corpus.cases.length, 11);
   assert.equal(corpus.cases.filter(item => item.split === 'holdout').length, 3);
+  assert.equal(corpus.cases.filter(item => item.expected.some(expected =>
+    expected.scope === 'personal')).length, 1);
   assert.ok(corpus.cases.every(item => item.messages.some(message => message.role === 'human') &&
     item.messages.some(message => message.role === 'assistant') &&
     item.expected.every(expected => expected.rationale)));
@@ -147,6 +149,52 @@ test('a semantically matching claim in the wrong scope is still a false save', a
   assert.deepEqual(report.semantic.missed_durable, { count: 1, denominator: 1 });
   assert.deepEqual(report.cases.find(item => item.case_id === entry.id).missed_expected_ids,
     ['rest-environment']);
+});
+
+test('declared personal preference is retained only in personal scope', async () => {
+  const { corpus } = await loadMemoryCorpus(fixturePath);
+  const entry = corpus.cases.find(item => item.id === 'owner-personal-preference');
+  const output = { version: 1, results: [{ ...outputFor(entry,
+    [candidateFor(entry, 'Eu prefiro explicações de código em português em qualquer projeto.',
+      'preference', 'personal')]),
+  adjudication: { source: 'fixture', labels: [{ candidate_index: 0,
+    expected_id: 'personal-language', verdict: 'full',
+    rationale: 'Preferência afirmada pelo proprietário para todos os projetos.' }] } }] };
+  const report = evaluateMemoryOutputs(corpus, output);
+  assert.equal(report.semantic.status, 'fixture_control');
+  assert.deepEqual(report.semantic.scope_error, { count: 0, denominator: 1 });
+  assert.deepEqual(report.semantic.false_save, { count: 0, denominator: 1 });
+  assert.deepEqual(report.semantic.missed_durable, { count: 0, denominator: 1 });
+  assert.deepEqual(report.cases.find(item => item.case_id === entry.id).missed_expected_ids, []);
+});
+
+test('third-party personal preference is an omitted fixture control', async () => {
+  const { corpus } = await loadMemoryCorpus(fixturePath);
+  const entry = corpus.cases.find(item => item.id === 'other-owner-personal-preference');
+  const output = { version: 1, results: [{ ...outputFor(entry,
+    [candidateFor(entry, 'A colega Ana prefere revisar respostas em espanhol.',
+      'preference', 'personal')]),
+  adjudication: { source: 'fixture', labels: [{ candidate_index: 0,
+    expected_id: 'other-owner-language', verdict: 'full',
+    rationale: 'Mesmo texto, mas descreve a colega e não o proprietário atual.' }] } }] };
+  const report = evaluateMemoryOutputs(corpus, output);
+  assert.equal(report.semantic.status, 'fixture_control');
+  assert.deepEqual(report.semantic.false_save, { count: 1, denominator: 1 });
+  assert.deepEqual(report.semantic.missed_durable, { count: 0, denominator: 0 });
+});
+
+test('correction retention explicitly means a new corrected candidate, not old-memory deletion', async () => {
+  const { corpus } = await loadMemoryCorpus(fixturePath);
+  const entry = corpus.cases.find(item => item.id === 'mizu-correction-condition');
+  const report = evaluateMemoryOutputs(corpus, { version: 1, results: [
+    { ...outputFor(entry, [candidateFor(entry,
+      'Não testar MizuAprov antes da promoção; testar somente depois do aviso do usuário de que o RPO foi promovido.')]),
+    adjudication: { source: 'fixture', labels: [{ candidate_index: 0,
+      expected_id: 'correct-test-rule', verdict: 'full', rationale: 'Condição corrigida retida.' }] } },
+  ] });
+  assert.deepEqual(report.semantic.correction_retention, { count: 1, denominator: 1 });
+  assert.match(report.metric_definitions.correction_retention, /candidate/i);
+  assert.match(report.metric_definitions.correction_retention, /not.*delet/i);
 });
 
 test('JSON loaders reject oversized or malformed files without executing corpus text', async t => {

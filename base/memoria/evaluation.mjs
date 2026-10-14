@@ -177,6 +177,9 @@ export function evaluateMemoryOutputs(corpus, outputs, { split = 'all' } = {}) {
     outputs_sha256: sha256(JSON.stringify(outputs)), split,
     assessment_scope: 'supplied_extractor_candidates_not_confirmed_Qdrant_writes',
     holdout_note: 'Reserved for operator review; published cases do not prove statistical independence.',
+    metric_definitions: {
+      correction_retention: 'Counts expected corrections matched by a full new candidate in the expected type and scope; does not verify deletion or deactivation of the old memory.',
+    },
     run: { ...(outputs.run ?? {}), provenance: 'supplied_metadata' },
     coverage: { selected: cases.length, submitted: 0, adjudicated: 0 },
     cases: [],
