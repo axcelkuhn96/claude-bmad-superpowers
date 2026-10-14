@@ -58,6 +58,23 @@ test('standalone MCP searches approved project memory without session or launche
   await mcp.close();
 });
 
+test('read-only MCP status reports locally configured automatic writing without contacting Qdrant', async t => {
+  const f = await fixture(t);
+  let remoteCalls = 0;
+  let consent = { version: 1, enabled: true, projectId: 'project-one', ownerId: 'axcel-local' };
+  const mcp = createReadonlyMcp({ cwd: f.root, cli: 'claude', stateRoot: f.stateRoot,
+    verifyNative: async () => ({ kind: 'verified' }),
+    owner: async () => ({ ownerId: 'axcel-local' }),
+    autoPublish: async () => consent,
+    authorize: async () => { remoteCalls++; throw Error('unexpected remote call'); } });
+  assert.deepEqual(await mcp.call('status'), { kind: 'ready', provider: 'mem0',
+    mode: 'readonly', projectId: 'project-one', automaticWriteConfigured: true });
+  consent = null;
+  assert.equal((await mcp.call('status')).automaticWriteConfigured, false);
+  assert.equal(remoteCalls, 0);
+  await mcp.close();
+});
+
 test('standalone MCP denies changed trust, project root overrides and bad queries before authorization', async t => {
   const f = await fixture(t);
   let authorized = 0;
@@ -132,6 +149,28 @@ test('explicit search returns curated first and bounded labelled legacy pointers
   const curated = await mcp.call('search', { query: 'database', source: 'curated' });
   assert.equal(curated.kind, 'items');
   assert.deepEqual(calls, ['curated:database']);
+  await mcp.close();
+});
+
+test('active automatic v3 memory remains searchable as curated source', async t => {
+  const f = await fixture(t);
+  const id = '64eef286-9f7e-4326-b137-5658f0286c46';
+  const automatic = { ...item, sdkId: id, text: 'Use Postgres for project memory.',
+    metadata: { ...item.metadata, format_version: 3, type: 'rule',
+      review_mode: 'automatic', auto_actor: 'project_auto_publisher',
+      auto_consent_hash: 'a'.repeat(64) } };
+  const mcp = createReadonlyMcp({ cwd: f.root, cli: 'claude', stateRoot: f.stateRoot,
+    verifyNative: async () => ({ kind: 'verified' }),
+    authorize: async () => ({ kind: 'authorized', key: 'private', connection: {} }),
+    search: async () => ({ kind: 'items', items: [automatic] }),
+    get: async ({ projectId }) => ({ kind: 'item', item: { projectId, source: 'curated',
+      memoryId: id, text: automatic.text, offset: 0, nextOffset: null } }) });
+  const found = await mcp.call('search', { query: 'project memory', source: 'curated' });
+  assert.equal(found.kind, 'items');
+  assert.match(found.context, /Use Postgres for project memory/);
+  assert.doesNotMatch(found.context, /human.review/i);
+  const read = await mcp.call('get', { memory_id: id, source: 'curated' });
+  assert.equal(read.item.text, automatic.text);
   await mcp.close();
 });
 

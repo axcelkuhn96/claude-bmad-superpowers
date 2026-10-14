@@ -7,7 +7,7 @@ import { inspectConfiguration } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
 import { readLocalTrust, sameTrustTuple, trustTuple, authorizeDestination } from './trust.mjs';
 import { verifyNativeCapture } from './native.mjs';
-import { readOwner } from './policy.mjs';
+import { readOwner, readAutoPublish } from './policy.mjs';
 import { pinDestination } from './activation.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
 import { selectRecall, renderRecall } from './context.mjs';
@@ -36,7 +36,7 @@ export const readonlyDefinitions = [
     inputSchema: { type: 'object', properties: { memory_id: { type: 'string' },
       source: { type: 'string', enum: ['curated', 'legacy'] }, offset: { type: 'integer', minimum: 0 } },
       required: ['memory_id', 'source'], additionalProperties: false } },
-  { name: 'status', description: 'Show read-only Mem0 availability for the trusted current project.',
+  { name: 'status', description: 'Show Mem0 availability and local automatic-writing configuration for the trusted current project. This MCP exposes only read tools; configured writing runs through native hooks and this status does not confirm a remote write.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
 ];
 for (const definition of readonlyDefinitions) definition.annotations = {
@@ -71,7 +71,8 @@ function createSearchWorker(resolution) {
 export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
   inspect = inspectConfiguration, identify = identifyProject,
   trust = readLocalTrust, verifyNative = verifyNativeCapture,
-  owner = readOwner, authorize, search, legacySearch, get } = {}) {
+  owner = readOwner, autoPublish = readAutoPublish,
+  authorize, search, legacySearch, get } = {}) {
   let frozen;
   let worker;
   let idle;
@@ -123,7 +124,16 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
     let ready;
     try { ready = await check(); } catch { return blocked('project_unavailable'); }
     if (ready.kind !== 'ready') return ready;
-    if (name === 'status') return { kind: 'ready', provider: 'mem0', mode: 'readonly', projectId: ready.projectId };
+    if (name === 'status') {
+      let automaticWriteConfigured = false;
+      try {
+        const consent = await autoPublish(ready.resolution);
+        automaticWriteConfigured = consent?.enabled === true && consent.projectId === ready.projectId &&
+          !!ready.ownerId && consent.ownerId === ready.ownerId;
+      } catch { /* A local policy read must not make read-only search unavailable. */ }
+      return { kind: 'ready', provider: 'mem0', mode: 'readonly', projectId: ready.projectId,
+        automaticWriteConfigured };
+    }
     let auth;
     try {
       if (authorize) auth = await authorize(ready.resolution);
