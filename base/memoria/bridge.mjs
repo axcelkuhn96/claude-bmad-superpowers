@@ -10,6 +10,7 @@ import { assertWriter } from './authority.mjs';
 import { targetVersion } from './correction.mjs';
 import { createOutbox } from './outbox.mjs';
 import { dedupKeyFor } from './dedup-key.mjs';
+import { sourceForExplicitMcp } from './mcp-request-proof.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'python', 'mem0_adapter.py');
@@ -45,6 +46,18 @@ export async function runBridgeOperation(cwd, sessionId, operation, readSecret, 
     if (operation.approval?.mode === 'automatic' && !options.autoPublishConsent) {
       return blocked('auto_publish_unproved');
     }
+    const explicit = operation.approval?.mode === 'explicit_mcp' ||
+      operation.metadata?.format_version === 5 || options.explicitMcpSource;
+    if (explicit) {
+      const source = options.explicitMcpSource ?? operation;
+      if (!options.run || !options.autoPublishConsent ||
+          source.approval?.mode !== 'explicit_mcp' ||
+          source.metadata?.format_version !== 5 ||
+          !await autoConsentCurrent(resolution, options.autoPublishConsent, options) ||
+          (await sourceForExplicitMcp(source, resolution)).kind !== 'local_source') {
+        return blocked('explicit_mcp_unproved');
+      }
+    }
   }
   const remaining = deadlineAt === null ? options.deadlineMs ?? undefined : Math.floor(deadlineAt - Date.now());
   if (deadlineAt !== null && remaining <= 0) return blocked('deadline');
@@ -70,7 +83,23 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
   } catch { return blocked('invalid_source_identity'); }
   const resolution = await (options.resolve ?? resolveProject)(cwd, sessionId, options);
   if (resolution.provider !== 'mem0' || resolution.projectId !== operation.projectId) return blocked('project_mismatch');
-  if (operation.metadata.review_mode === 'automatic' || operation.approval?.mode === 'automatic') {
+  const explicitMcp = operation.metadata.format_version === 5 ||
+    operation.metadata.review_mode === 'explicit_mcp' || operation.approval?.mode === 'explicit_mcp';
+  if (explicitMcp) {
+    if (operation.metadata.format_version !== 5 ||
+        operation.metadata.review_mode !== 'explicit_mcp' ||
+        operation.approval?.mode !== 'explicit_mcp' ||
+        operation.metadata.origin !== 'assistant_report' ||
+        operation.metadata.speaker_role !== 'assistant' ||
+        operation.metadata.actor !== 'mcp_agent' ||
+        operation.metadata.auto_consent_hash !== options.autoPublishConsent?.consentHash ||
+        !options.run || !await autoConsentCurrent(resolution, options.autoPublishConsent, options)) {
+      return blocked('explicit_mcp_unproved');
+    }
+    if ((await sourceForExplicitMcp(operation, resolution)).kind !== 'local_source') {
+      return blocked('explicit_mcp_source_unproved');
+    }
+  } else if (operation.metadata.review_mode === 'automatic' || operation.approval?.mode === 'automatic') {
     if (operation.metadata.review_mode !== 'automatic' || operation.approval?.mode !== 'automatic' ||
         ![3, 4].includes(operation.metadata.format_version) ||
         operation.metadata.format_version === 4 &&
@@ -83,8 +112,8 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
       return blocked('auto_publish_unproved');
     }
   }
-  const conversation = operation.metadata.format_version === 4;
-  if (conversation) {
+  const deduplicated = [4, 5].includes(operation.metadata.format_version);
+  if (deduplicated) {
     let expected;
     try { expected = dedupKeyFor({ projectId: operation.projectId,
       scope: operation.metadata.scope, ownerId: operation.metadata.owner_id,
@@ -98,13 +127,14 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
     const source = await createOutbox(resolution.stateDir).sourceForRemote(operation);
     if (source.kind !== 'local_source') return blocked('source_review_unproved');
   }
-  const bridge = request => runBridgeOperation(cwd, sessionId, request, readSecret, options);
+  const bridgeOptions = explicitMcp ? { ...options, explicitMcpSource: operation } : options;
+  const bridge = request => runBridgeOperation(cwd, sessionId, request, readSecret, bridgeOptions);
   const response = await withProjectLock(resolution.stateDir, async () => {
     const auth = await (options.authorize ?? authorizeCurrentDestination)(cwd, sessionId, readSecret, options);
     if (auth.kind !== 'authorized') return auth;
     const writer = await assertWriter(resolution, auth, options);
     if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
-    if (operation.approval?.mode === 'automatic' &&
+    if ((operation.approval?.mode === 'automatic' || explicitMcp) &&
         !await autoConsentCurrent(resolution, options.autoPublishConsent, options)) {
       return blocked('auto_publish_revoked');
     }
@@ -117,7 +147,7 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
       if (ready?.kind !== 'ready') return ready?.kind === 'blocked'
         ? ready : blocked('broker_unavailable');
     }
-    if (conversation) {
+    if (deduplicated) {
       const duplicate = await bridge({ op: 'dedup_find', projectId: operation.projectId,
         externalId: operation.externalId, sessionId: operation.sessionId,
         text: operation.text, metadata: operation.metadata });

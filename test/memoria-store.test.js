@@ -6,12 +6,79 @@ import path from 'node:path';
 import { createLedger, externalIdFor, reconcileStore, transferWriter, withProjectLock } from '../base/memoria/ledger.mjs';
 import { runBridgeOperation, searchProject } from '../base/memoria/bridge.mjs';
 import { storeMemory } from '../base/memoria/bridge.mjs';
+import { createExplicitMcpRequest } from '../base/memoria/mcp-request-proof.mjs';
 
 async function seedLedger(stateDir, writerId = 'writer-a') {
   await fs.mkdir(path.join(stateDir, 'ledger'), { recursive: true, mode: 0o700 });
   await fs.writeFile(path.join(stateDir, 'ledger', 'writer.json'), JSON.stringify({
     projectId: 'p', deviceId: writerId, collection: 'fixture', generation: 1 }) + '\n', { mode: 0o600 });
 }
+
+test('explicit MCP request stores only a sealed source and confirms the remote ACK', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-mcp-store-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, 'project');
+  await fs.mkdir(stateDir, { mode: 0o700 });
+  const deviceId = '11111111-1111-4111-8111-111111111111';
+  await fs.writeFile(path.join(root, 'device.json'), JSON.stringify({ deviceId }) + '\n', { mode: 0o600 });
+  await seedLedger(stateDir, deviceId);
+  const consent = { version: 1, enabled: true, projectId: 'p', ownerId: 'owner',
+    destinationHash: 'a'.repeat(64), consentHash: 'b'.repeat(64), deviceId,
+    enabledAt: '2026-10-14T12:00:00Z' };
+  const resolution = { provider: 'mem0', projectId: 'p', projectRoot: root, stateDir,
+    ownerId: 'owner', destination: { collection: 'fixture', url: 'https://example.test:48677/' },
+    extractor: { autoPublish: true, autoPublishConsent: consent } };
+  const source = await createExplicitMcpRequest({ resolution, cli: 'claude',
+    profile: path.join(root, 'profile'), ownerId: 'owner', consent,
+    text: 'Compilar no TRIPEX_COMP antes de promover RPO.', type: 'rule' });
+  assert.equal(source.kind, 'request');
+  const rows = [];
+  let additions = 0;
+  let acknowledgements = 0;
+  const options = {
+    resolve: async () => resolution, authorize: async () => ({ kind: 'authorized', key: 'test-key',
+      connection: { url: resolution.destination.url } }),
+    readAutoPublish: async () => consent, autoPublishConsent: consent,
+    control: async () => ({ kind: 'authority', record: { state: 'active', deviceId, generation: 1 } }),
+    run: async (_python, _script, request) => {
+      if (request.op === 'dedup_find') return { kind: 'clear' };
+      if (request.op === 'find') return { kind: 'items', items: rows.filter(row =>
+        row.externalId === request.externalId) };
+      if (request.op === 'add') {
+        additions++;
+        rows.push({ projectId: 'p', externalId: request.externalId,
+          sessionId: request.sessionId,
+          sdkId: '64eef286-9f7e-4326-b137-5658f0286c46',
+          qdrantId: '64eef286-9f7e-4326-b137-5658f0286c46', status: 'pending',
+          text: request.text, metadata: request.metadata });
+        return { kind: 'pending', sdkId: rows[0].sdkId };
+      }
+      if (request.op === 'read') return { kind: 'item', item: rows[0] };
+      if (request.op === 'activate') {
+        rows[0].status = 'active';
+        return { kind: 'item', item: rows[0] };
+      }
+      throw new Error('unexpected SDK operation');
+    },
+    ackLocal: async externalId => {
+      acknowledgements++;
+      return { kind: 'acked', operationId: externalId };
+    },
+  };
+  const denied = await storeMemory(root, source.operation.sessionId,
+    { ...source.operation, text: 'Tampered' }, () => 'secret', options);
+  assert.equal(denied.kind, 'blocked');
+  assert.equal(additions, 0);
+  const revoked = await storeMemory(root, source.operation.sessionId, source.operation,
+    () => 'secret', { ...options, readAutoPublish: async () => ({ ...consent, enabled: false }) });
+  assert.equal(revoked.kind, 'blocked');
+  assert.equal(additions, 0);
+  const stored = await storeMemory(root, source.operation.sessionId, source.operation,
+    () => 'secret', options);
+  assert.equal(stored.kind, 'stored', JSON.stringify(stored));
+  assert.equal(additions, 1);
+  assert.equal(acknowledgements, 1);
+});
 
 test('remote-add observation runs after real bridge add and before local ACK', async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-remote-boundary-'));

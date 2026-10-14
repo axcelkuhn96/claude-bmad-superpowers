@@ -17,6 +17,61 @@ spec.loader.exec_module(adapter)
 
 
 class AdapterTest(unittest.TestCase):
+    def test_explicit_mcp_record_is_curated_with_honest_provenance(self):
+        identifier = '64eef286-9f7e-4326-b137-5658f0286c46'
+        text = 'Compilar no HML_TRIPEX_COMP antes da promoção do RPO.'
+        metadata = {'scope': 'project', 'type': 'decision', 'origin': 'assistant_report',
+                    'speaker_role': 'assistant', 'actor': 'mcp_agent',
+                    'source': 'mcp_request:' + 'c' * 64,
+                    'source_text_sha256': 'a' * 64, 'review_mode': 'explicit_mcp',
+                    'auto_consent_hash': 'b' * 64, 'format_version': 5,
+                    'evidence_at': '2026-10-01T00:00:00Z'}
+        metadata['dedup_key'] = adapter._dedup_key('project', metadata, text)
+        row = {'projectId': 'project', 'status': 'active', 'text': text, 'metadata': metadata}
+        memory = SimpleNamespace(embedding_model=object(), get=lambda _: {'id': identifier})
+        request = {'op': 'readonly_get', 'collection': 'native', 'projectId': 'project',
+                   'memoryId': identifier, 'source': 'curated', 'connection': {}}
+        with patch.object(adapter, 'verify_collection'), \
+             patch.object(adapter, '_memory', return_value=memory), \
+             patch.object(adapter, '_row', side_effect=lambda *args: row):
+            result = adapter.execute_readonly(request, None, Path('/tmp'))
+            self.assertEqual(result['kind'], 'item')
+            self.assertEqual(result['item']['provenance']['review_mode'], 'explicit_mcp')
+            self.assertEqual(result['item']['provenance']['source_text_sha256'], 'a' * 64)
+            row['metadata'] = {**metadata, 'source_text_sha256': 'bad'}
+            self.assertEqual(adapter.execute_readonly(request, None, Path('/tmp'))['reason'],
+                             'source_unavailable')
+
+    def test_explicit_mcp_duplicate_reuses_v4_key_without_second_add(self):
+        text = 'Compilar no HML_TRIPEX_COMP antes da promoção do RPO.'
+        common = {'scope': 'project', 'type': 'decision', 'format_version': 5,
+                  'source': 'mcp_request:' + 'c' * 64,
+                  'actor': 'mcp_agent', 'origin': 'assistant_report',
+                  'speaker_role': 'assistant', 'review_mode': 'explicit_mcp',
+                  'source_text_sha256': 'a' * 64, 'auto_consent_hash': 'b' * 64,
+                  'evidence_at': '2026-10-01T00:00:00Z'}
+        common['dedup_key'] = adapter._dedup_key('project', common, text)
+        identifier = '64eef286-9f7e-4326-b137-5658f0286c46'
+        point = SimpleNamespace(id=identifier, payload={**common, 'project_id': 'project',
+            'user_id': 'project', 'data': text, 'status': 'active', 'source_record_id': 'first'})
+        class Client:
+            def scroll(self, **kwargs):
+                return ([point], None)
+        request = {'op': 'add', 'collection': 'native', 'projectId': 'project',
+                   'externalId': 'second', 'sessionId': 'mcp-request-v1:second',
+                   'text': text, 'metadata': common, 'connection': {}}
+        memory = SimpleNamespace(add=lambda *args, **kwargs: self.fail('duplicate reached add'))
+        with patch.object(adapter, 'verify_collection'), \
+             patch.object(adapter, '_memory', return_value=memory):
+            result = adapter.execute(request, Client(), Path('/tmp'))
+        self.assertEqual(result['kind'], 'duplicate')
+        self.assertEqual(result['duplicateOf']['externalId'], 'first')
+        invalid = {**request, 'metadata': {**common, 'review_mode': 'automatic'}}
+        with patch.object(adapter, 'verify_collection'), \
+             patch.object(adapter, '_memory', return_value=memory):
+            with self.assertRaisesRegex(ValueError, 'explicit_mcp_invalid'):
+                adapter.execute(invalid, Client(), Path('/tmp'))
+
     def test_memory_config_uses_ephemeral_history_only_when_requested(self):
         class Qdrant:
             pass

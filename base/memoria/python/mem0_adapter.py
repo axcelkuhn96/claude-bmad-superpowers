@@ -262,7 +262,7 @@ def _find_duplicate(client, collection: str, request: dict) -> dict:
     metadata = request['metadata']
     project = request['projectId']
     key = metadata.get('dedup_key')
-    if metadata.get('format_version') != 4 or \
+    if metadata.get('format_version') not in (4, 5) or \
             key != _dedup_key(project, metadata, request['text']):
         raise ValueError('dedup_key_mismatch')
     points, next_page = client.scroll(collection_name=collection,
@@ -395,6 +395,25 @@ def _conversation_summary(metadata: dict, text: str, project: str) -> bool:
             ref.get('role') == 'assistant' for ref in refs)
 
 
+def _explicit_mcp_record(metadata: dict, text: str, project: str) -> bool:
+    try:
+        expected_key = _dedup_key(project, metadata, text)
+    except ValueError:
+        return False
+    return metadata.get('format_version') == 5 and \
+        metadata.get('origin') == 'assistant_report' and \
+        metadata.get('speaker_role') == 'assistant' and \
+        metadata.get('actor') == 'mcp_agent' and \
+        metadata.get('review_mode') == 'explicit_mcp' and \
+        isinstance(metadata.get('source'), str) and \
+        re.fullmatch(r'mcp_request:[a-f0-9]{64}', metadata['source']) is not None and \
+        isinstance(metadata.get('source_text_sha256'), str) and \
+        re.fullmatch(r'[a-f0-9]{64}', metadata['source_text_sha256']) is not None and \
+        isinstance(metadata.get('auto_consent_hash'), str) and \
+        re.fullmatch(r'[a-f0-9]{64}', metadata['auto_consent_hash']) is not None and \
+        metadata.get('dedup_key') == expected_key
+
+
 def execute_readonly(request: dict, client, state: Path) -> dict:
     """Read-only MCP operations; collection is always derived from the bound native one."""
     native = request['collection']
@@ -469,6 +488,8 @@ def execute_readonly(request: dict, client, state: Path) -> dict:
             metadata.get('valid_from') and _time(metadata['valid_from']) > now or \
             metadata.get('valid_to') and _time(metadata['valid_to']) <= now or \
             not (_conversation_summary(metadata, row['text'], project) or
+                _explicit_mcp_record(metadata, row['text'], project) or
+                metadata.get('format_version') != 5 and
                 metadata.get('speaker_role') == {'user_direct': 'user', 'assistant_report': 'assistant',
                     'tool_observation': 'tool', 'external_reference': 'external'}.get(metadata.get('origin'))) or \
             not metadata.get('source') or not metadata.get('actor') or \
@@ -480,6 +501,9 @@ def execute_readonly(request: dict, client, state: Path) -> dict:
     if _conversation_summary(metadata, row['text'], project):
         provenance.update({'generated': True, 'source_ref_count': len(metadata['source_refs']),
                            'source_refs': metadata['source_refs']})
+    elif _explicit_mcp_record(metadata, row['text'], project):
+        provenance.update({'review_mode': 'explicit_mcp',
+                           'source_text_sha256': metadata['source_text_sha256']})
     return {'kind': 'item', 'item': {'projectId': project, 'source': 'curated',
         'memoryId': identifier, 'provenance': provenance, **page}}
 
@@ -518,7 +542,10 @@ def execute(request: dict, client, state: Path) -> dict:
             _time(metadata['valid_from'])
         if metadata.get('valid_to'):
             _time(metadata['valid_to'])
-        if metadata.get('format_version') == 4:
+        if metadata.get('format_version') == 5 and \
+                not _explicit_mcp_record(metadata, request['text'], project):
+            raise ValueError('explicit_mcp_invalid')
+        if metadata.get('format_version') in (4, 5):
             duplicate = _find_duplicate(client, collection, request)
             if duplicate['kind'] != 'clear':
                 return duplicate
@@ -564,6 +591,8 @@ def execute(request: dict, client, state: Path) -> dict:
                 isinstance(row.get('score'), (int, float)) and math.isfinite(row['score']) and
                 MIN_RECALL_SCORE <= row['score'] <= 1 and
                 row['status'] == 'active' and row['metadata'].get('source') and row['metadata'].get('actor') and
+                (row['metadata'].get('format_version') != 5 or
+                    _explicit_mcp_record(row['metadata'], row['text'], project)) and
                 row['metadata'].get('scope') in ('project', 'personal', 'episode') and
                 (row['metadata'].get('scope') != 'episode' or row['metadata'].get('valid_to')) and
                 (row['metadata']['scope'] in ('project', 'episode') or (request.get('ownerId') and
