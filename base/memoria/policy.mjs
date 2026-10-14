@@ -9,6 +9,10 @@ const digest = value => createHash('sha256').update(JSON.stringify(value)).diges
 const binding = resolution => digest([resolution.projectId, resolution.destination,
   resolution.embeddingFingerprint]);
 const ownerValid = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(value);
+const deviceValid = value => typeof value === 'string' && /^[a-f0-9-]{36}$/.test(value);
+const consentDigest = consent => digest([consent.version, consent.enabled, consent.projectId,
+  consent.destinationHash, consent.ownerId, consent.deviceId, consent.ownerCli,
+  consent.enabledAt, consent.nonce]);
 
 async function readPrivate(file) {
   if (process.platform === 'win32') {
@@ -115,11 +119,89 @@ export async function readExtractor(resolution) {
     if (!value) return null;
     if (value.projectId !== resolution.projectId || value.binding !== binding(resolution) ||
         !['sonnet', 'haiku'].includes(value.route) || value.maxCallsPerSession !== 4 ||
-        value.maxCandidatesPerCheckpoint !== 5 || value.autoPublish !== false) throw new Error('extractor_binding_changed');
+        value.maxCandidatesPerCheckpoint !== 5 ||
+        (value.autoPublish !== false && value.autoPublish !== true) ||
+        value.autoPublish === true && value.route !== 'haiku' ||
+        value.autoPublish === false && value.autoPublishConsent != null) throw new Error('extractor_binding_changed');
     const [profile, executable] = await Promise.all([fs.realpath(value.profile), fs.realpath(value.executable)]);
     if (profile !== value.profile || executable !== value.executable) throw new Error('extractor_path_changed');
-    return value;
+    return value.autoPublish === true && !await validConsent(resolution, value.autoPublishConsent)
+      ? { ...value, autoPublish: false, autoPublishConsent: null } : value;
   } catch { return blocked('extractor_binding_changed'); }
+}
+
+async function validConsent(resolution, consent) {
+  if (!consent || consent.version !== 1 || consent.enabled !== true ||
+      consent.projectId !== resolution.projectId ||
+      consent.destinationHash !== digest(resolution.destination) ||
+      !ownerValid(consent.ownerId) || !deviceValid(consent.deviceId) ||
+      !['claude', 'codex'].includes(consent.ownerCli) ||
+      typeof consent.enabledAt !== 'string' || !Number.isFinite(Date.parse(consent.enabledAt)) ||
+      !/^[a-f0-9-]{36}$/.test(consent.nonce ?? '') ||
+      consent.consentHash !== consentDigest(consent)) return false;
+  const device = await localDevice(resolution.stateDir);
+  if (device.kind !== 'device' || device.deviceId !== consent.deviceId) return false;
+  try {
+    const writer = await readPrivate(path.join(resolution.stateDir, 'ledger', 'writer.json'));
+    if (writer?.projectId !== resolution.projectId ||
+        writer.collection !== resolution.destination.collection ||
+        writer.deviceId !== consent.deviceId || writer.revoked === true ||
+        !Number.isSafeInteger(writer.generation) || writer.generation < 1) return false;
+    const owner = await readPrivate(path.join(resolution.stateDir, `owner-${consent.ownerCli}.json`));
+    if (typeof owner?.profile !== 'string' || !path.isAbsolute(owner.profile) ||
+        owner.profile !== await fs.realpath(owner.profile)) return false;
+    const profileStat = await fs.stat(owner.profile);
+    return owner?.projectId === resolution.projectId && owner.binding === binding(resolution) &&
+      owner.ownerId === consent.ownerId && owner.cli === consent.ownerCli &&
+      typeof owner.declaration === 'string' && profileStat.isDirectory() &&
+      (process.platform === 'win32' || process.getuid && profileStat.uid === process.getuid() &&
+        !(profileStat.mode & 0o022));
+  } catch { return false; }
+}
+
+export async function readAutoPublish(resolution) {
+  const extractor = await readExtractor(resolution);
+  return extractor && extractor.kind !== 'blocked' && extractor.autoPublish === true
+    ? extractor.autoPublishConsent : null;
+}
+
+export async function enableAutoPublish(resolution, { ownerId, cli, profile } = {}) {
+  if (!ownerValid(ownerId) || !['claude', 'codex'].includes(cli)) return blocked('owner_declaration_required');
+  const owner = await readOwner(resolution, cli, profile);
+  if (!owner || owner.kind === 'blocked' || owner.ownerId !== ownerId) return blocked('owner_declaration_required');
+  const extractor = await readExtractor(resolution);
+  if (!extractor || extractor.kind === 'blocked' || extractor.route !== 'haiku') return blocked('haiku_selection_required');
+  const device = await localDevice(resolution.stateDir);
+  if (device.kind !== 'device') return device;
+  let writer;
+  try { writer = await readPrivate(path.join(resolution.stateDir, 'ledger', 'writer.json')); }
+  catch { return blocked('writer_not_designated'); }
+  if (writer?.projectId !== resolution.projectId ||
+      writer.collection !== resolution.destination.collection ||
+      writer.deviceId !== device.deviceId || writer.revoked === true ||
+      !Number.isSafeInteger(writer.generation) || writer.generation < 1) return blocked('writer_not_designated');
+  const consent = { version: 1, enabled: true, projectId: resolution.projectId,
+    destinationHash: digest(resolution.destination), ownerId, deviceId: device.deviceId,
+    ownerCli: cli, enabledAt: new Date().toISOString(), nonce: randomUUID() };
+  consent.consentHash = consentDigest(consent);
+  try {
+    await writePrivate(path.join(resolution.stateDir, 'extractor.json'), {
+      ...extractor, autoPublish: true, autoPublishConsent: consent }, true);
+    return { kind: 'enabled', consentHash: consent.consentHash };
+  } catch { return blocked('unsafe_extractor_state'); }
+}
+
+export async function disableAutoPublish(resolution) {
+  try {
+    const extractor = await readPrivate(path.join(resolution.stateDir, 'extractor.json'));
+    if (extractor?.projectId !== resolution.projectId ||
+        extractor.binding !== binding(resolution) ||
+        !['sonnet', 'haiku'].includes(extractor.route)) return blocked('extractor_binding_changed');
+    const { autoPublishConsent, ...rest } = extractor;
+    await writePrivate(path.join(resolution.stateDir, 'extractor.json'),
+      { ...rest, autoPublish: false }, true);
+    return { kind: 'disabled' };
+  } catch { return blocked('unsafe_extractor_state'); }
 }
 
 export async function localDevice(stateDir) {

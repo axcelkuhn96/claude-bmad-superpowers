@@ -122,6 +122,10 @@ function sameSession(saved, current) {
     JSON.stringify(saved.destination) === JSON.stringify(current.destination) &&
     saved.embeddingFingerprint === current.embeddingFingerprint;
 }
+function extractorForOwner(extractor, ownerId) {
+  return extractor?.autoPublish === true && extractor.autoPublishConsent?.ownerId !== ownerId
+    ? { ...extractor, autoPublish: false, autoPublishConsent: null } : extractor;
+}
 async function inspect(cwd, sessionId, options) {
   if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 256) return blocked('invalid_session');
   const scope = await identifyProject(cwd);
@@ -176,7 +180,7 @@ export async function initializeSession(cwd, sessionId, options = {}) {
   const extractor = await readExtractor(found.current);
   if (owner?.kind === 'blocked' || extractor?.kind === 'blocked') return blocked('local_policy_changed');
   expected.ownerId = owner?.ownerId ?? null;
-  expected.extractor = extractor ?? null;
+  expected.extractor = extractorForOwner(extractor, expected.ownerId) ?? null;
   if (options.adminSession === true) expected.adminSession = true;
   const file = sessionFile(found.stateDir, sessionId);
   if (process.platform === 'win32') {

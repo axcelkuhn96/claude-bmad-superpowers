@@ -6,17 +6,21 @@ import { fileURLToPath } from 'node:url';
 import { inspectConfiguration } from './provider.mjs';
 import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
-import { registerOwner, configureExtractor, localDevice, readOwner, readExtractor } from './policy.mjs';
-import { administrativeSession, bootstrapWriter, beginWriterTransfer,
+import { registerOwner, configureExtractor, localDevice, readOwner, readExtractor,
+  readAutoPublish, enableAutoPublish, disableAutoPublish } from './policy.mjs';
+import { authorizeCurrentDestination } from './setup.mjs';
+import { administrativeSession, assertWriter, bootstrapWriter, beginWriterTransfer,
   completeWriterTransfer } from './authority.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const help = `Uso: cbs memoria <ação> [opções]
 Ações: status, check, provision, activate, launch, review-correct, deactivate,
-       owner-register, extractor-select, writer-device, writer-bootstrap,
+       owner-register, extractor-select, auto-publish-enable, auto-publish-disable,
+       writer-device, writer-bootstrap,
        writer-transfer-start, writer-transfer-complete, help
 Use --project /caminho/git nas ações de projeto. O cadastro pessoal e a seleção
-do extrator exigem declaração local explícita; a publicação automática permanece off.
+do extrator exigem declaração local explícita; publicação automática exige opt-in local
+por projeto, owner e writer designado.
 Activate aceita --allow-tracked-native para configuração nativa versionada autorizada.
 `;
 const value = (args, flag) => args.includes(flag) ? args[args.indexOf(flag) + 1] : null;
@@ -86,10 +90,13 @@ export async function main(args = []) {
     const owner = await readOwner(resolution, value(rest, '--cli'),
       value(rest, '--profile'));
     const extractor = await readExtractor(resolution);
+    const autoPublishConsent = await readAutoPublish(resolution);
     process.stdout.write(JSON.stringify({ projectId: resolution.projectId,
       collection: resolution.destination.collection, trusted,
-      owner: owner?.ownerId ?? null, extractor: extractor?.route ?? null,
-      autoPublish: false, release: process.platform === 'linux' ? 'linux_experimental' : 'blocked' }) + '\n');
+      owner: owner?.ownerId ?? autoPublishConsent?.ownerId ?? null,
+      extractor: extractor?.route ?? null,
+      autoPublish: trusted && autoPublishConsent !== null,
+      release: process.platform === 'linux' ? 'linux_experimental' : 'blocked' }) + '\n');
     return 0;
   }
   if (action === 'writer-device') {
@@ -118,6 +125,36 @@ export async function main(args = []) {
       profile: value(rest, '--profile'), executable: value(rest, '--executable') });
     process.stdout.write(`${result.kind}: ${result.reason ?? result.cost}\n`);
     return result.kind === 'selected' ? 0 : 1;
+  }
+  if (action === 'auto-publish-disable') {
+    const result = await disableAutoPublish(resolution);
+    process.stdout.write(`${result.kind}: ${result.reason ?? resolution.projectId}\n`);
+    return result.kind === 'disabled' ? 0 : 1;
+  }
+  if (action === 'auto-publish-enable') {
+    const ownerId = value(rest, '--owner');
+    const cli = value(rest, '--cli');
+    const profile = value(rest, '--profile');
+    if (!ownerId || !['claude', 'codex'].includes(cli) ||
+        !await askConfirmation(`Ativar publicação automática no projeto ${resolution.projectId}, ` +
+          `Qdrant ${resolution.destination.url}/${resolution.destination.collection}, ` +
+          `owner ${ownerId}, após validação Haiku e writer designado. Digite ${resolution.projectId}: `,
+        resolution.projectId)) return 1;
+    const admin = await administrativeSession(project);
+    if (admin.kind !== 'session') {
+      process.stdout.write(`${admin.kind}: ${admin.reason}\n`); return 1;
+    }
+    const auth = await authorizeCurrentDestination(project, admin.sessionId, readSecret);
+    if (auth.kind !== 'authorized') {
+      process.stdout.write(`${auth.kind}: ${auth.reason}\n`); return 1;
+    }
+    const writer = await assertWriter(resolution, auth);
+    if (writer.kind !== 'writer') {
+      process.stdout.write(`${writer.kind}: ${writer.reason}\n`); return 1;
+    }
+    const result = await enableAutoPublish(resolution, { ownerId, cli, profile });
+    process.stdout.write(`${result.kind}: ${result.reason ?? result.consentHash}\n`);
+    return result.kind === 'enabled' ? 0 : 1;
   }
   if (['writer-bootstrap', 'writer-transfer-start', 'writer-transfer-complete'].includes(action)) {
     if (!process.stdin.isTTY || !process.stdout.isTTY) return 1;
