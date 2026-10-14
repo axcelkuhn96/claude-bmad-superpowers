@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { extractionSchema, validateExtractionOutput, haikuExtractionSchema,
-  validateHaikuOutput } from './extract-contract.mjs';
+  validateHaikuOutput, conversationExtractionSchema, validateConversationOutput } from './extract-contract.mjs';
 import { identifyProject } from './project-id.mjs';
 import { ensureWindowsPrivateDirectory, inspectWindowsPath } from './windows-security.mjs';
 import { resolveEnrolledWindowsTool } from './windows-enrollment.mjs';
@@ -49,6 +49,7 @@ async function runClaudeExtraction(prompt, policy, route) {
     }
   } catch { return { kind: 'error', reason: 'cli_profile_untrusted' }; }
   const windows = process.platform === 'win32';
+  const conversation = route === 'haiku' && policy.mode === 'conversation';
   const stateRoot = policy.stateRoot ?? process.env.CBS_MEMORIA_STATE_ROOT;
   if (windows && !stateRoot) return { kind: 'error', reason: 'cli_state_unselected' };
   const cwd = windows ? path.join(stateRoot, 'extraction-temp', randomUUID()) :
@@ -69,7 +70,8 @@ async function runClaudeExtraction(prompt, policy, route) {
         '--model', route === 'haiku' ? 'claude-haiku-5-5' : 'sonnet',
         '--no-session-persistence', '--permission-mode', 'dontAsk',
         '--max-budget-usd', '0.10', '--json-schema',
-        JSON.stringify(route === 'haiku' ? haikuExtractionSchema : extractionSchema)];
+        JSON.stringify(conversation ? conversationExtractionSchema :
+          route === 'haiku' ? haikuExtractionSchema : extractionSchema)];
       const env = windows ? { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
         USERPROFILE: cwd, CLAUDE_CONFIG_DIR: profile } :
         { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: cwd,
@@ -100,7 +102,8 @@ async function runClaudeExtraction(prompt, policy, route) {
         try { result = JSON.parse(output); } catch { return finish({ kind: 'error', reason: 'cli_invalid_json' }); }
         if (!result || typeof result !== 'object' || Array.isArray(result) ||
             result.subtype !== 'success' || result.is_error ||
-            !(route === 'haiku' ? validateHaikuOutput(result.structured_output) :
+            !(conversation ? validateConversationOutput(result.structured_output) :
+              route === 'haiku' ? validateHaikuOutput(result.structured_output) :
               validateExtractionOutput(result.structured_output))) {
           return finish({ kind: 'error', reason: 'cli_invalid_schema' });
         }

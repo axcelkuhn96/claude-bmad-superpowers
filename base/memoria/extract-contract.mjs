@@ -4,6 +4,48 @@ const types = ['rule', 'fact', 'preference', 'decision', 'report', 'episode'];
 const scopes = ['project', 'personal', 'episode'];
 const dateTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
+export const conversationExtractionSchema = { type: 'object', additionalProperties: false,
+  required: ['candidates', 'no_facts'], properties: {
+    no_facts: { type: 'boolean' }, candidates: { type: 'array', items: {
+      type: 'object', additionalProperties: false,
+      required: ['text', 'type', 'scope', 'evidence'], properties: {
+        text: { type: 'string' }, type: { type: 'string', enum: ['rule', 'fact', 'preference', 'decision'] },
+        scope: { type: 'string', enum: ['project', 'personal'] },
+        evidence: { type: 'array', items: { type: 'object', additionalProperties: false,
+          required: ['source_message_id', 'excerpt'], properties: {
+            source_message_id: { type: 'string' }, excerpt: { type: 'string' },
+          } } },
+      },
+    } },
+  },
+};
+
+export function validateConversationOutput(output) {
+  if (!output || typeof output !== 'object' || Array.isArray(output) ||
+      Object.keys(output).some(key => !['candidates', 'no_facts'].includes(key)) ||
+      typeof output.no_facts !== 'boolean' || !Array.isArray(output.candidates) ||
+      output.candidates.length > 5 || output.no_facts !== (output.candidates.length === 0)) return false;
+  for (const item of output.candidates) {
+    if (!item || typeof item !== 'object' || Array.isArray(item) ||
+        Object.keys(item).some(key => !['text', 'type', 'scope', 'evidence'].includes(key)) ||
+        typeof item.text !== 'string' || !item.text.trim() ||
+        Buffer.byteLength(item.text, 'utf8') > 2048 ||
+        !['rule', 'fact', 'preference', 'decision'].includes(item.type) ||
+        !['project', 'personal'].includes(item.scope) || !Array.isArray(item.evidence) ||
+        item.evidence.length < 2 || item.evidence.length > 10) return false;
+    const seen = new Set();
+    for (const ref of item.evidence) {
+      if (!ref || typeof ref !== 'object' || Array.isArray(ref) ||
+          Object.keys(ref).some(key => !['source_message_id', 'excerpt'].includes(key)) ||
+          typeof ref.source_message_id !== 'string' || !ref.source_message_id ||
+          seen.has(ref.source_message_id) || typeof ref.excerpt !== 'string' ||
+          !ref.excerpt.trim() || Buffer.byteLength(ref.excerpt, 'utf8') > 512) return false;
+      seen.add(ref.source_message_id);
+    }
+  }
+  return true;
+}
+
 // Keep the CLI schema within Anthropic's supported structured-output subset.
 // Length, array size and cross-field requirements are enforced locally below.
 export const extractionSchema = { type: 'object', additionalProperties: false,

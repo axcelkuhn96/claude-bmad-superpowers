@@ -9,6 +9,7 @@ import { ensureWindowsPrivateDirectory, inspectWindowsPath, readWindowsBinary,
   publishWindowsBinary, deleteWindowsBinary, withWindowsFileLock } from './windows-security.mjs';
 import { createWindowsState } from './windows-state.mjs';
 import { POLICY_VERSION } from './transcript.mjs';
+import { conversationCutoff } from './conversation-batches.mjs';
 
 const DEFAULT_MAX = 256 * 1024 * 1024;
 const blocked = reason => ({ kind: 'blocked', reason });
@@ -56,6 +57,8 @@ export function createOutbox(stateDir, options = {}) {
     `baseline-${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.json`);
   const extractionFile = (cli, sessionId) => path.join(root,
     `extract-${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.json`);
+  const conversationFile = (cli, sessionId) => path.join(root,
+    `conversation-${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.json`);
   const hash = value => createHash('sha256').update(value).digest('hex');
   const v2PayloadValid = (data, original) => data.format_version === undefined ||
     [2, 3].includes(data.format_version) && typeof original?.text === 'string' &&
@@ -72,8 +75,11 @@ export function createOutbox(stateDir, options = {}) {
       original.origin === 'assistant' ? 'assistant_report' :
         original.origin === 'tool' ? 'tool_observation' : null) &&
     (data.scope !== 'personal' || data.owner_id === original.ownerId);
+  const payloadProofValid = async (data, original, row) => data.format_version === 4
+    ? (await import('./conversation-proof.mjs')).validateConversationProof(data, row).eligible
+    : v2PayloadValid(data, original);
   const windows = process.platform === 'win32';
-  const mutable = file => /(?:^|[\\/])(?:cursor-|extract-)[a-f0-9]{64}\.json$/.test(file) ||
+  const mutable = file => /(?:^|[\\/])(?:cursor-|extract-|conversation-)[a-f0-9]{64}\.json$/.test(file) ||
     /\.(?:manifest|retry)\.json$/.test(file);
 
   async function removeOwned(file, optional = false) {
@@ -385,8 +391,10 @@ export function createOutbox(stateDir, options = {}) {
     return { queuedEnd, ackedEnd, processedEnd };
   }
   async function cursorUnlocked(cli, sessionId) {
-    return cursorFrom(unique(await records()), cli, sessionId,
+    const cursor = cursorFrom(unique(await records()), cli, sessionId,
       await read(summaryFile(cli, sessionId)), await read(baselineFile(cli, sessionId)));
+    const staged = await read(conversationFile(cli, sessionId));
+    return staged ? { ...cursor, queuedEnd: Math.max(cursor.queuedEnd, staged.end) } : cursor;
   }
   async function ensureFutureBaseline(binding) {
     const { cli, sessionId, projectId, ownerId, consentHash, policyVersion, cutoffEnd } = binding ?? {};
@@ -415,6 +423,24 @@ export function createOutbox(stateDir, options = {}) {
       await durable(file, { cli, sessionId, projectId, ownerId, consentHash,
         policyVersion, cutoffEnd, initialSize });
       return { kind: 'baselined', cutoffEnd, initialSize };
+    });
+  }
+  async function readFutureBaseline(binding) {
+    const { cli, sessionId, projectId, ownerId, consentHash, policyVersion } = binding ?? {};
+    if (!['claude', 'codex'].includes(cli) || typeof sessionId !== 'string' || !sessionId ||
+        typeof projectId !== 'string' || !projectId || typeof ownerId !== 'string' || !ownerId ||
+        !/^[a-f0-9]{64}$/.test(consentHash ?? '') || policyVersion !== POLICY_VERSION) {
+      return blocked('invalid_future_baseline');
+    }
+    return withLock(async () => {
+      const baseline = await read(baselineFile(cli, sessionId));
+      if (!baseline) return blocked('future_baseline_unavailable');
+      return baseline.cli === cli && baseline.sessionId === sessionId &&
+        baseline.projectId === projectId && baseline.ownerId === ownerId &&
+        baseline.consentHash === consentHash && baseline.policyVersion === policyVersion
+        ? { kind: 'baselined', cutoffEnd: baseline.cutoffEnd,
+          initialSize: baseline.initialSize ?? baseline.cutoffEnd }
+        : blocked('future_baseline_changed');
     });
   }
   function futureSourceValid(source, baseline, binding) {
@@ -527,6 +553,142 @@ export function createOutbox(stateDir, options = {}) {
     for (const row of removable) await removeOwned(processedFile(row.operationId));
     await syncDir(processed);
   }
+  async function commitConversationUnlocked(staged, force = false, turns = 5) {
+    const cutoff = conversationCutoff(staged.messages, turns, force);
+    if (!cutoff) return { kind: 'staged', queuedEnd: staged.end };
+    const end = cutoff.end;
+    // sliceHash proves the original captured slice; fullStart/fullEnd retain its
+    // bounds when a large capture is divided between conversation batches.
+    const sourceSlices = staged.parts.filter(part => part.start < end).map(part =>
+      ({ ...part, end: Math.min(part.end, end) }));
+    const sliceHash = hash(JSON.stringify(sourceSlices));
+    const operationId = externalIdFor({ originCli: staged.cli, projectId: staged.projectId,
+      sessionId: staged.sessionId, start: staged.start, end, sliceHash,
+      policyVersion: staged.policyVersion });
+    const row = { operationId, projectId: staged.projectId, cli: staged.cli,
+      sessionId: staged.sessionId, start: staged.start, end, sliceHash,
+      policyVersion: staged.policyVersion, conversationBatch: true,
+      conversationPairs: cutoff.pairs, sourceSlices,
+      messages: staged.messages.filter(message => message.end <= end) };
+    const existing = await read(itemFile(operationId)) ?? await read(ackFile(operationId)) ??
+      await read(processedFile(operationId));
+    const summary = await read(summaryFile(staged.cli, staged.sessionId));
+    const compacted = !existing && summary?.projectId === staged.projectId &&
+      summary.policyVersion === staged.policyVersion && summary.cli === staged.cli &&
+      summary.sessionId === staged.sessionId && Number.isSafeInteger(summary.processedEnd) &&
+      summary.processedEnd >= end && summary.queuedEnd >= end &&
+      Number.isSafeInteger(summary.processedCount) && summary.processedCount > 0 &&
+      /^[a-f0-9]{64}$/.test(summary.processedAudit ?? '');
+    if (existing && (existing.projectId !== row.projectId || existing.start !== row.start ||
+        existing.end !== row.end || existing.sliceHash !== row.sliceHash ||
+        JSON.stringify(existing.messages) !== JSON.stringify(row.messages))) {
+      return blocked('conversation_batch_conflict');
+    }
+    if (!existing && !compacted) {
+      if (!await fits(row)) return { kind: 'full', operationId };
+      await durable(itemFile(operationId), row);
+    }
+    const remaining = { ...staged, start: end,
+      parts: staged.parts.filter(part => part.end > end).map(part =>
+        ({ ...part, start: Math.max(part.start, end) })),
+      messages: staged.messages.filter(message => message.end > end) };
+    if (remaining.start === remaining.end) await removeOwned(conversationFile(staged.cli, staged.sessionId));
+    else await durable(conversationFile(staged.cli, staged.sessionId), remaining);
+    return { kind: compacted || existing?.disposition ? 'processed' : existing?.sdkId ? 'acked' : 'queued',
+      operationId, queuedEnd: staged.end, conversationPairs: cutoff.pairs };
+  }
+  async function drainConversationUnlocked(staged, force, turns) {
+    let last = { kind: 'staged', queuedEnd: staged.end };
+    while (staged && conversationCutoff(staged.messages, turns, force)) {
+      const committed = await commitConversationUnlocked(staged, force, turns);
+      if (!['queued', 'acked', 'processed'].includes(committed.kind)) return committed;
+      last = committed;
+      staged = await read(conversationFile(staged.cli, staged.sessionId));
+    }
+    return last;
+  }
+  async function enqueueConversationSlice(slice, identity, { event, conversationTurns = 5 } = {}) {
+    const { cli, sessionId, start, end, sliceHash, messages } = slice ?? {};
+    const { projectId, policyVersion } = identity ?? {};
+    if (!['claude', 'codex'].includes(cli) || typeof sessionId !== 'string' || !sessionId ||
+        typeof projectId !== 'string' || !projectId || policyVersion !== POLICY_VERSION ||
+        !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= end ||
+        !/^[a-f0-9]{64}$/.test(sliceHash ?? '') || !Number.isSafeInteger(conversationTurns) ||
+        conversationTurns < 1 || conversationTurns > 100 || !Array.isArray(messages) ||
+        !messages.every(message => message && message.sessionId === sessionId &&
+          Number.isSafeInteger(message.start) && message.start >= start &&
+          Number.isSafeInteger(message.end) && message.end <= end && message.start < message.end)) {
+      return blocked('invalid_conversation_slice');
+    }
+    return withLock(async () => {
+      const file = conversationFile(cli, sessionId);
+      let staged = await read(file);
+      if (staged && (staged.projectId !== projectId || staged.policyVersion !== policyVersion ||
+          staged.cli !== cli || staged.sessionId !== sessionId)) return blocked('conversation_source_changed');
+      // A prior crash may have persisted the batch before removing its staging file.
+      if (staged && conversationCutoff(staged.messages, conversationTurns)) {
+        const recovered = await drainConversationUnlocked(staged, false, conversationTurns);
+        if (!['queued', 'processed', 'acked'].includes(recovered.kind)) return recovered;
+        staged = await read(file);
+      }
+      const position = cursorFrom(unique(await records()), cli, sessionId,
+        await read(summaryFile(cli, sessionId)), await read(baselineFile(cli, sessionId)));
+      const expected = staged?.end ?? position.queuedEnd;
+      if (start !== expected) return blocked('cursor_gap');
+      staged = staged ?? { cli, sessionId, projectId, policyVersion, start, end: start,
+        parts: [], messages: [] };
+      staged = { ...staged, end, parts: [...staged.parts,
+        { start, end, fullStart: start, fullEnd: end, sliceHash }],
+        messages: [...staged.messages, ...messages] };
+      if (!await fits(staged)) return { kind: 'full', usedBytes: await usageUnlocked(), maxBytes };
+      await durable(file, staged);
+      const force = ['PreCompact', 'SessionEnd', 'Interrupt', 'Recovery'].includes(event);
+      const result = await drainConversationUnlocked(staged, force, conversationTurns);
+      return result.kind === 'staged' ? { kind: 'staged', queuedEnd: end } : result;
+    });
+  }
+  async function flushConversationStage({ cli, sessionId, projectId, policyVersion, event,
+    conversationTurns = 5 } = {}) {
+    if (!['PreCompact', 'SessionEnd', 'Interrupt', 'Recovery'].includes(event) ||
+        !['claude', 'codex'].includes(cli) || typeof sessionId !== 'string' || !sessionId ||
+        typeof projectId !== 'string' || !projectId || policyVersion !== POLICY_VERSION ||
+        !Number.isSafeInteger(conversationTurns) || conversationTurns < 1 || conversationTurns > 100) {
+      return blocked('invalid_conversation_flush');
+    }
+    return withLock(async () => {
+      const staged = await read(conversationFile(cli, sessionId));
+      if (!staged) return { kind: 'no_complete_pairs' };
+      if (staged.projectId !== projectId || staged.policyVersion !== policyVersion) {
+        return blocked('conversation_source_changed');
+      }
+      const result = await drainConversationUnlocked(staged, true, conversationTurns);
+      return result.kind === 'staged' ? { kind: 'no_complete_pairs' } : result;
+    });
+  }
+  async function listConversationStages({ cli, projectId } = {}) {
+    if (!['claude', 'codex'].includes(cli) || typeof projectId !== 'string' || !projectId) {
+      return blocked('invalid_conversation_scope');
+    }
+    return withLock(async () => {
+      const stages = [];
+      for (const name of await fs.readdir(root)) {
+        if (!/^conversation-[a-f0-9]{64}\.json$/.test(name)) continue;
+        const file = path.join(root, name);
+        const staged = await read(file);
+        if (staged?.cli !== cli || staged.projectId !== projectId) continue;
+        if (staged.policyVersion !== POLICY_VERSION ||
+            conversationFile(staged.cli, staged.sessionId) !== file) {
+          return blocked('conversation_source_changed');
+        }
+        const stat = await fs.lstat(file);
+        if (!stat.isFile() || stat.isSymbolicLink()) return blocked('conversation_source_changed');
+        stages.push({ sessionId: staged.sessionId, completedPairs:
+          (await import('./conversation-batches.mjs')).completedConversationPairs(staged.messages).length,
+        queuedEnd: staged.end, updatedAtMs: stat.mtimeMs });
+      }
+      return { kind: 'stages', stages };
+    });
+  }
   async function enqueueCheckpoint(slice, identity) {
     const { cli, sessionId, start, end, sliceHash, messages } = slice ?? {};
     const { projectId, policyVersion } = identity ?? {};
@@ -538,6 +700,7 @@ export function createOutbox(stateDir, options = {}) {
       throw new Error('invalid_checkpoint_messages');
     }
     return withLock(async () => {
+      if (await read(conversationFile(cli, sessionId))) return blocked('conversation_stage_active');
       const existing = await read(itemFile(operationId)) ?? await read(ackFile(operationId)) ??
         await read(processedFile(operationId));
       if (existing) return { kind: existing.disposition ? 'processed' : existing.sdkId ? 'acked' : 'queued', operationId,
@@ -625,7 +788,7 @@ export function createOutbox(stateDir, options = {}) {
           data.slice_start === row.start && data.slice_end === row.end && data.slice_hash === row.sliceHash &&
           data.source_offsets?.start === candidate.evidence.start &&
           data.source_offsets?.end === candidate.evidence.end &&
-          v2PayloadValid(data, original) &&
+          await payloadProofValid(data, original, row) &&
           (data.source_text_sha256 === undefined || typeof original?.text === 'string' &&
             data.source_text_sha256 === hash(original.text)) ? data : false;
       } catch (error) {
@@ -660,7 +823,7 @@ export function createOutbox(stateDir, options = {}) {
           data.source_offsets?.end !== candidate.evidence.end) return false;
       const original = row.messages.find(message => message.messageId === data.source_message_id &&
         message.start === data.source_offsets.start && message.end === data.source_offsets.end);
-      if (!v2PayloadValid(data, original) || data.source_text_sha256 !== undefined &&
+      if (!await payloadProofValid(data, original, row) || data.source_text_sha256 !== undefined &&
           (typeof original?.text !== 'string' || data.source_text_sha256 !== hash(original.text))) return false;
       await handle.sync();
       const after = await fs.lstat(file);
@@ -745,8 +908,10 @@ export function createOutbox(stateDir, options = {}) {
       return { kind: 'persisted', externalId, payloadRef: { sha256: digest } };
     });
   }
-  async function claimExtraction(operationId) {
+  async function claimExtraction(operationId, maxCallsPerSession = 4) {
     if (!validId(operationId)) return blocked('invalid_operation');
+    if (!Number.isSafeInteger(maxCallsPerSession) || maxCallsPerSession < 1 ||
+        maxCallsPerSession > 1000) return blocked('invalid_extraction_limit');
     return withLock(async () => {
       const row = await read(itemFile(operationId));
       if (!row || await read(manifestFile(operationId))) return blocked('extraction_source_unavailable');
@@ -755,7 +920,7 @@ export function createOutbox(stateDir, options = {}) {
       if (prior && (prior.projectId !== row.projectId || prior.policyVersion !== row.policyVersion)) {
         return blocked('extraction_session_mismatch');
       }
-      if ((prior?.calls ?? 0) >= 4) return blocked('extraction_call_limit');
+      if ((prior?.calls ?? 0) >= maxCallsPerSession) return blocked('extraction_call_limit');
       const count = { cli: row.cli, sessionId: row.sessionId, projectId: row.projectId,
         policyVersion: row.policyVersion, calls: (prior?.calls ?? 0) + 1,
         results: prior?.results ?? [] };
@@ -850,7 +1015,7 @@ export function createOutbox(stateDir, options = {}) {
           payload.scope !== metadata.scope || payload.owner_id !== (metadata.owner_id ?? null) ||
           payload.actor !== metadata.actor || payload.origin !== metadata.origin ||
           payload.evidence_at !== metadata.evidence_at ||
-          [2, 3].includes(payload.format_version) && (payload.type !== metadata.type ||
+          [2, 3, 4].includes(payload.format_version) && (payload.type !== metadata.type ||
             payload.speaker_role !== metadata.speaker_role || metadata.format_version !== payload.format_version ||
             payload.source_text_sha256 !== metadata.source_text_sha256 ||
             metadata.claim_sha256 !== hash(JSON.stringify([item.text, metadata.type,
@@ -876,13 +1041,36 @@ export function createOutbox(stateDir, options = {}) {
         candidate.externalId === externalId && candidate.payloadRef?.sha256 ===
           names[0].slice(externalId.length + 1, -5) && candidate.status === 'remote_acked');
       const record = await verifiedReviewFile(path.join(reviews, `${externalId}.json`));
-      if (payload.format_version === 3) {
+      if (payload.format_version === 4) {
+        const { validateConversationProof } = await import('./conversation-proof.mjs');
+        const { dedupKeyFor } = await import('./dedup-key.mjs');
+        let dedupKey;
+        try { dedupKey = dedupKeyFor({ projectId: payload.project_id,
+          scope: payload.scope, ownerId: payload.owner_id, type: payload.type,
+          text: payload.text, condition: payload.condition,
+          validFrom: payload.valid_from, validTo: payload.valid_to }); }
+        catch { return blocked('source_mismatch'); }
+        if (payload.policy_version !== POLICY_VERSION || payload.origin !== 'conversation_summary' ||
+            payload.speaker_role !== 'mixed' || payload.actor !== 'conversation' ||
+            metadata.format_version !== 4 || metadata.origin !== payload.origin ||
+            metadata.speaker_role !== payload.speaker_role || metadata.actor !== payload.actor ||
+            !isDeepStrictEqual(metadata.source_refs, payload.source_refs) ||
+            metadata.dedup_key !== payload.dedup_key || dedupKey !== payload.dedup_key ||
+            metadata.review_mode !== 'automatic' ||
+            !/^[a-f0-9]{64}$/.test(metadata.auto_consent_hash ?? '') ||
+            metadata.auto_actor !== 'project_auto_publisher' || item.text !== payload.text ||
+            !(sourceRow ? validateConversationProof(payload, sourceRow).eligible : processedChild &&
+              record?.review?.sourceProof?.refsSha256 === hash(JSON.stringify(payload.source_refs)))) {
+          return blocked('source_mismatch');
+        }
+      }
+      if ([3, 4].includes(payload.format_version)) {
         const proven = sourceRow ?? processed;
         const baseline = proven && await read(baselineFile(proven.cli, proven.sessionId));
         const binding = { cli: proven?.cli,
           sessionId: proven?.sessionId, projectId: item.projectId,
           ownerId: baseline?.ownerId, consentHash: metadata.auto_consent_hash };
-        const legacyRemoteRead = allowLegacyReadOnly && acknowledgedChild &&
+        const legacyRemoteRead = payload.format_version === 3 && allowLegacyReadOnly && acknowledgedChild &&
           (sourceRow ?? processed)?.policyVersion === POLICY_VERSION &&
           record?.review?.sourceProof?.ownerId == null;
         if (!legacyRemoteRead && !(sourceRow ? futureSourceValid(sourceRow, baseline, binding) :
@@ -904,20 +1092,20 @@ export function createOutbox(stateDir, options = {}) {
           item.text !== payload.text || metadata.review_mode !== 'automatic' ||
           !/^[a-f0-9]{64}$/.test(metadata.auto_consent_hash ?? '') ||
           metadata.auto_actor !== 'project_auto_publisher')) return blocked('source_mismatch');
-      if ([2, 3].includes(payload.format_version)) {
+      if ([2, 3, 4].includes(payload.format_version)) {
         const { redactSource, containsSecret } = await import('./candidates.mjs');
         if (containsSecret(item.text) || redactSource(item.text) !== item.text) {
           return blocked('source_mismatch');
         }
       }
-      if (processed || item.status === 'active' || record || payload.format_version === 3) {
+      if (processed || item.status === 'active' || record || [3, 4].includes(payload.format_version)) {
         const proof = record?.review?.sourceProof;
         const operation = record?.review?.operation;
         if (record?.externalId !== externalId || record.operationId !== metadata.checkpoint_id ||
             record.payloadSha256 !== names[0].slice(externalId.length + 1, -5) ||
             record.digest !== hash(JSON.stringify(record.review)) ||
             !['approve', 'correct'].includes(record.review.decision) ||
-            payload.format_version === 3 && (record.review.mode !== 'automatic' ||
+            [3, 4].includes(payload.format_version) && (record.review.mode !== 'automatic' ||
               record.review.actor !== 'project_auto_publisher' ||
               record.review.consentHash !== metadata.auto_consent_hash) ||
             operation?.externalId !== externalId || operation.projectId !== item.projectId ||
@@ -927,13 +1115,14 @@ export function createOutbox(stateDir, options = {}) {
             operation.metadata?.checkpoint_id !== metadata.checkpoint_id ||
             operation.metadata?.scope !== metadata.scope ||
             (operation.metadata?.owner_id ?? null) !== (metadata.owner_id ?? null) ||
-            [2, 3].includes(payload.format_version) && (Object.entries(operation.metadata ?? {}).some(
+            [2, 3, 4].includes(payload.format_version) && (Object.entries(operation.metadata ?? {}).some(
               ([key, value]) => !isDeepStrictEqual(metadata[key], value)) ||
               item.sourceIdentity && !isDeepStrictEqual(item.sourceIdentity, operation.sourceIdentity)) ||
             proof?.messageId !== metadata.source ||
             proof?.messageSha256 !== payload.source_text_sha256 ||
             proof.approvedTextSha256 !== hash(item.text) ||
-            ([2, 3].includes(payload.format_version) ? proof.claimSha256 !== metadata.claim_sha256 :
+            (payload.format_version === 4 && proof.refsSha256 !== hash(JSON.stringify(payload.source_refs))) ||
+            ([2, 3, 4].includes(payload.format_version) ? proof.claimSha256 !== metadata.claim_sha256 :
               !Number.isSafeInteger(proof.start) || proof.start < 0 ||
               proof.end !== proof.start + item.text.length)) return blocked('source_mismatch');
       } else if (payload.format_version === 2 || !payload.text.includes(item.text)) return blocked('source_mismatch');
@@ -941,7 +1130,9 @@ export function createOutbox(stateDir, options = {}) {
         metadata: { source: metadata.source, source_offsets: metadata.source_offsets,
           checkpoint_id: metadata.checkpoint_id, evidence_at: metadata.evidence_at,
           origin: metadata.origin, actor: metadata.actor, scope: metadata.scope,
-          owner_id: metadata.owner_id ?? null } };
+          owner_id: metadata.owner_id ?? null,
+          ...(payload.format_version === 4 ? { format_version: 4,
+            source_refs: payload.source_refs, generated: true } : {}) } };
     });
   }
   async function verifiedReviewFile(file) {
@@ -1013,7 +1204,7 @@ export function createOutbox(stateDir, options = {}) {
         const approved = review.operation?.text;
         const start = typeof approved === 'string' ? source?.text?.indexOf(approved) : -1;
         if (!source || !approved || approved.length > 8192 ||
-            (payload.format_version !== 2 && start < 0) ||
+            (payload.format_version === 3 && start < 0) ||
             review.operation.externalId !== candidate.externalId ||
             review.operation.projectId !== row.projectId ||
             review.operation.sessionId !== row.sessionId ||
@@ -1022,7 +1213,7 @@ export function createOutbox(stateDir, options = {}) {
               JSON.stringify(payload.source_offsets) ||
             review.operation.metadata?.checkpoint_id !== operationId ||
             review.operation.metadata?.scope !== payload.scope ||
-            [2, 3].includes(payload.format_version) && (
+            [2, 3, 4].includes(payload.format_version) && (
               review.operation.metadata?.type !== payload.type ||
               review.operation.metadata?.actor !== payload.actor ||
               review.operation.metadata?.speaker_role !== payload.speaker_role ||
@@ -1073,10 +1264,41 @@ export function createOutbox(stateDir, options = {}) {
             return blocked('automatic_review_unproved');
           }
         }
+        if (payload.format_version === 4) {
+          const meta = review.operation.metadata;
+          const { validateConversationProof } = await import('./conversation-proof.mjs');
+          const { dedupKeyFor } = await import('./dedup-key.mjs');
+          const { containsSecret } = await import('./candidates.mjs');
+          const baseline = await read(baselineFile(row.cli, row.sessionId));
+          let dedupKey;
+          try { dedupKey = dedupKeyFor({ projectId: payload.project_id,
+            scope: payload.scope, ownerId: payload.owner_id, type: payload.type,
+            text: payload.text, condition: payload.condition,
+            validFrom: payload.valid_from, validTo: payload.valid_to }); }
+          catch { return blocked('automatic_review_unproved'); }
+          if (row.policyVersion !== POLICY_VERSION || payload.policy_version !== POLICY_VERSION ||
+              review.decision !== 'approve' || review.mode !== 'automatic' ||
+              review.actor !== 'project_auto_publisher' ||
+              review.consentHash !== meta.auto_consent_hash ||
+              !/^[a-f0-9]{64}$/.test(review.consentHash ?? '') ||
+              meta.review_mode !== 'automatic' || meta.auto_actor !== review.actor ||
+              meta.format_version !== 4 || approved !== payload.text ||
+              !futureSourceValid(row, baseline, { cli: row.cli, sessionId: row.sessionId,
+                projectId: row.projectId, ownerId: baseline?.ownerId,
+                consentHash: review.consentHash }) ||
+              !validateConversationProof(payload, row).eligible ||
+              !isDeepStrictEqual(meta.source_refs, payload.source_refs) ||
+              meta.dedup_key !== payload.dedup_key || payload.dedup_key !== dedupKey ||
+              meta.source_text_sha256 !== payload.source_text_sha256 ||
+              meta.claim_sha256 !== payload.claim_sha256 ||
+              containsSecret(review.operation)) return blocked('automatic_review_unproved');
+        }
         sealedReview = { ...review, sourceProof: { messageId: source.messageId,
           messageSha256: hash(source.text), approvedTextSha256: hash(approved),
-          ...(payload.format_version === 3 ? { ownerId: source.ownerId } : {}),
-          ...([2, 3].includes(payload.format_version) ? { claimSha256: review.operation.metadata.claim_sha256 } :
+          ...([3, 4].includes(payload.format_version) ? { ownerId: payload.format_version === 4
+            ? (await read(baselineFile(row.cli, row.sessionId)))?.ownerId : source.ownerId } : {}),
+          ...(payload.format_version === 4 ? { refsSha256: hash(JSON.stringify(payload.source_refs)) } : {}),
+          ...([2, 3, 4].includes(payload.format_version) ? { claimSha256: review.operation.metadata.claim_sha256 } :
             { start, end: start + approved.length }) } };
       }
       if (windows) {
@@ -1249,6 +1471,53 @@ export function createOutbox(stateDir, options = {}) {
         ...(status === 'conflict' ? { reason } : {}), operationId: candidate.externalId };
     });
   }
+  async function duplicateCandidate(operationId, candidateKey, proof) {
+    if (!validId(operationId) || typeof candidateKey !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(proof?.dedupKey ?? '') ||
+        !/^[a-f0-9]{64}$/.test(proof?.evidenceDigest ?? '') ||
+        !validId(proof?.duplicateOf?.externalId) ||
+        typeof proof?.duplicateOf?.sdkId !== 'string' || !proof.duplicateOf.sdkId ||
+        typeof proof?.duplicateOf?.qdrantId !== 'string' || !proof.duplicateOf.qdrantId ||
+        proof.duplicateOf.status !== 'active') return blocked('invalid_duplicate_proof');
+    return withLock(async () => {
+      const row = await read(itemFile(operationId));
+      const manifest = await read(manifestFile(operationId));
+      const candidate = manifest?.candidates?.find(item => item.candidateKey === candidateKey);
+      const payload = row && candidate && await payloadValid(candidate.payloadRef, row, candidate);
+      if (!row || !candidate || !payload || payload.format_version !== 4) {
+        return blocked('candidate_payload_mismatch');
+      }
+      const { dedupKeyFor } = await import('./dedup-key.mjs');
+      let exact;
+      try { exact = dedupKeyFor({ projectId: payload.project_id, scope: payload.scope,
+        ownerId: payload.owner_id, type: payload.type, text: payload.text,
+        condition: payload.condition, validFrom: payload.valid_from, validTo: payload.valid_to }); }
+      catch { return blocked('invalid_duplicate_proof'); }
+      if (proof.projectId !== row.projectId || proof.dedupKey !== exact ||
+          payload.dedup_key !== exact || proof.duplicateOf.externalId === candidate.externalId) {
+        return blocked('duplicate_source_mismatch');
+      }
+      const review = await verifiedReviewFile(path.join(reviews, `${candidate.externalId}.json`));
+      if (!review || review.kind === 'blocked' || review.operationId !== operationId ||
+          review.externalId !== candidate.externalId ||
+          review.payloadSha256 !== candidate.payloadRef.sha256 ||
+          review.review?.mode !== 'automatic' || review.review?.decision !== 'approve' ||
+          review.review?.operation?.metadata?.dedup_key !== exact ||
+          review.digest !== hash(JSON.stringify(review.review))) return blocked('review_mismatch');
+      const duplicateProof = { dedupKey: exact, duplicateOf: proof.duplicateOf,
+        evidenceDigest: proof.evidenceDigest };
+      if (candidate.status !== 'pending') return candidate.status === 'duplicate' &&
+        isDeepStrictEqual(candidate.duplicateProof, duplicateProof)
+        ? { kind: 'duplicate', operationId: candidate.externalId }
+        : blocked('candidate_already_terminal');
+      candidate.status = 'duplicate';
+      candidate.reason = 'exact_remote_duplicate';
+      candidate.duplicateProof = duplicateProof;
+      if (!await fits(manifest)) return { kind: 'full', operationId: candidate.externalId };
+      await durable(manifestFile(operationId), manifest);
+      return { kind: 'duplicate', operationId: candidate.externalId };
+    });
+  }
   async function completeCheckpoint(operationId) {
     if (!validId(operationId)) return blocked('invalid_operation');
     return withLock(async () => {
@@ -1388,11 +1657,14 @@ export function createOutbox(stateDir, options = {}) {
       return receipt;
     });
   }
-  return { enqueueCheckpoint, ensureFutureBaseline, futureSourceAllowed,
+  return { enqueueCheckpoint, enqueueConversationSlice, flushConversationStage,
+    listConversationStages,
+    ensureFutureBaseline, readFutureBaseline, futureSourceAllowed,
     ackVerified, recordManifest, persistCandidatePayload, sourceForRemote,
     claimExtraction, recordExtractionUsage, extractionUsage, readCandidatePayload, readReview, sealReview,
     readManifest,
     ackCandidate: (id, key, proof) => updateCandidate(id, key, 'remote_acked', null, proof),
+    duplicateCandidate,
     conflictCandidate: (id, key, reason, reviewDigest) =>
       /^[a-z_]{1,64}$/.test(reason ?? '') && /^[a-f0-9]{64}$/.test(reviewDigest ?? '')
         ? updateCandidate(id, key, 'conflict', reason, { reviewDigest }) : blocked('invalid_conflict'),
