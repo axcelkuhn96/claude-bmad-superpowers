@@ -6,3 +6,6 @@ test/
 *.log
 *.swp
 *Zone.Identifier
+__pycache__/
+*.pyc
+*.pyo
