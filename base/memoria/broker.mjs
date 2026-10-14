@@ -704,5 +704,6 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [stateRoot, cwd, sessionId] = process.argv.slice(2);
-  await serveBroker({ stateRoot, bootstrapCwd: cwd, bootstrapSessionId: sessionId });
+  void serveBroker({ stateRoot, bootstrapCwd: cwd, bootstrapSessionId: sessionId })
+    .catch(() => { process.exitCode = 1; });
 }

@@ -5,10 +5,51 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import * as moduleApi from 'node:module';
 import { ensureBrokerReady } from '../base/memoria/broker-start.mjs';
 import { inspectConfiguration, initializeSession } from '../base/memoria/provider.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
+
+const brokerEntrypoint = fileURLToPath(new URL('../base/memoria/broker.mjs', import.meta.url));
+const brokerLoaderSupported = typeof moduleApi.registerHooks === 'function';
+
+function brokerEntrypointWithStub(serveBody) {
+  const replacement = `export async function serveBroker() {\n${serveBody}\n}\n`;
+  const loader = `import { registerHooks } from 'node:module';
+registerHooks({ load(url, context, nextLoad) {
+  const loaded = nextLoad(url, context);
+  if (url !== ${JSON.stringify(new URL('../base/memoria/broker.mjs', import.meta.url).href)}) return loaded;
+  const source = String(loaded.source);
+  const start = source.indexOf('export async function serveBroker(');
+  const end = source.indexOf('\\nif (process.argv[1] === fileURLToPath(import.meta.url))', start);
+  if (start < 0 || end < 0) throw new Error('broker_stub_anchor_missing');
+  return { ...loaded, source: source.slice(0, start) + ${JSON.stringify(replacement)} + source.slice(end) };
+} });`;
+  const preload = `data:text/javascript;base64,${Buffer.from(loader).toString('base64')}`;
+  return spawnSync(process.execPath, [`--import=${preload}`, brokerEntrypoint], {
+    encoding: 'utf8', timeout: 5000,
+  });
+}
+
+test('broker entrypoint lets conversation proof import complete while server promise remains active',
+  { skip: !brokerLoaderSupported }, () => {
+  const child = brokerEntrypointWithStub(`
+    const loaded = Promise.all([import('./conversation-proof.mjs'), import('./candidates.mjs')])
+      .then(() => process.stdout.write('imports:resolved\\n'));
+    await Promise.race([loaded, new Promise(resolve => setTimeout(resolve, 1000))]);
+    process.stdout.write('serve:ended\\n');`);
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /^imports:resolved\nserve:ended\n$/);
+});
+
+test('broker entrypoint reports an unexpected server failure', { skip: !brokerLoaderSupported }, () => {
+  const child = brokerEntrypointWithStub(`throw new Error('fixture_broker_failure');`);
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 1, child.stderr);
+});
 
 async function fixture(t) {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-broker-start-'));
