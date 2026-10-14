@@ -6,13 +6,16 @@ import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const profileHash = profile => createHash('sha256').update(profile).digest('hex');
+const ownerFile = (resolution, cli, profile) => path.join(resolution.stateDir,
+  `owner-${cli}-${profileHash(profile)}.json`);
 const binding = resolution => digest([resolution.projectId, resolution.destination,
   resolution.embeddingFingerprint]);
 const ownerValid = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(value);
 const deviceValid = value => typeof value === 'string' && /^[a-f0-9-]{36}$/.test(value);
 const consentDigest = consent => digest([consent.version, consent.enabled, consent.projectId,
   consent.destinationHash, consent.ownerId, consent.deviceId, consent.ownerCli,
-  consent.enabledAt, consent.nonce]);
+  consent.enabledAt, consent.nonce, ...(consent.ownerProfileHash ? [consent.ownerProfileHash] : [])]);
 
 async function readPrivate(file) {
   if (process.platform === 'win32') {
@@ -66,7 +69,7 @@ export async function registerOwner(resolution, cli, profilePath, ownerId, attes
     if (!stat.isDirectory() || process.platform !== 'win32' && (!process.getuid ||
         stat.uid !== process.getuid() || (stat.mode & 0o022))) throw new Error('profile');
   } catch { return blocked('owner_profile_untrusted'); }
-  const file = path.join(resolution.stateDir, `owner-${cli}.json`);
+  const file = ownerFile(resolution, cli, profile);
   try {
     await writePrivate(file, { projectId: resolution.projectId, binding: binding(resolution),
       cli, profile, ownerId,
@@ -77,14 +80,20 @@ export async function registerOwner(resolution, cli, profilePath, ownerId, attes
 }
 
 export async function readOwner(resolution, cli, profilePath) {
-  if (!['claude', 'codex'].includes(cli) || !profilePath) return null;
+  if (!['claude', 'codex'].includes(cli) || typeof profilePath !== 'string' ||
+      !path.isAbsolute(profilePath)) return null;
   try {
-    const value = await readPrivate(path.join(resolution.stateDir, `owner-${cli}.json`));
+    const profile = await fs.realpath(profilePath);
+    const profileStat = await fs.stat(profile);
+    if (!profileStat.isDirectory() || process.platform !== 'win32' && (!process.getuid ||
+        profileStat.uid !== process.getuid() || (profileStat.mode & 0o022))) throw new Error('profile');
+    const value = await readPrivate(ownerFile(resolution, cli, profile)) ??
+      await readPrivate(path.join(resolution.stateDir, `owner-${cli}.json`));
     if (!value) return null;
     if (value.projectId !== resolution.projectId || value.binding !== binding(resolution) ||
         value.cli !== cli ||
         !ownerValid(value.ownerId) || typeof value.declaration !== 'string') throw new Error('owner_binding_changed');
-    if (value.profile !== await fs.realpath(profilePath)) return null;
+    if (value.profile !== profile) return null;
     return { ownerId: value.ownerId, declaration: value.declaration,
       declaredAt: value.declaredAt };
   } catch { return blocked('owner_binding_changed'); }
@@ -136,6 +145,7 @@ async function validConsent(resolution, consent) {
       consent.destinationHash !== digest(resolution.destination) ||
       !ownerValid(consent.ownerId) || !deviceValid(consent.deviceId) ||
       !['claude', 'codex'].includes(consent.ownerCli) ||
+      (consent.ownerProfileHash != null && !/^[a-f0-9]{64}$/.test(consent.ownerProfileHash)) ||
       typeof consent.enabledAt !== 'string' || !Number.isFinite(Date.parse(consent.enabledAt)) ||
       !/^[a-f0-9-]{36}$/.test(consent.nonce ?? '') ||
       consent.consentHash !== consentDigest(consent)) return false;
@@ -147,15 +157,14 @@ async function validConsent(resolution, consent) {
         writer.collection !== resolution.destination.collection ||
         writer.deviceId !== consent.deviceId || writer.revoked === true ||
         !Number.isSafeInteger(writer.generation) || writer.generation < 1) return false;
-    const owner = await readPrivate(path.join(resolution.stateDir, `owner-${consent.ownerCli}.json`));
-    if (typeof owner?.profile !== 'string' || !path.isAbsolute(owner.profile) ||
-        owner.profile !== await fs.realpath(owner.profile)) return false;
-    const profileStat = await fs.stat(owner.profile);
-    return owner?.projectId === resolution.projectId && owner.binding === binding(resolution) &&
-      owner.ownerId === consent.ownerId && owner.cli === consent.ownerCli &&
-      typeof owner.declaration === 'string' && profileStat.isDirectory() &&
-      (process.platform === 'win32' || process.getuid && profileStat.uid === process.getuid() &&
-        !(profileStat.mode & 0o022));
+    const ownerFilePath = consent.ownerProfileHash
+      ? path.join(resolution.stateDir, `owner-${consent.ownerCli}-${consent.ownerProfileHash}.json`)
+      : path.join(resolution.stateDir, `owner-${consent.ownerCli}.json`);
+    const record = await readPrivate(ownerFilePath);
+    if (typeof record?.profile !== 'string' || !path.isAbsolute(record.profile) ||
+        consent.ownerProfileHash && profileHash(record.profile) !== consent.ownerProfileHash) return false;
+    const owner = await readOwner(resolution, consent.ownerCli, record.profile);
+    return owner?.ownerId === consent.ownerId;
   } catch { return false; }
 }
 
@@ -167,7 +176,10 @@ export async function readAutoPublish(resolution) {
 
 export async function enableAutoPublish(resolution, { ownerId, cli, profile } = {}) {
   if (!ownerValid(ownerId) || !['claude', 'codex'].includes(cli)) return blocked('owner_declaration_required');
-  const owner = await readOwner(resolution, cli, profile);
+  let canonicalProfile;
+  try { canonicalProfile = await fs.realpath(profile); }
+  catch { return blocked('owner_declaration_required'); }
+  const owner = await readOwner(resolution, cli, canonicalProfile);
   if (!owner || owner.kind === 'blocked' || owner.ownerId !== ownerId) return blocked('owner_declaration_required');
   const extractor = await readExtractor(resolution);
   if (!extractor || extractor.kind === 'blocked' || extractor.route !== 'haiku') return blocked('haiku_selection_required');
@@ -182,7 +194,8 @@ export async function enableAutoPublish(resolution, { ownerId, cli, profile } = 
       !Number.isSafeInteger(writer.generation) || writer.generation < 1) return blocked('writer_not_designated');
   const consent = { version: 1, enabled: true, projectId: resolution.projectId,
     destinationHash: digest(resolution.destination), ownerId, deviceId: device.deviceId,
-    ownerCli: cli, enabledAt: new Date().toISOString(), nonce: randomUUID() };
+    ownerCli: cli, ownerProfileHash: profileHash(canonicalProfile),
+    enabledAt: new Date().toISOString(), nonce: randomUUID() };
   consent.consentHash = consentDigest(consent);
   try {
     await writePrivate(path.join(resolution.stateDir, 'extractor.json'), {

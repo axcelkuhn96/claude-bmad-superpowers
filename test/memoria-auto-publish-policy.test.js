@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { inspectConfiguration, initializeSession, resolveProject } from '../base/memoria/provider.mjs';
 import { registerOwner, configureExtractor, enableAutoPublish, disableAutoPublish,
-  readAutoPublish, readExtractor, localDevice } from '../base/memoria/policy.mjs';
+  readAutoPublish, readExtractor, readOwner, localDevice } from '../base/memoria/policy.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 
@@ -152,5 +153,92 @@ test('perfil do owner com permissão de escrita de terceiros revoga publicação
   assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
     cli: 'claude', profile: f.profile })).kind, 'enabled');
   await fs.chmod(f.profile, 0o777);
+  assert.equal(await readAutoPublish(f.resolution), null);
+});
+
+test('registros de perfis Claude coexistem e arquivo não expõe caminho do perfil', async t => {
+  const f = await fixture(t);
+  const second = path.join(f.home, 'claude-sigamina');
+  await fs.mkdir(second, { mode: 0o700 });
+  assert.equal((await registerOwner(f.resolution, 'claude', f.profile,
+    'axcel-local', true)).kind, 'registered');
+  assert.equal((await registerOwner(f.resolution, 'claude', second,
+    'axcel-local', true)).kind, 'registered');
+  assert.equal((await readOwner(f.resolution, 'claude', f.profile)).ownerId, 'axcel-local');
+  assert.equal((await readOwner(f.resolution, 'claude', second)).ownerId, 'axcel-local');
+  const ownerFiles = (await fs.readdir(f.resolution.stateDir)).filter(name => name.startsWith('owner-'));
+  assert.equal(ownerFiles.length, 2);
+  for (const name of ownerFiles) {
+    assert.match(name, /^owner-claude-[a-f0-9]{64}\.json$/);
+    assert.equal(name.includes('sigamina'), false);
+  }
+});
+
+test('consentimento de um perfil permanece válido ao registrar outro e revoga se o original mudar', async t => {
+  const f = await fixture(t);
+  await designated(f);
+  const second = path.join(f.home, 'claude-conta2');
+  await fs.mkdir(second, { mode: 0o700 });
+  await registerOwner(f.resolution, 'claude', f.profile, 'axcel-local', true);
+  assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
+    cli: 'claude', profile: f.profile })).kind, 'enabled');
+  const consent = await readAutoPublish(f.resolution);
+  await registerOwner(f.resolution, 'claude', second, 'axcel-local', true);
+  assert.equal((await readOwner(f.resolution, 'claude', f.profile)).ownerId, 'axcel-local');
+  assert.equal((await readAutoPublish(f.resolution)).consentHash, consent.consentHash);
+  await registerOwner(f.resolution, 'claude', f.profile, 'other-owner', true);
+  assert.equal(await readAutoPublish(f.resolution), null);
+});
+
+test('opt-in pode usar perfil secundário e registro legado fica acessível apenas no perfil correspondente', async t => {
+  const f = await fixture(t);
+  await designated(f);
+  const legacyFile = path.join(f.resolution.stateDir, 'owner-claude.json');
+  const secondary = path.join(f.home, 'claude-sigamina');
+  await fs.mkdir(secondary, { mode: 0o700 });
+  await registerOwner(f.resolution, 'claude', f.profile, 'axcel-local', true);
+  const firstFile = (await fs.readdir(f.resolution.stateDir)).find(name => name.startsWith('owner-claude-'));
+  if (firstFile) {
+    await fs.copyFile(path.join(f.resolution.stateDir, firstFile), legacyFile);
+    await fs.chmod(legacyFile, 0o600);
+    await fs.rm(path.join(f.resolution.stateDir, firstFile));
+  }
+  assert.equal((await readOwner(f.resolution, 'claude', f.profile)).ownerId, 'axcel-local');
+  assert.equal(await readOwner(f.resolution, 'claude', secondary), null);
+  await registerOwner(f.resolution, 'claude', secondary, 'axcel-local', true);
+  assert.equal((await readOwner(f.resolution, 'claude', f.profile)).ownerId, 'axcel-local');
+  assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
+    cli: 'claude', profile: secondary })).kind, 'enabled');
+  assert.equal((await readAutoPublish(f.resolution)).ownerId, 'axcel-local');
+  await registerOwner(f.resolution, 'claude', f.profile, 'other-owner', true);
+  assert.equal((await readAutoPublish(f.resolution)).ownerId, 'axcel-local');
+});
+
+test('consentimento legado continua válido ao registrar alias e detecta troca do owner original', async t => {
+  const f = await fixture(t);
+  await designated(f);
+  const secondary = path.join(f.home, 'claude-conta3');
+  await fs.mkdir(secondary, { mode: 0o700 });
+  await registerOwner(f.resolution, 'claude', f.profile, 'axcel-local', true);
+  const firstFile = (await fs.readdir(f.resolution.stateDir)).find(name => name.startsWith('owner-claude-'));
+  const legacyFile = path.join(f.resolution.stateDir, 'owner-claude.json');
+  await fs.copyFile(path.join(f.resolution.stateDir, firstFile), legacyFile);
+  await fs.chmod(legacyFile, 0o600);
+  await fs.rm(path.join(f.resolution.stateDir, firstFile));
+  assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
+    cli: 'claude', profile: f.profile })).kind, 'enabled');
+  const extractorFile = path.join(f.resolution.stateDir, 'extractor.json');
+  const extractor = JSON.parse(await fs.readFile(extractorFile, 'utf8'));
+  const consent = extractor.autoPublishConsent;
+  delete consent.ownerProfileHash;
+  consent.consentHash = createHash('sha256').update(JSON.stringify([
+    consent.version, consent.enabled, consent.projectId, consent.destinationHash,
+    consent.ownerId, consent.deviceId, consent.ownerCli, consent.enabledAt, consent.nonce
+  ])).digest('hex');
+  await fs.writeFile(extractorFile, JSON.stringify(extractor), { mode: 0o600 });
+  assert.equal((await readAutoPublish(f.resolution)).consentHash, consent.consentHash);
+  await registerOwner(f.resolution, 'claude', secondary, 'axcel-local', true);
+  assert.equal((await readAutoPublish(f.resolution)).consentHash, consent.consentHash);
+  await registerOwner(f.resolution, 'claude', f.profile, 'other-owner', true);
   assert.equal(await readAutoPublish(f.resolution), null);
 });
