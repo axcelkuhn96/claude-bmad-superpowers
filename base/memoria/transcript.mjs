@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { readWindowsBinary } from './windows-security.mjs';
 
-export const POLICY_VERSION = 'native-v1';
+export const POLICY_VERSION = 'native-v2';
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 
@@ -38,7 +38,9 @@ function claudeMessage(row) {
   const call = blocks.find(item => item?.type === 'tool_use');
   const origin = result || call ? 'tool' : row.type === 'assistant' ? 'assistant' :
     row.isSidechain === true || row.agentId ? 'agent' :
-      row.isSidechain === false && row.userType === 'external' && !row.sourceToolAssistantUUID
+      row.isSidechain === false && row.userType === 'external' && !row.sourceToolAssistantUUID &&
+        row.isMeta !== true && row.isCompactSummary !== true &&
+        row.isVisibleInTranscriptOnly !== true
         ? 'human' : 'unknown';
   const actor = result ? `tool:${result.tool_use_id ?? 'unknown'}` : call
     ? `tool:${call.name ?? 'unknown'}` : row.type;
@@ -50,6 +52,15 @@ function claudeMessage(row) {
 function codexTuiSource(meta, sessionId) {
   return meta?.source === 'cli' && meta?.originator === 'codex-tui' &&
     meta?.thread_source === 'user' && meta?.session_id === sessionId && meta?.id === sessionId;
+}
+
+function codexDirectUserText(payload) {
+  const content = payload.content;
+  const kinds = payload.internal_chat_message_metadata_passthrough?.content_item_kinds;
+  return Array.isArray(content) && content.length > 0 && Array.isArray(kinds) &&
+    kinds.length === content.length && content.every((item, index) =>
+      kinds[index] === 'user.text' && object(item) && item.type === 'input_text' &&
+      typeof item.text === 'string' && item.text.length > 0);
 }
 
 function codexMessage(row, directUser, tuiUser, sessionId) {
@@ -74,7 +85,8 @@ function codexMessage(row, directUser, tuiUser, sessionId) {
       messageId: payload.id ?? payload.call_id, timestamp: row.timestamp, nativeSessionId: null };
   }
   if (payload.type !== 'message' || !['user', 'assistant'].includes(payload.role)) return null;
-  return { origin: payload.role === 'user' ? directUser ? 'human' : 'unknown' : 'assistant', actor: payload.role,
+  return { origin: payload.role === 'user' ? directUser && codexDirectUserText(payload)
+    ? 'human' : 'unknown' : 'assistant', actor: payload.role,
     speakerRole: payload.role, text: textFrom(payload.content), messageId: payload.id,
     timestamp: row.timestamp, nativeSessionId: null };
 }

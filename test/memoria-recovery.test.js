@@ -61,6 +61,27 @@ test('sidechain user role and unproved Codex source never become direct human', 
   assert.notEqual(unknown.messages[0].origin, 'human');
 });
 
+test('Claude metadata and compact summaries cannot impersonate a direct user message', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const base = JSON.parse((await fs.readFile(fixture('memoria-native-claude.jsonl'), 'utf8')).split('\n')[0]);
+  const file = path.join(dir, 'native-session.jsonl');
+  const variants = [
+    { isMeta: true },
+    { isCompactSummary: true },
+    { isVisibleInTranscriptOnly: true },
+    { isCompactSummary: true, isVisibleInTranscriptOnly: true },
+  ];
+  for (const extra of variants) {
+    await fs.writeFile(file, JSON.stringify({ ...base, ...extra }) + '\n');
+    const parsed = await parsePersistedSlice({ cli: 'claude', transcriptPath: file,
+      sessionId: 'native-session' });
+    assert.equal(parsed.messages[0].origin, 'unknown', Object.keys(extra).join(','));
+  }
+  await fs.writeFile(file, JSON.stringify(base) + '\n');
+  assert.equal((await parsePersistedSlice({ cli: 'claude', transcriptPath: file,
+    sessionId: 'native-session' })).messages[0].origin, 'human');
+});
+
 test('native Codex VS Code root user is human only with matching session metadata', async t => {
   const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const lines = (await fs.readFile(fixture('memoria-native-codex-vscode.jsonl'), 'utf8')).trimEnd().split('\n').map(JSON.parse);
@@ -70,6 +91,40 @@ test('native Codex VS Code root user is human only with matching session metadat
   lines[0].payload.session_id = 'other';
   await fs.writeFile(file, lines.map(row => JSON.stringify(row)).join('\n') + '\n');
   await assert.rejects(parsePersistedSlice({ cli: 'codex', transcriptPath: file, sessionId: 'native-session' }), /transcript_session_mismatch/);
+});
+
+test('Codex exec attributes only explicitly tagged user text to a human', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'rollout-native-session.jsonl');
+  const sessionId = 'native-session';
+  const header = { timestamp: '2026-10-14T00:34:05.000Z', type: 'session_meta', payload: {
+    source: 'exec', thread_source: 'user', id: sessionId, session_id: sessionId } };
+  const item = (id, content, kinds) => ({ timestamp: '2026-10-14T00:34:06.000Z',
+    type: 'response_item', payload: { type: 'message', id, role: 'user', content,
+      ...(kinds === undefined ? {} : { internal_chat_message_metadata_passthrough: {
+        turn_id: 'turn-1', create_time: 1791940000, content_item_kinds: kinds } }) } });
+  const rows = [header,
+    item('startup-context', [{ type: 'input_text', text: 'AGENTS.md synthetic instructions' },
+      { type: 'input_text', text: 'Environment context synthetic' }],
+    ['agents_md.instructions', 'environments.environment_context']),
+    item('actual-user', [{ type: 'input_text', text: 'Keep the rule from this project.' }], ['user.text']),
+    item('mixed', [{ type: 'input_text', text: 'Actual user text.' },
+      { type: 'input_text', text: 'Injected context.' }], ['user.text', 'agents_md.instructions']),
+    item('missing-kinds', [{ type: 'input_text', text: 'No provenance.' }]),
+    item('wrong-count', [{ type: 'input_text', text: 'Two blocks.' },
+      { type: 'input_text', text: 'Second block.' }], ['user.text']),
+    item('wrong-shape', [{ type: 'output_text', text: 'Not input.' }], ['user.text'])];
+  const lines = rows.map(row => JSON.stringify(row) + '\n');
+  await fs.writeFile(file, lines.join(''));
+  const parsed = await parsePersistedSlice({ cli: 'codex', transcriptPath: file, sessionId });
+  assert.deepEqual(parsed.messages.map(message => [message.messageId, message.origin]), [
+    ['startup-context', 'unknown'], ['actual-user', 'human'], ['mixed', 'unknown'],
+    ['missing-kinds', 'unknown'], ['wrong-count', 'unknown'], ['wrong-shape', 'unknown'],
+  ]);
+  assert.equal(parsed.messages.filter(message => message.origin === 'human').length, 1);
+  const firstCheckpoint = await parsePersistedSlice({ cli: 'codex', transcriptPath: file,
+    start: Buffer.byteLength(lines[0]), end: Buffer.byteLength(lines.slice(0, 2).join('')), sessionId });
+  assert.equal(firstCheckpoint.messages[0].origin, 'unknown');
 });
 
 test('native Codex TUI trusts only a completed user item, preserving its own ID and byte offsets', async t => {
@@ -206,7 +261,7 @@ for (const [cli, filename] of [['claude', 'memoria-native-claude.jsonl'], ['code
       assert.ok(m.messageId);
       assert.match(m.timestamp, /^2026-/);
       assert.ok(m.end > m.start);
-      assert.equal(m.policyVersion, 'native-v1');
+      assert.equal(m.policyVersion, 'native-v2');
     }
     assert.equal(parsed.messages.at(-1).end, parsed.lastCompleteByte);
   });
