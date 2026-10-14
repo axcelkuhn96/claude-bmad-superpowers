@@ -53,7 +53,7 @@ def execute_one(request, secret):
     try:
         client = QdrantClient(url=connection['url'], api_key=secret.decode('utf-8'),
                               transport=transport, trust_env=False, follow_redirects=False,
-                              prefer_grpc=False, check_compatibility=False)
+                              prefer_grpc=False, check_compatibility=False, timeout=30.0)
         if request['op'] in ('raw_search', 'readonly_get'):
             return adapter.execute_readonly(request, client, state)
         return adapter.execute(request, client, state)

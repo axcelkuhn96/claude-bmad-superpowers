@@ -17,6 +17,7 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 - **Subagentes nomeados**: todo dispatch das skills e comandos passa `name` curto, kebab-case, único na sessão, no padrão `<papel>-<escopo>` (`impl-t3`, `rev-t3`, `rerev-t3-r2`, `explore-auth`, `rev-final`), pra você falar com o agente por `@nome`/`SendMessage`. Regra canônica em `executor-bmad-superpowers/referencia/dispatch.md` §2; o override de Model Selection passado ao SDD exige `name` em todo implementer e reviewer. Codex: nome do agente de `~/.codex/agents` quando existir; nome da instância no mesmo padrão quando o runtime aceitar.
 
 ### Corrigido
+- **Busca Mem0 no Qdrant remoto:** o cliente REST usa timeout explícito de 30 s para respostas de busca, dentro do prazo de 120 s do broker.
 - **Broker Mem0 em sessões ociosas:** o gatilho nativo acorda o runtime local sob demanda em sessões normais; a conexão autenticada preserva o worker de recall enquanto a CLI está aberta e libera recursos depois.
 - **Probe do plugin claude-mem no Codex:** verifica no JSON da CLI que o plugin está realmente instalado no marketplace esperado, sem confundir "not installed" com instalação.
 - **Compatibilidade Node 24:** a resolução do endereço fixado para ativação e autoridade HTTPS aceita o formato de resposta DNS usado pelo Node 24.
