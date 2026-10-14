@@ -482,6 +482,32 @@ test('invalid extractor output is recorded and does not spend another call on th
   assert.equal((await box.extractionUsage('claude', 's')).calls, 1);
 });
 
+test('a previous outbox-full extraction resumes after space is available without losing its checkpoint', async t => {
+  const { project, stateRoot, box } = await automaticConsumerFixture(t);
+  const [row] = await box.pending();
+  assert.equal((await box.markFailed(row.operationId, 'extract_failure_outbox_full',
+    { automatic: true })).kind, 'pending');
+  let calls = 0;
+  const retry = (await box.pending())[0].retryAt;
+  const originalNow = Date.now;
+  let result;
+  try {
+    Date.now = () => retry - 1;
+    const before = await worker.consumeCheckpoints({ cli: 'claude', cwd: project,
+      sessionId: 's', stateRoot,
+      runCli: async () => { calls++; return { kind: 'error', reason: 'cli_failed' }; } });
+    assert.equal(calls, 0);
+    assert.equal(before.nextRetryAt, retry);
+    Date.now = () => retry + 1;
+    result = await worker.consumeCheckpoints({ cli: 'claude', cwd: project,
+      sessionId: 's', stateRoot,
+      runCli: async () => { calls++; return { kind: 'error', reason: 'cli_failed' }; } });
+  } finally { Date.now = originalNow; }
+  assert.equal(calls, 1);
+  assert.ok(Number.isSafeInteger(result.nextRetryAt));
+  assert.equal((await box.pending())[0].lastError, 'cli_failed');
+});
+
 test('changing the capture profile owner blocks paid extraction while signed consent remains valid', async t => {
   const { project, originProfile, stateRoot, box, resolution } = await automaticConsumerFixture(t,
     { originProfileDistinct: true });
@@ -664,6 +690,9 @@ test('automatic consumer passes its custom state root through publisher and stor
 test('configured four-call budget stops transient Haiku retries and leaves schema errors for review', async t => {
   for (const response of [
     { kind: 'error', reason: 'cli_timeout' },
+    { kind: 'error', reason: 'cli_failed' },
+    { kind: 'error', reason: 'cli_not_enrolled' },
+    { kind: 'error', reason: 'cli_invalid_json' },
     { kind: 'error', reason: 'cli_invalid_schema' },
     { kind: 'error', reason: 'cli_profile_untrusted' },
   ]) {
@@ -681,7 +710,7 @@ test('configured four-call budget stops transient Haiku retries and leaves schem
           sessionId: 's', stateRoot, runCli: async () => { calls++; return response; } }),
       });
     } finally { Date.now = realNow; }
-    assert.equal(calls, response.reason === 'cli_timeout' ? 4 : 1);
+    assert.equal(calls, ['cli_timeout', 'cli_failed', 'cli_not_enrolled'].includes(response.reason) ? 4 : 1);
     assert.equal((await box.extractionUsage('claude', 's')).calls, calls);
   }
 });

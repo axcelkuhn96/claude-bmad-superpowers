@@ -9,7 +9,12 @@ import { nativeProfile } from './native-profile.mjs';
 const blocked = reason => ({ kind: 'blocked', reason });
 const script = fileURLToPath(import.meta.url);
 const boundaryEvents = new Set(['SessionStart', 'Stop', 'PreCompact', 'Interrupt', 'SessionEnd']);
-const transientExtractionErrors = new Set(['cli_error', 'cli_timeout', 'cli_unavailable']);
+// Only operational failures can resume automatically. Unknown and proof/schema failures
+// stay for review instead of spending more extraction calls on the same checkpoint.
+const recoverableExtractionErrors = new Set([
+  'outbox_full', 'usage_record_failed', 'local_extraction_error',
+  'cli_error', 'cli_timeout', 'cli_unavailable', 'cli_failed', 'cli_not_enrolled',
+]);
 const abandonedStageIdleMs = 30 * 60 * 1000;
 
 export async function runScheduledConsumer({ consume, now = Date.now,
@@ -148,7 +153,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
       }
       const rows = (await box.pending()).filter(row => row.projectId === current.projectId &&
         row.policyVersion === POLICY_VERSION);
-      const ready = new Set((await box.ready(Date.now(), { automatic: true }))
+      const ready = new Set((await box.ready(now(), { automatic: true }))
         .map(row => row.operationId));
       let manifested = 0;
       let pending = 0;
@@ -185,6 +190,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
           }
         }
         if (row.automatic === true && row.lastError?.startsWith('extract_failure_') &&
+            !recoverableExtractionErrors.has(row.lastError.slice('extract_failure_'.length)) &&
             (await box.readManifest(row.operationId)).reason === 'missing_manifest') {
           pending++;
           continue;
@@ -230,15 +236,16 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
           }
         } else {
           pending++;
-          if (policy.autoPublish === true && policy.autoPublishConsent && result.kind === 'pending') {
-            if (transientExtractionErrors.has(result.reason) &&
+          if (policy.autoPublish === true && policy.autoPublishConsent &&
+              ['pending', 'blocked'].includes(result.kind)) {
+            if (result.kind === 'pending' && recoverableExtractionErrors.has(result.reason) &&
                 (await box.extractionUsage(row.cli, row.sessionId)).calls <
                   (policy.maxCallsPerSession ?? 4)) {
               const retry = await box.markFailed(row.operationId, result.reason, { automatic: true });
               if (retry.kind === 'pending') {
                 nextRetryAt = Math.min(nextRetryAt ?? Infinity, retry.retryAt);
               }
-            } else if (!transientExtractionErrors.has(result.reason)) {
+            } else {
               const reason = /^[a-z_]{1,48}$/.test(result.reason ?? '')
                 ? result.reason : 'unknown';
               await box.markFailed(row.operationId, `extract_failure_${reason}`, { automatic: true });
