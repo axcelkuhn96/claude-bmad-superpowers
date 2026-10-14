@@ -503,7 +503,8 @@ def execute_readonly(request: dict, client, state: Path) -> dict:
                            'source_refs': metadata['source_refs']})
     elif _explicit_mcp_record(metadata, row['text'], project):
         provenance.update({'review_mode': 'explicit_mcp',
-                           'source_text_sha256': metadata['source_text_sha256']})
+                           'source_text_sha256': metadata['source_text_sha256'],
+                           'condition': metadata.get('condition')})
     return {'kind': 'item', 'item': {'projectId': project, 'source': 'curated',
         'memoryId': identifier, 'provenance': provenance, **page}}
 

@@ -34,10 +34,13 @@ const item = { sdkId: 'mem-1', projectId: 'project-one', status: 'active', text:
   score: .97, scoreSource: 'mem0_sdk_search', metadata: { scope: 'project', source: 'message-1',
     actor: 'user', origin: 'user_direct', speaker_role: 'user', evidence_at: '2026-10-01T00:00:00Z' } };
 
-test('all exposed standalone tools declare closed, idempotent read-only behavior', () => {
-  assert.deepEqual(readonlyDefinitions.map(tool => tool.name), ['search', 'get', 'status']);
-  for (const tool of readonlyDefinitions) assert.deepEqual(tool.annotations, {
+test('standalone tools describe read and explicit write behavior', () => {
+  assert.deepEqual(readonlyDefinitions.map(tool => tool.name), ['search', 'get', 'status', 'remember']);
+  for (const tool of readonlyDefinitions.slice(0, 3)) assert.deepEqual(tool.annotations, {
     readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false,
+  });
+  assert.deepEqual(readonlyDefinitions.at(-1).annotations, {
+    readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true,
   });
 });
 
@@ -62,14 +65,16 @@ test('standalone MCP searches approved project memory without session or launche
 test('read-only MCP status reports locally configured automatic writing without contacting Qdrant', async t => {
   const f = await fixture(t);
   let remoteCalls = 0;
-  let consent = { version: 1, enabled: true, projectId: 'project-one', ownerId: 'axcel-local' };
+  let consent = { version: 1, enabled: true, projectId: 'project-one',
+    ownerId: 'axcel-local', consentHash: 'a'.repeat(64) };
   const mcp = createReadonlyMcp({ cwd: f.root, cli: 'claude', stateRoot: f.stateRoot,
     verifyNative: async () => ({ kind: 'verified' }),
     owner: async () => ({ ownerId: 'axcel-local' }),
     autoPublish: async () => consent,
     authorize: async () => { remoteCalls++; throw Error('unexpected remote call'); } });
   assert.deepEqual(await mcp.call('status'), { kind: 'ready', provider: 'mem0',
-    mode: 'readonly', projectId: 'project-one', automaticWriteConfigured: true });
+    mode: 'readonly', projectId: 'project-one', automaticWriteConfigured: true,
+    manualWriteConfigured: false });
   consent = null;
   assert.equal((await mcp.call('status')).automaticWriteConfigured, false);
   assert.equal(remoteCalls, 0);

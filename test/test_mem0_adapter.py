@@ -25,7 +25,9 @@ class AdapterTest(unittest.TestCase):
                     'source': 'mcp_request:' + 'c' * 64,
                     'source_text_sha256': 'a' * 64, 'review_mode': 'explicit_mcp',
                     'auto_consent_hash': 'b' * 64, 'format_version': 5,
-                    'evidence_at': '2026-10-01T00:00:00Z'}
+                    'evidence_at': '2026-10-01T00:00:00Z',
+                    'condition': 'Somente após a promoção de RPO no HML_TRIPEX_COMP; '
+                                 'nunca testar o REST antes da confirmação. ' * 5}
         metadata['dedup_key'] = adapter._dedup_key('project', metadata, text)
         row = {'projectId': 'project', 'status': 'active', 'text': text, 'metadata': metadata}
         memory = SimpleNamespace(embedding_model=object(), get=lambda _: {'id': identifier})
@@ -38,6 +40,7 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(result['kind'], 'item')
             self.assertEqual(result['item']['provenance']['review_mode'], 'explicit_mcp')
             self.assertEqual(result['item']['provenance']['source_text_sha256'], 'a' * 64)
+            self.assertEqual(result['item']['provenance']['condition'], metadata['condition'])
             row['metadata'] = {**metadata, 'source_text_sha256': 'bad'}
             self.assertEqual(adapter.execute_readonly(request, None, Path('/tmp'))['reason'],
                              'source_unavailable')

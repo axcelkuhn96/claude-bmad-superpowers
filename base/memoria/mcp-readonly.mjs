@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import os from 'node:os';
 import path from 'node:path';
+import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { inspectConfiguration } from './provider.mjs';
@@ -8,12 +9,16 @@ import { identifyProject } from './project-id.mjs';
 import { readLocalTrust, sameTrustTuple, trustTuple, authorizeDestination } from './trust.mjs';
 import { verifyNativeCapture } from './native.mjs';
 import { readOwner, readAutoPublish } from './policy.mjs';
+import { assertWriter } from './authority.mjs';
 import { pinDestination } from './activation.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
 import { selectRecall, renderRecall } from './context.mjs';
 import { runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { createBrokerWorker } from './broker-worker.mjs';
 import { serveMcp } from './mcp.mjs';
+import { containsSecret } from './candidates.mjs';
+import { createExplicitMcpRequest, ackExplicitMcpRequest } from './mcp-request-proof.mjs';
+import { storeMemory } from './bridge.mjs';
 
 const blocked = reason => ({ kind: 'unavailable', reason });
 const script = fileURLToPath(new URL('./python/worker.py', import.meta.url));
@@ -36,12 +41,21 @@ export const readonlyDefinitions = [
     inputSchema: { type: 'object', properties: { memory_id: { type: 'string' },
       source: { type: 'string', enum: ['curated', 'legacy'] }, offset: { type: 'integer', minimum: 0 } },
       required: ['memory_id', 'source'], additionalProperties: false } },
-  { name: 'status', description: 'Show Mem0 availability and local automatic-writing configuration for the trusted current project. This MCP exposes only read tools; configured writing runs through native hooks and this status does not confirm a remote write.',
+  { name: 'status', description: 'Show Mem0 availability and local automatic/manual writing configuration for the trusted current project. Local configuration does not confirm remote writer authority or a saved memory.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'remember', description: 'Grave agora uma regra, fato, decisão ou preferência no projeto atual. O texto fornecido pelo agente será identificado como pedido via MCP; confirme gravação apenas quando a resposta trouxer ACK remoto. Requer escrita automática habilitada, proprietário e escritor válidos.',
+    inputSchema: { type: 'object', properties: {
+      text: { type: 'string', minLength: 1, maxLength: 8192 },
+      type: { type: 'string', enum: ['rule', 'fact', 'decision', 'preference'] },
+      scope: { type: 'string', enum: ['project', 'personal'] },
+      condition: { type: 'string', maxLength: 512 },
+    }, required: ['text'], additionalProperties: false } },
 ];
 for (const definition of readonlyDefinitions) definition.annotations = {
   readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false,
 };
+readonlyDefinitions.at(-1).annotations = { readOnlyHint: false, destructiveHint: false,
+  idempotentHint: true, openWorldHint: true };
 
 function createSearchWorker(resolution) {
   const model = path.join(resolution.stateDir, 'artifacts', 'model.onnx');
@@ -53,7 +67,7 @@ function createSearchWorker(resolution) {
       CBS_MEMORIA_TOKENIZER: tokenizer, OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1',
       MKL_NUM_THREADS: '1' },
   }), { coldMs: 30000 });
-  return { async request(request, auth) {
+  return { async request(request, auth, beforeDispatch) {
     if ((await verifyRuntimeArtifacts(model, tokenizer)).kind !== 'verified') return blocked('missing_artifact');
     const ready = await worker.start();
     if (ready?.kind !== 'ready' || ready.fingerprint !== resolution.embeddingFingerprint) {
@@ -63,7 +77,7 @@ function createSearchWorker(resolution) {
     try { return await worker.request({ ...request, projectId: resolution.projectId,
       collection: resolution.destination.collection,
       connection: auth.connection, state: resolution.stateDir },
-    key, Date.now() + 120000); }
+    key, Date.now() + 120000, beforeDispatch); }
     finally { key.fill(0); }
   }, close: () => worker.close() };
 }
@@ -72,7 +86,7 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
   inspect = inspectConfiguration, identify = identifyProject,
   trust = readLocalTrust, verifyNative = verifyNativeCapture,
   owner = readOwner, autoPublish = readAutoPublish,
-  authorize, search, legacySearch, get } = {}) {
+  writer = assertWriter, authorize, search, legacySearch, get, remember } = {}) {
   let frozen;
   let worker;
   let idle;
@@ -108,6 +122,55 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
     if (!frozen) frozen = { resolution: current, activeRoot: scope.activeRoot, ownerId: read?.ownerId ?? null, profile };
     return { kind: 'ready', projectId: current.projectId, ownerId: frozen.ownerId, resolution: current };
   }
+  async function localWriter(resolution, consent) {
+    try {
+      const file = path.join(resolution.stateDir, 'ledger', 'writer.json');
+      const stat = await fs.lstat(file);
+      if (!stat.isFile() || stat.isSymbolicLink() ||
+          process.platform !== 'win32' && (stat.uid !== process.getuid() || (stat.mode & 0o077))) return false;
+      const record = JSON.parse(await fs.readFile(file, 'utf8'));
+      return record.projectId === resolution.projectId &&
+        record.collection === resolution.destination.collection &&
+        record.deviceId === consent.deviceId && record.revoked !== true &&
+        Number.isSafeInteger(record.generation) && record.generation > 0;
+    } catch { return false; }
+  }
+  const consentMatches = (consent, ready) => consent?.version === 1 &&
+    consent.enabled === true && consent.projectId === ready.projectId &&
+    !!ready.ownerId && consent.ownerId === ready.ownerId &&
+    typeof consent.consentHash === 'string' && !!consent.consentHash;
+  async function writeReady(frozenConsent) {
+    const ready = await check();
+    if (ready.kind !== 'ready' || !ready.ownerId) return blocked(ready.reason ?? 'owner_unavailable');
+    const consent = await autoPublish(ready.resolution);
+    if (!consentMatches(consent, ready)) return blocked('automatic_write_disabled');
+    if (frozenConsent && ['consentHash', 'destinationHash', 'deviceId', 'ownerId', 'enabledAt']
+      .some(key => consent[key] !== frozenConsent[key])) return blocked('auto_publish_revoked');
+    return { ...ready, consent, resolution: { ...ready.resolution, ownerId: ready.ownerId,
+      extractor: { autoPublish: true, autoPublishConsent: consent } } };
+  }
+  async function authorizeReady(ready) {
+    if (authorize) return authorize(ready.resolution);
+    const destination = ready.resolution.destination;
+    const pin = await pinDestination(destination.url, { address: destination.address,
+      allowPublic: destination.allowPublic });
+    if (pin.kind !== 'pinned') return blocked(pin.reason ?? 'destination_unavailable');
+    const current = await check();
+    if (current.kind !== 'ready' || current.projectId !== ready.projectId ||
+        current.ownerId !== ready.ownerId) return blocked('project_changed');
+    const authorized = authorizeDestination(ready.resolution,
+      await trust(ready.resolution.stateDir), readQdrantSecret);
+    return authorized.kind === 'authorized' ? { ...authorized, connection: pin.connection } : authorized;
+  }
+  async function dispatch(value, auth, beforeDispatch) {
+    clearTimeout(idle);
+    worker ??= createSearchWorker((await initial).resolution);
+    try { return await worker.request(value, auth, beforeDispatch); }
+    finally {
+      idle = setTimeout(() => { const stale = worker; worker = undefined; void stale?.close(); }, 5 * 60 * 1000);
+      idle.unref?.();
+    }
+  }
   async function call(name, args = {}) {
     const definition = definitions.find(row => row.name === name);
     if (!definition) return blocked('unknown_method');
@@ -121,6 +184,13 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
     if (name === 'get' && !['curated', 'legacy'].includes(args.source)) return blocked('invalid_source');
     if (name === 'get' && (typeof args.memory_id !== 'string' || !uuid.test(args.memory_id))) return blocked('invalid_memory_id');
     if (name === 'get' && (args.offset !== undefined && (!Number.isSafeInteger(args.offset) || args.offset < 0 || args.offset > 16 * 1024 * 1024))) return blocked('invalid_offset');
+    if (name === 'remember' && (typeof args.text !== 'string' || !args.text.trim() ||
+        Buffer.byteLength(args.text, 'utf8') > 8192 ||
+        !['rule', 'fact', 'decision', 'preference'].includes(args.type ?? 'fact') ||
+        !['project', 'personal'].includes(args.scope ?? 'project') ||
+        args.condition !== undefined && (typeof args.condition !== 'string' ||
+          Buffer.byteLength(args.condition, 'utf8') > 512) ||
+        containsSecret(args))) return blocked('invalid_request');
     let ready;
     try { ready = await check(); } catch { return blocked('project_unavailable'); }
     if (ready.kind !== 'ready') return ready;
@@ -128,40 +198,79 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
       let automaticWriteConfigured = false;
       try {
         const consent = await autoPublish(ready.resolution);
-        automaticWriteConfigured = consent?.enabled === true && consent.projectId === ready.projectId &&
-          !!ready.ownerId && consent.ownerId === ready.ownerId;
+        automaticWriteConfigured = consentMatches(consent, ready);
+        const manualWriteConfigured = automaticWriteConfigured &&
+          await localWriter(ready.resolution, consent);
+        return { kind: 'ready', provider: 'mem0',
+          mode: manualWriteConfigured ? 'readwrite_configured' : 'readonly', projectId: ready.projectId,
+          automaticWriteConfigured, manualWriteConfigured };
       } catch { /* A local policy read must not make read-only search unavailable. */ }
       return { kind: 'ready', provider: 'mem0', mode: 'readonly', projectId: ready.projectId,
-        automaticWriteConfigured };
+        automaticWriteConfigured, manualWriteConfigured: false };
+    }
+    if (name === 'remember') {
+      try {
+        const current = await writeReady();
+        if (current.kind !== 'ready') return { kind: 'unavailable', reason: current.reason };
+        const source = await createExplicitMcpRequest({ resolution: current.resolution, cli,
+          profile, ownerId: current.ownerId, consent: current.consent,
+          text: args.text, type: args.type, scope: args.scope, condition: args.condition });
+        if (source.kind !== 'request') return { kind: 'unavailable', reason: source.reason };
+        const live = await writeReady(current.consent);
+        if (live.kind !== 'ready') return { kind: 'unavailable', reason: live.reason };
+        const auth = await authorizeReady(live);
+        if (auth.kind !== 'authorized') return { kind: 'unavailable', reason: auth.reason };
+        const writerState = await writer(live.resolution, auth);
+        if (writerState.kind !== 'writer') return { kind: 'unavailable', reason: writerState.reason };
+        const fresh = async () => {
+          const latest = await writeReady(current.consent);
+          return latest.kind === 'ready' ? latest : { provider: 'blocked', reason: latest.reason };
+        };
+        const freshAuth = async () => {
+          const latest = await fresh();
+          if (latest.kind !== 'ready') return latest;
+          return authorizeReady(latest);
+        };
+        const beforeDispatch = async () => {
+          const latest = await fresh();
+          if (latest.kind !== 'ready') return latest;
+          const authorized = await authorizeReady(latest);
+          if (authorized.kind !== 'authorized') return authorized;
+          const designated = await writer(latest.resolution, authorized);
+          return designated.kind === 'writer' ? { kind: 'allowed' } :
+            blocked(designated.reason ?? 'writer_not_designated');
+        };
+        const operation = source.operation;
+        const result = remember ? await remember(operation, { ready: live, auth,
+          beforeDispatch, ackLocal: (id, proof) => ackExplicitMcpRequest(operation,
+            live.resolution, id, proof) })
+          : await storeMemory(cwd, operation.sessionId, operation, readQdrantSecret, {
+            stateRoot, resolve: async () => {
+              const latest = await fresh();
+              return latest.kind === 'ready' ? latest.resolution : latest;
+            }, authorize: freshAuth,
+            readAutoPublish: autoPublish, autoPublishConsent: current.consent,
+            ackLocal: (id, proof) => ackExplicitMcpRequest(operation, live.resolution, id, proof),
+            run: (_python, _script, request, _env, key) => dispatch(request,
+              { ...auth, key }, beforeDispatch),
+          });
+        if (result?.kind === 'duplicate' && result.duplicateOf?.sdkId &&
+            result.duplicateOf?.qdrantId) return { kind: 'duplicate',
+          memoryId: result.duplicateOf.sdkId, qdrantId: result.duplicateOf.qdrantId };
+        if (!['stored', 'acked'].includes(result?.kind)) return {
+          kind: 'unavailable', reason: result?.reason ?? 'remote_ack_unconfirmed' };
+        if (!result.sdkId || !result.qdrantId) return {
+          kind: 'unavailable', reason: 'remote_ack_unconfirmed' };
+        return { kind: 'stored', memoryId: result.sdkId, qdrantId: result.qdrantId };
+      } catch { return { kind: 'unavailable', reason: 'write_failed' }; }
     }
     let auth;
     try {
-      if (authorize) auth = await authorize(ready.resolution);
-      else {
-        const destination = ready.resolution.destination;
-        const pin = await pinDestination(destination.url, { address: destination.address,
-          allowPublic: destination.allowPublic });
-        if (pin.kind !== 'pinned') return blocked(pin.reason ?? 'destination_unavailable');
-        if (!sameProject(ready.resolution, await inspect(cwd, { stateRoot })) ||
-          !sameTrustTuple(trustTuple(ready.resolution), await trust(ready.resolution.stateDir))) {
-          return blocked('project_changed');
-        }
-        const authorized = authorizeDestination(ready.resolution,
-          await trust(ready.resolution.stateDir), readQdrantSecret);
-        auth = authorized.kind === 'authorized' ? { ...authorized, connection: pin.connection } : authorized;
-      }
+      auth = await authorizeReady(ready);
     } catch { return blocked('authorization_failed'); }
     if (auth?.kind !== 'authorized') return blocked(auth?.reason ?? 'authorization_failed');
     try {
-      const request = async value => {
-        clearTimeout(idle);
-        worker ??= createSearchWorker(ready.resolution);
-        try { return await worker.request(value, auth); }
-        finally {
-          idle = setTimeout(() => { const stale = worker; worker = undefined; void stale?.close(); }, 5 * 60 * 1000);
-          idle.unref?.();
-        }
-      };
+      const request = async value => dispatch(value, auth);
       if (name === 'get') {
         const answer = get ? await get({ memoryId: args.memory_id, source: args.source,
           offset: args.offset ?? 0, projectId: ready.projectId, ownerId: ready.ownerId }, auth)

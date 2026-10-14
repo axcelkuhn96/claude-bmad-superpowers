@@ -45,6 +45,22 @@ function generatedConversation(metadata, text) {
     refs.some(ref => ref?.origin === 'assistant' && ref.role === 'assistant');
 }
 
+function explicitMcpRequest(metadata, text, projectId) {
+  let expectedKey;
+  try { expectedKey = dedupKeyFor({ projectId, scope: metadata.scope,
+    ownerId: metadata.owner_id, type: metadata.type, text,
+    condition: metadata.condition, validFrom: metadata.valid_from,
+    validTo: metadata.valid_to }); }
+  catch { return false; }
+  return metadata.format_version === 5 && metadata.origin === 'assistant_report' &&
+    metadata.speaker_role === 'assistant' && metadata.actor === 'mcp_agent' &&
+    metadata.review_mode === 'explicit_mcp' &&
+    /^mcp_request:[a-f0-9]{64}$/.test(metadata.source ?? '') &&
+    /^[a-f0-9]{64}$/.test(metadata.source_text_sha256 ?? '') &&
+    /^[a-f0-9]{64}$/.test(metadata.auto_consent_hash ?? '') &&
+    metadata.dedup_key === expectedKey;
+}
+
 export function selectRecall(results, { projectId, now, ownerId } = {}) {
   const instant = date(now);
   if (!projectId || !Number.isFinite(instant) || !Array.isArray(results)) return [];
@@ -59,7 +75,9 @@ export function selectRecall(results, { projectId, now, ownerId } = {}) {
       typeof item.text === 'string' && item.text.length > 0 && item.id &&
       typeof m.source === 'string' && m.source && typeof m.actor === 'string' && m.actor &&
       ((m.origin === 'user_direct' && m.speaker_role === 'user') ||
-        (m.origin === 'assistant_report' && m.speaker_role === 'assistant') ||
+        (m.origin === 'assistant_report' && m.speaker_role === 'assistant' &&
+          m.format_version !== 5) ||
+        explicitMcpRequest(m, item.text, item.projectId) ||
         (m.origin === 'tool_observation' && m.speaker_role === 'tool') ||
         (m.origin === 'external_reference' && m.speaker_role === 'external') ||
         generatedConversation({ ...m, projectId: item.projectId }, item.text)) &&
@@ -89,12 +107,17 @@ function renderWithItems(items, maxTokens) {
     const item = fields(row);
     const m = item.metadata;
     const condition = typeof m.condition === 'string' && m.condition ? `; condition ${m.condition}` : '';
+    const explicit = explicitMcpRequest(m, item.text, item.projectId);
     const line = generatedConversation({ ...m, projectId: item.projectId }, item.text)
       ? `[${item.id}; resumo gerado; referências ${m.source_refs.length}; date ${m.evidence_at.slice(0, 10)}${condition}] ${item.text}`
+      : explicit
+      ? `[${item.id}; pedido via MCP/agente; date ${m.evidence_at.slice(0, 10)}${condition}] ${item.text}`
       : m.type === 'source_note'
       ? `[${item.id}; date ${m.evidence_at.slice(0, 10)}; actor ${m.actor}; origin ${m.origin}] ${item.text}`
       : `[${item.id}; source ${m.source}; date ${m.evidence_at}; actor ${m.actor}; origin ${m.origin}; role ${m.speaker_role}${condition}] ${item.text}`;
-    if (!append(line)) continue;
+    if (!append(line)) {
+      if (!explicit || !append(`[${item.id}; pedido via MCP/agente; texto longo; use get source=curated memory_id=${item.id}]`)) continue;
+    }
     used.push(row);
   }
   return { text: lines.join('\n'), used };
