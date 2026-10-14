@@ -10,6 +10,7 @@ import { createExplicitMcpRequest, sourceForExplicitMcp,
 import { inspectConfiguration } from '../base/memoria/provider.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
+import { localDevice } from '../base/memoria/policy.mjs';
 
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-mcp-write-'));
@@ -112,6 +113,55 @@ test('status reports only local writing configuration, without a remote check', 
   assert.equal(status.mode, 'readwrite_configured');
   assert.equal(status.manualWriteConfigured, true);
   assert.equal(remoteCalls, 0);
+  await mcp.close();
+});
+
+test('normal MCP remember uses bridge and confirms remote activation before reporting saved', async t => {
+  const f = await fixture(t);
+  const device = await localDevice(f.resolution.stateDir);
+  assert.equal(device.kind, 'device');
+  f.consent.deviceId = device.deviceId;
+  const ledger = path.join(f.resolution.stateDir, 'ledger');
+  await fs.mkdir(ledger, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(ledger, 'writer.json'), JSON.stringify({
+    projectId: f.resolution.projectId, collection: f.resolution.destination.collection,
+    deviceId: device.deviceId, generation: 1 }) + '\n', { mode: 0o600 });
+  const rows = [];
+  let adds = 0;
+  const id = '64eef286-9f7e-4326-b137-5658f0286c46';
+  const mcp = createReadonlyMcp({ cwd: f.root, cli: 'codex', stateRoot: f.stateRoot,
+    verifyNative: async () => ({ kind: 'verified' }),
+    owner: async () => ({ ownerId: 'axcel-local' }), autoPublish: async () => f.consent,
+    authorize: async () => ({ kind: 'authorized', key: 'fixture', connection: {} }),
+    writer: async () => ({ kind: 'writer' }),
+    writerControl: async () => ({ kind: 'authority', record: {
+      state: 'active', deviceId: device.deviceId, generation: 1 } }),
+    workerFactory: () => ({ close: async () => {}, request: async (request, _auth, beforeDispatch) => {
+      if (beforeDispatch) assert.equal((await beforeDispatch()).kind, 'allowed');
+      if (request.op === 'dedup_find') return { kind: 'clear' };
+      if (request.op === 'find') return { kind: 'items', items: rows.filter(row =>
+        row.externalId === request.externalId) };
+      if (request.op === 'add') {
+        adds++;
+        rows.push({ projectId: request.projectId, externalId: request.externalId,
+          sessionId: request.sessionId, sdkId: id, qdrantId: id, status: 'pending',
+          text: request.text, metadata: request.metadata });
+        return { kind: 'pending', sdkId: id };
+      }
+      if (request.op === 'read') return { kind: 'item', item: rows[0] };
+      if (request.op === 'activate') {
+        rows[0].status = 'active';
+        return { kind: 'item', item: rows[0] };
+      }
+      throw Error(`unexpected ${request.op}`);
+    } }),
+  });
+  const args = { text: 'Compile on TRIPEX before RPO promotion.', type: 'rule' };
+  assert.deepEqual(await mcp.call('remember', args),
+    { kind: 'stored', memoryId: id, qdrantId: id });
+  assert.deepEqual(await mcp.call('remember', args),
+    { kind: 'stored', memoryId: id, qdrantId: id });
+  assert.equal(adds, 1);
   await mcp.close();
 });
 

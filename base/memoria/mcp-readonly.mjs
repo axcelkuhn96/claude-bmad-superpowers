@@ -86,7 +86,8 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
   inspect = inspectConfiguration, identify = identifyProject,
   trust = readLocalTrust, verifyNative = verifyNativeCapture,
   owner = readOwner, autoPublish = readAutoPublish,
-  writer = assertWriter, authorize, search, legacySearch, get, remember } = {}) {
+  writer = assertWriter, writerControl, workerFactory = createSearchWorker,
+  authorize, search, legacySearch, get, remember } = {}) {
   let frozen;
   let worker;
   let idle;
@@ -164,7 +165,7 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
   }
   async function dispatch(value, auth, beforeDispatch) {
     clearTimeout(idle);
-    worker ??= createSearchWorker((await initial).resolution);
+    worker ??= workerFactory((await initial).resolution);
     try { return await worker.request(value, auth, beforeDispatch); }
     finally {
       idle = setTimeout(() => { const stale = worker; worker = undefined; void stale?.close(); }, 5 * 60 * 1000);
@@ -250,6 +251,7 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
               return latest.kind === 'ready' ? latest.resolution : latest;
             }, authorize: freshAuth,
             readAutoPublish: autoPublish, autoPublishConsent: current.consent,
+            ...(writerControl ? { control: writerControl } : {}),
             ackLocal: (id, proof) => ackExplicitMcpRequest(operation, live.resolution, id, proof),
             run: (_python, _script, request, _env, key) => dispatch(request,
               { ...auth, key }, beforeDispatch),
