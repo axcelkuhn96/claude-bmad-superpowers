@@ -1,6 +1,6 @@
 # Referência — dispatch por caminho (executor, Fases 3 e 5)
 
-Contrato do SDD 6.3: tudo que você cola num prompt de subagent fica residente no seu contexto pelo resto da sessão. Por isso persona, ponytail, rulebooks e lentes entram como **caminho de arquivo** + um **resumo vinculante ≤10 linhas**. O subagent lê os arquivos com `Read` antes de agir — no contexto dele, não no seu.
+Contrato do SDD 7.0: tudo que você cola num prompt de subagent fica residente no seu contexto pelo resto da sessão. Por isso persona, ponytail, rulebooks e lentes entram como **caminho de arquivo** + um **resumo vinculante ≤10 linhas**. O subagent lê os arquivos com `Read` antes de agir — no contexto dele, não no seu.
 
 Caminhos instalados (primeiro existente vence): override do usuário `~/.claude/cbs-overrides/personas/...` → base `~/.claude/personas/...`. A persona dev destilada vive nesta skill: `~/.claude/skills/executor-bmad-superpowers/referencia/persona-dev.md`.
 

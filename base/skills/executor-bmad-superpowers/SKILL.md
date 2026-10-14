@@ -1,13 +1,13 @@
 ---
 name: executor-bmad-superpowers
-description: Use esta skill quando o usuário tiver um prompt refinado, spec ou PRD e quiser EXECUTAR até a entrega validada. Orquestra o Superpowers 6.3 (brainstorming → writing-plans → subagent-driven-development → finishing-a-development-branch) com a disciplina BMAD 6.12 (stories; persona dev, ponytail e rulebooks lidos POR CAMINHO). Suporta --auto, models.yml (agente por papel, runtime Claude/Codex), roteamento por domínio e TDD por tipo.
+description: Use esta skill quando o usuário tiver um prompt refinado, spec ou PRD e quiser EXECUTAR até a entrega validada. Orquestra o Superpowers 7.0 (brainstorming → writing-plans → subagent-driven-development → finishing-a-development-branch) com a disciplina BMAD 6.12 (stories; persona dev, ponytail e rulebooks lidos POR CAMINHO). Suporta --auto, models.yml (agente por papel, runtime Claude/Codex), roteamento por domínio e TDD por tipo.
 ---
 
 # Executor (Superpowers como motor, BMAD como disciplina)
 
 Você é o **orquestrador** do contexto principal. Você **não implementa inline**: conduz a feature do prompt refinado até a entrega delegando ao Superpowers, que garante TDD, subagents isolados, um task reviewer por task e um review final da branch.
 
-- **Superpowers 6.3 = motor**: `brainstorming` → `writing-plans` → `subagent-driven-development` (SDD) → `finishing-a-development-branch`.
+- **Superpowers 7.0 = motor**: `brainstorming` → `writing-plans` → `subagent-driven-development` (SDD) → `finishing-a-development-branch`.
 - **BMAD 6.12 = disciplina**: stories no planejamento (`bmad-create-epics-and-stories`), persona dev e rulebooks lidos **por caminho** dentro de cada subagent.
 - Não há flag pra desligar: toda execução usa os dois.
 
@@ -17,11 +17,11 @@ Referências: `referencia/roteamento.md` (domínios, lentes, TDD por tipo), `ref
 
 Determine o modo na primeira ação e registre em 1 linha (`modo: auto` ou `modo: normal`).
 
-**Modo auto** vale quando qualquer um: argumento `--auto` (ou `auto` como primeira palavra); `printenv CLAUDE_AUTONOMOUS` definida; ferramenta `AskUserQuestion` ausente na sessão (`-p`, subagente, cron, teammate). Em auto: nenhuma pergunta ao usuário. Brainstorming em modo *bounded* com decisões registradas; o "Which approach?" do `writing-plans` você mesmo responde ("Subagent-Driven"); a Fase 4 assume `s`. Toda suposição vai marcada `SUPOSIÇÃO` no plano e na entrega. **Único gate obrigatório**: antes de `git push`, deploy ou merge em main/master — o menu do `finishing-a-development-branch`. Nunca pule esse.
+**Modo auto** vale quando qualquer um: argumento `--auto` (ou `auto` como primeira palavra); `printenv CLAUDE_AUTONOMOUS` definida; ferramenta `AskUserQuestion` ausente na sessão (`-p`, subagente, cron, teammate). Em auto: o usuário dispensou perguntas intermediárias; registre as decisões e suposições do design como `SUPOSIÇÃO` no plano e na entrega. A Fase 4 assume `s`. **Único gate obrigatório**: antes de `git push`, deploy ou merge em main/master — o menu do `finishing-a-development-branch`. Nunca pule esse.
 
-**Modo normal**: exatamente **um** gate de decisão nesta skill — aprovação do plano (Fase 4) — mais o gate de integração no fim. Nada de "Posso continuar?" entre tasks, nada de pergunta de modelo.
+**Modo normal**: aprovação da descrição na Fase 2 quando houver brainstorming (contrato Superpowers 7.0), aprovação do plano na Fase 4 **sempre** e gate de integração no fim. Um design aprovado não aprova um plano que ainda não foi visto. Nada de "Posso continuar?" entre tasks, nada de pergunta de modelo.
 
-**Menus de outras skills (qualquer modo)**: `brainstorming` (aprovação do design), `writing-plans` ("Which approach?") e as skills BMAD ("halt at menus", "wait for user", `Fast path`) têm gates próprios. **Você** responde todos — Continue / defaults do projeto / `Fast path` / "Subagent-Driven" — e leva a decisão pro plano; nunca repasse ao usuário. Só a Fase 4 chega ao usuário.
+**Menus de outras skills**: o gate de descrição do `brainstorming` 7.0 chega ao usuário no modo normal para ideia não refinada; os menus operacionais do BMAD ficam com o executor. Em auto, a dispensa explícita das perguntas permite registrar decisões e seguir. Não invente o antigo menu "Which approach?" do `writing-plans`, ausente na versão 7.0.
 
 ## Modelo por papel e agentes nomeados (`models.yml`)
 
@@ -90,7 +90,7 @@ Escalonamentos do SDD (não substitutos): **teammate** (subagent persistente, `S
 
 ### Fase 2 — Brainstorming técnico
 
-Invoque `superpowers:brainstorming` **só se o prompt não veio refinado** (`/refinar` e `/piloto` já fizeram esse trabalho — pule e diga em 1 linha). Classifique: *bounded* pra mudança em fluxo que já existe no repo; *architectural* só com subsistema novo. **Em qualquer modo**, o design (3 linhas em bounded; spec em `docs/superpowers/specs/` em architectural) vai pro plano e a aprovação é a da Fase 4 — não pare no gate do brainstorming nem no "review da spec". Se delegar o design a um subagent, use o papel `architect`.
+Invoque `superpowers:brainstorming` **só se o prompt não veio refinado** (`/refinar` e `/piloto` já fizeram esse trabalho — pule e diga em 1 linha). Pela versão 7.0, classifique: tarefa rápida e clara (pedido basta); mudança pequena (descrição em chat); projeto maior (design escrito em `docs/superpowers/specs/`). No modo normal, obtenha aprovação da descrição **antes** de `writing-plans` quando houver mudança pequena ou design escrito. Em auto, a opção do usuário dispensa perguntas; registre decisões próprias. Se delegar o design, use o papel `architect`.
 
 → chat: `Fase 2 — <abordagem> (tradeoff: <x>)` ou `Fase 2 — pulada (prompt refinado)`
 
@@ -102,7 +102,7 @@ Invoque `superpowers:brainstorming` **só se o prompt não veio refinado** (`/re
    - Senão (o caso pequeno comum) → **não** rode `bmad-create-epics-and-stories`: gere a story mínima a partir do template dela (`.claude/skills/bmad-create-epics-and-stories/templates/epics-template.md`) com critérios de aceite, tasks, File List e Dev Agent Record; marque `BMAD: template`.
    - PRD só com decisão de produto: `bmad-prd` em `Fast path`. Arquitetura nova: `bmad-architecture`.
    Sempre ≥1 story. Artefatos em `_bmad-output/` ou `docs/` — **commite-os**. A Fase 3 nunca para esperando o usuário.
-2. **Plano**: `superpowers:writing-plans` com as stories como spec → `docs/superpowers/plans/<data>-<slug>.md`. Ao "Which approach?" responda você: Subagent-Driven (não é decisão do usuário, em nenhum modo).
+2. **Plano**: `superpowers:writing-plans` com as stories como spec → `docs/superpowers/plans/<data>-<slug>.md`. A versão 7.0 não apresenta o antigo menu "Which approach?"; a execução segue o SDD definido nesta skill.
 3. **Classifique cada task** e anote no texto da task — o `task-brief` do SDD extrai só esse texto: `(domínio: laravel+database; tipo: regra-de-negocio; review: seguranca)`. Regras em `referencia/roteamento.md`: tabela sinais → domínio; até 2 domínios (linguagem + área); 3 domínios = quebre a task.
 4. **Global Constraints do plano**: acrescente o bloco de `referencia/dispatch.md` §1 (caminhos dos rulebooks por papel, resumo ≤10 linhas, política de TDD por tipo, branch). É por esse bloco que o SDD leva persona dev, ponytail, domínios e lentes de review a implementer, task reviewer e reviewer final.
 5. Riscos numerados no plano. Commite o plano.
@@ -111,7 +111,7 @@ Invoque `superpowers:brainstorming` **só se o prompt não veio refinado** (`/re
 
 ### Fase 4 — Gate do plano
 
-**Normal**: mostre em ≤8 linhas (abordagem, tasks com domínio/tipo, arquivos prováveis, riscos, models) e pergunte **"Posso implementar? [s/N]"** (via `AskUserQuestion` quando disponível). `s` / `continue` → Fase 5. `N` → pare; a branch `feat/<slug>` com stories e plano commitados fica (diga isso na linha de chat). Não escreva código antes do `s`.
+**Normal**: mostre em ≤8 linhas (abordagem, tasks com domínio/tipo, arquivos prováveis, riscos, models) e pergunte **"Posso implementar? [s/N]"** (via `AskUserQuestion` quando disponível), mesmo que o design tenha sido aprovado na Fase 2. `s` / `continue` → Fase 5. `N` → pare; a branch `feat/<slug>` com stories e plano commitados fica (diga isso na linha de chat). Não escreva código antes do `s`.
 
 **Auto**: assume `s`; grave `Ruling: gate da Fase 4 assumido (--auto)` no ledger do SDD assim que ele existir.
 
@@ -121,7 +121,7 @@ Invoque `superpowers:subagent-driven-development` passando: caminho do plano; o 
 
 Regras:
 - **Implementer: `general-purpose` ou o agente nomeado do `models.yml`** (`implementer_backend` / `implementer_frontend`). Nunca agentes de plugin — `bmad-agent-*`, `*-pro`, `*-specialist`, `*-expert`, `voltagent-*` — trazem agenda própria e fogem do plano. Reviewers: `general-purpose` (ou agente nomeado `reviewer`) com os templates do próprio SDD.
-- **Papéis (vocabulário 6.3)**: implementer → **task reviewer** (spec + qualidade num só veredito) → **re-reviewer** (fix rounds, máx. 5) → **reviewer final** da branch. Não existem dois reviewers separados por task no 6.3 — não os invente.
+- **Papéis (vocabulário 7.0)**: implementer → **task reviewer** (spec + qualidade num só veredito) → **re-reviewer** (fix rounds, máx. 5) → **reviewer final** da branch. Não invente dois reviewers separados por task.
 - Subagent devolve só status, commits, 1 linha de teste, preocupações; o resto fica em `.superpowers/sdd/<plano>/task-N-report.md`.
 - BLOCKED / NEEDS_CONTEXT: trate como o SDD manda (contexto, modelo mais capaz, quebrar a task); BLOCKED por build/typecheck → papel `build_fixer` (`referencia/dispatch.md` §2). Encerre subagents ociosos ao fim de cada task.
 - Fallback sem SDD (Superpowers ausente): TDD manual com os mesmos papéis e subagents; recomende instalar o Superpowers no fim.

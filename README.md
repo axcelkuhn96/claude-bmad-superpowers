@@ -7,7 +7,7 @@ Um pacote de **8 skills** e **13 comandos** em português que amarram cinco cama
 | Camada | Quem faz | Papel |
 |---|---|---|
 | **Front-end PT-BR** (o diferencial) | skills deste pacote | Grelha e refina sua ideia com memória, faz discovery sem tocar código, roteia personas por domínio, controla gates e modelo por papel |
-| **Motor de execução** | [Superpowers ≥ 6.3](https://github.com/obra/superpowers) | brainstorming → plano → subagent-driven-development (implementer → task reviewer → re-reviewer → reviewer final) → finishing-a-development-branch |
+| **Motor de execução** | [Superpowers ≥ 7.0](https://github.com/obra/superpowers) | brainstorming → plano → subagent-driven-development (implementer → task reviewer → re-reviewer → reviewer final) → finishing-a-development-branch |
 | **Disciplina de processo** (sempre) | [BMAD-METHOD ≥ 6.12](https://github.com/bmad-code-org/BMAD-METHOD) | Gera as stories no planejamento (`bmad-create-epics-and-stories`, `bmad-prd`, `bmad-architecture`) e empresta a persona dev (Amelia) a cada implementer |
 | **Expertise por domínio** (quando aplicável) | rulebooks em `personas/dominios/` + lentes em `personas/review/` | Em cima da persona dev, empilha regras de linguagem (`laravel`, `python`, `node`) e de área (`frontend`, `database`, `integracao`); reviewers ganham lentes de `seguranca` e `cobertura-de-testes` |
 | **Anti-over-engineering** (sempre, transversal) | rulebook `personas/ponytail.md` | Lido por **todo** subagent: escada de decisão (reusar > stdlib > nativo > dep > 1 linha > só então build) pra escrever o **mínimo** — sem cortar validação, erro, segurança ou teste |
@@ -44,7 +44,7 @@ Em vez de competir, cada peça fica no que faz bem: **você refina em português
 - **Node 18+** (`node --version`)
 - **Claude Code** instalado e logado (`claude --version`)
 - **Git**
-- **Superpowers ≥ 6.3** (plugin; o instalador mostra o comando) — o executor descreve o contrato do `subagent-driven-development` 6.3 (task reviewer único, briefs/reports em `.superpowers/sdd/<plano>/`, `finishing-a-development-branch`)
+- **Superpowers ≥ 7.0** (plugin; o instalador mostra o comando) — o executor usa o contrato do `subagent-driven-development` 7.0 (task reviewer único, ledger/briefs/reports em `.superpowers/sdd/<plano>/`, `finishing-a-development-branch`)
 - **BMAD ≥ 6.12** por projeto (`_bmad/`, skills `bmad-*` em `.claude/skills/`) — o pacote usa `bmad-prd`, `bmad-architecture`, `bmad-create-epics-and-stories`, `bmad-spec`, `bmad-agent-*`
 - Opcional, recomendado: **[claude-mem](https://github.com/thedotmack/claude-mem)** — se presente, as skills consultam sua memória de sessões anteriores antes de planejar.
 - Opcional, pra validação de UI: Playwright num venv do projeto ou do usuário (ex.: `/tmp/pwval`) — as personas de frontend exigem screenshot antes de DONE.
@@ -119,7 +119,8 @@ Comandos de manutenção:
 | **Gate 1** — prompt refinado (`ok` / ajuste) | sim | não | — (o prompt já vem pronto) | — |
 | **Gate 2** — plano aprovado ("Posso implementar?") | sim | não | sim | não |
 | Perguntas entre tasks ("continuar?", "qual modelo?") | nunca | nunca | nunca | nunca |
-| Menus do BMAD (`bmad-prd` Fast path, "wait for user"), do `brainstorming` e o "Which approach?" do `writing-plans` | o executor responde | o executor responde | o executor responde | o executor responde |
+| Brainstorming 7.0 de ideia ainda não refinada | — (gate 1 refina) | — | aprova descrição antes do plano | decisões registradas |
+| Menus operacionais do BMAD | o executor responde | o executor responde | o executor responde | o executor responde |
 | **Gate de integração** — antes de `git push` / merge / deploy (`finishing-a-development-branch`) | sim | **sim** | sim | **sim** |
 
 O modo auto também é detectado sem flag: `CLAUDE_AUTONOMOUS` definida no ambiente, ou sessão sem `AskUserQuestion` (`claude -p`, subagente, cron, teammate). `auto` como primeira palavra do argumento equivale a `--auto`. Em auto, toda suposição vai marcada no plano e na entrega.
@@ -423,7 +424,7 @@ Mesma mecânica pra `review/<lente>.md` e `ponytail.md`.
 
 ## Ponytail: menos código, mesma segurança
 
-Enquanto os rulebooks de domínio são **por-task**, o **ponytail é transversal** — lido por **todo** subagent implementer e reviewer, em qualquer task. Ele importa a filosofia [ponytail](https://github.com/DietrichGebert/ponytail) ("lazy senior developer") pra dentro da execução: entender o problema por completo e **depois** escrever o mínimo que resolve.
+Enquanto os rulebooks de domínio são **por-task**, o **ponytail é transversal** — lido por **todo** subagent implementer e reviewer, em qualquer task. O CBS mantém uma adaptação da filosofia [Ponytail 5.2.0 de Dietrich Gebert](https://github.com/DietrichGebert/ponytail/tree/v5.2.0) ([licença MIT](https://github.com/DietrichGebert/ponytail/blob/v5.2.0/LICENSE)): entender o problema por completo e **depois** escrever o mínimo que resolve. O plugin Ponytail e seus hooks não são instalados pelo CBS. Os benchmarks do projeto original não medem esta adaptação.
 
 **A escada de decisão** (antes de criar qualquer código novo, pare no primeiro "sim"):
 
@@ -535,7 +536,7 @@ Não desinstala o Superpowers nem o BMAD — a saída mostra os comandos pra iss
 |---|---|
 | `comando claude não encontrado` | Claude Code não está no PATH. A CLI imprime as instruções pra instalar o Superpowers manualmente dentro do app. |
 | Superpowers não instalou | Dentro do Claude Code: `/plugin marketplace add obra/superpowers-marketplace` e `/plugin install superpowers@superpowers-marketplace` |
-| Executor descreve reviewers que não existem | Superpowers < 6.3. Atualize o plugin: o executor segue o contrato 6.3 (task reviewer único, briefs em `.superpowers/sdd/`). |
+| Executor descreve reviewers que não existem | Superpowers < 7.0. Atualize o plugin: o executor segue o contrato 7.0 (task reviewer único, briefs em `.superpowers/sdd/`). |
 | `bmad-prd` / `bmad-create-epics-and-stories` não existem | BMAD < 6.12. Rode `cbs atualizar --auto-bmad` ou `cbs instalar-bmad --force`. |
 | `/piloto` fica esperando resposta num script/cron | Use `--auto` ou exporte `CLAUDE_AUTONOMOUS=1`; sem `AskUserQuestion` o modo auto também é detectado. |
 | Subagents rodando no modelo errado | Edite `~/.claude/cbs-overrides/models.yml` ou passe `models=...` / `modelo=...` no comando. Agente nomeado que não existe em `~/.claude/agents` cai no modelo default (a entrega anota `agente ausente`). |

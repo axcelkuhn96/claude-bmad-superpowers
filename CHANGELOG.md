@@ -2,6 +2,20 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.14.2] - 2026-10-14
+
+### Corrigido
+- **Retomada da curadoria:** falhas recuperáveis persistem com estado tipado e podem ser tentadas novamente dentro do orçamento da sessão, sem repetir indefinidamente chamadas inválidas. Um lote pendente não equivale a memória gravada.
+- **Contexto para seleção:** a busca coleta no máximo 64 pontos da primeira página de Qdrant por projeto/escopo, seleciona até oito memórias completas e limita a 4.096 bytes UTF-8 a soma de texto e condição. Esse contexto é auxiliar para reduzir repetição e conflito; não transforma memórias antigas em prova do fato novo. A busca saturada registra degradação. O caminho reaproveita a chamada de curadoria e o embedding existentes, sem chamada adicional a Haiku ou E5 por desenho.
+- **Diagnóstico da curadoria:** o contador durável do outbox registra `ready`, `saturated` ou `unavailable` para o contexto usado na seleção, separado da confirmação de gravação. Deduplicação de paráfrases é melhor esforço, não garantia semântica.
+
+### Atualizado
+- **Superpowers 7.0.0 e BMAD 6.12.4:** referências ativas seguem os nomes de skills atuais. Para uma ideia ainda não refinada no modo normal, o brainstorming 7.0 exige aprovação da descrição antes do plano; o CBS mantém a aprovação do plano antes da execução. `--auto` preserva a dispensa explícita de perguntas intermediárias. Contratos foram conferidos nas fontes; o fluxo interativo completo dessas versões requer validação em sessão nova.
+- **Ponytail:** rulebook transversal adaptado do [Ponytail 5.2.0](https://github.com/DietrichGebert/ponytail/tree/v5.2.0) (Dietrich Gebert, MIT) agora explicita revisão dos chamadores e riscos do fluxo, teste pequeno para lógica nova e análise do código tocado fora do diff. O CBS distribui somente sua adaptação, sem plugin ou hooks Ponytail; benchmarks upstream não medem este rulebook.
+
+### Verificado
+- Na sessão Mizu encerrada com Ctrl+C, houve uma memória confirmada às 21:22:15 UTC (18:22:15 em São Paulo). Esse caso comprova uma gravação; não garante que todo fechamento por Ctrl+C acione o hook ou produza candidato útil.
+
 ## [0.14.1] - 2026-10-14
 
 ### Adicionado

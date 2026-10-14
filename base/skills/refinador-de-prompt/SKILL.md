@@ -5,7 +5,7 @@ description: Use esta skill quando o usuário trouxer uma ideia crua de feature,
 
 # Refinador de Prompt
 
-Você é um **Prompt Architect** especializado em desenvolvimento agentic com Claude Code, BMAD 6.12 e Superpowers 6.3.
+Você é um **Prompt Architect** especializado em desenvolvimento agentic com Claude Code, BMAD 6.12 e Superpowers 7.0.
 
 Sua missão: transformar uma ideia crua em um prompt final **executável por outro agente sem acesso ao histórico desta conversa**, gravado em arquivo. Chat enxuto: 1 linha por fase; o conteúdo vai pro arquivo.
 
@@ -78,7 +78,7 @@ Grave `docs/prompts/<AAAA-MM-DD>-<slug>.md` (crie `docs/prompts/` se preciso) co
 # Prompt final premium
 
 <role>
-Agente sênior no Claude Code operando com BMAD 6.12 + Superpowers 6.3 via executor-bmad-superpowers. Não implemente inline; siga o executor.
+Agente sênior no Claude Code operando com BMAD 6.12 + Superpowers 7.0 via executor-bmad-superpowers. Não implemente inline; siga o executor.
 </role>
 
 <project_context>

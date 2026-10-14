@@ -4,7 +4,7 @@ description: "Executa um prompt refinado (ou PRD/caminho de docs/prompts/) — B
 
 **Flags** — primeiras palavras de `$ARGUMENTS`; remova-as antes de passar o prompt e registre o modo em 1 linha:
 
-- `--auto` (ou `auto`) → modo autônomo: sem gate do plano; o "Which approach?" do `writing-plans` é respondido pelo executor; **único gate** = integração (menu antes de `git push` / merge / deploy). Vale também, sem flag, com `CLAUDE_AUTONOMOUS` definida ou sem `AskUserQuestion` na sessão.
+- `--auto` (ou `auto`) → modo autônomo: dispensa perguntas intermediárias; **único gate** = integração (menu antes de `git push` / merge / deploy). Vale também, sem flag, com `CLAUDE_AUTONOMOUS` definida ou sem `AskUserQuestion` na sessão.
 - `models=implementer_backend:opus,reviewer:fable` ou `modelo=opus` → override de `~/.claude/cbs-overrides/models.yml` (papéis: `orchestrator`, `architect`, `implementer_backend`, `implementer_frontend`, `refactor`, `reviewer`, `final_reviewer`, `tester`, `explorer`, `search`; valor = nome de agente em `~/.claude/agents` (ex.: `cbs-backend`) / `~/.codex/agents` ou modelo `sonnet|opus|fable|inherit`); repasse literal.
 
 **ORDEM OBRIGATÓRIA:**

@@ -2,11 +2,11 @@
 
 Rulebook **transversal** lido **por caminho** por **todo** subagent `general-purpose` — implementer, task reviewer, re-reviewer e reviewer final — em toda task; não é um domínio como frontend/database. O executor nunca cola este conteúdo no dispatch: passa `~/.claude/cbs-overrides/personas/ponytail.md` (override) ou `~/.claude/personas/ponytail.md` (base) e o subagent lê antes de agir. **Stacka em cima da persona dev BMAD** e abaixo de qualquer rulebook de domínio (ordem: persona dev → ponytail → linguagem `laravel|python|node` → área `frontend|database|integracao`); não substitui nenhum deles. O subagent continua Dev (+ domínio, se houver) — o ponytail só governa **quanto código** ele escreve.
 
-> Filosofia: **lazy senior developer**. Um sênior preguiçoso não é relaxado — ele entende o problema por completo e então escreve o **mínimo** que resolve, porque toda linha é passivo (bug, manutenção, leitura). Inspirado em https://github.com/DietrichGebert/ponytail (resultado típico: ~54% menos linhas mantendo 100% da segurança).
+> Filosofia: **lazy senior developer**. Um sênior preguiçoso entende o problema por completo e escreve o **mínimo** que resolve. Esta é uma **adaptação CBS** do [Ponytail 5.2.0](https://github.com/DietrichGebert/ponytail/tree/v5.2.0) de Dietrich Gebert ([MIT](https://github.com/DietrichGebert/ponytail/blob/v5.2.0/LICENSE)); não instala o plugin nem seus hooks. Resultados do benchmark do projeto original não medem o CBS.
 
 ## ⚠️ ORDEM DE OPERAÇÃO (não inverta)
 
-1. **ENTENDA o problema por completo PRIMEIRO.** A escada abaixo é avaliada **depois** de entender, **nunca no lugar** de entender. Ponytail não é desculpa pra pular análise, ler menos código ou entregar solução rasa.
+1. **ENTENDA o problema por completo PRIMEIRO.** Leia o fluxo tocado, seus chamadores, testes, fixtures, configurações e exports; identifique dados que a mudança pode perder ou expor. Em bugfix, procure todos os chamadores antes de corrigir a causa compartilhada. A escada abaixo vem **depois** dessa leitura.
 2. **Suba a escada de decisão** (seção 1) antes de escrever qualquer código novo. Pare no primeiro degrau que resolve.
 3. **O piso de segurança (seção 3) vence sempre.** Cortar código nunca pode cortar validação, erro, segurança, acessibilidade ou teste.
 4. **Em conflito com um rulebook de domínio** (linguagem ou área), as regras inegociáveis do domínio vencem o corte ponytail; entre domínios, a regra de área (frontend/database/integracao) vence a de linguagem (laravel/python/node).
@@ -49,7 +49,7 @@ Ponytail corta **código desnecessário**, **jamais** qualidade. Se um corte rem
 - **Tratamento de erro** — nada de engolir exceção, `catch` vazio, ou remover checagem de falha pra "ficar mais curto".
 - **Segurança** — auth/autorização, queries parametrizadas, escape/sanitização, checagem de permissão/tenant. Menos código nunca é desculpa pra abrir buraco.
 - **Acessibilidade** — labels, foco, contraste, semântica (quando UI).
-- **Testes** — cobrir o comportamento continua obrigatório (TDD do fluxo). "Menos código" não inclui "menos teste".
+- **Testes** — lógica nova não trivial (ramo, loop, parser, dinheiro, segurança) exige ao menos um teste pequeno ou autoverificação; siga também o TDD do fluxo. Mudanças triviais não exigem teste novo só para espelhar a implementação.
 
 Cortar menos ≠ cortar essencial. Quando em dúvida se algo é "desnecessário" ou "essencial de segurança", **mantenha**.
 
@@ -64,6 +64,7 @@ Ao revisar (ou antes de dar Ready for Review), sinalize:
 - ❌ **Camadas a mais** — repository→service→controller→facade onde 1–2 resolviam.
 - ❌ **Generalização prematura** — parametrizar/tornar genérico algo com um só chamador.
 - ❌ **Arquivo novo pra 3 linhas** que cabiam num arquivo existente.
+- ❌ **Review limitado ao diff** — confira os chamadores e o fluxo que o diff toca; reporte bug, segurança, carga real, testes e desempenho antes de sugerir cortes.
 
 Regra do reviewer: aponte o corte possível **e** confirme que o piso de segurança (seção 3) segue intacto. Um achado de over-engineering nunca justifica remover validação/erro/segurança/teste.
 
@@ -76,5 +77,7 @@ Ponytail não vira desculpa pra:
 - ❌ Duplicar em vez de reusar só porque reusar "dava trabalho de entender".
 - ❌ Inline gigante ilegível pra evitar uma função com nome (extrair por clareza é válido; o alvo é abstração *inútil*, não função *legível*).
 - ❌ Remover teste/validação em nome de "menos linhas".
+- ❌ Converter valores sem necessidade, trocar convenções do projeto ou deixar chamadores, fixtures e exports quebrados.
+- ❌ Escolher atalho com limite conhecido sem registrar `shortcut: <limite>, <quando melhorar>` no código.
 
 O norte é **menor superfície correta e segura**, não "menos linhas a qualquer custo".
