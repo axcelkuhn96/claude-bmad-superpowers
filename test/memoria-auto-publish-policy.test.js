@@ -141,6 +141,78 @@ test('orçamento não grava consentimento saneado quando writer fica indisponív
     JSON.parse(before).autoPublishConsent.consentHash);
 });
 
+test('revogação concorrente com agenda não restaura consentimento anterior', async t => {
+  const f = await fixture(t);
+  await designated(f);
+  await registerOwner(f.resolution, 'claude', f.profile, 'axcel-local', true);
+  assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
+    cli: 'claude', profile: f.profile })).kind, 'enabled');
+  const file = path.join(f.resolution.stateDir, 'extractor.json');
+  const originalRename = fs.rename.bind(fs);
+  let resumeRename;
+  const paused = new Promise(resolve => { resumeRename = resolve; });
+  let signalRename;
+  const reached = new Promise(resolve => { signalRename = resolve; });
+  let held = false;
+  t.mock.method(fs, 'rename', async (source, target) => {
+    if (target === file && !held) {
+      held = true;
+      signalRename();
+      await paused;
+    }
+    return originalRename(source, target);
+  });
+  const scheduled = configureExtractionSchedule(f.resolution, {
+    maxCallsPerSession: 200, mode: 'conversation', conversationTurns: 5 });
+  await reached;
+  const revoked = disableAutoPublish(f.resolution);
+  try {
+    await Promise.race([revoked, new Promise(resolve => setTimeout(resolve, 250))]);
+  } finally { resumeRename(); }
+  assert.equal((await scheduled).kind, 'configured');
+  assert.equal((await revoked).kind, 'disabled');
+  const saved = await readExtractor(f.resolution);
+  assert.equal(saved.maxCallsPerSession, 200);
+  assert.equal(saved.autoPublish, false);
+  assert.equal(saved.autoPublishConsent, undefined);
+});
+
+test('opt-in concorrente com agenda preserva consentimento novo', async t => {
+  const f = await fixture(t);
+  await designated(f);
+  await registerOwner(f.resolution, 'claude', f.profile, 'axcel-local', true);
+  const file = path.join(f.resolution.stateDir, 'extractor.json');
+  const originalRename = fs.rename.bind(fs);
+  let resumeRename;
+  const paused = new Promise(resolve => { resumeRename = resolve; });
+  let signalRename;
+  const reached = new Promise(resolve => { signalRename = resolve; });
+  let held = false;
+  t.mock.method(fs, 'rename', async (source, target) => {
+    if (target === file && !held) {
+      held = true;
+      signalRename();
+      await paused;
+    }
+    return originalRename(source, target);
+  });
+  const scheduled = configureExtractionSchedule(f.resolution, {
+    maxCallsPerSession: 200, mode: 'conversation', conversationTurns: 5 });
+  await reached;
+  const enabled = enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
+    cli: 'claude', profile: f.profile });
+  try {
+    await Promise.race([enabled, new Promise(resolve => setTimeout(resolve, 250))]);
+  } finally { resumeRename(); }
+  assert.equal((await scheduled).kind, 'configured');
+  const granted = await enabled;
+  assert.equal(granted.kind, 'enabled');
+  const saved = await readExtractor(f.resolution);
+  assert.equal(saved.maxCallsPerSession, 200);
+  assert.equal(saved.autoPublish, true);
+  assert.equal(saved.autoPublishConsent.consentHash, granted.consentHash);
+});
+
 test('CLI ajusta agenda existente e status mostra limite sem refazer opt-in', async t => {
   const f = await fixture(t);
   await designated(f);

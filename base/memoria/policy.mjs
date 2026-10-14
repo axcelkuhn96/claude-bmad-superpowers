@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
   writeWindowsPrivateFile } from './windows-security.mjs';
+import { withProjectLock } from './ledger.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const validCalls = value => Number.isSafeInteger(value) && value >= 1 && value <= 1000;
@@ -18,6 +19,8 @@ const deviceValid = value => typeof value === 'string' && /^[a-f0-9-]{36}$/.test
 const consentDigest = consent => digest([consent.version, consent.enabled, consent.projectId,
   consent.destinationHash, consent.ownerId, consent.deviceId, consent.ownerCli,
   consent.enabledAt, consent.nonce, ...(consent.ownerProfileHash ? [consent.ownerProfileHash] : [])]);
+const withExtractorLock = (resolution, callback) =>
+  withProjectLock(resolution.stateDir, callback, 'extractor-policy.lock');
 
 async function readPrivate(file) {
   if (process.platform === 'win32') {
@@ -116,11 +119,12 @@ export async function configureExtractor(resolution, selection) {
           (profileStat.mode & 0o022) || (executableStat.mode & 0o022))) throw new Error('untrusted');
   } catch { return blocked('extractor_path_untrusted'); }
   try {
-    await writePrivate(path.join(resolution.stateDir, 'extractor.json'), {
-      projectId: resolution.projectId, binding: binding(resolution), route: selection.route,
-      profile, executable, maxCallsPerSession: 100, maxCandidatesPerCheckpoint: 5,
-      mode: 'conversation', conversationTurns: 5,
-      autoPublish: false, selectedAt: new Date().toISOString() }, true);
+    await withExtractorLock(resolution, () =>
+      writePrivate(path.join(resolution.stateDir, 'extractor.json'), {
+        projectId: resolution.projectId, binding: binding(resolution), route: selection.route,
+        profile, executable, maxCallsPerSession: 100, maxCandidatesPerCheckpoint: 5,
+        mode: 'conversation', conversationTurns: 5,
+        autoPublish: false, selectedAt: new Date().toISOString() }, true));
   } catch { return blocked('unsafe_extractor_state'); }
   return { kind: 'selected', route: selection.route, cost: 'up to 100 automatic paid CLI calls per session; five candidates per checkpoint; auto publication off' };
 }
@@ -149,16 +153,18 @@ export async function configureExtractionSchedule(resolution,
   { maxCallsPerSession, mode, conversationTurns } = {}) {
   if (!validCalls(maxCallsPerSession) || mode !== 'conversation' ||
       !validTurns(conversationTurns)) return blocked('extractor_schedule_invalid');
-  const extractor = await readExtractor(resolution);
-  if (!extractor || extractor.kind === 'blocked') return blocked('extractor_binding_changed');
   try {
-    const saved = await readPrivate(path.join(resolution.stateDir, 'extractor.json'));
-    if (saved?.autoPublish !== extractor.autoPublish ||
-        (saved?.autoPublishConsent?.consentHash ?? null) !==
-          (extractor.autoPublishConsent?.consentHash ?? null)) return blocked('auto_publish_consent_invalid');
-    await writePrivate(path.join(resolution.stateDir, 'extractor.json'), {
-      ...extractor, maxCallsPerSession, mode, conversationTurns }, true);
-    return { kind: 'configured', maxCallsPerSession, mode, conversationTurns };
+    return await withExtractorLock(resolution, async () => {
+      const extractor = await readExtractor(resolution);
+      if (!extractor || extractor.kind === 'blocked') return blocked('extractor_binding_changed');
+      const saved = await readPrivate(path.join(resolution.stateDir, 'extractor.json'));
+      if (saved?.autoPublish !== extractor.autoPublish ||
+          (saved?.autoPublishConsent?.consentHash ?? null) !==
+            (extractor.autoPublishConsent?.consentHash ?? null)) return blocked('auto_publish_consent_invalid');
+      await writePrivate(path.join(resolution.stateDir, 'extractor.json'), {
+        ...extractor, maxCallsPerSession, mode, conversationTurns }, true);
+      return { kind: 'configured', maxCallsPerSession, mode, conversationTurns };
+    });
   } catch { return blocked('unsafe_extractor_state'); }
 }
 
@@ -219,39 +225,43 @@ export async function enableAutoPublish(resolution, { ownerId, cli, profile } = 
   catch { return blocked('owner_declaration_required'); }
   const owner = await readOwner(resolution, cli, canonicalProfile);
   if (!owner || owner.kind === 'blocked' || owner.ownerId !== ownerId) return blocked('owner_declaration_required');
-  const extractor = await readExtractor(resolution);
-  if (!extractor || extractor.kind === 'blocked' || extractor.route !== 'haiku') return blocked('haiku_selection_required');
-  const device = await localDevice(resolution.stateDir);
-  if (device.kind !== 'device') return device;
-  let writer;
-  try { writer = await readPrivate(path.join(resolution.stateDir, 'ledger', 'writer.json')); }
-  catch { return blocked('writer_not_designated'); }
-  if (writer?.projectId !== resolution.projectId ||
-      writer.collection !== resolution.destination.collection ||
-      writer.deviceId !== device.deviceId || writer.revoked === true ||
-      !Number.isSafeInteger(writer.generation) || writer.generation < 1) return blocked('writer_not_designated');
-  const consent = { version: 1, enabled: true, projectId: resolution.projectId,
-    destinationHash: digest(resolution.destination), ownerId, deviceId: device.deviceId,
-    ownerCli: cli, ownerProfileHash: profileHash(canonicalProfile),
-    enabledAt: new Date().toISOString(), nonce: randomUUID() };
-  consent.consentHash = consentDigest(consent);
   try {
-    await writePrivate(path.join(resolution.stateDir, 'extractor.json'), {
-      ...extractor, autoPublish: true, autoPublishConsent: consent }, true);
-    return { kind: 'enabled', consentHash: consent.consentHash };
+    return await withExtractorLock(resolution, async () => {
+      const extractor = await readExtractor(resolution);
+      if (!extractor || extractor.kind === 'blocked' || extractor.route !== 'haiku') return blocked('haiku_selection_required');
+      const device = await localDevice(resolution.stateDir);
+      if (device.kind !== 'device') return device;
+      let writer;
+      try { writer = await readPrivate(path.join(resolution.stateDir, 'ledger', 'writer.json')); }
+      catch { return blocked('writer_not_designated'); }
+      if (writer?.projectId !== resolution.projectId ||
+          writer.collection !== resolution.destination.collection ||
+          writer.deviceId !== device.deviceId || writer.revoked === true ||
+          !Number.isSafeInteger(writer.generation) || writer.generation < 1) return blocked('writer_not_designated');
+      const consent = { version: 1, enabled: true, projectId: resolution.projectId,
+        destinationHash: digest(resolution.destination), ownerId, deviceId: device.deviceId,
+        ownerCli: cli, ownerProfileHash: profileHash(canonicalProfile),
+        enabledAt: new Date().toISOString(), nonce: randomUUID() };
+      consent.consentHash = consentDigest(consent);
+      await writePrivate(path.join(resolution.stateDir, 'extractor.json'), {
+        ...extractor, autoPublish: true, autoPublishConsent: consent }, true);
+      return { kind: 'enabled', consentHash: consent.consentHash };
+    });
   } catch { return blocked('unsafe_extractor_state'); }
 }
 
 export async function disableAutoPublish(resolution) {
   try {
-    const extractor = await readPrivate(path.join(resolution.stateDir, 'extractor.json'));
-    if (extractor?.projectId !== resolution.projectId ||
-        extractor.binding !== binding(resolution) ||
-        !['sonnet', 'haiku'].includes(extractor.route)) return blocked('extractor_binding_changed');
-    const { autoPublishConsent, ...rest } = extractor;
-    await writePrivate(path.join(resolution.stateDir, 'extractor.json'),
-      { ...rest, autoPublish: false }, true);
-    return { kind: 'disabled' };
+    return await withExtractorLock(resolution, async () => {
+      const extractor = await readPrivate(path.join(resolution.stateDir, 'extractor.json'));
+      if (extractor?.projectId !== resolution.projectId ||
+          extractor.binding !== binding(resolution) ||
+          !['sonnet', 'haiku'].includes(extractor.route)) return blocked('extractor_binding_changed');
+      const { autoPublishConsent, ...rest } = extractor;
+      await writePrivate(path.join(resolution.stateDir, 'extractor.json'),
+        { ...rest, autoPublish: false }, true);
+      return { kind: 'disabled' };
+    });
   } catch { return blocked('unsafe_extractor_state'); }
 }
 
