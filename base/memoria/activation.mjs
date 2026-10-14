@@ -56,7 +56,9 @@ async function probeCollection(url, collection, key, address) {
   return new Promise((resolve) => {
     const req = transport.get(target, {
       headers: key ? { 'api-key': key, accept: 'application/json' } : { accept: 'application/json' }, timeout: 5000,
-      lookup: (_host, _options, callback) => callback(null, address, net.isIP(address)),
+      lookup: (_host, options, callback) => options.all
+        ? callback(null, [{ address, family: net.isIP(address) }])
+        : callback(null, address, net.isIP(address)),
     }, (res) => {
       if (res.statusCode !== 200 || !key) { res.resume(); resolve({ statusCode: res.statusCode }); return; }
       let body = '';

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import https from 'node:https';
+import { spawn, spawnSync } from 'node:child_process';
 import { initializeSession } from '../base/memoria/provider.mjs';
 import { pinDestination, validateDestination } from '../base/memoria/activation.mjs';
 import { authorizeDestination, trustTuple, writeLocalTrust } from '../base/memoria/trust.mjs';
@@ -132,4 +133,45 @@ test('public activation validates trusted pin and collection metadata', async t 
   });
   assert.equal(result.kind, 'authorized');
   assert.equal(probes, 2);
+});
+
+test('activation reaches protected collection through pinned HTTPS on current Node', async t => {
+  if (spawnSync('openssl', ['version']).status !== 0) return t.skip('openssl unavailable');
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-pinned-tls-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const key = path.join(dir, 'key.pem');
+  const cert = path.join(dir, 'cert.pem');
+  const generated = spawnSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+    '-keyout', key, '-out', cert, '-days', '1', '-subj', '/CN=localhost',
+    '-addext', 'subjectAltName=DNS:localhost'], { encoding: 'utf8' });
+  assert.equal(generated.status, 0, generated.stderr);
+  const server = https.createServer({ key: await fs.readFile(key), cert: await fs.readFile(cert) },
+    (req, res) => {
+      if (req.headers['api-key'] !== 'synthetic-key') { res.writeHead(401).end(); return; }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ result: { config: {
+        params: { vectors: { size: 384, distance: 'Cosine' } },
+        metadata: { cbs_embedding_fingerprint: fingerprint },
+      } } }));
+    });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const target = `https://localhost:${server.address().port}`;
+  const script = `import { validateDestination } from ${JSON.stringify(new URL('../base/memoria/activation.mjs', import.meta.url).href)};
+const destination = { url: ${JSON.stringify(target)}, collection: 'fixture', apiKeyEnv: 'TEST_KEY' };
+const resolution = { provider: 'mem0', projectRoot: '/test', projectId: 'fixture', destination };
+const result = await validateDestination(resolution, ${JSON.stringify(fingerprint)}, {
+  approve: async tuple => tuple, readSecret: () => 'synthetic-key',
+  lookup: async () => ['127.0.0.1'],
+});
+process.stdout.write(JSON.stringify(result));`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+    env: { ...process.env, NODE_EXTRA_CA_CERTS: cert }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  let errors = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.on('data', chunk => { errors += chunk; });
+  const [code] = await new Promise(resolve => child.once('close', (...args) => resolve(args)));
+  assert.equal(code, 0, errors);
+  assert.equal(JSON.parse(output).kind, 'authorized', output + errors);
 });
