@@ -73,7 +73,8 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
         autoPublishConsent: frozen }));
     const result = await store(operation, ackLocal);
     if (result?.kind === 'blocked') return {
-      kind: result.reason === 'destination_unavailable' ? 'retry' : 'blocked',
+      kind: ['destination_unavailable', 'broker_unavailable'].includes(result.reason)
+        ? 'retry' : 'blocked',
       published, pending, reason: result.reason ?? 'store_blocked' };
     if (result?.kind === 'conflict') return { kind: 'blocked', published, pending,
       reason: result.reason ?? 'store_conflict' };

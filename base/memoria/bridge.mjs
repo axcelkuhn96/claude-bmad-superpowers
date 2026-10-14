@@ -4,6 +4,7 @@ import { authorizeCurrentDestination } from './setup.mjs';
 import { resolveProject } from './provider.mjs';
 import { runtimePython } from './runtime.mjs';
 import { requestBroker } from './broker.mjs';
+import { ensureBrokerReady } from './broker-start.mjs';
 import { createLedger, externalIdFor, reconcileStore, withProjectLock } from './ledger.mjs';
 import { assertWriter } from './authority.mjs';
 import { targetVersion } from './correction.mjs';
@@ -90,6 +91,15 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
     if (operation.approval?.mode === 'automatic' &&
         !await autoConsentCurrent(resolution, options.autoPublishConsent, options)) {
       return blocked('auto_publish_revoked');
+    }
+    if (operation.approval?.mode === 'automatic' && !options.run) {
+      let ready;
+      try {
+        ready = await (options.ensureBrokerReady ?? ensureBrokerReady)(cwd,
+          { stateRoot: options.stateRoot, bootstrapSessionId: sessionId });
+      } catch { return blocked('broker_unavailable'); }
+      if (ready?.kind !== 'ready') return ready?.kind === 'blocked'
+        ? ready : blocked('broker_unavailable');
     }
     const checkTarget = async () => {
       const targetId = operation.metadata.supersedes_id;

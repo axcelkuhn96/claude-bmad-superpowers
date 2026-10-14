@@ -196,6 +196,20 @@ test('temporary DNS failure retries sealed automatic operation; destination poli
   assert.equal(policy.reason, 'public_destination');
 });
 
+test('temporary broker startup failure retries the same sealed operation without extraction', async t => {
+  const { outbox, stateDir, row } = await fixture(t);
+  assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
+  let calls = 0;
+  const result = await publishCheckpointAutomatically(row, resolution(stateDir), {
+    outbox, readAutoPublish: async () => consent,
+    store: async () => { calls++; return { kind: 'blocked', reason: 'broker_unavailable' }; },
+  });
+  assert.deepEqual(result, { kind: 'retry', published: 0, pending: 0,
+    reason: 'broker_unavailable' });
+  assert.equal(calls, 1);
+  assert.equal((await outbox.readManifest(row.operationId)).candidates[0].status, 'pending');
+});
+
 test('real store refuses revoked consent and an unassigned writer before remote add', async t => {
   const { outbox, stateDir, row } = await fixture(t);
   assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
