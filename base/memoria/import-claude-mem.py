@@ -3,12 +3,14 @@
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
 import sqlite3
 import sys
 import uuid
+from urllib.parse import urlsplit
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / 'python'))
@@ -117,15 +119,27 @@ def row_digest(row):
                                      separators=(',', ':')).encode('utf-8')).hexdigest()
 
 
+def source_identity(item):
+    row = item['row']
+    return json.dumps([item['collection'], item['source_project'], item['source_table'],
+                       row['id'], row.get('memory_session_id')], ensure_ascii=False,
+                      separators=(',', ':'))
+
+
+def chunk_id(identity, index):
+    return str(uuid.uuid5(NAMESPACE, identity + ('\0anchor' if index == 0 else f'\0{index}')))
+
+
 def points_for_row(item, tokenizer, max_tokens=480, overlap=32):
+    import mem0_adapter as adapter
     if not (0 <= overlap < max_tokens <= 480):
         raise ValueError('invalid_chunk_size')
     row = item['row']
     source = item['source_project']
     table = item['source_table']
     digest = row_digest(row)
-    identity = f'{source}\0{table}\0{row["id"]}\0{row.get("memory_session_id")}\0{digest}'
-    anchor = str(uuid.uuid5(NAMESPACE, identity + '\0anchor'))
+    identity = source_identity(item)
+    anchor = chunk_id(identity, 0)
     pieces = []
     for field in CONTENT_FIELDS:
         value = row.get(field)
@@ -155,8 +169,7 @@ def points_for_row(item, tokenizer, max_tokens=480, overlap=32):
         pieces = [('empty', 0, 0, f'{source} {table} {row["id"]}')]
     result = []
     for index, (field, start, end, text) in enumerate(pieces):
-        point_id = anchor if index == 0 else str(uuid.uuid5(
-            NAMESPACE, identity + f'\0{field}\0{start}\0{end}'))
+        point_id = chunk_id(identity, index)
         payload = {'source': 'claude-mem', 'source_type': 'imported_legacy',
                    'origin': 'assistant_report', 'speaker_role': 'assistant',
                    'actor': 'claude-mem', 'label': LABEL,
@@ -164,11 +177,16 @@ def points_for_row(item, tokenizer, max_tokens=480, overlap=32):
                    'source_session': row.get('memory_session_id'),
                    'evidence_at': row.get('created_at'),
                    'source_content_hash': row.get('content_hash'),
-                   'raw_content_sha256': digest, 'field': field,
+                   'raw_content_sha256': digest,
+                   'embedding_text_sha256': hashlib.sha256(text.encode('utf-8')).hexdigest(),
+                   'embedding_fingerprint': adapter.FINGERPRINT,
+                   'import_identity': anchor, 'chunk_ordinal': index,
+                   'field': field,
                    'start': start, 'end': end, 'text': text,
                    'anchor_id': anchor, 'collection': item['collection']}
         if index == 0:
             payload['raw_row'] = row
+            payload['chunk_count'] = len(pieces)
         result.append({'id': point_id, 'payload': payload, 'text': text})
     return result
 
@@ -212,7 +230,6 @@ def safe_key(file):
 def client_for(options):
     import mem0_adapter as adapter
     from qdrant_client import QdrantClient
-    from urllib.parse import urlsplit
     target = urlsplit(options.url)
     if target.scheme != 'https' or not target.hostname or target.path not in ('', '/') or \
             target.query or target.fragment or target.username or target.password:
@@ -261,9 +278,59 @@ def snapshot_digest(path):
     return digest.hexdigest()
 
 
-def save_checkpoint(path, digest, line, offset):
+def file_digest(path):
+    return snapshot_digest(Path(path).resolve(strict=True))
+
+
+def snapshot_mapping(path):
+    mapping = {}
+    with Path(path).open('r', encoding='utf-8') as stream:
+        for line in stream:
+            item = json.loads(line)
+            project, collection = item['source_project'], item['collection']
+            if not isinstance(project, str) or not project or not valid_collection(collection):
+                raise ValueError('invalid_snapshot_mapping')
+            if project in mapping and mapping[project] != collection:
+                raise ValueError('inconsistent_snapshot_mapping')
+            mapping[project] = collection
+    return mapping
+
+
+def import_identity(options, mapping):
+    import mem0_adapter as adapter
+    target = urlsplit(options.url)
+    if target.scheme.lower() != 'https' or not target.hostname or \
+            target.path not in ('', '/') or target.query or target.fragment or \
+            target.username or target.password:
+        raise ValueError('explicit_https_destination_required')
+    address = ipaddress.ip_address(options.address)
+    if address.version != 4 or not address.is_global:
+        raise ValueError('public_ipv4_destination_required')
+    return {'version': 2, 'url': f'https://{target.hostname.lower()}:{target.port or 443}',
+            'address': str(address), 'public_mode': True,
+            'collection_map': mapping,
+            'embedding_fingerprint': adapter.FINGERPRINT,
+            'model_sha256': file_digest(options.model),
+            'tokenizer_sha256': file_digest(options.tokenizer),
+            'dimension': 384, 'chunk_schema': 'claude-mem-raw-v2-480-32'}
+
+
+def save_checkpoint(path, digest, line, offset, identity):
     private_atomic(path, lambda stream: stream.write(json.dumps(
-        {'snapshot_sha256': digest, 'line': line, 'offset': offset}) + '\n'))
+        {'snapshot_sha256': digest, 'line': line, 'offset': offset,
+         'identity': identity}) + '\n'))
+
+
+def acknowledged(result, action):
+    if str(result.status).lower() not in ('completed', 'updatestatus.completed'):
+        raise RuntimeError(f'{action}_not_acknowledged')
+
+
+def owned_point(point, anchor, ordinal):
+    payload = point.payload or {}
+    if payload.get('source') != 'claude-mem' or payload.get('import_identity') != anchor or \
+            payload.get('chunk_ordinal') != ordinal or payload.get('anchor_id') != anchor:
+        raise ValueError('raw_point_ownership_mismatch')
 
 
 def import_snapshot(options, client=None, embedder=None):
@@ -277,12 +344,19 @@ def import_snapshot(options, client=None, embedder=None):
                             source.stat().st_mode & 0o777 != 0o600):
         raise ValueError('private_snapshot_required')
     digest = snapshot_digest(source)
+    identity = import_identity(options, snapshot_mapping(source))
     cursor = {'line': 0, 'offset': 0, 'snapshot_sha256': digest}
     if checkpoint.exists():
         if os.name != 'nt' and (checkpoint.stat().st_uid != os.getuid() or
                                 checkpoint.stat().st_mode & 0o777 != 0o600):
             raise ValueError('private_checkpoint_required')
         cursor = json.loads(checkpoint.read_text(encoding='utf-8'))
+        if not isinstance(cursor, dict):
+            raise ValueError('checkpoint_invalid')
+        if 'identity' not in cursor:
+            raise ValueError('checkpoint_identity_required')
+        if cursor['identity'] != identity:
+            raise ValueError('checkpoint_identity_mismatch')
         if cursor.get('snapshot_sha256') != digest or \
                 type(cursor.get('line')) is not int or cursor['line'] < 0 or \
                 type(cursor.get('offset')) is not int or cursor['offset'] < 0:
@@ -303,23 +377,55 @@ def import_snapshot(options, client=None, embedder=None):
         checked = set()
         with source.open('r', encoding='utf-8') as stream:
             for line_index, line in enumerate(stream):
-                if line_index < cursor['line']:
-                    continue
                 item = json.loads(line)
                 name = item['collection']
                 if name not in checked:
                     ensure_raw_collection(client, name)
                     checked.add(name)
                 pieces = points_for_row(item, embedder.tokenizer)
-                start = cursor['offset'] if line_index == cursor['line'] else 0
-                for offset in range(start, len(pieces), options.batch_size):
+                anchor = pieces[0]['id']
+                first_batch = pieces[:options.batch_size]
+                first_existing = {str(point.id): point for point in client.retrieve(
+                    name, ids=[part['id'] for part in first_batch], with_payload=True,
+                    with_vectors=False)}
+                old_anchor = [first_existing[anchor]] if anchor in first_existing else []
+                old_count = 0
+                if old_anchor:
+                    owned_point(old_anchor[0], anchor, 0)
+                    old_count = old_anchor[0].payload.get('chunk_count', 0)
+                    if type(old_count) is not int or old_count < 0:
+                        raise ValueError('raw_chunk_count_invalid')
+                if old_count > len(pieces):
+                    row_identity = source_identity(item)
+                    old_ids = [chunk_id(row_identity, index)
+                               for index in range(len(pieces), old_count)]
+                    obsolete = client.retrieve(name, ids=old_ids, with_payload=True,
+                                               with_vectors=False)
+                    for point in obsolete:
+                        owned_point(point, anchor, old_ids.index(str(point.id)) + len(pieces))
+                    if obsolete:
+                        acknowledged(client.delete(name, points_selector=[point.id for point in obsolete],
+                                                   wait=True), 'delete')
+                for offset in range(0, len(pieces), options.batch_size):
                     batch = pieces[offset:offset + options.batch_size]
-                    existing = {str(point.id) for point in client.retrieve(
-                        name, ids=[part['id'] for part in batch], with_payload=False,
-                        with_vectors=False)}
-                    missing = [part for part in batch if part['id'] not in existing]
+                    existing = first_existing if offset == 0 else {
+                        str(point.id): point for point in client.retrieve(
+                            name, ids=[part['id'] for part in batch], with_payload=True,
+                            with_vectors=False)}
                     points = []
-                    for part in missing:
+                    for part in batch:
+                        remote = existing.get(part['id'])
+                        if remote:
+                            owned_point(remote, anchor, part['payload']['chunk_ordinal'])
+                            if remote.payload.get('embedding_text_sha256') == \
+                                    part['payload']['embedding_text_sha256'] and \
+                                    remote.payload.get('embedding_fingerprint') == \
+                                    part['payload']['embedding_fingerprint']:
+                                if remote.payload != part['payload']:
+                                    acknowledged(client.overwrite_payload(
+                                        name, payload=part['payload'], points=[part['id']],
+                                        wait=True), 'payload')
+                                continue
                         if len(embedder.tokenizer.encode('passage: ' + part['text']).ids) > 512:
                             raise ValueError('chunk_exceeds_model_context')
                         points.append(PointStruct(id=part['id'],
@@ -327,13 +433,13 @@ def import_snapshot(options, client=None, embedder=None):
                             payload=part['payload']))
                     if points:
                         result = client.upsert(name, points=points, wait=True)
-                        if str(result.status).lower() not in ('completed', 'updatestatus.completed'):
-                            raise RuntimeError('upsert_not_acknowledged')
+                        acknowledged(result, 'upsert')
                         count += len(points)
                     next_offset = offset + len(batch)
                     save_checkpoint(checkpoint, digest,
                                     line_index + (next_offset >= len(pieces)),
-                                    0 if next_offset >= len(pieces) else next_offset)
+                                    0 if next_offset >= len(pieces) else next_offset,
+                                    identity)
         return count
     finally:
         if owned_client:
