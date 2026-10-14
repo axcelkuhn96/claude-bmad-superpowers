@@ -39,6 +39,9 @@ export const readonlyDefinitions = [
   { name: 'status', description: 'Show read-only Mem0 availability for the trusted current project.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
 ];
+for (const definition of readonlyDefinitions) definition.annotations = {
+  readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false,
+};
 
 function createSearchWorker(resolution) {
   const model = path.join(resolution.stateDir, 'artifacts', 'model.onnx');

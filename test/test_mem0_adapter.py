@@ -3,6 +3,7 @@ import io
 import math
 import os
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +17,78 @@ spec.loader.exec_module(adapter)
 
 
 class AdapterTest(unittest.TestCase):
+    def test_memory_config_uses_ephemeral_history_only_when_requested(self):
+        class Qdrant:
+            pass
+        class Factory:
+            provider_to_class = {}
+        class MemoryConfig:
+            def __init__(self, **kwargs):
+                self.history_db_path = kwargs['history_db_path']
+        fake = {
+            'mem0_adapter': adapter,
+            'mem0.configs.base': SimpleNamespace(MemoryConfig=MemoryConfig),
+            'mem0.configs.llms.base': SimpleNamespace(BaseLlmConfig=object),
+            'mem0.memory.main': SimpleNamespace(Memory=lambda config: config),
+            'mem0.utils.factory': SimpleNamespace(EmbedderFactory=Factory, LlmFactory=Factory,
+                                                  VectorStoreFactory=Factory),
+            'mem0.vector_stores.qdrant': SimpleNamespace(Qdrant=Qdrant),
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, fake):
+            state = Path(directory)
+            connection = {'hostname': 'localhost', 'port': 6333}
+            self.assertEqual(adapter._memory(None, 'native', state, connection).history_db_path,
+                             str(state / 'mem0' / 'history.db'))
+            self.assertEqual(adapter._memory(None, 'native', state, connection,
+                             history_db_path=':memory:').history_db_path, ':memory:')
+            self.assertFalse((state / 'mem0' / 'history.db').exists())
+
+    def test_curated_readonly_get_uses_ephemeral_history_and_preserves_existing_db(self):
+        identifier = '64eef286-9f7e-4326-b137-5658f0286c46'
+        class Memory:
+            embedding_model = object()
+            def get(self, memory_id):
+                self_test.assertEqual(memory_id, identifier)
+                return {'id': memory_id}
+        self_test = self
+        metadata = {'scope': 'project', 'origin': 'user_direct', 'speaker_role': 'user',
+                    'source': 'message', 'actor': 'user', 'evidence_at': '2026-10-01T00:00:00Z'}
+        row = {'projectId': 'project', 'status': 'active', 'text': 'Remembered fact', 'metadata': metadata}
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            history = state / 'mem0' / 'history.db'
+            history.parent.mkdir()
+            history.write_bytes(b'existing history')
+            before = (history.read_bytes(), history.stat().st_mtime_ns)
+            with patch.object(adapter, 'verify_collection'), \
+                 patch.object(adapter, '_memory', return_value=Memory()) as memory, \
+                 patch.object(adapter, '_row', return_value=row):
+                result = adapter.execute_readonly({'op': 'readonly_get', 'collection': 'native',
+                    'projectId': 'project', 'memoryId': identifier, 'source': 'curated',
+                    'connection': {}}, None, state)
+            self.assertEqual(result['item']['text'], 'Remembered fact')
+            self.assertEqual(memory.call_args.kwargs['history_db_path'], ':memory:')
+            self.assertEqual((history.read_bytes(), history.stat().st_mtime_ns), before)
+
+    def test_search_uses_ephemeral_history_but_write_path_keeps_persistent_history(self):
+        class Memory:
+            embedding_model = object()
+            def search(self, *args, **kwargs):
+                return {'results': []}
+            def get_all(self, **kwargs):
+                return {'results': []}
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            with patch.object(adapter, 'verify_collection'), \
+                 patch.object(adapter, '_memory', return_value=Memory()) as memory:
+                result = adapter.execute({'op': 'search', 'collection': 'native',
+                    'projectId': 'project', 'query': 'fact', 'connection': {}}, None, state)
+                self.assertEqual(result['items'], [])
+                self.assertEqual(memory.call_args.kwargs['history_db_path'], ':memory:')
+                adapter.execute({'op': 'find', 'collection': 'native', 'projectId': 'project',
+                    'externalId': 'item', 'connection': {}}, None, state)
+                self.assertNotIn('history_db_path', memory.call_args.kwargs)
+
     def test_e5_passes_bounded_options_to_onnx_without_loading_model(self):
         sessions = []
         class Options:

@@ -1,4 +1,7 @@
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const script = fileURLToPath(new URL('./mcp-readonly.mjs', import.meta.url));
@@ -32,6 +35,59 @@ function matches(cli, output, command, args) {
     fields.Command === command && fields.Args === args.join(' ') && !environment;
 }
 
+const codexPolicy = [
+  ['enabled_tools', '["search", "get", "status"]'],
+  ['default_tools_approval_mode', '"writes"'],
+];
+
+async function persistCodexPolicy(env) {
+  const profile = env.CODEX_HOME ?? path.join(env.HOME ?? os.homedir(), '.codex');
+  if (!path.isAbsolute(profile)) return false;
+  const file = path.join(profile, 'config.toml');
+  let temporary;
+  try {
+    const before = await fs.readFile(file, 'utf8');
+    const stat = await fs.lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) return false;
+    const headers = [...before.matchAll(/^\s*\[([^\]\r\n]+)\][ \t]*(?:#.*)?$/gm)];
+    const owned = headers.filter(match => match[1] === 'mcp_servers.cbs_memoria' ||
+      match[1] === 'mcp_servers."cbs_memoria"');
+    if (owned.length !== 1) return false;
+    if (headers.some(match => match[1].startsWith('mcp_servers.cbs_memoria.tools.') ||
+        match[1].startsWith('mcp_servers."cbs_memoria".tools.'))) return false;
+    const header = owned[0];
+    const next = headers.find(match => match.index > header.index);
+    const start = header.index + header[0].length;
+    const end = next?.index ?? before.length;
+    let section = before.slice(start, end);
+    if (/^[ \t]*tools(?:\.|[ \t]*=)/m.test(section)) return false;
+    const newline = before.includes('\r\n') ? '\r\n' : '\n';
+    for (const [key, value] of codexPolicy) {
+      const pattern = new RegExp(`^([ \\t]*${key}[ \\t]*=[ \\t]*)([^\\r\\n]*)(\\r?\\n|$)`, 'gm');
+      const matches = [...section.matchAll(pattern)];
+      if (matches.length > 1) return false;
+      if (matches.length === 1) {
+        const current = matches[0][2].trim();
+        if (key === 'enabled_tools' && !(current.startsWith('[') && current.endsWith(']')) ||
+            key === 'default_tools_approval_mode' && !/^"[^"\r\n]*"$/.test(current)) return false;
+        section = section.replace(pattern, `$1${value}$3`);
+      } else {
+        section = `${section}${section.endsWith(newline) || !section ? '' : newline}${key} = ${value}${newline}`;
+      }
+    }
+    const after = before.slice(0, start) + section + before.slice(end);
+    if (after === before) return true;
+    temporary = path.join(profile, `.config.toml.cbs-${process.pid}-${Date.now()}`);
+    await fs.writeFile(temporary, after, { mode: 0o600, flag: 'wx' });
+    const now = await fs.lstat(file);
+    if (now.ino !== stat.ino || now.size !== stat.size || now.mtimeMs !== stat.mtimeMs) return false;
+    await fs.rename(temporary, file);
+    temporary = undefined;
+    return true;
+  } catch { return false; }
+  finally { if (temporary) await fs.rm(temporary, { force: true }).catch(() => {}); }
+}
+
 export async function registerReadonlyMcp(projectRoot, cli, { env = process.env } = {}) {
   if (!['claude', 'codex'].includes(cli)) return unavailable('invalid_cli', cli, projectRoot);
   const args = cli === 'claude'
@@ -41,8 +97,9 @@ export async function registerReadonlyMcp(projectRoot, cli, { env = process.env 
   const found = run(cli, getArgs, projectRoot, env);
   if (found.error) return unavailable('mcp_cli_unavailable', cli, projectRoot);
   if (found.status === 0) {
-    return matches(cli, found.stdout, process.execPath, args)
-      ? { kind: 'existing' } : unavailable('mcp_conflict', cli, projectRoot);
+    if (!matches(cli, found.stdout, process.execPath, args)) return unavailable('mcp_conflict', cli, projectRoot);
+    if (cli === 'codex' && !await persistCodexPolicy(env)) return unavailable('mcp_registration_failed', cli, projectRoot);
+    return { kind: 'existing' };
   }
   const missing = cli === 'claude'
     ? /No MCP server named "cbs_memoria"/.test(found.stderr)
@@ -55,6 +112,7 @@ export async function registerReadonlyMcp(projectRoot, cli, { env = process.env 
   if (added.error || added.status !== 0) return unavailable('mcp_registration_failed', cli, projectRoot);
   const verified = run(cli, getArgs, projectRoot, env);
   return !verified.error && verified.status === 0 &&
-    matches(cli, verified.stdout, process.execPath, args)
+    matches(cli, verified.stdout, process.execPath, args) &&
+    (cli !== 'codex' || await persistCodexPolicy(env))
     ? { kind: 'registered' } : unavailable('mcp_registration_failed', cli, projectRoot);
 }

@@ -169,7 +169,7 @@ def _time(value: str) -> datetime:
     return parsed
 
 
-def _memory(client, collection: str, state: Path, connection: dict):
+def _memory(client, collection: str, state: Path, connection: dict, history_db_path: str | None = None):
     from mem0.configs.base import MemoryConfig
     from mem0.configs.llms.base import BaseLlmConfig
     from mem0.memory.main import Memory
@@ -192,7 +192,7 @@ def _memory(client, collection: str, state: Path, connection: dict):
             'port': connection['port'], 'path': None, 'collection_name': collection, 'embedding_model_dims': 384}},
         embedder={'provider': 'ollama', 'config': {'model': 'multilingual-e5-small', 'embedding_dims': 384}},
         llm={'provider': 'ollama', 'config': {}},
-        history_db_path=str(state / 'mem0' / 'history.db'),
+        history_db_path=history_db_path if history_db_path is not None else str(state / 'mem0' / 'history.db'),
     )
     return Memory(config)
 
@@ -348,7 +348,7 @@ def execute_readonly(request: dict, client, state: Path) -> dict:
     if source != 'curated':
         raise ValueError('invalid_source')
     verify_collection(client, native, FINGERPRINT)
-    memory = _memory(client, native, state, request['connection'])
+    memory = _memory(client, native, state, request['connection'], history_db_path=':memory:')
     row = _row(memory.get(identifier), client, native, memory.embedding_model)
     if row is None or row['projectId'] != project or row['status'] != 'active':
         return {'kind': 'blocked', 'reason': 'source_unavailable'}
@@ -380,8 +380,9 @@ def execute(request: dict, client, state: Path) -> dict:
     if not isinstance(project, str) or not project or not isinstance(collection, str) or not collection:
         raise ValueError('invalid_identity')
     verify_collection(client, collection, FINGERPRINT)
-    memory = _memory(client, collection, state, request['connection'])
     op = request['op']
+    memory = _memory(client, collection, state, request['connection'], history_db_path=':memory:') \
+        if op == 'search' else _memory(client, collection, state, request['connection'])
     if op == 'find':
         return {'kind': 'items', 'items': _find(memory, client, collection, project, external)}
     if op == 'read':

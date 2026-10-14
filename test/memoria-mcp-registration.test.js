@@ -45,6 +45,8 @@ if (args[1] === 'add') {
   const separator = args.indexOf('--');
   state.cbs_memoria = { scope, command: args[separator + 1], args: args.slice(separator + 2) };
   fs.writeFileSync(file, JSON.stringify(state));
+  if (cli === 'codex' && !fs.existsSync(path.join(home, 'config.toml')))
+    fs.writeFileSync(path.join(home, 'config.toml'), '[mcp_servers.cbs_memoria]\\ncommand = "node"\\nargs = []\\n');
   process.exit(0);
 }
 process.exit(2);
@@ -59,6 +61,60 @@ process.exit(2);
   const calls = async () => JSON.parse(await fs.readFile(path.join(profile, 'calls.json'), 'utf8'));
   return { dir, project, profile, env, state, calls };
 }
+
+test('Codex persists scoped read-only policy and preserves unrelated TOML byte for byte', async t => {
+  const f = await fixture(t);
+  const config = path.join(f.profile, 'config.toml');
+  const other = '[other]\nvalue = "keep me"\n\n';
+  await fs.writeFile(config, `${other}[mcp_servers.cbs_memoria]\ncommand = "node"\nargs = []\n\n[tail]\nx = 1\n`);
+  assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).kind, 'registered');
+  const after = await fs.readFile(config, 'utf8');
+  assert.ok(after.startsWith(other));
+  assert.ok(after.endsWith('[tail]\nx = 1\n'));
+  assert.match(after, /\[mcp_servers\.cbs_memoria\][\s\S]*enabled_tools = \["search", "get", "status"\]/);
+  assert.match(after, /\[mcp_servers\.cbs_memoria\][\s\S]*default_tools_approval_mode = "writes"/);
+  assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).kind, 'existing');
+  assert.equal(await fs.readFile(config, 'utf8'), after);
+  assert.ok((await f.calls()).every(call => !call.args.includes('-c')));
+});
+
+test('Codex repairs policy drift on owned entry, but leaves a conflicting server unchanged', async t => {
+  const f = await fixture(t);
+  const config = path.join(f.profile, 'config.toml');
+  await fs.writeFile(config, '[mcp_servers.cbs_memoria]\nenabled_tools = ["search", "write"]\ndefault_tools_approval_mode = "approve"\n');
+  assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).kind, 'registered');
+  assert.match(await fs.readFile(config, 'utf8'), /enabled_tools = \["search", "get", "status"\]/);
+  assert.match(await fs.readFile(config, 'utf8'), /default_tools_approval_mode = "writes"/);
+  const current = await fs.readFile(config, 'utf8');
+  const state = await f.state();
+  state.cbs_memoria.command = '/other';
+  await fs.writeFile(path.join(f.profile, 'servers.json'), JSON.stringify(state));
+  assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).reason, 'mcp_conflict');
+  assert.equal(await fs.readFile(config, 'utf8'), current);
+});
+
+test('Codex fails closed if its owned TOML stanza is absent or ambiguous', async t => {
+  const f = await fixture(t);
+  const config = path.join(f.profile, 'config.toml');
+  await fs.writeFile(config, '[other]\nx = 1\n');
+  assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).reason, 'mcp_registration_failed');
+  const state = await f.state();
+  delete state.cbs_memoria;
+  await fs.writeFile(path.join(f.profile, 'servers.json'), JSON.stringify(state));
+  const duplicate = '[mcp_servers.cbs_memoria]\ncommand = "node"\n[mcp_servers.cbs_memoria]\ncommand = "node"\n';
+  await fs.writeFile(config, duplicate);
+  assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).reason, 'mcp_registration_failed');
+  assert.equal(await fs.readFile(config, 'utf8'), duplicate);
+});
+
+test('Codex refuses an owned server with a per-tool approval override', async t => {
+  const f = await fixture(t);
+  const config = path.join(f.profile, 'config.toml');
+  const before = '[mcp_servers.cbs_memoria]\ncommand = "node"\n[mcp_servers.cbs_memoria.tools.search]\napproval_mode = "approve"\n';
+  await fs.writeFile(config, before);
+  assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).reason, 'mcp_registration_failed');
+  assert.equal(await fs.readFile(config, 'utf8'), before);
+});
 
 test('Claude registra MCP local no projeto, preserva terceiros e é idempotente', async t => {
   const f = await fixture(t);

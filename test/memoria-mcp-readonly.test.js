@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { createReadonlyMcp, installReadonlyShutdown } from '../base/memoria/mcp-readonly.mjs';
+import { createReadonlyMcp, installReadonlyShutdown, readonlyDefinitions } from '../base/memoria/mcp-readonly.mjs';
 import { inspectConfiguration } from '../base/memoria/provider.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
@@ -32,6 +32,13 @@ async function fixture(t) {
 const item = { sdkId: 'mem-1', projectId: 'project-one', status: 'active', text: 'Use Postgres.',
   score: .97, scoreSource: 'mem0_sdk_search', metadata: { scope: 'project', source: 'message-1',
     actor: 'user', origin: 'user_direct', speaker_role: 'user', evidence_at: '2026-10-01T00:00:00Z' } };
+
+test('all exposed standalone tools declare closed, idempotent read-only behavior', () => {
+  assert.deepEqual(readonlyDefinitions.map(tool => tool.name), ['search', 'get', 'status']);
+  for (const tool of readonlyDefinitions) assert.deepEqual(tool.annotations, {
+    readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false,
+  });
+});
 
 test('standalone MCP searches approved project memory without session or launcher', async t => {
   const f = await fixture(t);
