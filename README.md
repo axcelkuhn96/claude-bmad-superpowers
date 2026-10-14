@@ -325,6 +325,34 @@ Para importar o histórico gerado anteriormente pelo claude-mem, veja [o tutoria
 
 Uma avaliação contextual pequena usou uma instrução humana real e uma nova tarefa em sessões nativas de Claude Code e Codex. Nos dois CLIs, a memória lembrou a restrição que os controles omitiram; os controles também permaneceram seguros. As quatro respostas não executaram ferramentas. A auditoria Astra validou esse benefício mínimo, limitado ao caso avaliado.
 
+### Avaliação offline da curadoria
+
+O corpus versionado em `base/memoria/evals/curation-v1.json` contém nove casos de conversa, memória anterior e decisão esperada (`keep`, `omit` ou `correct`), incluindo três casos `holdout`. Para avaliar saídas já capturadas de um extrator, crie um JSON com o mesmo `case_id` e a saída candidata. Exemplo mínimo de abstenção:
+
+```json
+{"version":1,"results":[{"case_id":"mizu-transient-cbs-status","output":{"no_facts":true,"candidates":[]}}]}
+```
+
+```sh
+cbs memoria avaliar --outputs /caminho/resultados.json --split dev
+cbs memoria avaliar --corpus /caminho/corpus.json --outputs /caminho/resultados.json --split holdout
+```
+
+O relatório JSON mede cobertura e checagens determinísticas de contrato, referências à conversa, segredo, estado temporário e duplicata exata. Tentativas, tokens, latência e custo só são computados quando informados no arquivo de saídas. Para métricas semânticas de falso salvamento, omissão, correção, escopo e tipo, cada candidato precisa de adjudicação declarada `fixture` ou `human` com justificativa; o CBS não verifica quem a declarou. Sem ela, `semantic.status` é `unmeasured`. O comando é offline e não chama Haiku, embedding, broker ou Qdrant. Esse ensaio avalia **candidatos fornecidos**, não memória realmente gravada; o corpus publicado não prova independência estatística nem qualidade geral do modelo.
+
+### Inventário incremental de skills
+
+```sh
+cbs skills inventario --json
+cbs skills inventario --save-snapshot ~/.local/state/cbs/skills-inventory/snapshot.json
+cbs skills inventario --changed --json
+cbs skills inventario --root /caminho/skills --snapshot ~/.local/state/cbs/skills-inventory/snapshot.json --changed
+```
+
+O inventário lê `SKILL.md` das raízes globais Claude, Codex e `.agents`, das skills do projeto atual e dos caches de plugins. `CLAUDE_CONFIG_DIR` e `CODEX_HOME` selecionam os perfis correspondentes. Uma raiz explícita com `--root` substitui o conjunto padrão. A primeira execução tem baseline `unknown`; só após salvar um snapshot privado o hash do conteúdo distingue `added`, `changed`, `unchanged` e `deleted`. `--changed` apresenta apenas alterações identificadas. Referências locais ausentes e nomes iguais com conteúdo divergente são sinais para revisão manual. Um arquivo presente no cache não comprova plugin habilitado ou carregado na sessão; o relatório marca essa fonte `runtime_unverified`. Uso não é medido, e hash igual não prova compatibilidade semântica. O inventário não executa nem atualiza skills.
+
+Para site público novo ou redesign, o [rulebook frontend](base/personas/dominios/frontend-referencia.md) acrescenta ao brief/report existente a finalidade e a afirmação de cada seção, sua fonte de prova e a origem/licença ou prompt do asset. A captura Playwright confirma se o asset realmente apareceu. Esse critério foi adaptado do [Taste skill observado](https://github.com/Leonxlnx/taste-skill/blob/f624f37a8c650b9cc550253104925efe4c8de246/skills/taste-skill/SKILL.md); a avaliação e o inventário foram inspirados nos [conceitos de eval do ECC](https://github.com/affaan-m/ECC/blob/b92f181b3b748d1abbc2afd94af6aa7d8c8fca29/skills/eval-harness/SKILL.md) e de [stocktake do ECC](https://github.com/affaan-m/ECC/blob/b92f181b3b748d1abbc2afd94af6aa7d8c8fca29/skills/skill-stocktake/SKILL.md).
+
 Um ensaio local isolado completou o ciclo automático em ambas as CLIs: hooks capturaram a fonte, o checkpoint acionou Haiku, a revisão no terminal gravou pelo SDK e uma sessão nova recuperou a memória. Outro ensaio validou correção de memória, indisponibilidade do Qdrant, interrupção de worker próprio e repetição do mesmo checkpoint; a recuperação retornou somente a versão ativa, sem perda ou duplicação no ensaio. A revisão desses ensaios foi automatizada para QA e não substitui o aceite humano do proprietário. O transporte HTTPS público do Qdrant também passou por teste remoto limitado de TLS, autenticação e operações SDK; essa prova não cobre o pipeline completo de memórias no servidor remoto.
 
 **Experimental em Linux:** a rota de ativação em sessões normais de Claude Code e Codex passou a prova nativa limitada; os estados locais de confiança e propriedade continuam obrigatórios. Windows segue sem prova de release (`windows_release_unproved`) e será validado por outro responsável. Isso não representa aceite de qualidade geral: julgamento do proprietário, RF-19 completo e pipeline de memórias no Qdrant remoto permanecem pendentes. A operação entre duas máquinas foi adiada pelo proprietário para depois da implantação.
@@ -485,6 +513,8 @@ cbs instalar-bmad    # só BMAD no diretório atual (interativo, PT-BR) + regist
 cbs atualizar        # self-update + skills/comandos/personas + Superpowers + BMAD dos projetos
 cbs remover          # desinstala skills/comandos (preserva cbs-overrides/)
 cbs status           # versões (pacote, Superpowers, BMAD por projeto), skills/comandos, personas
+cbs memoria avaliar --outputs resultados.json  # avaliação offline de candidatos de memória
+cbs skills inventario --changed --json          # skills alteradas desde o snapshot privado
 ```
 
 **Flags do `atualizar`:**

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { loadMemoryCorpus, loadMemoryOutputs, evaluateMemoryOutputs } from '../base/memoria/evaluation.mjs';
 
 const fixturePath = path.join(path.dirname(fileURLToPath(import.meta.url)),
-  'fixtures/memoria-eval/curation-v1.json');
+  '../base/memoria/evals/curation-v1.json');
 
 const outputFor = (entry, candidates) => ({ case_id: entry.id,
   output: { no_facts: candidates.length === 0, candidates } });

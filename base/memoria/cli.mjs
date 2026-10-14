@@ -15,7 +15,7 @@ import { administrativeSession, assertWriter, bootstrapWriter, beginWriterTransf
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const help = `Uso: cbs memoria <ação> [opções]
-Ações: status, check, provision, activate, launch, review-correct, deactivate,
+Ações: avaliar, status, check, provision, activate, launch, review-correct, deactivate,
        owner-register, extractor-select, extractor-schedule,
        auto-publish-enable, auto-publish-disable,
        writer-device, writer-bootstrap,
@@ -24,6 +24,7 @@ Use --project /caminho/git nas ações de projeto. O cadastro pessoal e a seleç
 do extrator exigem declaração local explícita; publicação automática exige opt-in local
 por projeto, owner e writer designado.
 Activate aceita --allow-tracked-native para configuração nativa versionada autorizada.
+Avaliar é offline: cbs memoria avaliar --outputs arquivo.json [--corpus arquivo.json] [--split dev|holdout|all].
 `;
 const value = (args, flag) => args.includes(flag) ? args[args.indexOf(flag) + 1] : null;
 const readSecret = readQdrantSecret;
@@ -47,6 +48,10 @@ async function subprocess(script, args) {
 export async function main(args = []) {
   const [action, ...rest] = args;
   if (!action || action === 'help' || action === '--help') { process.stdout.write(help); return 0; }
+  if (action === 'avaliar') {
+    const { evaluateCli } = await import('./evaluation-cli.mjs');
+    return evaluateCli(rest);
+  }
   if (action === 'hook') {
     const [operation, encoded] = rest;
     if ((operation === 'start' && rest.length === 1) ||

@@ -31,6 +31,7 @@ Comandos:
   remover          Desinstala skills/commands do pacote (preserva overrides)
   status           Versões (pacote, Superpowers, BMAD por projeto), skills/commands/personas, models.yml
   memoria          Operações Mem0 locais (cbs memoria help)
+  skills           Inventário incremental de skills (cbs skills inventario --help)
 
 Flags do instalar:
   --apenas-global       Não instala BMAD no cwd (skills/commands/Superpowers somente)
@@ -72,6 +73,16 @@ async function main() {
       process.exitCode = await memoria(process.argv.slice(3));
     } catch (err) {
       console.error(`CBS Mem0: ${err.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (sub === 'skills') {
+    try {
+      const { skillsCli } = await import('../src/skills-cli.js');
+      process.exitCode = await skillsCli(process.argv.slice(3));
+    } catch (err) {
+      console.error(`CBS skills: ${err.message}`);
       process.exitCode = 1;
     }
     return;

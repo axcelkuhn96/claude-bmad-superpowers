@@ -2,6 +2,15 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.15.0] - 2026-10-14
+
+### Adicionado
+- **Avaliação offline da curadoria:** `cbs memoria avaliar --outputs resultados.json [--corpus corpus.json] [--split dev|holdout|all]` compara saídas fornecidas com um corpus versionado de nove casos, incluindo três reservados para revisão. Relata contrato, evidência, segredos, estados temporários, duplicatas exatas, cobertura, tentativas e uso informado. Métricas semânticas dependem de adjudicação declarada; fixtures não medem precisão do Haiku nem confirmam gravações no Qdrant. O comando não chama modelo, embedding ou serviço de memória.
+- **Inventário incremental de skills:** `cbs skills inventario` lê `SKILL.md` nas raízes globais, do projeto e dos caches de plugins Claude/Codex, com limites de leitura. `--snapshot`, `--save-snapshot`, `--changed`, `--root` e `--json` comparam hash de conteúdo e referências locais; snapshots de escrita ficam no estado privado do CBS. Cache em disco não comprova plugin habilitado, divergência de hash é informativa e uso permanece não medido.
+- **Brief de site público por seção:** o rulebook frontend pede objetivo, afirmação comprovada, fonte e origem/licença ou prompt do asset no brief/report existente; presença visual é conferida em captura Playwright. Restrito a sites públicos novos ou redesenhos.
+
+Inspiração seletiva: [ECC eval-harness](https://github.com/affaan-m/ECC/blob/b92f181b3b748d1abbc2afd94af6aa7d8c8fca29/skills/eval-harness/SKILL.md), [ECC skill-stocktake](https://github.com/affaan-m/ECC/blob/b92f181b3b748d1abbc2afd94af6aa7d8c8fca29/skills/skill-stocktake/SKILL.md) (MIT, Affaan Mustafa) e [Taste skill](https://github.com/Leonxlnx/taste-skill/blob/f624f37a8c650b9cc550253104925efe4c8de246/skills/taste-skill/SKILL.md). As métricas, o inventário e o adaptador são implementações próprias do CBS; nenhum runner externo ou workflow visual foi instalado.
+
 ## [0.14.2] - 2026-10-14
 
 ### Corrigido
