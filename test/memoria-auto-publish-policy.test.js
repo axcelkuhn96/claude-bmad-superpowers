@@ -214,6 +214,35 @@ test('opt-in pode usar perfil secundário e registro legado fica acessível apen
   assert.equal((await readAutoPublish(f.resolution)).ownerId, 'axcel-local');
 });
 
+test('upgrade de owner legado mantém opt-in ativo e revoga ao trocar o owner', async t => {
+  const f = await fixture(t);
+  await designated(f);
+  await registerOwner(f.resolution, 'claude', f.profile, 'axcel-local', true);
+  const hashedFile = path.join(f.resolution.stateDir,
+    (await fs.readdir(f.resolution.stateDir)).find(name => name.startsWith('owner-claude-')));
+  const legacyFile = path.join(f.resolution.stateDir, 'owner-claude.json');
+  await fs.rename(hashedFile, legacyFile);
+
+  assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
+    cli: 'claude', profile: f.profile })).kind, 'enabled');
+  assert.equal((await readAutoPublish(f.resolution)).ownerId, 'axcel-local');
+  await writeLocalTrust(f.resolution.stateDir, trustTuple(f.resolution));
+  const bin = new URL('../bin/cli.js', import.meta.url).pathname;
+  const status = () => spawnSync(process.execPath,
+    [bin, 'memoria', 'status', '--project', f.project],
+    { encoding: 'utf8', env: { ...process.env, HOME: f.home } });
+  assert.equal(JSON.parse(status().stdout).autoPublish, true);
+
+  const secondary = path.join(f.home, 'claude-conta2');
+  await fs.mkdir(secondary, { mode: 0o700 });
+  await registerOwner(f.resolution, 'claude', secondary, 'axcel-local', true);
+  assert.equal((await readAutoPublish(f.resolution)).ownerId, 'axcel-local');
+  const legacy = JSON.parse(await fs.readFile(legacyFile, 'utf8'));
+  await fs.writeFile(legacyFile, JSON.stringify({ ...legacy, ownerId: 'other-owner' }), { mode: 0o600 });
+  assert.equal(await readAutoPublish(f.resolution), null);
+  assert.equal(JSON.parse(status().stdout).autoPublish, false);
+});
+
 test('consentimento legado continua válido ao registrar alias e detecta troca do owner original', async t => {
   const f = await fixture(t);
   await designated(f);

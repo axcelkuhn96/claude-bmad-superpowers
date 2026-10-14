@@ -157,10 +157,11 @@ async function validConsent(resolution, consent) {
         writer.collection !== resolution.destination.collection ||
         writer.deviceId !== consent.deviceId || writer.revoked === true ||
         !Number.isSafeInteger(writer.generation) || writer.generation < 1) return false;
-    const ownerFilePath = consent.ownerProfileHash
-      ? path.join(resolution.stateDir, `owner-${consent.ownerCli}-${consent.ownerProfileHash}.json`)
-      : path.join(resolution.stateDir, `owner-${consent.ownerCli}.json`);
-    const record = await readPrivate(ownerFilePath);
+    const legacyOwnerFile = path.join(resolution.stateDir, `owner-${consent.ownerCli}.json`);
+    const record = consent.ownerProfileHash
+      ? await readPrivate(path.join(resolution.stateDir,
+        `owner-${consent.ownerCli}-${consent.ownerProfileHash}.json`)) ?? await readPrivate(legacyOwnerFile)
+      : await readPrivate(legacyOwnerFile);
     if (typeof record?.profile !== 'string' || !path.isAbsolute(record.profile) ||
         consent.ownerProfileHash && profileHash(record.profile) !== consent.ownerProfileHash) return false;
     const owner = await readOwner(resolution, consent.ownerCli, record.profile);
