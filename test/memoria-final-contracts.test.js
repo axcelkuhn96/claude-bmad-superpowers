@@ -555,7 +555,7 @@ test('extrator unset/Sol não chama CLI; seleção Sonnet congela sessão', asyn
   const session = await initializeSession(fixture.gitRoot, 's', { event: 'SessionStart',
     stateRoot: fixture.stateRoot });
   assert.equal(session.extractor.route, 'sonnet');
-  assert.equal(session.extractor.maxCallsPerSession, 4);
+  assert.equal(session.extractor.maxCallsPerSession, 100);
   assert.equal(session.extractor.autoPublish, false);
 });
 

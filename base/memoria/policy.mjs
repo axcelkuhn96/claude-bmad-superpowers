@@ -5,6 +5,8 @@ import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
   writeWindowsPrivateFile } from './windows-security.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
+const validCalls = value => Number.isSafeInteger(value) && value >= 1 && value <= 1000;
+const validTurns = value => Number.isSafeInteger(value) && value >= 1 && value <= 100;
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const profileHash = profile => createHash('sha256').update(profile).digest('hex');
 const ownerFile = (resolution, cli, profile) => path.join(resolution.stateDir,
@@ -116,10 +118,11 @@ export async function configureExtractor(resolution, selection) {
   try {
     await writePrivate(path.join(resolution.stateDir, 'extractor.json'), {
       projectId: resolution.projectId, binding: binding(resolution), route: selection.route,
-      profile, executable, maxCallsPerSession: 4, maxCandidatesPerCheckpoint: 5,
+      profile, executable, maxCallsPerSession: 100, maxCandidatesPerCheckpoint: 5,
+      mode: 'conversation', conversationTurns: 5,
       autoPublish: false, selectedAt: new Date().toISOString() }, true);
   } catch { return blocked('unsafe_extractor_state'); }
-  return { kind: 'selected', route: selection.route, cost: 'up to four automatic paid CLI calls per session; five candidates per checkpoint; auto publication off' };
+  return { kind: 'selected', route: selection.route, cost: 'up to 100 automatic paid CLI calls per session; five candidates per checkpoint; auto publication off' };
 }
 
 export async function readExtractor(resolution) {
@@ -127,8 +130,11 @@ export async function readExtractor(resolution) {
     const value = await readPrivate(path.join(resolution.stateDir, 'extractor.json'));
     if (!value) return null;
     if (value.projectId !== resolution.projectId || value.binding !== binding(resolution) ||
-        !['sonnet', 'haiku'].includes(value.route) || value.maxCallsPerSession !== 4 ||
+        !['sonnet', 'haiku'].includes(value.route) || !validCalls(value.maxCallsPerSession) ||
         value.maxCandidatesPerCheckpoint !== 5 ||
+        (value.mode !== undefined && value.mode !== 'conversation') ||
+        (value.mode === 'conversation' && !validTurns(value.conversationTurns)) ||
+        (value.mode === undefined && value.conversationTurns !== undefined) ||
         (value.autoPublish !== false && value.autoPublish !== true) ||
         value.autoPublish === true && value.route !== 'haiku' ||
         value.autoPublish === false && value.autoPublishConsent != null) throw new Error('extractor_binding_changed');
@@ -137,6 +143,37 @@ export async function readExtractor(resolution) {
     return value.autoPublish === true && !await validConsent(resolution, value.autoPublishConsent)
       ? { ...value, autoPublish: false, autoPublishConsent: null } : value;
   } catch { return blocked('extractor_binding_changed'); }
+}
+
+export async function configureExtractionSchedule(resolution,
+  { maxCallsPerSession, mode, conversationTurns } = {}) {
+  if (!validCalls(maxCallsPerSession) || mode !== 'conversation' ||
+      !validTurns(conversationTurns)) return blocked('extractor_schedule_invalid');
+  const extractor = await readExtractor(resolution);
+  if (!extractor || extractor.kind === 'blocked') return blocked('extractor_binding_changed');
+  try {
+    const saved = await readPrivate(path.join(resolution.stateDir, 'extractor.json'));
+    if (saved?.autoPublish !== extractor.autoPublish ||
+        (saved?.autoPublishConsent?.consentHash ?? null) !==
+          (extractor.autoPublishConsent?.consentHash ?? null)) return blocked('auto_publish_consent_invalid');
+    await writePrivate(path.join(resolution.stateDir, 'extractor.json'), {
+      ...extractor, maxCallsPerSession, mode, conversationTurns }, true);
+    return { kind: 'configured', maxCallsPerSession, mode, conversationTurns };
+  } catch { return blocked('unsafe_extractor_state'); }
+}
+
+// Only scheduling fields can move forward for an already bound session. Identity and
+// the consent that authorized publication remain frozen to the original capture.
+export async function currentExtractionSchedule(resolution, frozen) {
+  if (!frozen || frozen.kind === 'blocked') return frozen;
+  const live = await readExtractor(resolution);
+  if (!live || live.kind === 'blocked' || live.route !== frozen.route ||
+      live.profile !== frozen.profile || live.executable !== frozen.executable ||
+      live.autoPublish !== frozen.autoPublish ||
+      (live.autoPublishConsent?.consentHash ?? null) !==
+        (frozen.autoPublishConsent?.consentHash ?? null)) return frozen;
+  return { ...frozen, maxCallsPerSession: live.maxCallsPerSession,
+    mode: live.mode, conversationTurns: live.conversationTurns };
 }
 
 async function validConsent(resolution, consent) {

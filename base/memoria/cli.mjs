@@ -7,7 +7,8 @@ import { inspectConfiguration } from './provider.mjs';
 import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
 import { registerOwner, configureExtractor, localDevice, readOwner, readExtractor,
-  readAutoPublish, enableAutoPublish, disableAutoPublish } from './policy.mjs';
+  readAutoPublish, enableAutoPublish, disableAutoPublish,
+  configureExtractionSchedule } from './policy.mjs';
 import { authorizeCurrentDestination } from './setup.mjs';
 import { administrativeSession, assertWriter, bootstrapWriter, beginWriterTransfer,
   completeWriterTransfer } from './authority.mjs';
@@ -15,7 +16,8 @@ import { administrativeSession, assertWriter, bootstrapWriter, beginWriterTransf
 const here = path.dirname(fileURLToPath(import.meta.url));
 const help = `Uso: cbs memoria <ação> [opções]
 Ações: status, check, provision, activate, launch, review-correct, deactivate,
-       owner-register, extractor-select, auto-publish-enable, auto-publish-disable,
+       owner-register, extractor-select, extractor-schedule,
+       auto-publish-enable, auto-publish-disable,
        writer-device, writer-bootstrap,
        writer-transfer-start, writer-transfer-complete, help
 Use --project /caminho/git nas ações de projeto. O cadastro pessoal e a seleção
@@ -95,6 +97,9 @@ export async function main(args = []) {
       collection: resolution.destination.collection, trusted,
       owner: owner?.ownerId ?? autoPublishConsent?.ownerId ?? null,
       extractor: extractor?.route ?? null,
+      maxCallsPerSession: extractor?.maxCallsPerSession ?? null,
+      extractionMode: extractor?.mode ?? (extractor?.route ? 'prompt' : null),
+      conversationTurns: extractor?.conversationTurns ?? null,
       autoPublish: trusted && autoPublishConsent !== null,
       release: process.platform === 'linux' ? 'linux_experimental' : 'blocked' }) + '\n');
     return 0;
@@ -119,12 +124,22 @@ export async function main(args = []) {
     const route = value(rest, '--route');
     if (route === 'sol') { process.stdout.write('blocked: sol_tool_isolation_unproved\n'); return 1; }
     if (!['sonnet', 'haiku'].includes(route) || !await askConfirmation(
-      `${route} cobra até quatro chamadas automáticas por sessão, cinco candidatos/checkpoint; publicação automática off. Digite ${resolution.projectId}: `,
+      `${route} cobra até 100 chamadas automáticas por sessão, cinco candidatos/checkpoint; publicação automática off. Digite ${resolution.projectId}: `,
       resolution.projectId)) return 1;
     const result = await configureExtractor(resolution, { route,
       profile: value(rest, '--profile'), executable: value(rest, '--executable') });
     process.stdout.write(`${result.kind}: ${result.reason ?? result.cost}\n`);
     return result.kind === 'selected' ? 0 : 1;
+  }
+  if (action === 'extractor-schedule') {
+    const calls = value(rest, '--max-calls');
+    const turns = value(rest, '--turns');
+    const mode = value(rest, '--mode');
+    const result = await configureExtractionSchedule(resolution, {
+      maxCallsPerSession: /^(?:[1-9]\d{0,3})$/.test(calls ?? '') ? Number(calls) : NaN,
+      mode, conversationTurns: /^(?:[1-9]\d{0,2})$/.test(turns ?? '') ? Number(turns) : NaN });
+    process.stdout.write(`${result.kind}: ${result.reason ?? `${result.mode} every ${result.conversationTurns} turns; ${result.maxCallsPerSession} calls/session`}\n`);
+    return result.kind === 'configured' ? 0 : 1;
   }
   if (action === 'auto-publish-disable') {
     const result = await disableAutoPublish(resolution);

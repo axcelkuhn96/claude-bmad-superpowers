@@ -7,7 +7,8 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { inspectConfiguration, initializeSession, resolveProject } from '../base/memoria/provider.mjs';
 import { registerOwner, configureExtractor, enableAutoPublish, disableAutoPublish,
-  readAutoPublish, readExtractor, readOwner, localDevice } from '../base/memoria/policy.mjs';
+  readAutoPublish, readExtractor, readOwner, localDevice, configureExtractionSchedule,
+  currentExtractionSchedule } from '../base/memoria/policy.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 
@@ -75,6 +76,94 @@ test('opt-in exige owner registrado e writer designado, e congela consentimento 
   assert.equal(unrelated.provider, 'mem0');
   assert.equal(unrelated.ownerId, null);
   assert.equal(unrelated.extractor.autoPublish, false);
+});
+
+test('orçamento novo usa 100 chamadas e cinco trocas; migração preserva consentimento', async t => {
+  const f = await fixture(t);
+  assert.equal((await readExtractor(f.resolution)).maxCallsPerSession, 100);
+  assert.equal((await readExtractor(f.resolution)).mode, 'conversation');
+  assert.equal((await readExtractor(f.resolution)).conversationTurns, 5);
+  await designated(f);
+  await registerOwner(f.resolution, 'claude', f.profile, 'axcel-local', true);
+  assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
+    cli: 'claude', profile: f.profile })).kind, 'enabled');
+  const file = path.join(f.resolution.stateDir, 'extractor.json');
+  const legacy = { ...await readExtractor(f.resolution), maxCallsPerSession: 4 };
+  delete legacy.mode;
+  delete legacy.conversationTurns;
+  await fs.writeFile(file, JSON.stringify(legacy), { mode: 0o600 });
+  assert.equal((await readExtractor(f.resolution)).maxCallsPerSession, 4);
+  assert.equal((await configureExtractionSchedule(f.resolution, {
+    maxCallsPerSession: 100, mode: 'conversation', conversationTurns: 5 })).kind, 'configured');
+  const updated = await readExtractor(f.resolution);
+  assert.equal(updated.maxCallsPerSession, 100);
+  assert.equal(updated.mode, 'conversation');
+  assert.equal(updated.conversationTurns, 5);
+  assert.equal(updated.autoPublishConsent.consentHash, legacy.autoPublishConsent.consentHash);
+  assert.equal(updated.profile, legacy.profile);
+  assert.equal(updated.executable, legacy.executable);
+  assert.equal(updated.selectedAt, legacy.selectedAt);
+  assert.equal((await currentExtractionSchedule(f.resolution, legacy)).maxCallsPerSession, 100);
+  assert.equal((await currentExtractionSchedule(f.resolution, {
+    ...legacy, executable: '/different' })).maxCallsPerSession, 4);
+  assert.equal((await currentExtractionSchedule(f.resolution, {
+    ...legacy, autoPublishConsent: { consentHash: 'different' } })).maxCallsPerSession, 4);
+});
+
+test('orçamento recusa valores ilimitados ou malformados sem alterar política', async t => {
+  const f = await fixture(t);
+  const before = await readExtractor(f.resolution);
+  for (const bad of [0, -1, 1001, 1.5, Infinity, '100', null]) {
+    assert.equal((await configureExtractionSchedule(f.resolution, {
+      maxCallsPerSession: bad, mode: 'conversation', conversationTurns: 5 })).kind, 'blocked');
+  }
+  assert.equal((await configureExtractionSchedule(f.resolution, {
+    maxCallsPerSession: 100, mode: 'conversation', conversationTurns: 0 })).kind, 'blocked');
+  assert.deepEqual(await readExtractor(f.resolution), before);
+});
+
+test('orçamento não grava consentimento saneado quando writer fica indisponível', async t => {
+  const f = await fixture(t);
+  await designated(f);
+  await registerOwner(f.resolution, 'claude', f.profile, 'axcel-local', true);
+  assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
+    cli: 'claude', profile: f.profile })).kind, 'enabled');
+  const file = path.join(f.resolution.stateDir, 'extractor.json');
+  const before = await fs.readFile(file, 'utf8');
+  const writer = path.join(f.resolution.stateDir, 'ledger', 'writer.json');
+  const writerText = await fs.readFile(writer, 'utf8');
+  await fs.rm(writer);
+  assert.equal((await configureExtractionSchedule(f.resolution, {
+    maxCallsPerSession: 200, mode: 'conversation', conversationTurns: 5 })).kind, 'blocked');
+  assert.equal(await fs.readFile(file, 'utf8'), before);
+  await fs.writeFile(writer, writerText, { mode: 0o600 });
+  assert.equal((await readAutoPublish(f.resolution)).consentHash,
+    JSON.parse(before).autoPublishConsent.consentHash);
+});
+
+test('CLI ajusta agenda existente e status mostra limite sem refazer opt-in', async t => {
+  const f = await fixture(t);
+  await designated(f);
+  await registerOwner(f.resolution, 'claude', f.profile, 'axcel-local', true);
+  assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
+    cli: 'claude', profile: f.profile })).kind, 'enabled');
+  const consentHash = (await readAutoPublish(f.resolution)).consentHash;
+  const bin = new URL('../bin/cli.js', import.meta.url).pathname;
+  const run = args => spawnSync(process.execPath,
+    [bin, 'memoria', ...args, '--project', f.project],
+    { encoding: 'utf8', env: { ...process.env, HOME: f.home } });
+  const changed = run(['extractor-schedule', '--mode', 'conversation',
+    '--turns', '5', '--max-calls', '200']);
+  assert.equal(changed.status, 0, changed.stdout + changed.stderr);
+  const status = run(['status']);
+  assert.equal(status.status, 0, status.stdout + status.stderr);
+  assert.equal(JSON.parse(status.stdout).maxCallsPerSession, 200);
+  assert.equal(JSON.parse(status.stdout).extractionMode, 'conversation');
+  assert.equal(JSON.parse(status.stdout).conversationTurns, 5);
+  assert.equal((await readAutoPublish(f.resolution)).consentHash, consentHash);
+  assert.equal(run(['extractor-schedule', '--mode', 'conversation',
+    '--turns', '5', '--max-calls', 'unlimited']).status, 1);
+  assert.equal((await readExtractor(f.resolution)).maxCallsPerSession, 200);
 });
 
 test('revogação desliga consentimento atual e não promove sessão antiga', async t => {
