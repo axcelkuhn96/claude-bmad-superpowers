@@ -11,6 +11,17 @@ import { createOutbox } from './outbox.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'python', 'mem0_adapter.py');
+const sameAutoConsent = (frozen, live, resolution) => frozen?.version === 1 &&
+  frozen.enabled === true && live?.version === 1 && live.enabled === true &&
+  resolution.extractor?.autoPublish === true &&
+  resolution.ownerId === frozen.ownerId &&
+  frozen.projectId === resolution.projectId && live.projectId === resolution.projectId &&
+  ['consentHash', 'destinationHash', 'ownerId', 'deviceId', 'enabledAt']
+    .every(key => typeof frozen[key] === 'string' && frozen[key] && frozen[key] === live[key]);
+async function autoConsentCurrent(resolution, frozen, options) {
+  const read = options.readAutoPublish ?? (await import('./policy.mjs')).readAutoPublish;
+  return sameAutoConsent(frozen, await read(resolution), resolution);
+}
 
 export async function runBridgeOperation(cwd, sessionId, operation, readSecret, options = {}) {
   const deadlineAt = options.deadlineAt ?? (options.deadlineMs != null ? Date.now() + options.deadlineMs : null);
@@ -25,6 +36,13 @@ export async function runBridgeOperation(cwd, sessionId, operation, readSecret, 
   if (['add', 'activate'].includes(operation.op)) {
     const writer = await assertWriter(resolution, auth, options);
     if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+    if (options.autoPublishConsent &&
+        !await autoConsentCurrent(resolution, options.autoPublishConsent, options)) {
+      return blocked('auto_publish_revoked');
+    }
+    if (operation.approval?.mode === 'automatic' && !options.autoPublishConsent) {
+      return blocked('auto_publish_unproved');
+    }
   }
   const remaining = deadlineAt === null ? options.deadlineMs ?? undefined : Math.floor(deadlineAt - Date.now());
   if (deadlineAt !== null && remaining <= 0) return blocked('deadline');
@@ -48,7 +66,16 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
   } catch { return blocked('invalid_source_identity'); }
   const resolution = await (options.resolve ?? resolveProject)(cwd, sessionId, options);
   if (resolution.provider !== 'mem0' || resolution.projectId !== operation.projectId) return blocked('project_mismatch');
-  if (operation.metadata.format_version === 2) {
+  if (operation.metadata.review_mode === 'automatic' || operation.approval?.mode === 'automatic') {
+    if (operation.metadata.review_mode !== 'automatic' || operation.approval?.mode !== 'automatic' ||
+        operation.metadata.format_version !== 3 ||
+        operation.metadata.auto_actor !== 'project_auto_publisher' ||
+        operation.metadata.auto_consent_hash !== options.autoPublishConsent?.consentHash ||
+        !await autoConsentCurrent(resolution, options.autoPublishConsent, options)) {
+      return blocked('auto_publish_unproved');
+    }
+  }
+  if ([2, 3].includes(operation.metadata.format_version)) {
     const source = await createOutbox(resolution.stateDir).sourceForRemote(operation);
     if (source.kind !== 'local_source') return blocked('source_review_unproved');
   }
@@ -58,6 +85,10 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
     if (auth.kind !== 'authorized') return auth;
     const writer = await assertWriter(resolution, auth, options);
     if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+    if (operation.approval?.mode === 'automatic' &&
+        !await autoConsentCurrent(resolution, options.autoPublishConsent, options)) {
+      return blocked('auto_publish_revoked');
+    }
     const checkTarget = async () => {
       const targetId = operation.metadata.supersedes_id;
       if (!targetId) return { kind: 'eligible' };

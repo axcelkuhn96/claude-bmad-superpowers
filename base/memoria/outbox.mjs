@@ -55,10 +55,14 @@ export function createOutbox(stateDir, options = {}) {
     `extract-${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.json`);
   const hash = value => createHash('sha256').update(value).digest('hex');
   const v2PayloadValid = (data, original) => data.format_version === undefined ||
-    data.format_version === 2 && typeof original?.text === 'string' &&
+    [2, 3].includes(data.format_version) && typeof original?.text === 'string' &&
     data.source_text_sha256 === hash(original.text) &&
     data.claim_sha256 === hash(JSON.stringify([data.text, data.type, data.scope,
       data.condition ?? null, data.valid_from ?? null, data.valid_to ?? null])) &&
+    (data.format_version !== 3 || original.origin === 'human' &&
+      original.text.includes(data.text) && ['rule', 'fact', 'preference', 'decision'].includes(data.type) &&
+      data.scope !== 'episode' && data.condition == null && data.valid_from == null &&
+      data.valid_to == null) &&
     data.actor === original.actor && data.speaker_role === original.speakerRole &&
     data.evidence_at === original.timestamp &&
     data.origin === (original.origin === 'human' ? 'user_direct' :
@@ -356,7 +360,8 @@ export function createOutbox(stateDir, options = {}) {
       a.sessionId.localeCompare(b.sessionId) || a.start - b.start);
     return Promise.all(rows.map(async row => {
       const retry = await read(retryFile(row.operationId));
-      if (retry && (!Number.isSafeInteger(retry.attempts) || retry.attempts < 1 || retry.attempts > 5 ||
+      if (retry && (!Number.isSafeInteger(retry.attempts) || retry.attempts < 1 ||
+          retry.attempts > (retry.automatic === true ? Number.MAX_SAFE_INTEGER : 5) ||
           !Number.isSafeInteger(retry.retryAt) || typeof retry.lastError !== 'string')) {
         throw new Error('corrupt_retry');
       }
@@ -734,6 +739,12 @@ export function createOutbox(stateDir, options = {}) {
       return await payloadValid(candidate.payloadRef, row, candidate) || blocked('candidate_payload_mismatch');
     });
   }
+  function rowSourceValid(row, payload, text) {
+    const source = row?.messages?.find(message => message.messageId === payload.source_message_id &&
+      message.start === payload.source_offsets.start && message.end === payload.source_offsets.end);
+    return source?.origin === 'human' && typeof source.text === 'string' &&
+      hash(source.text) === payload.source_text_sha256 && source.text.includes(text);
+  }
   async function sourceForRemote(item) {
     const externalId = item?.externalId;
     if (!validId(externalId) || typeof item.projectId !== 'string' ||
@@ -776,8 +787,8 @@ export function createOutbox(stateDir, options = {}) {
           payload.scope !== metadata.scope || payload.owner_id !== (metadata.owner_id ?? null) ||
           payload.actor !== metadata.actor || payload.origin !== metadata.origin ||
           payload.evidence_at !== metadata.evidence_at ||
-          payload.format_version === 2 && (payload.type !== metadata.type ||
-            payload.speaker_role !== metadata.speaker_role || metadata.format_version !== 2 ||
+          [2, 3].includes(payload.format_version) && (payload.type !== metadata.type ||
+            payload.speaker_role !== metadata.speaker_role || metadata.format_version !== payload.format_version ||
             payload.source_text_sha256 !== metadata.source_text_sha256 ||
             metadata.claim_sha256 !== hash(JSON.stringify([item.text, metadata.type,
               metadata.scope, metadata.condition ?? null, metadata.valid_from ?? null,
@@ -792,21 +803,33 @@ export function createOutbox(stateDir, options = {}) {
               payload.valid_to ?? null])))) {
         return blocked('source_mismatch');
       }
-      if (payload.format_version === 2) {
+      const sourceRow = await read(itemFile(metadata.checkpoint_id));
+      const processed = await read(processedFile(metadata.checkpoint_id));
+      const processedChild = processed?.candidates?.find(candidate =>
+        candidate.externalId === externalId && candidate.payloadRef?.sha256 ===
+          names[0].slice(externalId.length + 1, -5) && candidate.status === 'remote_acked');
+      if (payload.format_version === 3 && (payload.origin !== 'user_direct' ||
+          !(sourceRow ? rowSourceValid(sourceRow, payload, item.text) : processedChild) ||
+          item.text !== payload.text || metadata.review_mode !== 'automatic' ||
+          !/^[a-f0-9]{64}$/.test(metadata.auto_consent_hash ?? '') ||
+          metadata.auto_actor !== 'project_auto_publisher')) return blocked('source_mismatch');
+      if ([2, 3].includes(payload.format_version)) {
         const { redactSource, containsSecret } = await import('./candidates.mjs');
         if (containsSecret(item.text) || redactSource(item.text) !== item.text) {
           return blocked('source_mismatch');
         }
       }
       const record = await verifiedReviewFile(path.join(reviews, `${externalId}.json`));
-      const processed = await read(processedFile(metadata.checkpoint_id));
-      if (processed || item.status === 'active' || record) {
+      if (processed || item.status === 'active' || record || payload.format_version === 3) {
         const proof = record?.review?.sourceProof;
         const operation = record?.review?.operation;
         if (record?.externalId !== externalId || record.operationId !== metadata.checkpoint_id ||
             record.payloadSha256 !== names[0].slice(externalId.length + 1, -5) ||
             record.digest !== hash(JSON.stringify(record.review)) ||
             !['approve', 'correct'].includes(record.review.decision) ||
+            payload.format_version === 3 && (record.review.mode !== 'automatic' ||
+              record.review.actor !== 'project_auto_publisher' ||
+              record.review.consentHash !== metadata.auto_consent_hash) ||
             operation?.externalId !== externalId || operation.projectId !== item.projectId ||
             operation.sessionId !== item.sessionId || operation.text !== item.text ||
             operation.metadata?.source !== metadata.source ||
@@ -814,13 +837,13 @@ export function createOutbox(stateDir, options = {}) {
             operation.metadata?.checkpoint_id !== metadata.checkpoint_id ||
             operation.metadata?.scope !== metadata.scope ||
             (operation.metadata?.owner_id ?? null) !== (metadata.owner_id ?? null) ||
-            payload.format_version === 2 && (Object.entries(operation.metadata ?? {}).some(
+            [2, 3].includes(payload.format_version) && (Object.entries(operation.metadata ?? {}).some(
               ([key, value]) => !isDeepStrictEqual(metadata[key], value)) ||
               item.sourceIdentity && !isDeepStrictEqual(item.sourceIdentity, operation.sourceIdentity)) ||
             proof?.messageId !== metadata.source ||
             proof?.messageSha256 !== payload.source_text_sha256 ||
             proof.approvedTextSha256 !== hash(item.text) ||
-            (payload.format_version === 2 ? proof.claimSha256 !== metadata.claim_sha256 :
+            ([2, 3].includes(payload.format_version) ? proof.claimSha256 !== metadata.claim_sha256 :
               !Number.isSafeInteger(proof.start) || proof.start < 0 ||
               proof.end !== proof.start + item.text.length)) return blocked('source_mismatch');
       } else if (payload.format_version === 2 || !payload.text.includes(item.text)) return blocked('source_mismatch');
@@ -909,7 +932,7 @@ export function createOutbox(stateDir, options = {}) {
               JSON.stringify(payload.source_offsets) ||
             review.operation.metadata?.checkpoint_id !== operationId ||
             review.operation.metadata?.scope !== payload.scope ||
-            payload.format_version === 2 && (
+            [2, 3].includes(payload.format_version) && (
               review.operation.metadata?.type !== payload.type ||
               review.operation.metadata?.actor !== payload.actor ||
               review.operation.metadata?.speaker_role !== payload.speaker_role ||
@@ -938,9 +961,26 @@ export function createOutbox(stateDir, options = {}) {
           finally { io.close(); }
           if (confirmed !== 'yes') return blocked('owner_approval_required');
         }
+        if (payload.format_version === 3) {
+          const meta = review.operation.metadata;
+          const { redactSource, containsSecret } = await import('./candidates.mjs');
+          if (review.decision !== 'approve' || review.mode !== 'automatic' ||
+              review.actor !== 'project_auto_publisher' ||
+              review.consentHash !== meta.auto_consent_hash ||
+              !/^[a-f0-9]{64}$/.test(review.consentHash ?? '') ||
+              meta.review_mode !== 'automatic' || meta.auto_actor !== review.actor ||
+              meta.format_version !== 3 || approved !== payload.text ||
+              source.origin !== 'human' || !source.text.includes(approved) ||
+              meta.source_text_sha256 !== hash(source.text) ||
+              meta.claim_sha256 !== hash(JSON.stringify([approved, meta.type, meta.scope,
+                meta.condition ?? null, meta.valid_from ?? null, meta.valid_to ?? null])) ||
+              containsSecret(review.operation) || redactSource(source.text) !== source.text) {
+            return blocked('automatic_review_unproved');
+          }
+        }
         sealedReview = { ...review, sourceProof: { messageId: source.messageId,
           messageSha256: hash(source.text), approvedTextSha256: hash(approved),
-          ...(payload.format_version === 2 ? { claimSha256: review.operation.metadata.claim_sha256 } :
+          ...([2, 3].includes(payload.format_version) ? { claimSha256: review.operation.metadata.claim_sha256 } :
             { start, end: start + approved.length }) } };
       }
       if (windows) {
@@ -1143,7 +1183,7 @@ export function createOutbox(stateDir, options = {}) {
       return { kind: 'processed', operationId };
     });
   }
-  async function markFailed(operationId, reason) {
+  async function markFailed(operationId, reason, options = {}) {
     if (!validId(operationId) || typeof reason !== 'string' || !/^[a-z_]{1,64}$/.test(reason)) {
       return blocked('invalid_failure');
     }
@@ -1152,18 +1192,24 @@ export function createOutbox(stateDir, options = {}) {
       if (!await read(itemFile(operationId))) return blocked('missing_operation');
       const previous = await read(retryFile(operationId));
       if (previous && (!Number.isSafeInteger(previous.attempts) || previous.attempts < 1 ||
-          previous.attempts > 5)) throw new Error('corrupt_retry');
-      const attempts = Math.min(5, (previous?.attempts ?? 0) + 1);
-      const retryAt = Date.now() + Math.min(60000, 1000 * 2 ** (attempts - 1));
-      const retry = { attempts, retryAt, lastError: reason };
+          previous.attempts > (previous.automatic ? Number.MAX_SAFE_INTEGER - 1 : 5))) {
+        throw new Error('corrupt_retry');
+      }
+      const automatic = options.automatic === true;
+      if (previous && (previous.automatic === true) !== automatic) return blocked('retry_mode_mismatch');
+      const attempts = automatic ? (previous?.attempts ?? 0) + 1 : Math.min(5, (previous?.attempts ?? 0) + 1);
+      const retryAt = Date.now() + Math.min(automatic ? 300000 : 60000,
+        1000 * 2 ** Math.min(attempts - 1, 20));
+      const retry = { attempts, retryAt, lastError: reason, ...(automatic ? { automatic: true } : {}) };
       if (!await fits(retry)) return { kind: 'full', operationId };
       await durable(retryFile(operationId), retry);
       return { kind: 'pending', operationId, attempts, retryAt };
     });
   }
-  async function ready(now = Date.now()) {
+  async function ready(now = Date.now(), options = {}) {
     if (!Number.isSafeInteger(now) || now < 0) throw new Error('invalid_retry_clock');
-    return (await withLock(pendingUnlocked)).filter(row => row.attempts < 5 && row.retryAt <= now);
+    return (await withLock(pendingUnlocked)).filter(row =>
+      (row.attempts < 5 || options.automatic === true && row.automatic === true) && row.retryAt <= now);
   }
   async function readManifest(operationId) {
     if (!validId(operationId)) return blocked('invalid_operation');
