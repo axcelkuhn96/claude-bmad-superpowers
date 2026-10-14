@@ -264,3 +264,61 @@ test('Haiku sees both conversation roles once and persists a proven v4 summary',
     assert.equal(receipt.candidates[0].sdkId, undefined);
   });
 });
+
+test('conversation context guides one Haiku call while transient CBS status is omitted', async () => {
+  await fixture(async box => {
+    const human = { ...slice(0, 'human', 'UserPromptSubmit').messages[0],
+      text: 'Nesta sessão a memória CBS ficou somente leitura. Use PostgreSQL para persistência.' };
+    const assistant = { ...slice(1, 'assistant', 'Stop').messages[0],
+      text: 'At the time of this session, the CBS Qdrant memory for this project was read-only (automaticWriteConfigured: false). PostgreSQL is the persistence database.' };
+    assert.equal((await box.enqueueConversationSlice({ cli: 'codex', sessionId: 'conversation',
+      start: 0, end: 20, sliceHash: 'a'.repeat(64), messages: [human, assistant] },
+    identity, { event: 'SessionEnd' })).kind, 'queued');
+    const [row] = await box.pending();
+    const consent = { enabled: true, ownerId: 'axcel', consentHash: 'a'.repeat(64) };
+    const prior = 'Compile A, B, C, D and E in this order.';
+    let calls = 0;
+    let scrolls = 0;
+    const result = await extractCheckpoint(row, { route: 'haiku', mode: 'conversation',
+      maxCallsPerSession: 100, autoPublish: true, autoPublishConsent: consent }, {
+      outbox: box, contextCwd: '/project',
+      resolveProject: async () => ({ provider: 'mem0', projectId: 'project', ownerId: 'axcel',
+        extractor: { autoPublishConsent: consent }, destination: { collection: 'c' } }),
+      authorize: async () => ({ kind: 'authorized', connection: {}, key: 'private' }),
+      scroll: async () => {
+        scrolls++;
+        return { kind: 'ready', scanned: 1, points: [
+          { id: 'old', payload: { project_id: 'project', user_id: 'project',
+            status: 'active', scope: 'project', data: prior } },
+        ] };
+      },
+      runCli: async prompt => {
+        calls++;
+        const parsed = JSON.parse(prompt);
+        assert.equal(parsed.existing_memories[0].text, prior);
+        assert.equal(Object.hasOwn(parsed.existing_memories[0], 'memory_id'), false);
+        assert.match(parsed.instruction, /fully covers the same subject, condition, negation/i);
+        return { kind: 'success', no_facts: false, model: 'claude-haiku-5-5',
+          usage: {}, candidates: [
+            { text: 'At the time of this session, the CBS Qdrant memory for this project was read-only (automaticWriteConfigured: false).',
+              type: 'fact', scope: 'project', evidence: [
+                { source_message_id: human.messageId, excerpt: 'memória CBS ficou somente leitura' },
+                { source_message_id: assistant.messageId,
+                  excerpt: 'CBS Qdrant memory for this project was read-only' }] },
+            { text: 'PostgreSQL is the persistence database.',
+              type: 'decision', scope: 'project', evidence: [
+                { source_message_id: human.messageId, excerpt: 'Use PostgreSQL para persistência' },
+                { source_message_id: assistant.messageId, excerpt: 'PostgreSQL is the persistence database' }] },
+          ] };
+      },
+    });
+    assert.equal(result.kind, 'manifested', JSON.stringify(result));
+    assert.deepEqual(result.context, { kind: 'ready', scanned: 1, selected: 1 });
+    assert.equal(calls, 1);
+    assert.equal(scrolls, 1);
+    const manifest = await box.readManifest(row.operationId);
+    assert.equal(manifest.candidates.length, 1);
+    assert.equal((await box.readCandidatePayload(row.operationId,
+      manifest.candidates[0].candidateKey)).text, 'PostgreSQL is the persistence database.');
+  });
+});

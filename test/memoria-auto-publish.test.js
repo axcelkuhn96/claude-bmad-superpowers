@@ -61,6 +61,36 @@ test('automatic candidate keeps only Haiku selected literal claim and semantic t
     false);
 });
 
+test('pre-existing v4 manifest with temporary CBS status is rejected before store', async () => {
+  const row = { operationId: 'src-' + 'a'.repeat(64), projectId: 'p',
+    cli: 'claude', sessionId: 'session', policyVersion: POLICY_VERSION,
+    start: 0, end: 100, sliceHash: 'c'.repeat(64), messages: [source] };
+  const statusText = 'At the time of this session, the CBS Qdrant memory for this project was read-only (automaticWriteConfigured: false).';
+  let disposed = 0;
+  const result = await publish(row, resolution('/private-state'), {
+    outbox: {
+      pending: async () => [row],
+      futureSourceAllowed: async () => ({ kind: 'allowed' }),
+      readManifest: async () => ({ kind: 'manifested', candidates: [
+        { status: 'pending', candidateKey: 'temporary',
+          payloadRef: { sha256: 'a'.repeat(64) } }] }),
+      readCandidatePayload: async () => ({ format_version: 4, text: statusText }),
+      disposeCandidate: async (_operationId, _key, status, reason) => {
+        disposed++;
+        assert.equal(status, 'rejected');
+        assert.equal(reason, 'transient_cbs_runtime_status');
+        return { kind: 'disposed' };
+      },
+      completeCheckpoint: async () => ({ kind: 'processed' }),
+    },
+    readAutoPublish: async () => consent,
+    store: async () => { throw Error('temporary status reached Qdrant'); },
+  });
+  assert.equal(result.kind, 'published');
+  assert.equal(result.published, 0);
+  assert.equal(disposed, 1);
+});
+
 test('automatic Haiku prompt asks for a literal durable span', async t => {
   const { outbox, row } = await fixture(t);
   let prompt;

@@ -215,7 +215,8 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
           // This dedicated extraction child is serialized by extract.lock; the broker cwd never changes.
           if (!runCli) process.chdir(original.nativeRoot);
           result = await extractCheckpoint(row, { ...policy,
-            embeddingFingerprint: fresh.embeddingFingerprint, stateRoot }, { outbox: box, runCli });
+            embeddingFingerprint: fresh.embeddingFingerprint, stateRoot }, {
+            outbox: box, runCli, contextCwd: original.nativeRoot, stateRoot });
         } finally { if (!runCli) process.chdir(previousCwd); }
         if (result.kind === 'manifested' || result.kind === 'processed') {
           manifested++;

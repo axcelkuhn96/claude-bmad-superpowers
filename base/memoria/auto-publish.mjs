@@ -5,6 +5,7 @@ import { readQdrantSecret } from './qdrant-key.mjs';
 import { POLICY_VERSION } from './transcript.mjs';
 import { validateConversationProof } from './conversation-proof.mjs';
 import { dedupKeyFor } from './dedup-key.mjs';
+import { transientCbsRuntimeStatus } from './curation-policy.mjs';
 
 const blocked = reason => ({ kind: 'blocked', published: 0, pending: 0, reason });
 const sameConsent = (frozen, live, projectId) => frozen?.version === 1 &&
@@ -71,9 +72,17 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
   let published = 0;
   let pending = 0;
   for (const entry of manifest.candidates) {
-    if (entry.status === 'remote_acked' || entry.status === 'duplicate') continue;
+    if (entry.status === 'remote_acked' || entry.status === 'duplicate' ||
+        entry.status === 'rejected') continue;
     if (entry.status !== 'pending') { pending++; continue; }
     const payload = await outbox.readCandidatePayload(row.operationId, entry.candidateKey);
+    if (payload.format_version === 4 && transientCbsRuntimeStatus(payload.text)) {
+      const disposed = await outbox.disposeCandidate(row.operationId, entry.candidateKey,
+        'rejected', 'transient_cbs_runtime_status');
+      if (disposed.kind !== 'disposed') return { kind: 'retry', published, pending,
+        reason: disposed.reason ?? 'local_disposition_failed' };
+      continue;
+    }
     const source = checkpointRow.messages?.find(message => message.messageId === payload.source_message_id &&
       message.start === payload.source_offsets?.start && message.end === payload.source_offsets?.end);
     let conversationValid = false;
