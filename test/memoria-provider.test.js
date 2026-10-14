@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { spawnSync } from 'node:child_process';
-import { initializeSession, resolveProject } from '../base/memoria/provider.mjs';
+import { initializeSession, inspectConfiguration, resolveProject } from '../base/memoria/provider.mjs';
 import { authorizeDestination, readLocalTrust, writeLocalTrust } from '../base/memoria/trust.mjs';
 import { pinDestination, validateDestination } from '../base/memoria/activation.mjs';
 import { activateProject, authorizeCurrentDestination } from '../base/memoria/setup.mjs';
@@ -463,6 +463,29 @@ test('ativação só persiste trust após preflight e revalida config antes do s
     { kind: 'blocked', reason: 'session_changed' });
   assert.equal(reads, 1);
   assert.equal(session.provider, 'mem0');
+});
+
+test('ativação pública registra MCP após trust e relata indisponibilidade', async t => {
+  const { root, stateRoot } = await fixture(t);
+  await putConfig(root);
+  const preflight = { stateRoot, cli: 'claude', lookup: async () => ['10.1.2.3'],
+    readSecret: () => 'fixture-key', approve: async tuple => tuple,
+    probeCollection: async (_url, _collection, key) => key ? ({ statusCode: 200, body: { result: { config: {
+      params: { vectors: { size: 384, distance: 'Cosine' } },
+      metadata: { cbs_embedding_fingerprint: config().embedding.fingerprint },
+    } } } }) : ({ statusCode: 401 }), applyNative: async () => ({ kind: 'applied' }) };
+  let registered = false;
+  const result = await activateProject(root, { ...preflight,
+    registerMcp: async (projectRoot, cli) => {
+      assert.equal(projectRoot, root);
+      assert.equal(cli, 'claude');
+      const current = await inspectConfiguration(root, { stateRoot });
+      assert.ok(await readLocalTrust(current.stateDir));
+      registered = true;
+      return { kind: 'unavailable', reason: 'mcp_cli_unavailable', action: 'Install Claude CLI.' };
+    } });
+  assert.equal(registered, true, JSON.stringify(result));
+  assert.deepEqual(result, { kind: 'blocked', reason: 'mcp_cli_unavailable', action: 'Install Claude CLI.' });
 });
 
 test('Claude local snapshot restaura ausência e preserva outras keys', async (t) => {

@@ -3,6 +3,7 @@ import { authorizeDestination, readLocalTrust, sameTrustTuple, trustTuple, write
 import { pinDestination, validateDestination } from './activation.mjs';
 import { applyNativeExclusion, restoreNativeExclusion } from './native.mjs';
 import { identifyProject } from './project-id.mjs';
+import { registerReadonlyMcp } from './mcp-register.mjs';
 
 const blocked = (reason) => ({ kind: 'blocked', reason });
 const same = (a, b) => a?.provider === 'mem0' && b?.provider === 'mem0' &&
@@ -37,6 +38,15 @@ export async function activateProject(cwd, deps = {}) {
   } catch (error) {
     if (!deps.applyNative && !native?.existing) await restoreNativeExclusion(nativeRoot, nativeOptions);
     return blocked('trust_write_failed');
+  }
+  if (deps.cli) {
+    let mcp;
+    try { mcp = await (deps.registerMcp ?? registerReadonlyMcp)(resolution.projectRoot, deps.cli); }
+    catch { mcp = { kind: 'unavailable', reason: 'mcp_registration_failed',
+      action: `Verifique a CLI ${deps.cli} e repita cbs memoria activate --cli ${deps.cli} --project ${resolution.projectRoot}.` }; }
+    if (!['registered', 'existing'].includes(mcp?.kind)) {
+      return { kind: 'blocked', reason: mcp?.reason ?? 'mcp_registration_failed', action: mcp?.action };
+    }
   }
   return { kind: 'activated', projectId: resolution.projectId, stateDir: resolution.stateDir };
 }

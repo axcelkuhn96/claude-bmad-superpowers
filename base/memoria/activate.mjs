@@ -26,6 +26,8 @@ export async function main(args = process.argv.slice(2)) {
       },
     });
     process.stdout.write(`${result.kind}: ${result.reason ?? result.projectId}\n`);
+    if (result.action) process.stdout.write(`Ação: ${result.action}\n`);
+    if (result.kind === 'activated') process.stdout.write('MCP cbs_memoria registrado para novas sessões.\n');
     if (result.kind === 'activated' && cli === 'codex') {
       process.stdout.write('Revise os hooks distribuídos pelo CBS no /hooks do Codex antes da nova sessão.\n');
     }

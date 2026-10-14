@@ -278,15 +278,20 @@ Sem claude-mem, as skills marcam "Memória: não disponível" e seguem normalmen
 
 O **claude-mem continua sendo o padrão**. O CBS também contém uma opção Mem0 por projeto, com seleção e confiança locais explícitas para sessões novas de Claude Code ou Codex. Cada sessão usa um provedor de memória; uma sessão Mem0 não consulta o claude-mem. A importação opcional do histórico claude-mem é manual e fica numa coleção separada, sem alimentar o recall automático.
 
-Em um projeto já configurado e ativado para Mem0, abra `claude` ou `codex` normalmente. Com o MCP somente de leitura `cbs_memoria` registrado no perfil da CLI, as ferramentas `search`, `get` e `status` aparecem no catálogo da **nova sessão**: peça em linguagem natural para consultar a memória e a busca usa `search` diretamente; `get` lê um resultado completo e `status` verifica a disponibilidade. Não é necessário `cbs memoria launch`. No Claude Code, o registro deve usar o diretório do perfil em uso (`CLAUDE_CONFIG_DIR`, quando definido; caso contrário, `~/.claude`); no Codex, o perfil é `CODEX_HOME` ou `~/.codex`. Abra uma nova sessão após registrar o MCP ou trocar o provedor. O MCP é vinculado ao projeto Git confiável e não dá permissão de gravação.
+Em um projeto já configurado e ativado para Mem0, abra `claude` ou `codex` normalmente. A ativação registra o MCP somente de leitura `cbs_memoria` no perfil da CLI escolhida; as ferramentas `search`, `get` e `status` aparecem no catálogo da **nova sessão**: peça em linguagem natural para consultar a memória e a busca usa `search` diretamente; `get` lê um resultado completo e `status` verifica a disponibilidade. Não é necessário `cbs memoria launch`. O Claude Code usa `CLAUDE_CONFIG_DIR` quando definido; o Codex usa `CODEX_HOME` quando definido. Abra uma nova sessão após a ativação ou troca do provedor. O MCP é vinculado ao projeto Git confiável e não dá permissão de gravação.
 
-O registro é manual, usando o caminho da instalação durável do CBS e a raiz Git do projeto. No Claude Code, execute na raiz de **cada projeto Mem0** e repita em cada perfil usado; `--scope local` registra naquele projeto. Para o perfil padrão, omita `CLAUDE_CONFIG_DIR=...`. No Codex, o registro é global ao perfil e o MCP usa a raiz da sessão atual:
+Execute a ativação na raiz Git para cada CLI que usará a memória. Ela registra Claude Code com escopo local por projeto e perfil; no Codex, registra um único servidor global por perfil, que usa a raiz da sessão atual. Para perfis adicionais, execute novamente com `CLAUDE_CONFIG_DIR` ou `CODEX_HOME` apropriado. Uma entrada `cbs_memoria` divergente bloqueia o registro sem sobrescrevê-la; a CLI informa a ação necessária. Os comandos `mcp get` ajudam a diagnosticar o registro:
 
 ```sh
 cd /raiz/git
-CLAUDE_CONFIG_DIR=/caminho/do/perfil claude mcp add --scope local cbs_memoria -- node /caminho/instalacao-cbs/base/memoria/mcp-readonly.mjs --cli claude --project /raiz/git
+cbs memoria activate --cli claude --project /raiz/git
+cbs memoria activate --cli codex --project /raiz/git
+CLAUDE_CONFIG_DIR=/caminho/do/perfil cbs memoria activate --cli claude --project /raiz/git
+CODEX_HOME=/caminho/do/perfil cbs memoria activate --cli codex --project /raiz/git
+claude mcp get cbs_memoria
+codex mcp get cbs_memoria --json
 CLAUDE_CONFIG_DIR=/caminho/do/perfil claude mcp get cbs_memoria
-codex mcp add cbs_memoria -- node /caminho/instalacao-cbs/base/memoria/mcp-readonly.mjs --cli codex
+CODEX_HOME=/caminho/do/perfil codex mcp get cbs_memoria --json
 ```
 
 Os hooks nativos continuam responsáveis pela captura. O recall automático dos hooks e das skills usa apenas a **curadoria**; o MCP também atende a consultas explícitas, cuja busca padrão pode incluir histórico bruto importado do Claude-mem, identificado como legado não verificado. Use `source: "curated"` para limitar a consulta à curadoria ou `source: "legacy"` para consultar apenas o histórico antigo. Nenhum resultado legado entra no recall automático nem é promovido a memória revisada. Não há serviço no startup do PC: o worker local de busca inicia sob demanda e encerra após cinco minutos sem uso. O MCP de gravação vinculado ao `cbs memoria launch` permanece distinto.
