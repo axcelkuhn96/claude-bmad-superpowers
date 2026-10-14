@@ -96,7 +96,13 @@ export function createBrokerWorker(start, { coldMs = 30000, onFatal = () => {} }
     child.once('exit', failed);
     child.once('error', failed);
     child.stdin.once('error', failed);
-    return Object.assign(worker, { readyPromise, request(request, secret, deadlineAt) {
+    return Object.assign(worker, { readyPromise, async request(request, secret, deadlineAt, beforeDispatch) {
+      if (beforeDispatch) {
+        try {
+          const result = await beforeDispatch();
+          if (result?.kind !== 'allowed') return result ?? unavailable('dispatch_denied');
+        } catch { return unavailable('dispatch_denied'); }
+      }
       return new Promise(resolve => {
         const remaining = deadlineAt - Date.now();
         if (remaining <= 0) { resolve(unavailable('deadline')); return; }
@@ -154,7 +160,7 @@ export function createBrokerWorker(start, { coldMs = 30000, onFatal = () => {} }
       }
       return ready.readyPromise;
     },
-    request: async (request, secret, deadlineAt) => {
+    request: async (request, secret, deadlineAt, beforeDispatch) => {
       if (closed) return unavailable('worker_exited');
       if (fatal) return fatal;
       if (restarting || !current || current.dead || current.child.exitCode !== null ||
@@ -169,7 +175,7 @@ export function createBrokerWorker(start, { coldMs = 30000, onFatal = () => {} }
       }
       if (closed) return unavailable('worker_exited');
       if (fatal) return fatal;
-      return current.request(request, secret, deadlineAt);
+      return current.request(request, secret, deadlineAt, beforeDispatch);
     },
     close: async () => {
       closed = true;

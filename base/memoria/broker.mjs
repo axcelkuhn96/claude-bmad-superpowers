@@ -12,6 +12,7 @@ import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
 import { authorizeCurrentDestination } from './setup.mjs';
 import { assertWriter } from './authority.mjs';
+import { readAutoPublish } from './policy.mjs';
 import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { openArtifactIdentity, runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { withProjectLock } from './ledger.mjs';
@@ -23,6 +24,36 @@ import { parseWindowsDiscovery, newWindowsDiscovery, authenticateWindowsClient,
   authenticateWindowsServer } from './windows-transport.mjs';
 
 const blocked = reason => ({ kind: 'unavailable', reason });
+const denied = reason => ({ kind: 'blocked', reason });
+const sameAutoConsent = (frozen, live, current) => frozen?.version === 1 &&
+  frozen.enabled === true && live?.version === 1 && live.enabled === true &&
+  current.extractor?.autoPublish === true && current.ownerId === frozen.ownerId &&
+  frozen.projectId === current.projectId && live.projectId === current.projectId &&
+  ['consentHash', 'destinationHash', 'ownerId', 'deviceId', 'enabledAt']
+    .every(key => typeof frozen[key] === 'string' && frozen[key] && frozen[key] === live[key]) &&
+  ['consentHash', 'destinationHash', 'ownerId', 'deviceId', 'enabledAt']
+    .every(key => current.extractor.autoPublishConsent?.[key] === frozen[key]);
+
+export async function authorizeAutomaticBrokerWrite(current, operation, consent,
+  readConsent = readAutoPublish) {
+  if (!['add', 'activate'].includes(operation?.op)) return { kind: 'allowed' };
+  const marked = operation.approval?.mode === 'automatic' ||
+    operation.metadata?.review_mode === 'automatic' ||
+    operation.metadata?.auto_consent_hash != null;
+  if (!consent) return marked ? denied('auto_publish_unproved') : { kind: 'allowed' };
+  if (operation.op === 'add' &&
+      (operation.approval?.kind !== 'approved' || operation.approval?.mode !== 'automatic' ||
+        operation.metadata?.review_mode !== 'automatic' ||
+        operation.metadata?.format_version !== 3 ||
+        operation.metadata?.auto_actor !== 'project_auto_publisher' ||
+        operation.metadata?.auto_consent_hash !== consent.consentHash)) {
+    return denied('auto_publish_unproved');
+  }
+  try {
+    return sameAutoConsent(consent, await readConsent(current), current)
+      ? { kind: 'allowed' } : denied('auto_publish_revoked');
+  } catch { return denied('auto_publish_revoked'); }
+}
 export const brokerPath = (root = path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria')) =>
   path.join(root, process.platform === 'win32' ? 'encoder.discovery.json' : 'encoder.sock');
 async function windowsDiscovery(root) {
@@ -558,14 +589,29 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     const authorized = await authorizeCurrentDestination(cwd, sessionId, () => secret.toString('utf8'),
       { stateRoot, deadlineAt, signal });
     if (authorized.kind !== 'authorized') return blocked(authorized.reason);
-    if (['add', 'activate'].includes(operation.op)) {
+    const writing = ['add', 'activate'].includes(operation.op);
+    const autoConsent = value.autoPublishConsent;
+    if (writing) {
       const writer = await assertWriter(current, authorized, { stateRoot });
       if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+      const consent = await authorizeAutomaticBrokerWrite(current, operation, autoConsent);
+      if (consent.kind !== 'allowed') return consent;
     }
     const request = { ...operation, projectId: current.projectId, state: current.stateDir,
       collection: current.destination.collection, connection: authorized.connection };
     if (deadlineAt <= Date.now()) return blocked('deadline');
-    return bridge.request(request, secret, deadlineAt);
+    const beforeDispatch = writing && (autoConsent || operation.approval?.mode === 'automatic' ||
+      operation.metadata?.review_mode === 'automatic' || operation.metadata?.auto_consent_hash != null)
+      ? async () => {
+        if (signal.aborted || deadlineAt <= Date.now()) return denied('deadline');
+        const live = await resolveProject(cwd, sessionId, { stateRoot });
+        if (live.provider !== 'mem0' || live.projectId !== current.projectId ||
+            live.embeddingFingerprint !== current.embeddingFingerprint) return denied('project_mismatch');
+        const writer = await assertWriter(live, authorized, { stateRoot });
+        if (writer.kind !== 'writer') return denied(writer.reason ?? 'writer_not_designated');
+        return authorizeAutomaticBrokerWrite(live, operation, autoConsent);
+      } : undefined;
+    return bridge.request(request, secret, deadlineAt, beforeDispatch);
   }
   try {
     await new Promise((resolve, reject) => {

@@ -49,7 +49,9 @@ export async function runBridgeOperation(cwd, sessionId, operation, readSecret, 
   const request = { ...operation, collection: resolution.destination.collection, connection: auth.connection };
   const env = { OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1', MKL_NUM_THREADS: '1' };
   if (options.run) return options.run(runtimePython(resolution.stateDir), script, request, env, Buffer.from(auth.key));
-  return requestBroker({ cwd, sessionId, operation }, auth.key,
+  return requestBroker({ cwd, sessionId, operation,
+    ...(['add', 'activate'].includes(operation.op) && options.autoPublishConsent
+      ? { autoPublishConsent: options.autoPublishConsent } : {}) }, auth.key,
     { stateRoot: options.stateRoot, deadlineMs: remaining });
 }
 
