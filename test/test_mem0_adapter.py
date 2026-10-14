@@ -238,6 +238,57 @@ class AdapterTest(unittest.TestCase):
                                       'connection': {}, 'query': 'fact'}, None, Path('/tmp'))
             self.assertEqual(result['items'], [{**rows[2], 'scoreSource': 'mem0_sdk_search'}])
 
+    def test_readonly_raw_search_uses_only_derived_marked_collection(self):
+        from uuid import uuid4
+        anchor = str(uuid4())
+        payload = {'source': 'claude-mem', 'source_type': 'imported_legacy',
+                   'origin': 'assistant_report', 'speaker_role': 'assistant',
+                   'collection': 'native_claude_mem_raw', 'anchor_id': anchor,
+                   'embedding_fingerprint': adapter.FINGERPRINT, 'text': 'historical note',
+                   'source_project': 'old-project', 'source_table': 'observations',
+                   'source_id': 4, 'evidence_at': '2024-01-01T00:00:00Z'}
+        class Client:
+            def collection_exists(self, name):
+                self_test.assertEqual(name, 'native_claude_mem_raw')
+                return True
+            def get_collection(self, name):
+                return SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(vectors=SimpleNamespace(
+                    size=384, distance='Cosine')), metadata={'cbs_embedding_fingerprint': adapter.FINGERPRINT,
+                    'cbs_source': 'claude-mem-raw-v1'}))
+            def query_points(self, name, *, query, limit, with_payload):
+                self_test.assertEqual(name, 'native_claude_mem_raw')
+                self_test.assertEqual(limit, 8)
+                return SimpleNamespace(points=[SimpleNamespace(id=anchor, payload=payload, score=.82)])
+        self_test = self
+        with patch.object(adapter, '_WARM_EMBEDDER', SimpleNamespace(embed=lambda text, action: [0.0] * 384)):
+            result = adapter.execute_readonly({'op': 'raw_search', 'collection': 'native',
+                'projectId': 'project', 'query': 'note'}, Client(), Path('/tmp'))
+        self.assertEqual(result['items'][0]['readId'], anchor)
+        self.assertEqual(result['items'][0]['preview'], 'historical note')
+
+    def test_readonly_raw_missing_collection_is_empty_and_foreign_anchor_is_denied(self):
+        from uuid import uuid4
+        anchor = str(uuid4())
+        class Missing:
+            def collection_exists(self, name):
+                return False
+        self.assertEqual(adapter.execute_readonly({'op': 'raw_search', 'collection': 'native',
+            'projectId': 'project', 'query': 'note'}, Missing(), Path('/tmp'))['items'], [])
+        class Foreign:
+            def collection_exists(self, name):
+                return True
+            def get_collection(self, name):
+                return SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(vectors=SimpleNamespace(
+                    size=384, distance='Cosine')), metadata={'cbs_embedding_fingerprint': adapter.FINGERPRINT,
+                    'cbs_source': 'claude-mem-raw-v1'}))
+            def retrieve(self, name, *, ids, with_payload):
+                return [SimpleNamespace(id=anchor, payload={'anchor_id': anchor,
+                    'collection': 'foreign_claude_mem_raw', 'raw_row': {'secret': True}})]
+        result = adapter.execute_readonly({'op': 'readonly_get', 'collection': 'native',
+            'projectId': 'project', 'source': 'legacy', 'memoryId': anchor,
+            'offset': 0}, Foreign(), Path('/tmp'))
+        self.assertEqual(result['reason'], 'source_unavailable')
+
 
 if __name__ == '__main__':
     unittest.main()

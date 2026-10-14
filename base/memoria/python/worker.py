@@ -40,7 +40,8 @@ def send(value):
 
 
 def execute_one(request, secret):
-    if not secret or request.get('op') not in ('search', 'find', 'read', 'add', 'activate'):
+    if not secret or request.get('op') not in ('search', 'find', 'read', 'add', 'activate',
+                                               'raw_search', 'readonly_get'):
         return {'kind': 'blocked', 'reason': 'invalid_operation'}
     state = Path(request['state']).resolve()
     os.environ['MEM0_DIR'] = str(state / 'mem0')
@@ -51,6 +52,8 @@ def execute_one(request, secret):
         client = QdrantClient(url=connection['url'], api_key=secret.decode('utf-8'),
                               transport=transport, trust_env=False, follow_redirects=False,
                               prefer_grpc=False, check_compatibility=False)
+        if request['op'] in ('raw_search', 'readonly_get'):
+            return adapter.execute_readonly(request, client, state)
         return adapter.execute(request, client, state)
     finally:
         if client is not None:

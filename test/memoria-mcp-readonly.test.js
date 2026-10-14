@@ -103,3 +103,63 @@ test('SIGTERM closes only the owned MCP worker before process exit', async () =>
   assert.deepEqual(events, ['close', 'exit:0']);
   removed();
 });
+
+test('explicit search returns curated first and bounded labelled legacy pointers', async t => {
+  const f = await fixture(t);
+  const calls = [];
+  const mcp = createReadonlyMcp({ cwd: f.root, cli: 'claude', stateRoot: f.stateRoot,
+    verifyNative: async () => ({ kind: 'verified' }),
+    authorize: async () => ({ kind: 'authorized', key: 'private', connection: {} }),
+    search: async request => { calls.push(`curated:${request.query}`); return { kind: 'items', items: [item] }; },
+    legacySearch: async request => { calls.push(`legacy:${request.query}`); return { kind: 'items', items: [
+      { id: '27dbfc70-f05f-4b74-a2a0-3d41f87807dd', readId: '64eef286-9f7e-4326-b137-5658f0286c46',
+        preview: 'Old generated note', sourceProject: 'old-name', sourceTable: 'observations',
+        sourceId: 42, evidenceAt: '2024-01-01T00:00:00Z', score: .83 } ] }; } });
+  const result = await mcp.call('search', { query: 'database' });
+  assert.equal(result.kind, 'items');
+  assert.deepEqual(calls, ['curated:database', 'legacy:database']);
+  assert.ok(result.context.indexOf('Use Postgres.') < result.context.indexOf('Old generated note'));
+  assert.match(result.context, /Claude-mem legado.*não verificado/);
+  assert.match(result.context, /64eef286-9f7e-4326-b137-5658f0286c46/);
+  calls.length = 0;
+  const curated = await mcp.call('search', { query: 'database', source: 'curated' });
+  assert.equal(curated.kind, 'items');
+  assert.deepEqual(calls, ['curated:database']);
+  await mcp.close();
+});
+
+test('legacy absence is empty and untrusted selector is rejected before authorization', async t => {
+  const f = await fixture(t);
+  let authorized = 0;
+  const mcp = createReadonlyMcp({ cwd: f.root, cli: 'codex', stateRoot: f.stateRoot,
+    verifyNative: async () => ({ kind: 'verified' }),
+    authorize: async () => { authorized++; return { kind: 'authorized', key: 'private', connection: {} }; },
+    search: async () => ({ kind: 'items', items: [] }),
+    legacySearch: async () => ({ kind: 'items', items: [] }) });
+  assert.equal((await mcp.call('search', { query: 'db', source: 'other' })).reason, 'invalid_source');
+  assert.equal((await mcp.call('search', { query: 'db', collection: 'foreign' })).reason, 'invalid_arguments');
+  assert.equal((await mcp.call('get', { memory_id: 'x', source: 'legacy' })).reason, 'invalid_memory_id');
+  assert.equal(authorized, 0);
+  assert.equal((await mcp.call('search', { query: 'db' })).kind, 'abstain');
+  assert.equal(authorized, 1);
+  await mcp.close();
+});
+
+test('get binds UUID and source, pages only the selected project result', async t => {
+  const f = await fixture(t);
+  const id = '64eef286-9f7e-4326-b137-5658f0286c46';
+  const requests = [];
+  const mcp = createReadonlyMcp({ cwd: f.root, cli: 'claude', stateRoot: f.stateRoot,
+    verifyNative: async () => ({ kind: 'verified' }),
+    authorize: async () => ({ kind: 'authorized', key: 'private', connection: {} }),
+    get: async request => { requests.push(request); return { kind: 'item', item: {
+      projectId: request.projectId, source: 'legacy', label: 'Claude-mem legado, gerado, não verificado',
+      text: 'old page', offset: request.offset, nextOffset: null } }; } });
+  assert.equal((await mcp.call('get', { memory_id: id, source: 'legacy', offset: 0 })).kind, 'item');
+  assert.deepEqual(requests.map(row => [row.memoryId, row.source, row.projectId]),
+    [[id, 'legacy', 'project-one']]);
+  assert.equal((await mcp.call('get', { memory_id: id, source: 'legacy', offset: -1 })).reason, 'invalid_offset');
+  assert.equal((await mcp.call('get', { memory_id: id, source: 'other' })).reason, 'invalid_source');
+  assert.equal((await mcp.call('get', { memory_id: id, source: 'curated', projectRoot: '/other' })).reason, 'invalid_arguments');
+  await mcp.close();
+});

@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import ssl
 import sys
+import uuid
 from urllib.parse import urlsplit
 
 import httpx
@@ -234,6 +235,142 @@ def _find(memory, client, collection: str, project: str, external: str) -> list[
             return [_row(row, client, collection, memory.embedding_model) for row in rows]
         limit *= 2
     raise ValueError('remote_inventory_saturated')
+
+
+def _page(value: str, offset: int) -> dict:
+    if type(offset) is not int or offset < 0 or offset > 16 * 1024 * 1024:
+        raise ValueError('invalid_offset')
+    data = value.encode('utf-8')
+    if offset > len(data):
+        raise ValueError('invalid_offset')
+    end = min(len(data), offset + 8192)
+    while end > offset:
+        try:
+            content = data[offset:end].decode('utf-8')
+            break
+        except UnicodeDecodeError:
+            end -= 1
+    else:
+        raise ValueError('invalid_offset')
+    return {'text': content, 'offset': offset,
+            'nextOffset': end if end < len(data) else None, 'totalBytes': len(data)}
+
+
+def _raw_collection(client, native: str) -> str | None:
+    name = native + '_claude_mem_raw'
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', name):
+        raise ValueError('invalid_raw_collection')
+    if not client.collection_exists(name):
+        return None
+    verify_collection(client, name, FINGERPRINT)
+    if (client.get_collection(name).config.metadata or {}).get('cbs_source') != 'claude-mem-raw-v1':
+        raise ValueError('raw_collection_marker_mismatch')
+    return name
+
+
+def _raw_payload(payload: dict, collection: str, identifier) -> bool:
+    try:
+        anchor = str(uuid.UUID(str(payload.get('anchor_id'))))
+        uuid.UUID(str(identifier))
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return payload.get('source') == 'claude-mem' and \
+        payload.get('source_type') == 'imported_legacy' and \
+        payload.get('origin') == 'assistant_report' and \
+        payload.get('speaker_role') == 'assistant' and \
+        payload.get('collection') == collection and \
+        payload.get('embedding_fingerprint') == FINGERPRINT and \
+        isinstance(payload.get('text'), str) and \
+        payload.get('source_table') in ('observations', 'session_summaries') and \
+        isinstance(payload.get('source_project'), str) and \
+        isinstance(payload.get('source_id'), int) and \
+        isinstance(payload.get('evidence_at'), str)
+
+
+def execute_readonly(request: dict, client, state: Path) -> dict:
+    """Read-only MCP operations; collection is always derived from the bound native one."""
+    native = request['collection']
+    project = request['projectId']
+    if not isinstance(native, str) or not native or not isinstance(project, str) or not project:
+        raise ValueError('invalid_identity')
+    op = request['op']
+    if op == 'raw_search':
+        collection = _raw_collection(client, native)
+        if collection is None:
+            return {'kind': 'items', 'items': []}
+        query = request['query']
+        if not isinstance(query, str) or not query.strip() or len(query.encode('utf-8')) > 4096:
+            raise ValueError('invalid_query')
+        if _WARM_EMBEDDER is None:
+            raise ValueError('encoder_unready')
+        hits = client.query_points(collection, query=_WARM_EMBEDDER.embed(query, 'search'),
+                                   limit=8, with_payload=True).points
+        items = []
+        for point in hits:
+            payload = point.payload or {}
+            score = point.score
+            if not _raw_payload(payload, collection, point.id) or \
+                    not isinstance(score, (int, float)) or not math.isfinite(score) or not 0 <= score <= 1:
+                continue
+            items.append({'id': str(point.id), 'readId': payload['anchor_id'],
+                          'preview': payload['text'][:240],
+                          'sourceProject': payload['source_project'],
+                          'sourceTable': payload['source_table'],
+                          'sourceId': payload['source_id'],
+                          'evidenceAt': payload['evidence_at'], 'score': score})
+            if len(items) == 5:
+                break
+        return {'kind': 'items', 'items': items}
+    if op != 'readonly_get':
+        raise ValueError('unknown_operation')
+    try:
+        identifier = str(uuid.UUID(request['memoryId']))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError('invalid_memory_id') from None
+    source = request['source']
+    if source == 'legacy':
+        collection = _raw_collection(client, native)
+        if collection is None:
+            return {'kind': 'blocked', 'reason': 'source_unavailable'}
+        points = client.retrieve(collection, ids=[identifier], with_payload=True)
+        if len(points) != 1:
+            return {'kind': 'blocked', 'reason': 'source_unavailable'}
+        payload = points[0].payload or {}
+        if not _raw_payload(payload, collection, points[0].id) or \
+                payload.get('anchor_id') != identifier or not isinstance(payload.get('raw_row'), dict):
+            return {'kind': 'blocked', 'reason': 'source_unavailable'}
+        page = _page(json.dumps(payload['raw_row'], ensure_ascii=False, separators=(',', ':')),
+                     request.get('offset', 0))
+        return {'kind': 'item', 'item': {'projectId': project, 'source': 'legacy',
+            'label': 'Claude-mem legado, gerado, não verificado',
+            'sourceProject': payload['source_project'], 'sourceTable': payload['source_table'],
+            'sourceId': payload['source_id'], 'evidenceAt': payload['evidence_at'], **page}}
+    if source != 'curated':
+        raise ValueError('invalid_source')
+    verify_collection(client, native, FINGERPRINT)
+    memory = _memory(client, native, state, request['connection'])
+    row = _row(memory.get(identifier), client, native, memory.embedding_model)
+    if row is None or row['projectId'] != project or row['status'] != 'active':
+        return {'kind': 'blocked', 'reason': 'source_unavailable'}
+    metadata = row['metadata']
+    now = datetime.now(timezone.utc)
+    if metadata.get('scope') not in ('project', 'personal', 'episode') or \
+            metadata.get('scope') == 'personal' and (not request.get('ownerId') or
+                metadata.get('owner_id') != request['ownerId']) or \
+            metadata.get('scope') == 'episode' and not metadata.get('valid_to') or \
+            metadata.get('valid_from') and _time(metadata['valid_from']) > now or \
+            metadata.get('valid_to') and _time(metadata['valid_to']) <= now or \
+            metadata.get('origin') not in ('user_direct', 'assistant_report',
+                'tool_observation', 'external_reference') or \
+            metadata.get('speaker_role') != {'user_direct': 'user', 'assistant_report': 'assistant',
+                'tool_observation': 'tool', 'external_reference': 'external'}.get(metadata.get('origin')) or \
+            not metadata.get('source') or not metadata.get('actor') or \
+            not metadata.get('evidence_at'):
+        return {'kind': 'blocked', 'reason': 'source_unavailable'}
+    page = _page(row['text'], request.get('offset', 0))
+    return {'kind': 'item', 'item': {'projectId': project, 'source': 'curated',
+        'memoryId': identifier, 'provenance': {key: metadata.get(key) for key in
+            ('source', 'actor', 'origin', 'speaker_role', 'evidence_at', 'scope')}, **page}}
 
 
 def execute(request: dict, client, state: Path) -> dict:
