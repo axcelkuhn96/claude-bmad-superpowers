@@ -88,6 +88,18 @@ test('automatic gate quarantines question, status and mixed speaker text', async
   }
 });
 
+test('automatic source mismatch is labeled as validation quarantine, without promising manual approval', async t => {
+  const { outbox, stateDir, row } = await fixture(t);
+  assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
+  const changed = { ...row, messages: [{ ...source, text: 'A different source.' }] };
+  const result = await publishCheckpointAutomatically(changed, resolution(stateDir), {
+    outbox, readAutoPublish: async () => consent,
+    store: async () => { throw Error('must not store'); },
+  });
+  assert.deepEqual(result, { kind: 'pending', published: 0, pending: 1,
+    reason: 'automatic_validation_failed' });
+});
+
 test('automatic retry remains ready after five transient failures', async t => {
   const { outbox, stateDir, row } = await fixture(t);
   let last;
@@ -152,6 +164,36 @@ test('revocation and changed destination block automatic store', async t => {
     { ...resolution(stateDir), ownerId: 'other-owner' },
     { outbox, readAutoPublish: async () => consent, store: async () => { stores++; } })).kind,
   'blocked');
+});
+
+test('temporary DNS failure retries sealed automatic operation; destination policy rejection stays blocked', async t => {
+  const { outbox, stateDir, row } = await fixture(t);
+  assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
+  let stores = 0;
+  const options = { outbox, readAutoPublish: async () => consent,
+    store: async (operation, ackLocal) => {
+      stores++;
+      if (stores === 1) return { kind: 'blocked', reason: 'destination_unavailable' };
+      const proof = { externalId: operation.externalId, projectId: 'p', status: 'active',
+        sdkId: 'sdk-1', qdrantId: 'qdrant-1' };
+      await ackLocal(operation.externalId, proof);
+      return { kind: 'stored', externalId: operation.externalId };
+    } };
+  const first = await publishCheckpointAutomatically(row, resolution(stateDir), options);
+  assert.deepEqual(first, { kind: 'retry', published: 0, pending: 0,
+    reason: 'destination_unavailable' });
+  assert.equal((await publishCheckpointAutomatically(row, resolution(stateDir), options)).kind,
+    'published');
+  assert.equal(stores, 2);
+
+  const refused = await fixture(t);
+  assert.equal((await extract(refused.row, refused.outbox, [choice(source.text)])).kind, 'manifested');
+  const policy = await publishCheckpointAutomatically(refused.row, resolution(refused.stateDir), {
+    outbox: refused.outbox, readAutoPublish: async () => consent,
+    store: async () => ({ kind: 'blocked', reason: 'public_destination' }),
+  });
+  assert.equal(policy.kind, 'blocked');
+  assert.equal(policy.reason, 'public_destination');
 });
 
 test('real store refuses revoked consent and an unassigned writer before remote add', async t => {

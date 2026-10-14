@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 const blocked = reason => ({ kind: 'blocked', reason });
 const script = fileURLToPath(import.meta.url);
 const boundaryEvents = new Set(['SessionStart', 'Stop', 'PreCompact', 'SessionEnd']);
+const transientExtractionErrors = new Set(['cli_error', 'cli_timeout', 'cli_unavailable']);
 
 export async function runScheduledConsumer({ consume, now = Date.now,
   wait = ms => new Promise(resolve => setTimeout(resolve, ms)), maxDurationMs = 30 * 60 * 1000 } = {}) {
@@ -165,7 +166,17 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
               nextRetryAt = Math.min(nextRetryAt ?? Infinity, publication.nextRetryAt);
             }
           }
-        } else pending++;
+        } else {
+          pending++;
+          if (policy.autoPublish === true && policy.autoPublishConsent &&
+              result.kind === 'pending' && transientExtractionErrors.has(result.reason) &&
+              (await box.extractionUsage(row.cli, row.sessionId)).calls < 4) {
+            const retry = await box.markFailed(row.operationId, result.reason, { automatic: true });
+            if (retry.kind === 'pending') {
+              nextRetryAt = Math.min(nextRetryAt ?? Infinity, retry.retryAt);
+            }
+          }
+        }
       }
       return { kind: 'consumed', manifested, pending,
         ...(nextRetryAt === undefined ? {} : { nextRetryAt }) };

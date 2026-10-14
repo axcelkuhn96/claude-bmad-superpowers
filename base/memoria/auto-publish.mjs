@@ -72,8 +72,9 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
       row.sessionId, op, options.readSecret ?? readQdrantSecret, { ...options, ackLocal: ack,
         autoPublishConsent: frozen }));
     const result = await store(operation, ackLocal);
-    if (result?.kind === 'blocked') return { kind: 'blocked', published, pending,
-      reason: result.reason ?? 'store_blocked' };
+    if (result?.kind === 'blocked') return {
+      kind: result.reason === 'destination_unavailable' ? 'retry' : 'blocked',
+      published, pending, reason: result.reason ?? 'store_blocked' };
     if (result?.kind === 'conflict') return { kind: 'blocked', published, pending,
       reason: result.reason ?? 'store_conflict' };
     const saved = await outbox.readManifest(row.operationId);
@@ -92,5 +93,5 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
     }
     return { kind: 'published', published, pending };
   }
-  return { kind: 'pending', published, pending, reason: 'manual_review_required' };
+  return { kind: 'pending', published, pending, reason: 'automatic_validation_failed' };
 }

@@ -6,7 +6,9 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import * as worker from '../base/memoria/extract-worker.mjs';
 import { inspectConfiguration, initializeSession } from '../base/memoria/provider.mjs';
-import { registerOwner, configureExtractor, enableAutoPublish, localDevice } from '../base/memoria/policy.mjs';
+import { registerOwner, configureExtractor, enableAutoPublish, localDevice,
+  readAutoPublish } from '../base/memoria/policy.mjs';
+import { publishCheckpointAutomatically } from '../base/memoria/auto-publish.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { applyNativeExclusion } from '../base/memoria/native.mjs';
@@ -121,7 +123,7 @@ test('transient publication failure persists an automatic retry; permanent rejec
   }), null);
 });
 
-test('consumer resumes a manifested Haiku checkpoint after transient publication failure', async t => {
+async function automaticConsumerFixture(t) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-consumer-auto-'));
   t.after(() => fs.rm(home, { recursive: true, force: true }));
   const project = path.join(home, 'project');
@@ -161,6 +163,11 @@ test('consumer resumes a manifested Haiku checkpoint after transient publication
       actor: 'fixture-owner', origin: 'human', text: 'A release checklist is required.',
       timestamp: '2026-10-01T00:00:00Z', start: 0, end: 32 }] },
   { projectId: 'fixture-project', policyVersion: 'native-v1' })).kind, 'queued');
+  return { project, stateRoot, box };
+}
+
+test('consumer resumes a manifested Haiku checkpoint after transient publication failure', async t => {
+  const { project, stateRoot } = await automaticConsumerFixture(t);
   let extracted = 0;
   let published = 0;
   let clock = Date.now();
@@ -185,4 +192,89 @@ test('consumer resumes a manifested Haiku checkpoint after transient publication
   assert.equal(result.kind, 'consumed');
   assert.equal(extracted, 1);
   assert.equal(published, 2);
+});
+
+test('consumer retries transient Haiku failure and publishes after SessionEnd without a new hook', async t => {
+  const { project, stateRoot, box } = await automaticConsumerFixture(t);
+  let calls = 0;
+  let published = 0;
+  let clock = Date.now();
+  const realNow = Date.now;
+  try {
+    Date.now = () => clock;
+    const result = await worker.runScheduledConsumer({
+      now: () => clock,
+      wait: async ms => { clock += ms; },
+      consume: () => worker.consumeCheckpoints({ cli: 'claude', cwd: project, sessionId: 's', stateRoot,
+        runCli: async () => ++calls === 1
+          ? { kind: 'error', reason: 'cli_unavailable' }
+          : { kind: 'success', model: 'claude-haiku-5-5',
+            decisions: [{ source_message_id: 'm1', abstain_reason: '', candidates: [{
+              text: 'A release checklist is required.', type: 'rule', scope: 'project' }] }],
+            usage: { inputTokens: 1, outputTokens: 1, costUsd: 0 } },
+        publishCheckpoint: async () => { published++; return { kind: 'published', published: 1, pending: 0 }; },
+      }),
+    });
+    assert.equal(result.kind, 'consumed');
+  } finally { Date.now = realNow; }
+  assert.equal(calls, 2);
+  assert.equal(published, 1);
+  assert.equal((await box.extractionUsage('claude', 's')).calls, 2);
+});
+
+test('consumer resumes DNS failure after SessionEnd and stores without another extraction', async t => {
+  const { project, stateRoot } = await automaticConsumerFixture(t);
+  let calls = 0;
+  let stores = 0;
+  let clock = Date.now();
+  const realNow = Date.now;
+  try {
+    Date.now = () => clock;
+    await worker.runScheduledConsumer({
+      now: () => clock,
+      wait: async ms => { clock += ms; },
+      consume: () => worker.consumeCheckpoints({ cli: 'claude', cwd: project,
+        sessionId: 's', stateRoot,
+        runCli: async () => { calls++; return { kind: 'success', model: 'claude-haiku-5-5',
+          decisions: [{ source_message_id: 'm1', abstain_reason: '', candidates: [{
+            text: 'A release checklist is required.', type: 'rule', scope: 'project' }] }],
+          usage: { inputTokens: 1, outputTokens: 1, costUsd: 0 } }; },
+        publishCheckpoint: (row, resolution, options) => publishCheckpointAutomatically(
+          row, resolution, { ...options, readAutoPublish,
+            store: async (operation, ackLocal) => {
+              stores++;
+              if (stores === 1) return { kind: 'blocked', reason: 'destination_unavailable' };
+              await ackLocal(operation.externalId, { externalId: operation.externalId,
+                projectId: row.projectId, status: 'active', sdkId: 'sdk-1', qdrantId: 'qdrant-1' });
+              return { kind: 'stored', externalId: operation.externalId };
+            } }),
+      }),
+    });
+  } finally { Date.now = realNow; }
+  assert.equal(calls, 1);
+  assert.equal(stores, 2);
+});
+
+test('consumer stops after four transient Haiku calls and leaves schema errors for review', async t => {
+  for (const response of [
+    { kind: 'error', reason: 'cli_timeout' },
+    { kind: 'error', reason: 'cli_invalid_schema' },
+    { kind: 'error', reason: 'cli_profile_untrusted' },
+  ]) {
+    const { project, stateRoot, box } = await automaticConsumerFixture(t);
+    let calls = 0;
+    let clock = Date.now();
+    const realNow = Date.now;
+    try {
+      Date.now = () => clock;
+      await worker.runScheduledConsumer({
+        now: () => clock,
+        wait: async ms => { clock += ms; },
+        consume: () => worker.consumeCheckpoints({ cli: 'claude', cwd: project,
+          sessionId: 's', stateRoot, runCli: async () => { calls++; return response; } }),
+      });
+    } finally { Date.now = realNow; }
+    assert.equal(calls, response.reason === 'cli_timeout' ? 4 : 1);
+    assert.equal((await box.extractionUsage('claude', 's')).calls, calls);
+  }
 });
