@@ -139,6 +139,17 @@ test('Codex registra um MCP global por perfil com cwd dinâmico', async t => {
   assert.equal((await f.calls()).filter(call => call.args[1] === 'add').length, 1);
 });
 
+test('Codex reconhece entrada legada node quando resolve ao mesmo runtime', async t => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.profile, 'servers.json'), JSON.stringify({ other: { command: 'other' },
+    cbs_memoria: { scope: 'global', command: 'node', args: [mcpScript, '--cli', 'codex'] } }));
+  await fs.writeFile(path.join(f.profile, 'config.toml'), '[mcp_servers.cbs_memoria]\ncommand = "node"\n');
+  assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).kind, 'existing');
+  assert.match(await fs.readFile(path.join(f.profile, 'config.toml'), 'utf8'),
+    /enabled_tools = \["search", "get", "status"\]/);
+  assert.equal((await f.calls()).filter(call => call.args[1] === 'add').length, 0);
+});
+
 test('entrada divergente permanece intacta e recebe ação concreta', async t => {
   const f = await fixture(t);
   await fs.writeFile(path.join(f.profile, 'servers.json'), JSON.stringify({

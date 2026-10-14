@@ -15,13 +15,17 @@ function run(cli, args, cwd, env) {
   return spawnSync(cli, args, { cwd, env, encoding: 'utf8', timeout: 15000, maxBuffer: 64 * 1024 });
 }
 
-function matches(cli, output, command, args) {
+function matches(cli, output, command, args, env) {
   if (cli === 'codex') {
     let entry;
     try { entry = JSON.parse(output); } catch { return false; }
     const transport = entry.transport;
+    const legacyNode = transport?.command === 'node'
+      ? run('node', ['-p', 'process.execPath'], process.cwd(), env) : null;
+    const launcher = transport?.command === command ||
+      legacyNode?.status === 0 && legacyNode.stdout.trim() === command;
     return entry.enabled === true && transport?.type === 'stdio' &&
-      transport.command === command && JSON.stringify(transport.args) === JSON.stringify(args) &&
+      launcher && JSON.stringify(transport.args) === JSON.stringify(args) &&
       !transport.cwd && (!transport.env || Object.keys(transport.env).length === 0) &&
       (!transport.env_vars || transport.env_vars.length === 0);
   }
@@ -97,7 +101,7 @@ export async function registerReadonlyMcp(projectRoot, cli, { env = process.env 
   const found = run(cli, getArgs, projectRoot, env);
   if (found.error) return unavailable('mcp_cli_unavailable', cli, projectRoot);
   if (found.status === 0) {
-    if (!matches(cli, found.stdout, process.execPath, args)) return unavailable('mcp_conflict', cli, projectRoot);
+    if (!matches(cli, found.stdout, process.execPath, args, env)) return unavailable('mcp_conflict', cli, projectRoot);
     if (cli === 'codex' && !await persistCodexPolicy(env)) return unavailable('mcp_registration_failed', cli, projectRoot);
     return { kind: 'existing' };
   }
@@ -112,7 +116,7 @@ export async function registerReadonlyMcp(projectRoot, cli, { env = process.env 
   if (added.error || added.status !== 0) return unavailable('mcp_registration_failed', cli, projectRoot);
   const verified = run(cli, getArgs, projectRoot, env);
   return !verified.error && verified.status === 0 &&
-    matches(cli, verified.stdout, process.execPath, args) &&
+    matches(cli, verified.stdout, process.execPath, args, env) &&
     (cli !== 'codex' || await persistCodexPolicy(env))
     ? { kind: 'registered' } : unavailable('mcp_registration_failed', cli, projectRoot);
 }
