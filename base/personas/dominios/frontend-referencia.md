@@ -8,7 +8,7 @@ Conteúdo integral do rulebook de frontend, lido **por caminho** pelo subagent d
 
 Rulebook injetado no prompt do subagent `general-purpose` quando a story for de UI/frontend. **Stacka em cima do `@dev` BMAD**, não substitui — o subagent é Dev + UI, não só UI.
 
-> Skill oficial obrigatória: invoque `frontend-design` (plugin `claude-plugins-official`) **toda vez** que houver story de UI. Ela guia a parte estética/criativa. Este rulebook diz **como usar** ela no contexto do projeto.
+> A skill é escolhida pelo roteador `dominios/frontend.md`: `frontend-design` em greenfield, padrão existente sem skill adicional ou Design Read do Taste quando houver referência. Este rulebook complementa a escolha sem empilhar skills.
 
 ## ⚠️ ORDEM DE OPERAÇÃO (não inverta)
 
@@ -202,6 +202,12 @@ Reporte essa varredura no Dev Agent Record: "Padronização: substituí N hex po
 - **CTA:** cabe em 1 linha no desktop (≤ 3 palavras); **uma label por intenção** na página inteira (não "Fale conosco" + "Entre em contato" + "Vamos conversar").
 - Defaults banidos: ver "Recuse como default" acima.
 
+### Evidência por seção — adaptador Taste para site público novo ou redesign
+
+No **brief e report de frontend já existentes**, registre uma linha por seção de landing, portfólio, marketing ou editorial: **seção · propósito · afirmação sustentada · fonte da prova · status (`verificada`/`não verificada`) · caminho do asset · origem/licença ou prompt de geração · aparece na captura Playwright (`sim`/`não`/`não aplicável`)**. Se a seção não usa asset, marque `não aplicável`. Em redesign, preserve conteúdo e identidade definidos no brief e no design system existente.
+
+Use só fatos que a fonte realmente sustenta; quando faltar prova, marque `não verificada` e ajuste a copy antes de publicar. Não invente depoimentos, números, clientes, direitos de uso nem evidência visual. Um caminho de asset no código não prova que ele apareceu: confira a captura desktop/mobile com Playwright (venv `/tmp/pwval`, nunca `agent-browser`) e marque `sim` apenas quando estiver visível. Aplique o mesmo critério ao reviewer de UI. Use a orientação do Taste para relacionar conteúdo, prova e imagem; não importe seus presets estéticos, cotas de seções ou chamadas obrigatórias de geração de imagem.
+
 ## Projeto Laravel/Blade (complemento)
 Se o projeto é Laravel e o plugin `ui-ux-pro-max` está instalado, uma consulta pontual é permitida (não a skill inteira, não `--persist`):
 `python "${CLAUDE_PLUGIN_ROOT}/.claude/skills/ui-ux-pro-max/scripts/search.py" "<tema: form validation | blade component | livewire loading>" --stack laravel`
@@ -265,6 +271,7 @@ Além do que o `@dev` BMAD pede normalmente (File List, Dev Agent Record, status
 - Lista de **primitivos reutilizados / criados**.
 - Lista de **estados implementados** por componente/rota (loading, empty, error, success, etc.).
 - **Validação visual**: o que foi checado no browser (rotas, breakpoints, dark mode, teclado). Ou nota explícita de "não foi possível validar visualmente".
+- Em site público novo/redesign: registro "Evidência por seção" no mesmo report, com prova, origem/licença ou prompt dos assets e confirmação na captura Playwright.
 - **Tradeoffs aceitos** (ex.: "não implementei animação de page-load porque o resto do projeto não tem motion ainda").
 
 ## Anti-padrões fatais (frontend)
@@ -293,7 +300,9 @@ Ordem de prioridade; pare no primeiro 🔴:
 9. **Charts** 🟢 — legenda, tooltip, cor acessível, não depende só de cor.
 10. **Integridade de implementação** 🔴 — a tela expressa um sistema **deste** produto ou seria intercambiável com um produto qualquer? Drift do design system (hex solto, componente one-off onde existe primitivo), conteúdo decorativo/enganoso, itens do "Recuse como default" presentes sem o brief ter pedido.
 
+Em site público novo/redesign, confira também as linhas "Evidência por seção": afirmações sem fonte marcada como verificadas, licença/origem inventada ou asset declarado que não aparece na captura bloqueiam a aprovação. Não aplique esta checagem a telas de app/CRUD/admin.
+
 **Formato de saída do reviewer de UI** (entra no relatório junto do QA):
 
 ## Fontes
-Rulebook original do pacote · adendo adaptado de pbakaus/impeccable (Apache-2.0: modos, piso de craft, score de audit, triagem), Leonxlnx/taste-skill (MIT: Design Read, dials, regras de CTA), nextlevelbuilder/ui-ux-pro-max 2.13 (MIT: checklist por prioridade, `--stack laravel`), ckm:design-system (MIT: 3 camadas de token, prioridade de estados), skill oficial `frontend-design` (Apache-2.0), affaan-m/ECC (MIT: §React/§React Native). Reescrita em pt-BR.
+Rulebook original do pacote · adendo adaptado de pbakaus/impeccable (Apache-2.0: modos, piso de craft, score de audit, triagem), [Leonxlnx/taste-skill @ f624f37](https://github.com/Leonxlnx/taste-skill/blob/f624f37a8c650b9cc550253104925efe4c8de246/skills/taste-skill/SKILL.md) (MIT: Design Read, dials, regras de CTA, conteúdo e proveniência de assets), nextlevelbuilder/ui-ux-pro-max 2.13 (MIT: checklist por prioridade, `--stack laravel`), ckm:design-system (MIT: 3 camadas de token, prioridade de estados), skill oficial `frontend-design` (Apache-2.0), affaan-m/ECC (MIT: §React/§React Native). Reescrita em pt-BR.

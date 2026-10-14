@@ -14,6 +14,8 @@ Design system existente? (`tailwind.config.*`, tokens, `components/ui/`, lib UI,
 
 **Persuadir** liga os dials; **Operar** (app, CRUD, admin) segue o projeto, não "embeleza". Nunca invoque `ui-ux-pro-max`, `impeccable` ou `--persist` no subagent.
 
+**Site público novo ou redesign** (landing, portfólio, marketing, editorial): use o adaptador curto "Evidência por seção" em `frontend-referencia.md` no brief e no report já existentes. Ele aproveita os princípios de conteúdo/asset do Taste sem invocar outra skill nem alterar o roteador acima. Não se aplica a app/CRUD/admin.
+
 ## 3. Sempre
 - Anti-IA-genérico, estados completos (loading/empty/error/success/disabled), a11y AA, tokens > literais, DRY de CSS.
 - Piso de craft antes de editar; **validação visual** (Playwright, venv `/tmp/pwval`, nunca `agent-browser`) antes de Ready for Review — ou declare que não validou.
