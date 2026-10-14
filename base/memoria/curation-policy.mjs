@@ -16,6 +16,19 @@ export function transientCbsRuntimeStatus(text) {
     !/(?:\bbug\b|erro|incorret|deve|should|requirement|regra)/.test(value);
 }
 
+// A development handoff can repeat stable steps while reporting the current
+// review queue. Its review state expires as soon as another file is approved.
+// Keep this narrow: business approvals, rules, decisions and bug findings are
+// not treated as temporary development status.
+export function transientDevelopmentReviewStatus(text, type) {
+  if (type !== 'fact' || typeof text !== 'string') return false;
+  const value = text.normalize('NFKD').toLowerCase().replace(/[\u0300-\u036f]/g, '');
+  const development = /\b(?:compil(?:e|ed|ing|ation|ar|ado|acao)|deploy|build|release|package|pacote)\b|\.(?:prw|tlpp|js|ts|py)\b/.test(value);
+  const review = /\b(?:pending final review|awaiting final review|under review|em revisao|revisao final pendente)\b/.test(value);
+  const unfinished = /\b(?:not compiled yet|ainda nao compilad[oa]|wait(?:ing)? for the final list|aguard(?:ar|ando) (?:a )?lista final)\b/.test(value);
+  return development && review && unfinished;
+}
+
 export function selectExistingMemories(points, { projectId, ownerId, now, query = '',
   isSafe = () => true } = {}) {
   if (!Array.isArray(points) || points.length > 64 || !projectId || !ownerId) return [];

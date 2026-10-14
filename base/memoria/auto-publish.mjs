@@ -5,7 +5,7 @@ import { readQdrantSecret } from './qdrant-key.mjs';
 import { POLICY_VERSION } from './transcript.mjs';
 import { validateConversationProof } from './conversation-proof.mjs';
 import { dedupKeyFor } from './dedup-key.mjs';
-import { transientCbsRuntimeStatus } from './curation-policy.mjs';
+import { transientCbsRuntimeStatus, transientDevelopmentReviewStatus } from './curation-policy.mjs';
 
 const blocked = reason => ({ kind: 'blocked', published: 0, pending: 0, reason });
 const sameConsent = (frozen, live, projectId) => frozen?.version === 1 &&
@@ -76,9 +76,13 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
         entry.status === 'rejected') continue;
     if (entry.status !== 'pending') { pending++; continue; }
     const payload = await outbox.readCandidatePayload(row.operationId, entry.candidateKey);
-    if (payload.format_version === 4 && transientCbsRuntimeStatus(payload.text)) {
+    const transientReason = payload.format_version === 4 &&
+      (transientCbsRuntimeStatus(payload.text) ? 'transient_cbs_runtime_status' :
+        transientDevelopmentReviewStatus(payload.text, payload.type) ?
+          'transient_development_review_status' : null);
+    if (transientReason) {
       const disposed = await outbox.disposeCandidate(row.operationId, entry.candidateKey,
-        'rejected', 'transient_cbs_runtime_status');
+        'rejected', transientReason);
       if (disposed.kind !== 'disposed') return { kind: 'retry', published, pending,
         reason: disposed.reason ?? 'local_disposition_failed' };
       continue;

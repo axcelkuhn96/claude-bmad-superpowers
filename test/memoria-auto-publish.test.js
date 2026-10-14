@@ -11,6 +11,7 @@ import { externalIdFor, reconcileStore } from '../base/memoria/ledger.mjs';
 import { storeMemory } from '../base/memoria/bridge.mjs';
 import { POLICY_VERSION } from '../base/memoria/transcript.mjs';
 import { dedupKeyFor } from '../base/memoria/dedup-key.mjs';
+import { transientDevelopmentReviewStatus } from '../base/memoria/curation-policy.mjs';
 
 const source = { origin: 'human', actor: 'user', speakerRole: 'user',
   ownerId: 'owner-123',
@@ -79,6 +80,44 @@ test('pre-existing v4 manifest with temporary CBS status is rejected before stor
         disposed++;
         assert.equal(status, 'rejected');
         assert.equal(reason, 'transient_cbs_runtime_status');
+        return { kind: 'disposed' };
+      },
+      completeCheckpoint: async () => ({ kind: 'processed' }),
+    },
+    readAutoPublish: async () => consent,
+    store: async () => { throw Error('temporary status reached Qdrant'); },
+  });
+  assert.equal(result.kind, 'published');
+  assert.equal(result.published, 0);
+  assert.equal(disposed, 1);
+});
+
+test('temporary development review fact is rejected without suppressing durable findings', () => {
+  const temporary = 'Deploy compile order for the HML package, still pending final review (not compiled yet). Files are A.prw then B.tlpp. A was approved, B is under review, and the assistant asked to wait for the final list.';
+  assert.equal(transientDevelopmentReviewStatus(temporary, 'fact'), true);
+  assert.equal(transientDevelopmentReviewStatus(temporary, 'decision'), false);
+  assert.equal(transientDevelopmentReviewStatus('Known limitation: the first imported signature is not counted by the portal; the issue is still open.', 'fact'), false);
+  assert.equal(transientDevelopmentReviewStatus('AP invoice is pending business review before payment.', 'fact'), false);
+  assert.equal(transientDevelopmentReviewStatus('The compiler requires a final review before publishing a release.', 'rule'), false);
+});
+
+test('pre-existing v4 manifest with temporary development review fact is rejected before store', async () => {
+  const row = { operationId: 'src-' + 'a'.repeat(64), projectId: 'p',
+    cli: 'claude', sessionId: 'session', policyVersion: POLICY_VERSION,
+    start: 0, end: 100, sliceHash: 'c'.repeat(64), messages: [source] };
+  let disposed = 0;
+  const result = await publish(row, resolution('/private-state'), {
+    outbox: {
+      pending: async () => [row],
+      futureSourceAllowed: async () => ({ kind: 'allowed' }),
+      readManifest: async () => ({ kind: 'manifested', candidates: [
+        { status: 'pending', candidateKey: 'temporary', payloadRef: { sha256: 'a'.repeat(64) } }] }),
+      readCandidatePayload: async () => ({ format_version: 4, type: 'fact',
+        text: 'HML package is pending final review (not compiled yet). A.prw was approved, B.tlpp is under review. Wait for the final list.' }),
+      disposeCandidate: async (_operationId, _key, status, reason) => {
+        disposed++;
+        assert.equal(status, 'rejected');
+        assert.equal(reason, 'transient_development_review_status');
         return { kind: 'disposed' };
       },
       completeCheckpoint: async () => ({ kind: 'processed' }),
