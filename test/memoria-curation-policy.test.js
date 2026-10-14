@@ -98,3 +98,30 @@ test('context keeps at most eight complete memories and 4096 content bytes', () 
     ({ ...points[n % points.length], id: `overflow-${n}` })), { projectId: 'p',
     ownerId: 'owner', query: 'Compile order' }), []);
 });
+
+test('context considers the ninth ranked memory when an earlier memory exceeds the byte budget', () => {
+  const points = Array.from({ length: 9 }, (_, n) => ({ id: `id-${n}`, payload: {
+    project_id: 'p', user_id: 'p', status: 'active', scope: 'project',
+    data: n === 8 ? 'Short useful rule.' : 'A'.repeat(512),
+    ...(n === 7 ? { condition: 'Only after approval.' } : {}),
+  } }));
+  const selected = selectExistingMemories(points, { projectId: 'p', ownerId: 'owner',
+    now: '2026-10-14T22:00:00Z' });
+  assert.deepEqual(selected.map(item => item.memory_id),
+    ['id-0', 'id-1', 'id-2', 'id-3', 'id-4', 'id-5', 'id-6', 'id-8']);
+});
+
+test('time-bounded existing memories cannot suppress a durable new memory', () => {
+  const points = [
+    { id: 'future-expiry', payload: { project_id: 'p', user_id: 'p',
+      status: 'active', scope: 'project', data: 'Use short-lived endpoint.',
+      valid_to: '2026-12-31T00:00:00Z' } },
+    { id: 'past-start', payload: { project_id: 'p', user_id: 'p',
+      status: 'active', scope: 'project', data: 'Use revised endpoint.',
+      valid_from: '2026-01-01T00:00:00Z' } },
+    { id: 'durable', payload: { project_id: 'p', user_id: 'p',
+      status: 'active', scope: 'project', data: 'Use durable endpoint.' } },
+  ];
+  assert.deepEqual(selectExistingMemories(points, { projectId: 'p', ownerId: 'owner',
+    now: '2026-10-14T22:00:00Z' }).map(item => item.memory_id), ['durable']);
+});

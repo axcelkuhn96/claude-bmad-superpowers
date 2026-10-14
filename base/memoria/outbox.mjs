@@ -929,7 +929,7 @@ export function createOutbox(stateDir, options = {}) {
       return { kind: 'claimed', calls: count.calls };
     });
   }
-  async function recordExtractionUsage(operationId, callIndex, usage, latencyMs) {
+  async function recordExtractionUsage(operationId, callIndex, usage, latencyMs, context) {
     if (!validId(operationId) || !Number.isSafeInteger(callIndex) || callIndex < 1 ||
         !Number.isSafeInteger(latencyMs) || latencyMs < 0) return blocked('invalid_extraction_usage');
     return withLock(async () => {
@@ -940,8 +940,20 @@ export function createOutbox(stateDir, options = {}) {
       if (!counter || callIndex > counter.calls) return blocked('missing_extraction_claim');
       if (counter.results.some(result => result.callIndex === callIndex)) return { kind: 'recorded' };
       const number = value => Number.isFinite(value) && value >= 0 ? value : null;
+      const bounded = (value, limit) => Number.isSafeInteger(value) && value >= 0
+        ? Math.min(value, limit) : 0;
+      const kinds = ['ready', 'saturated', 'unavailable'];
+      const reasons = ['context_not_configured', 'context_identity_changed',
+        'context_untrusted', 'context_unavailable', 'remote_status', 'remote_schema',
+        'remote_unavailable'];
+      const contextStatus = context && kinds.includes(context.kind)
+        ? { kind: context.kind,
+          ...(reasons.includes(context.reason) ? { reason: context.reason } : {}),
+          scanned: bounded(context.scanned, 64), selected: bounded(context.selected, 8) }
+        : null;
       counter.results.push({ callIndex, operationId, inputTokens: number(usage.inputTokens),
-        outputTokens: number(usage.outputTokens), costUsd: number(usage.costUsd), latencyMs });
+        outputTokens: number(usage.outputTokens), costUsd: number(usage.costUsd), latencyMs,
+        ...(contextStatus ? { context: contextStatus } : {}) });
       if (!await fits(counter)) return { kind: 'full', operationId };
       await durable(file, counter);
       return { kind: 'recorded' };

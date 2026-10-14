@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createOutbox } from '../base/memoria/outbox.mjs';
+import { createWindowsState } from '../base/memoria/windows-state.mjs';
 import { extractCheckpoint, storeOperation } from '../base/memoria/candidates.mjs';
 
 const identity = { projectId: 'project', policyVersion: 'native-v2' };
@@ -23,6 +24,14 @@ async function fixture(fn) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-conversation-'));
   try { await fn(createOutbox(root), root); }
   finally { await fs.rm(root, { recursive: true, force: true }); }
+}
+
+async function readExtractionCounter(root) {
+  const digest = createHash('sha256').update(JSON.stringify(['codex', 'conversation']))
+    .digest('hex');
+  const file = path.join(root, 'outbox', `extract-${digest}.json`);
+  return process.platform === 'win32' ? createWindowsState(file).read()
+    : JSON.parse(await fs.readFile(file, 'utf8'));
 }
 
 test('five completed exchanges make one durable checkpoint and only then permit extraction', async () => {
@@ -266,7 +275,7 @@ test('Haiku sees both conversation roles once and persists a proven v4 summary',
 });
 
 test('conversation context guides one Haiku call while transient CBS status is omitted', async () => {
-  await fixture(async box => {
+  await fixture(async (box, root) => {
     const human = { ...slice(0, 'human', 'UserPromptSubmit').messages[0],
       text: 'Nesta sessão a memória CBS ficou somente leitura. Use PostgreSQL para persistência.' };
     const assistant = { ...slice(1, 'assistant', 'Stop').messages[0],
@@ -314,11 +323,38 @@ test('conversation context guides one Haiku call while transient CBS status is o
     });
     assert.equal(result.kind, 'manifested', JSON.stringify(result));
     assert.deepEqual(result.context, { kind: 'ready', scanned: 1, selected: 1 });
+    const counter = await readExtractionCounter(root);
+    assert.deepEqual(counter.results[0].context, { kind: 'ready', scanned: 1, selected: 1 });
+    const resumed = createOutbox(root);
+    assert.equal((await resumed.extractionUsage('codex', 'conversation')).calls, 1);
     assert.equal(calls, 1);
     assert.equal(scrolls, 1);
     const manifest = await box.readManifest(row.operationId);
     assert.equal(manifest.candidates.length, 1);
     assert.equal((await box.readCandidatePayload(row.operationId,
       manifest.candidates[0].candidateKey)).text, 'PostgreSQL is the persistence database.');
+  });
+});
+
+test('extraction diagnostics keep only bounded context status in durable outbox', async () => {
+  await fixture(async (box, root) => {
+    const human = { ...slice(0, 'human', 'UserPromptSubmit').messages[0],
+      text: 'Use PostgreSQL for storage.' };
+    const assistant = { ...slice(1, 'assistant', 'Stop').messages[0],
+      text: 'Use PostgreSQL for storage.', finalVisible: true };
+    assert.equal((await box.enqueueConversationSlice({ cli: 'codex', sessionId: 'conversation',
+      start: 0, end: 20, sliceHash: 'b'.repeat(64), messages: [human, assistant] },
+    identity, { event: 'SessionEnd' })).kind, 'queued');
+    const [row] = await box.pending();
+    const claimed = await box.claimExtraction(row.operationId, 4);
+    assert.equal(claimed.kind, 'claimed');
+    const result = await box.recordExtractionUsage(row.operationId, claimed.calls, {}, 1,
+      { kind: 'unavailable', reason: 'private key abc', scanned: 900,
+        selected: 900, text: 'secret text', memory_id: 'remote-id' });
+    assert.equal(result.kind, 'recorded');
+    const persisted = await readExtractionCounter(root);
+    assert.deepEqual(persisted.results[0].context,
+      { kind: 'unavailable', scanned: 64, selected: 8 });
+    assert.doesNotMatch(JSON.stringify(persisted.results[0]), /private key|secret text|remote-id/);
   });
 });

@@ -28,8 +28,7 @@ export function selectExistingMemories(points, { projectId, ownerId, now, query 
         p.status !== 'active' || p.scope !== 'project' ||
         typeof p.data !== 'string' || !p.data.trim() || bytes(p.data) > 512 ||
         p.condition != null && (typeof p.condition !== 'string' || bytes(p.condition) > 512) ||
-        p.valid_to && (!Number.isFinite(Date.parse(p.valid_to)) || Date.parse(p.valid_to) <= at) ||
-        p.valid_from && (!Number.isFinite(Date.parse(p.valid_from)) || Date.parse(p.valid_from) > at) ||
+        p.valid_from != null || p.valid_to != null ||
         !isSafe(p.data) || p.condition && !isSafe(p.condition)) return [];
     const memory_id = String(point.id ?? '');
     if (!memory_id) return [];
@@ -39,8 +38,9 @@ export function selectExistingMemories(points, { projectId, ownerId, now, query 
     return [{ memory_id, text: p.data, ...(p.condition ? { condition: p.condition } : {}),
       overlap, recent: Number.isFinite(recent) ? recent : 0 }];
   }).sort((a, b) => b.overlap - a.overlap || b.recent - a.recent ||
-    a.memory_id.localeCompare(b.memory_id)).slice(0, 8)
+    a.memory_id.localeCompare(b.memory_id))
     .reduce((picked, item) => {
+      if (picked.length >= 8) return picked;
       const bytesUsed = picked.reduce((n, prior) => n + bytes(prior.text) +
         bytes(prior.condition ?? ''), 0);
       if (bytesUsed + bytes(item.text) + bytes(item.condition ?? '') <= 4096) {

@@ -199,7 +199,9 @@ async function extractConversationCheckpoint(row, cliPolicy, options = {}) {
   try { response = await (runCli ?? runHaikuExtraction)(prompt, cliPolicy); }
   catch { return pending('cli_error'); }
   const usage = await outbox.recordExtractionUsage(row.operationId, claim.calls,
-    response?.usage ?? {}, Date.now() - began);
+    response?.usage ?? {}, Date.now() - began,
+    { kind: context.kind, reason: context.reason, scanned: context.scanned ?? 0,
+      selected: context.items.length });
   if (usage.kind !== 'recorded') return pending('usage_record_failed');
   if (response?.kind !== 'success') return pending(response?.reason ?? 'cli_error');
   if (containsSecret(response) || !/^claude-haiku-5-5(?:-[a-z0-9-]+)?$/.test(response.model ?? '') ||
