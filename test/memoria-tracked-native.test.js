@@ -66,6 +66,54 @@ test('tracked Codex config and hooks preserve existing hooks and index on restor
   assert.deepEqual(f.paths.map(file => git(f.root, 'ls-files', '--stage', '--', path.relative(f.root, file))), f.index);
 });
 
+test('tracked Codex upgrades owned 0.13.3 hooks in place without touching user hooks or index', async t => {
+  const f = await fixture(t, 'codex');
+  const originalHooks = await fs.readFile(f.hooks, 'utf8');
+  const options = { cli: 'codex', stateRoot: f.stateRoot, installedPlugin: true };
+  assert.equal((await applyNativeExclusion(f.root,
+    { ...options, allowTrackedNative: true })).kind, 'applied');
+  const scope = createHash('sha256').update(f.root).digest('hex');
+  const snapshot = path.join(f.stateRoot, scope, 'native-codex.json');
+  const installed = JSON.parse(await fs.readFile(f.hooks, 'utf8'));
+  delete installed.hooks.PreCompact;
+  delete installed.hooks.Interrupt;
+  installed.hooks.SessionEnd.at(-1).hooks[0].timeout = 10;
+  const oldHooks = JSON.stringify(installed, null, 2) + '\n';
+  await fs.writeFile(f.hooks, oldHooks);
+  const saved = JSON.parse(await fs.readFile(snapshot, 'utf8'));
+  delete saved.captureSchema;
+  saved.trackedNative.paths.find(row => row.file === f.hooks).installedHash =
+    createHash('sha256').update(oldHooks).digest('hex');
+  const { rollback, ...sealed } = saved;
+  saved.trackedNative.seal = createHash('sha256').update(JSON.stringify({ ...sealed,
+    trackedNative: { rootIdentity: saved.trackedNative.rootIdentity,
+      paths: saved.trackedNative.paths } })).digest('hex');
+  await fs.writeFile(snapshot, JSON.stringify(saved) + '\n');
+
+  const rename = fs.rename;
+  let injected = false;
+  fs.rename = async (from, to) => {
+    if (to === snapshot && !injected) { injected = true; throw new Error('injected snapshot failure'); }
+    return rename(from, to);
+  };
+  let failed;
+  try { failed = await applyNativeExclusion(f.root, { ...options, allowTrackedNative: true }); }
+  finally { fs.rename = rename; }
+  assert.equal(failed.reason, 'native_snapshot_changed');
+  assert.equal(await fs.readFile(f.hooks, 'utf8'), oldHooks);
+
+  const upgraded = await applyNativeExclusion(f.root, { ...options, allowTrackedNative: true });
+  assert.equal(upgraded.kind, 'applied', JSON.stringify(upgraded));
+  assert.equal((await verifyNativeCapture(f.root, options)).kind, 'verified');
+  const after = JSON.parse(await fs.readFile(f.hooks, 'utf8'));
+  assert.equal(after.hooks.SessionStart[0].hooks[0].command, 'echo existing');
+  assert.equal(after.hooks.SessionEnd.at(-1).hooks[0].timeout, 3);
+  assert.equal(after.hooks.Interrupt.at(-1).hooks[0].timeout, 3);
+  assert.deepEqual(f.paths.map(file => git(f.root, 'ls-files', '--stage', '--', path.relative(f.root, file))), f.index);
+  assert.equal((await restoreNativeExclusion(f.root, options)).kind, 'restored');
+  assert.equal(await fs.readFile(f.hooks, 'utf8'), originalHooks);
+});
+
 test('tracked Codex restore resumes after the second config write fails', async t => {
   const f = await fixture(t, 'codex');
   const originalHooks = await fs.readFile(f.hooks, 'utf8');

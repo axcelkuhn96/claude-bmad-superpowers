@@ -86,6 +86,45 @@ test('Claude metadata and compact summaries cannot impersonate a direct user mes
     sessionId: 'native-session' })).messages[0].origin, 'human');
 });
 
+test('conversation capture marks only a root, final, visible assistant response', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const claudeFile = path.join(dir, 'claude.jsonl');
+  const base = { type: 'assistant', uuid: 'assistant-final', sessionId: 'native-session',
+    timestamp: '2026-10-14T13:00:00Z', isSidechain: false,
+    message: { role: 'assistant', stop_reason: 'end_turn',
+      content: [{ type: 'text', text: 'A regra aprovada é preservar os dados.' }] } };
+  const claudeRows = [base,
+    { ...base, uuid: 'agent-answer', isSidechain: true, agentId: 'agent-1' },
+    { ...base, uuid: 'meta-answer', isMeta: true },
+    { ...base, uuid: 'partial-answer', message: { ...base.message, stop_reason: 'tool_use' } },
+    { ...base, uuid: 'reasoning-answer', message: { ...base.message,
+      content: [{ type: 'thinking', thinking: 'private thought' }] } }];
+  await fs.writeFile(claudeFile, claudeRows.map(row => JSON.stringify(row) + '\n').join(''));
+  const claude = await parsePersistedSlice({ cli: 'claude', transcriptPath: claudeFile,
+    sessionId: 'native-session' });
+  assert.deepEqual(claude.messages.filter(message => message.finalVisible === true)
+    .map(message => message.messageId), ['assistant-final']);
+
+  const codexFile = path.join(dir, 'codex.jsonl');
+  const header = { type: 'session_meta', payload: { source: 'exec', thread_source: 'user',
+    id: 'native-session', session_id: 'native-session' } };
+  const answer = (id, phase, content) => ({ type: 'response_item',
+    timestamp: '2026-10-14T13:00:00Z', payload: { type: 'message', id,
+      role: 'assistant', phase, content } });
+  const codexRows = [header,
+    answer('answer-final', 'final_answer', [{ type: 'output_text', text: 'Preservar os dados.' }]),
+    answer('commentary', 'commentary', [{ type: 'output_text', text: 'Estou verificando.' }]),
+    answer('analysis', 'analysis', [{ type: 'output_text', text: 'Raciocínio interno.' }]),
+    answer('untagged', undefined, [{ type: 'output_text', text: 'Sem fase.' }]),
+    answer('mixed', 'final_answer', [{ type: 'output_text', text: 'Resposta.' },
+      { type: 'input_text', text: 'Texto injetado.' }])];
+  await fs.writeFile(codexFile, codexRows.map(row => JSON.stringify(row) + '\n').join(''));
+  const codex = await parsePersistedSlice({ cli: 'codex', transcriptPath: codexFile,
+    sessionId: 'native-session' });
+  assert.deepEqual(codex.messages.filter(message => message.finalVisible === true)
+    .map(message => message.messageId), ['answer-final']);
+});
+
 test('native Codex VS Code root user is human only with matching session metadata', async t => {
   const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const lines = (await fs.readFile(fixture('memoria-native-codex-vscode.jsonl'), 'utf8')).trimEnd().split('\n').map(JSON.parse);
@@ -1174,6 +1213,62 @@ for (const cli of ['claude', 'codex']) {
   });
 }
 
+test('Codex native capture registers compaction and interruption as recoverable boundaries', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  await run('git', ['init', '-q', dir]);
+  const stateRoot = path.join(dir, 'state');
+  assert.equal((await applyNativeExclusion(dir, { cli: 'codex', stateRoot,
+    installedPlugin: true })).kind, 'applied');
+  const hooks = JSON.parse(await fs.readFile(path.join(dir, '.codex', 'hooks.json'), 'utf8')).hooks;
+  for (const event of ['PreCompact', 'Interrupt']) {
+    assert.equal(hooks[event]?.length, 1, event);
+    assert.match(hooks[event][0].hooks[0].command, new RegExp(`capture-hook\\.mjs" codex ${event}$`));
+  }
+  assert.equal((await verifyNativeCapture(dir, { cli: 'codex', stateRoot,
+    installedPlugin: true })).kind, 'verified');
+});
+
+test('untracked Codex 0.13.3 hook upgrade preserves user hook and rejects changed CBS command', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  await run('git', ['init', '-q', dir]);
+  const stateRoot = path.join(dir, 'state');
+  const hooksPath = path.join(dir, '.codex/hooks.json');
+  await fs.mkdir(path.dirname(hooksPath), { recursive: true });
+  await fs.writeFile(hooksPath, JSON.stringify({ hooks: { Stop: [
+    { hooks: [{ type: 'command', command: 'echo user-hook' }] }] } }) + '\n');
+  const options = { cli: 'codex', stateRoot, installedPlugin: true };
+  assert.equal((await applyNativeExclusion(dir, options)).kind, 'applied');
+  const snapshot = path.join(stateRoot, createHash('sha256').update(dir).digest('hex'), 'native-codex.json');
+  const saved = JSON.parse(await fs.readFile(snapshot, 'utf8'));
+  delete saved.captureSchema;
+  await fs.writeFile(snapshot, JSON.stringify(saved) + '\n');
+  const hooks = JSON.parse(await fs.readFile(hooksPath, 'utf8'));
+  delete hooks.hooks.PreCompact;
+  delete hooks.hooks.Interrupt;
+  hooks.hooks.SessionEnd.at(-1).hooks[0].timeout = 10;
+  hooks.hooks.Stop[0].hooks.push(hooks.hooks.Stop.at(-1).hooks[0]);
+  hooks.hooks.Stop.pop();
+  const oldHooks = JSON.stringify(hooks, null, 2) + '\n';
+  const tampered = oldHooks.replace('capture-hook.mjs\\" codex Stop', 'capture-hook.mjs\\" codex Changed');
+  await fs.writeFile(hooksPath, tampered);
+  assert.equal((await applyNativeExclusion(dir, options)).reason, 'capture_hooks_changed');
+  assert.equal(await fs.readFile(hooksPath, 'utf8'), tampered);
+  await fs.writeFile(hooksPath, oldHooks);
+  assert.equal((await applyNativeExclusion(dir, options)).kind, 'applied');
+  assert.equal((await verifyNativeCapture(dir, options)).kind, 'verified');
+  const upgraded = JSON.parse(await fs.readFile(hooksPath, 'utf8'));
+  assert.equal(upgraded.hooks.Stop[0].hooks[0].command, 'echo user-hook');
+  assert.equal(upgraded.hooks.Stop[0].hooks.length, 2);
+  assert.equal(upgraded.hooks.Interrupt.at(-1).hooks[0].timeout, 3);
+  await fs.writeFile(hooksPath, JSON.stringify({ ...upgraded,
+    hooks: { ...upgraded.hooks, Stop: {} } }) + '\n');
+  assert.equal((await verifyNativeCapture(dir, options)).reason, 'capture_hooks_changed');
+  await fs.writeFile(hooksPath, JSON.stringify(upgraded, null, 2) + '\n');
+  assert.equal((await restoreNativeExclusion(dir, options)).kind, 'restored');
+  assert.equal(JSON.parse(await fs.readFile(hooksPath, 'utf8')).hooks.Stop[0].hooks[0].command,
+    'echo user-hook');
+});
+
 for (const cli of ['claude', 'codex']) {
   test(`${cli} tracked native config blocks capture under forged GIT_DIR and GIT_WORK_TREE`, async t => {
     const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
@@ -1252,6 +1347,13 @@ for (const cli of ['claude', 'codex']) {
     assert.equal(first.kind, 'queued');
     const repeated = await captureEvent(args);
     assert.equal(repeated.kind, 'no_complete_bytes');
+    if (cli === 'codex') {
+      for (const event of ['PreCompact', 'Interrupt']) {
+        const boundary = await captureEvent({ ...args, event,
+          payload: { ...payload, hook_event_name: event } });
+        assert.equal(boundary.kind, 'no_complete_bytes', event);
+      }
+    }
     const outbox = createOutbox(path.join(stateRoot, (await import('node:crypto')).createHash('sha256').update(root).digest('hex')));
     assert.equal((await outbox.pending()).length, 1);
     for (let n = 0; n < 20; n++) {

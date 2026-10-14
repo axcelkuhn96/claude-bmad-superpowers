@@ -8,8 +8,9 @@ import { nativeProfile } from './native-profile.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const script = fileURLToPath(import.meta.url);
-const boundaryEvents = new Set(['SessionStart', 'Stop', 'PreCompact', 'SessionEnd']);
+const boundaryEvents = new Set(['SessionStart', 'Stop', 'PreCompact', 'Interrupt', 'SessionEnd']);
 const transientExtractionErrors = new Set(['cli_error', 'cli_timeout', 'cli_unavailable']);
+const abandonedStageIdleMs = 30 * 60 * 1000;
 
 export async function runScheduledConsumer({ consume, now = Date.now,
   wait = ms => new Promise(resolve => setTimeout(resolve, ms)), maxDurationMs = 30 * 60 * 1000 } = {}) {
@@ -28,13 +29,16 @@ export async function runScheduledConsumer({ consume, now = Date.now,
 export async function runExclusiveConsumer({ ownerRoot, lockTimeoutMs = 1000, ...options } = {}) {
   if (!ownerRoot || !path.isAbsolute(ownerRoot)) return blocked('invalid_consumer_identity');
   const { withProjectLock } = await import('./ledger.mjs');
-  try {
-    return await withProjectLock(ownerRoot, () => runScheduledConsumer(options),
-      'consumer.lock', lockTimeoutMs);
-  } catch (error) {
-    return blocked(['writer_lock_timeout', 'windows_file_lock_busy'].includes(error?.message)
-      ? 'consumer_busy' : 'consumer_unavailable');
-  }
+  return runScheduledConsumer({ ...options, consume: async () => {
+    try {
+      return await withProjectLock(ownerRoot, options.consume, 'consumer.lock', lockTimeoutMs);
+    } catch (error) {
+      if (['writer_lock_timeout', 'windows_file_lock_busy'].includes(error?.message)) {
+        return { kind: 'consumed', nextRetryAt: (options.now ?? Date.now)() + 1000 };
+      }
+      return blocked('consumer_unavailable');
+    }
+  } });
 }
 
 export async function publishManifestIfEnabled(row, resolution, { outbox, publishCheckpoint, cwd, stateRoot } = {}) {
@@ -49,7 +53,8 @@ export async function publishManifestIfEnabled(row, resolution, { outbox, publis
 
 export function scheduleExtraction({ cli, event, payload, result, stateRoot, spawnChild = spawn } = {}) {
   if (!boundaryEvents.has(event) || !['claude', 'codex'].includes(cli) ||
-      result?.kind === 'blocked' || result?.kind === 'pass_through' || !result ||
+      result?.kind === 'blocked' || result?.kind === 'pass_through' ||
+      result?.kind === 'staged' || !result ||
       typeof payload?.cwd !== 'string' || typeof payload.session_id !== 'string') return false;
   const env = Object.fromEntries(['PATH', 'HOME', 'LANG', 'TMPDIR', 'TEMP', 'TMP', 'SystemRoot', 'WINDIR', 'USERPROFILE',
     'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'CBS_MEMORIA_LAUNCH_ID', 'CBS_MEMORIA_STATE_ROOT']
@@ -62,14 +67,14 @@ export function scheduleExtraction({ cli, event, payload, result, stateRoot, spa
 }
 
 export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCli,
-  publishCheckpoint } = {}) {
+  publishCheckpoint, now = Date.now } = {}) {
   if (!['claude', 'codex'].includes(cli) || !cwd || !sessionId) {
     return blocked('invalid_consumer_identity');
   }
   const [{ identifyProject }, { resolveProject }, { verifyNativeCapture },
     { readSessionCheckout }, { readLocalTrust, sameTrustTuple, trustTuple }, { createOutbox },
     { extractCheckpoint }, { withProjectLock }, { POLICY_VERSION },
-    { readOwner, readAutoPublish }] = await Promise.all([
+    { readOwner, readAutoPublish, currentExtractionSchedule }] = await Promise.all([
     import('./project-id.mjs'), import('./provider.mjs'), import('./native.mjs'),
     import('./session-checkout.mjs'), import('./trust.mjs'), import('./outbox.mjs'),
     import('./candidates.mjs'), import('./ledger.mjs'), import('./transcript.mjs'),
@@ -105,13 +110,48 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
   const ownerRoot = path.dirname(current.stateDir);
   try {
     return await withProjectLock(ownerRoot, async () => {
+      let nextRetryAt;
+      const staged = await box.listConversationStages({ cli, projectId: current.projectId });
+      if (staged.kind !== 'stages') return staged;
+      for (const stage of staged.stages) {
+        if (stage.sessionId === sessionId || stage.completedPairs < 1 ||
+            !Number.isFinite(stage.updatedAtMs)) continue;
+        const eligibleAt = Math.ceil(stage.updatedAtMs + abandonedStageIdleMs);
+        if (now() < eligibleAt) continue;
+        const original = await readSessionCheckout(current.stateDir, cli, stage.sessionId);
+        if (original.kind !== 'bound' || original.projectId !== current.projectId ||
+            original.projectRoot !== current.projectRoot || !original.profile) continue;
+        const sourceScope = await identifyProject(original.nativeRoot);
+        const fresh = await resolveProject(original.nativeRoot, stage.sessionId, { stateRoot });
+        if (sourceScope.kind !== 'git' || sourceScope.activeRoot !== original.nativeRoot ||
+            sourceScope.projectRoot !== current.projectRoot || fresh.provider !== 'mem0' ||
+            fresh.projectId !== current.projectId || fresh.stateDir !== current.stateDir) continue;
+        const sourceNative = await verifyNativeCapture(original.nativeRoot,
+          { cli, stateRoot, projectRoot: current.projectRoot,
+            ...(process.platform === 'win32' ? { profile: original.profile } : {}) });
+        if (sourceNative.kind !== 'verified') continue;
+        const sourceTrust = await readLocalTrust(fresh.stateDir);
+        if (!sameTrustTuple(trustTuple(fresh), sourceTrust)) continue;
+        const policy = await currentExtractionSchedule(fresh, fresh.extractor);
+        if (policy?.autoPublish !== true || policy.mode !== 'conversation') continue;
+        const consent = await readAutoPublish(fresh);
+        const owner = await readOwner(fresh, cli, original.profile);
+        if (!consent || consent.ownerId !== fresh.ownerId || owner?.ownerId !== fresh.ownerId ||
+            consent.consentHash !== policy.autoPublishConsent?.consentHash) continue;
+        const baseline = await box.readFutureBaseline({ cli, sessionId: stage.sessionId,
+          projectId: current.projectId, ownerId: fresh.ownerId,
+          consentHash: consent.consentHash, policyVersion: POLICY_VERSION });
+        if (baseline.kind !== 'baselined') continue;
+        await box.flushConversationStage({ cli, sessionId: stage.sessionId,
+          projectId: current.projectId, policyVersion: POLICY_VERSION,
+          event: 'Recovery', conversationTurns: policy.conversationTurns });
+      }
       const rows = (await box.pending()).filter(row => row.projectId === current.projectId &&
         row.policyVersion === POLICY_VERSION);
       const ready = new Set((await box.ready(Date.now(), { automatic: true }))
         .map(row => row.operationId));
       let manifested = 0;
       let pending = 0;
-      let nextRetryAt;
       for (const row of rows) {
         const original = await readSessionCheckout(current.stateDir, row.cli, row.sessionId);
         if (original.kind !== 'bound' || original.projectId !== current.projectId ||
@@ -129,7 +169,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
         if (!sameTrustTuple(trustTuple(fresh), sourceTrust)) {
           pending++; continue;
         }
-        const policy = fresh.extractor;
+        const policy = await currentExtractionSchedule(fresh, fresh.extractor);
         if (!policy || !['sonnet', 'haiku'].includes(policy.route) || !path.isAbsolute(policy.profile) ||
             !path.isAbsolute(policy.executable)) { pending++; continue; }
         if (policy.autoPublish === true) {
@@ -186,7 +226,8 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
           pending++;
           if (policy.autoPublish === true && policy.autoPublishConsent &&
               result.kind === 'pending' && transientExtractionErrors.has(result.reason) &&
-              (await box.extractionUsage(row.cli, row.sessionId)).calls < 4) {
+              (await box.extractionUsage(row.cli, row.sessionId)).calls <
+                (policy.maxCallsPerSession ?? 4)) {
             const retry = await box.markFailed(row.operationId, result.reason, { automatic: true });
             if (retry.kind === 'pending') {
               nextRetryAt = Math.min(nextRetryAt ?? Infinity, retry.retryAt);

@@ -39,7 +39,10 @@ const sameVersion = (actual, expected) => validVersion(actual) && validVersion(e
   actual.sha256 === expected.sha256 && actual.fileId === expected.fileId;
 const configFile = (root, cli) => path.join(root, cli === 'claude' ? '.claude/settings.local.json' : '.codex/config.toml');
 const captureEvents = { claude: ['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'SessionEnd'],
-  codex: ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'] };
+  codex: ['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'Interrupt', 'SessionEnd'] };
+const legacyCodexEvents = ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'];
+const hookTimeout = (cli, event, legacy = false) =>
+  cli === 'codex' && !legacy && ['Interrupt', 'SessionEnd'].includes(event) ? 3 : 10;
 const captureScript = fileURLToPath(new URL('./capture-hook.mjs', import.meta.url));
 const skillScript = fileURLToPath(new URL('./skill-hook-cli.mjs', import.meta.url));
 const hookFile = root => path.join(root, '.codex', 'hooks.json');
@@ -55,21 +58,30 @@ function skillCommand(cli) {
       [process.execPath, skillScript].some(value => /[$`"\r\n]/.test(value))) return null;
   return `"${process.execPath}" "${skillScript}" ${cli}`;
 }
-function editCaptureHooks(raw, cli, remove = false) {
+function editCaptureHooks(raw, cli, remove = false, legacy = false) {
   let value;
   try { value = raw === null ? {} : JSON.parse(raw); } catch { return null; }
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
       (value.hooks !== undefined && (!value.hooks || typeof value.hooks !== 'object' || Array.isArray(value.hooks)))) return null;
   const hooks = { ...(value.hooks ?? {}) };
-  for (const event of captureEvents[cli]) {
+  for (const event of cli === 'codex' && legacy ? legacyCodexEvents : captureEvents[cli]) {
     const command = captureCommand(cli, event);
     if (!command || (hooks[event] !== undefined && !Array.isArray(hooks[event]))) return null;
     const groups = hooks[event] ?? [];
+    if (groups.some(group => group?.hooks !== undefined && !Array.isArray(group.hooks))) return null;
     const ours = group => group?.hooks?.some(h => h?.command === command);
     if (groups.some(group => group?.hooks?.some(h => typeof h?.command === 'string' &&
         h.command.includes('capture-hook.mjs') && h.command !== command))) return null;
-    hooks[event] = remove ? groups.filter(group => !ours(group)) :
-      groups.some(ours) ? groups : [...groups, { hooks: [{ type: 'command', command, timeout: 10 }] }];
+    hooks[event] = remove ? groups.flatMap(group => {
+      if (!Array.isArray(group?.hooks)) return [group];
+      const remaining = group?.hooks?.filter(handler => handler?.command !== command);
+      return remaining?.length ? [{ ...group, hooks: remaining }] : [];
+    }) :
+      groups.some(ours) ? groups.map(group => ours(group) ? { ...group,
+        hooks: group.hooks.map(handler => handler.command === command
+          ? { ...handler, timeout: hookTimeout(cli, event, legacy) } : handler) } : group) :
+        [...groups, { hooks: [{ type: 'command', command,
+          timeout: hookTimeout(cli, event, legacy) }] }];
     if (!hooks[event].length) delete hooks[event];
   }
   if (process.platform !== 'win32') {
@@ -121,7 +133,7 @@ function exactCodexHooks(hooks, allowUnrelated = false) {
           (event === 'PreToolUse' && group.matcher !== 'Bash') ||
           Object.keys(handler).length !== 3 || handler.type !== 'command' ||
           handler.command !== (event === 'PreToolUse' ? skillCommand('codex') : captureCommand('codex', event)) ||
-          handler.timeout !== 10 ||
+          handler.timeout !== hookTimeout('codex', event) ||
           selected[event]) return null;
       selected[event] = [group];
     }
@@ -217,10 +229,80 @@ async function validTrackedReceipt(root, cli, saved, file, capturePath, snapshot
   const edit = (cli === 'claude' ? claudeEdit : codexEdit)(original.get(file));
   if (!edit || edit.had !== saved.had || edit.previous !== saved.previous ||
       edit.hadSection !== saved.hadSection || edit.old !== saved.old) return false;
-  const capture = editCaptureHooks(cli === 'claude' ? edit.raw : original.get(capturePath), cli);
+  const capture = editCaptureHooks(cli === 'claude' ? edit.raw : original.get(capturePath), cli,
+    false, cli === 'codex' && saved.captureSchema !== 2);
   if (!capture) return false;
   return receipt.paths.every(row => row.installedHash === hash(row.file === file
     ? (cli === 'claude' ? capture : edit.raw) : capture));
+}
+
+function exactOwnedCapture(raw, cli, legacy = false) {
+  let hooks;
+  try { hooks = JSON.parse(raw).hooks; } catch { return false; }
+  if (!hooks || typeof hooks !== 'object') return false;
+  const events = cli === 'codex' && legacy ? legacyCodexEvents : captureEvents[cli];
+  return events.every(event => {
+    const command = captureCommand(cli, event);
+    if (!Array.isArray(hooks[event]) || hooks[event].some(group =>
+      group?.hooks !== undefined && !Array.isArray(group.hooks))) return false;
+    const owned = hooks[event]?.flatMap(group => group?.hooks?.filter(handler =>
+      handler?.command === command) ?? []);
+    return owned?.length === 1 && Object.keys(owned[0]).length === 3 &&
+      owned[0].type === 'command' && owned[0].command === command &&
+      owned[0].timeout === hookTimeout(cli, event, legacy);
+  });
+}
+
+async function upgradeLegacyCodexCapture(root, options, saved, priorSnapshot, snapshot) {
+  const capturePath = hookFile(root);
+  if (saved.capturePath !== capturePath || saved.pluginChecked !== true) {
+    return blocked('native_snapshot_changed');
+  }
+  if (!await safeParent(capturePath) || !await safeFile(capturePath) ||
+      (await tracked(root, capturePath) && !saved.trackedNative)) return blocked('unsafe_capture_hooks');
+  const raw = await readOptional(capturePath);
+  if (raw === null) return blocked('capture_hooks_changed');
+  const old = exactOwnedCapture(raw, 'codex', true);
+  const current = exactOwnedCapture(raw, 'codex');
+  if (!old && !current) return blocked('capture_hooks_changed');
+  let edited = editCaptureHooks(raw, 'codex');
+  if (!edited || !exactOwnedCapture(edited, 'codex')) return blocked('capture_hooks_changed');
+  if (saved.trackedNative) {
+    const original = saved.trackedNative.paths.find(row => row.file === capturePath)?.original;
+    if (typeof original !== 'string') return blocked('native_snapshot_changed');
+    const oldInstalled = editCaptureHooks(original, 'codex', false, true);
+    const newInstalled = editCaptureHooks(original, 'codex');
+    if (!oldInstalled || !newInstalled ||
+        (raw !== oldInstalled && raw !== newInstalled)) {
+      return blocked('native_config_changed');
+    }
+    edited = newInstalled;
+  }
+  const next = { ...saved, captureSchema: 2 };
+  if (saved.trackedNative) {
+    const paths = saved.trackedNative.paths.map(row => row.file === capturePath
+      ? { ...row, installedHash: hash(edited) } : row);
+    next.trackedNative = { ...saved.trackedNative, paths };
+    const { rollback, ...sealed } = next;
+    next.trackedNative.seal = hash(JSON.stringify({ ...sealed,
+      trackedNative: { rootIdentity: next.trackedNative.rootIdentity, paths } }));
+  }
+  let changedCapture = false;
+  try {
+    if (raw !== edited) {
+      await writeAtomic(capturePath, edited, false, raw);
+      changedCapture = true;
+    }
+    await writeAtomic(snapshot, JSON.stringify(next) + '\n', true, priorSnapshot);
+  } catch {
+    if (changedCapture) {
+      try { await writeAtomic(capturePath, raw, false, edited); }
+      catch { return blocked('native_recovery_required'); }
+    }
+    return blocked('native_snapshot_changed');
+  }
+  const verified = await verifyNativeCapture(root, options);
+  return verified.kind === 'verified' ? { kind: 'applied', existing: true, upgraded: true } : blocked(verified.reason);
 }
 async function excludePlan(root, cli, target = configFile(root, cli)) {
   const relative = process.platform === 'win32' ? windowsGitPattern(root, target).slice(1) : path.relative(root, target);
@@ -538,6 +620,7 @@ export async function applyNativeExclusion(root, options = {}) {
     let saved;
     try { saved = JSON.parse(priorSnapshot); } catch { return blocked('unsafe_snapshot'); }
     const raw = await readOptional(file);
+    if (saved.captureSchema !== undefined && saved.captureSchema !== 2) return blocked('native_snapshot_changed');
     if (saved.trackedNative && !await validTrackedReceipt(root, cli, saved, file,
       cli === 'claude' ? file : hookFile(root), snapshot).catch(() => false)) return blocked('native_snapshot_changed');
     if (configTracked !== !!saved.trackedNative?.paths?.[0]?.index) return blocked('native_snapshot_changed');
@@ -545,6 +628,10 @@ export async function applyNativeExclusion(root, options = {}) {
         (saved.projectRoot && saved.projectRoot !== scope.projectRoot) || raw === null ||
         !(cli === 'claude' ? claudeEdit(raw, saved) : codexEdit(raw, saved))) {
       return blocked('native_config_changed');
+    }
+    if (cli === 'codex' && saved.captureSchema !== 2) {
+      return upgradeLegacyCodexCapture(root, { ...options, projectRoot: scope.projectRoot },
+        saved, priorSnapshot, snapshot);
     }
     const verification = await verifyNativeCapture(root, { ...options, projectRoot: scope.projectRoot });
     if (verification.kind === 'verified') return { kind: 'applied', existing: true };
@@ -585,6 +672,7 @@ export async function applyNativeExclusion(root, options = {}) {
     return blocked('unsupported_windows_replace');
   }
   const save = { cli, file, projectRoot: scope.projectRoot, nativeRoot: root, leased: true,
+    ...(cli === 'codex' ? { captureSchema: 2 } : {}),
     existed: raw !== null, had: edit.had, previous: edit.previous,
     hadEnabledPlugins: cli === 'claude' && raw !== null && Object.hasOwn(JSON.parse(raw), 'enabledPlugins'),
     hadSection: edit.hadSection, old: edit.old, exclude,
@@ -959,8 +1047,7 @@ export async function verifyNativeCapture(root, options = {}) {
   }
   let hooks;
   try { hooks = JSON.parse(captureRaw).hooks; } catch { return blocked('capture_hooks_changed'); }
-  if (!captureEvents[cli].every(event => hooks?.[event]?.some(group =>
-    group?.hooks?.some(h => h?.command === captureCommand(cli, event))))) return blocked('capture_hooks_changed');
+  if (!exactOwnedCapture(captureRaw, cli)) return blocked('capture_hooks_changed');
   if (process.platform !== 'win32' && !hooks?.PreToolUse?.some(group =>
     group?.matcher === 'Bash' && group.hooks?.some(h =>
       h?.type === 'command' && h.command === skillCommand(cli) && h.timeout === 10))) {

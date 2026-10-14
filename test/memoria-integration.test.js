@@ -811,6 +811,7 @@ test('capture scheduler dispatches only verified checkpoint boundaries and keeps
   const input = { cli: 'claude', payload: { cwd: '/checkout', session_id: 's' },
     result: { kind: 'queued' }, spawnChild };
   assert.equal(scheduleExtraction({ ...input, event: 'UserPromptSubmit' }), false);
+  assert.equal(scheduleExtraction({ ...input, event: 'Stop', result: { kind: 'staged' } }), false);
   assert.equal(scheduleExtraction({ ...input, event: 'Stop', result: { kind: 'pass_through' } }), false);
   assert.equal(scheduleExtraction({ ...input, event: 'SessionStart', result: { kind: 'blocked' } }), false);
   for (const event of ['SessionStart', 'Stop', 'PreCompact', 'SessionEnd']) {
@@ -819,6 +820,9 @@ test('capture scheduler dispatches only verified checkpoint boundaries and keeps
   assert.equal(calls.length, 4);
   assert.ok(calls.every(call => call.options.cwd === '/checkout' &&
     call.options.env.CBS_MEMORIA_API_KEY === undefined && call.options.detached === true));
+  const codex = { ...input, cli: 'codex' };
+  assert.equal(scheduleExtraction({ ...codex, event: 'PreCompact' }), true);
+  assert.equal(scheduleExtraction({ ...codex, event: 'Interrupt' }), true);
 });
 
 test('consumer processes a protected checkpoint once, then recovery skips its manifest', async t => {

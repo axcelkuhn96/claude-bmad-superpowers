@@ -14,10 +14,12 @@ import { bindSessionCheckoutProfile, recordSessionCheckout,
   readSessionCheckout } from './session-checkout.mjs';
 import { readWindowsBinary } from './windows-security.mjs';
 import { nativeProfile } from './native-profile.mjs';
+import { currentExtractionSchedule } from './policy.mjs';
 
 const events = { claude: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'SessionEnd']),
-  codex: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd']) };
+  codex: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'Interrupt', 'SessionEnd']) };
 const blocked = reason => ({ kind: 'blocked', reason });
+const flushEvents = new Set(['PreCompact', 'SessionEnd', 'Interrupt']);
 
 async function completeTranscriptEnd(transcriptPath, stat) {
   if (!stat) return 0;
@@ -57,9 +59,11 @@ async function completeTranscriptEnd(transcriptPath, stat) {
 }
 
 export async function captureEvent({ cli, event, payload, stateRoot, installedPlugin } = {}) {
+  const noTranscriptFlush = cli === 'codex' && flushEvents.has(event) &&
+    payload?.transcript_path === null;
   if (!events[cli]?.has(event) || payload?.hook_event_name !== event ||
       typeof payload.cwd !== 'string' || typeof payload.session_id !== 'string' ||
-      typeof payload.transcript_path !== 'string') return blocked('invalid_hook_payload');
+      (typeof payload.transcript_path !== 'string' && !noTranscriptFlush)) return blocked('invalid_hook_payload');
   if (process.platform !== 'win32' && !process.getuid) return blocked('native_windows_unproved');
   if (process.platform === 'win32' && !/^[a-f0-9]{64}$/.test(process.env.CBS_MEMORIA_LAUNCH_ID ?? '')) {
     return blocked('unbound');
@@ -88,16 +92,18 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
       profile: nativeProfile(cli) }) : resolution;
   if (session.provider !== 'mem0') return blocked(session.reason ?? 'unresolved_session');
   const transcriptPath = payload.transcript_path;
-  const basename = path.basename(transcriptPath);
-  if (!path.isAbsolute(transcriptPath) || !(cli === 'claude'
-    ? basename === `${payload.session_id}.jsonl` : basename.endsWith(`${payload.session_id}.jsonl`))) {
+  const basename = typeof transcriptPath === 'string' ? path.basename(transcriptPath) : null;
+  if (!noTranscriptFlush && (!path.isAbsolute(transcriptPath) || !(cli === 'claude'
+    ? basename === `${payload.session_id}.jsonl` : basename.endsWith(`${payload.session_id}.jsonl`)))) {
     return blocked('transcript_session_mismatch');
   }
   let stat;
-  try { stat = await fs.lstat(transcriptPath); }
-  catch (error) {
-    if (error.code !== 'ENOENT' || !['SessionStart', 'UserPromptSubmit'].includes(event)) {
-      return blocked(error.code === 'ENOENT' ? 'missing_transcript' : 'unsafe_transcript');
+  if (!noTranscriptFlush) {
+    try { stat = await fs.lstat(transcriptPath); }
+    catch (error) {
+      if (error.code !== 'ENOENT' || !['SessionStart', 'UserPromptSubmit'].includes(event)) {
+        return blocked(error.code === 'ENOENT' ? 'missing_transcript' : 'unsafe_transcript');
+      }
     }
   }
   if (stat && process.platform === 'win32') {
@@ -130,8 +136,25 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   session = await refreshSessionPolicyForCapture(payload.cwd, payload.session_id,
     { stateRoot, cli, profile: nativeProfile(cli) });
   if (session.provider !== 'mem0') return blocked(session.reason ?? 'local_policy_changed');
+  if (session.extractor?.autoPublish === true) {
+    session = { ...session,
+      extractor: await currentExtractionSchedule(session, session.extractor) };
+  }
   const outbox = createOutbox(session.stateDir);
+  const conversation = session.extractor?.autoPublish === true &&
+    session.extractor.mode === 'conversation';
+  const flushStage = () => outbox.flushConversationStage({ cli, sessionId: payload.session_id,
+    projectId: session.projectId, policyVersion: POLICY_VERSION, event,
+    conversationTurns: session.extractor.conversationTurns });
   if (session.extractor?.autoPublish === true && !stat) {
+    if (conversation && noTranscriptFlush) {
+      const proof = await outbox.readFutureBaseline({ cli, sessionId: payload.session_id,
+        projectId: session.projectId, ownerId: session.ownerId,
+        consentHash: session.extractor.autoPublishConsent?.consentHash,
+        policyVersion: POLICY_VERSION });
+      if (proof.kind !== 'baselined') return proof;
+      return flushStage();
+    }
     const { queuedEnd } = await outbox.cursor(cli, payload.session_id);
     return { kind: 'no_complete_bytes', queuedEnd };
   }
@@ -161,16 +184,30 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
           error.code === 'ELOOP') return blocked(error.code === 'ELOOP' ? 'unsafe_transcript' : error.message);
       throw error;
     }
-    if (parsed.lastCompleteByte === queuedEnd) return last;
+    if (parsed.lastCompleteByte === queuedEnd) break;
     const sliceHash = createHash('sha256').update(parsed.completeBytes).digest('hex');
-    last = await outbox.enqueueCheckpoint({ cli, sessionId: payload.session_id, start: queuedEnd,
+    const slice = { cli, sessionId: payload.session_id, start: queuedEnd,
       end: parsed.lastCompleteByte, sliceHash,
       messages: parsed.messages.filter(message => !baseline || message.start >= baseline.initialSize)
         .map(message => message.origin === 'human' && session.ownerId
-          ? { ...message, ownerId: session.ownerId } : message) },
-    { projectId: session.projectId, policyVersion: POLICY_VERSION });
-    if (last.kind !== 'queued' && last.kind !== 'acked') return last;
+          ? { ...message, ownerId: session.ownerId } : message) };
+    const queued = conversation
+      ? await outbox.enqueueConversationSlice(slice,
+        { projectId: session.projectId, policyVersion: POLICY_VERSION },
+        { event, conversationTurns: session.extractor.conversationTurns })
+      : await outbox.enqueueCheckpoint(slice,
+        { projectId: session.projectId, policyVersion: POLICY_VERSION });
+    if (!['queued', 'acked', 'processed', 'staged'].includes(queued.kind)) return queued;
+    if (last.kind !== 'queued' || queued.kind === 'queued') last = queued;
     queuedEnd = parsed.lastCompleteByte;
+  }
+  if (conversation && flushEvents.has(event)) {
+    const flushed = await flushStage();
+    if (['queued', 'acked', 'processed'].includes(flushed.kind)) return flushed;
+    if (!['no_complete_pairs', 'staged'].includes(flushed.kind)) return flushed;
+  }
+  if (conversation && event === 'Stop' && last.kind === 'no_complete_bytes') {
+    return { kind: 'staged', queuedEnd };
   }
   return last;
 }

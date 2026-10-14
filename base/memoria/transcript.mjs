@@ -45,8 +45,13 @@ function claudeMessage(row) {
   const actor = result ? `tool:${result.tool_use_id ?? 'unknown'}` : call
     ? `tool:${call.name ?? 'unknown'}` : row.type;
   const text = result ? textFrom(result.content) : call ? JSON.stringify(call.input ?? {}) : textFrom(row.message.content);
+  const finalVisible = row.type === 'assistant' && !result && !call &&
+    row.isSidechain === false && !row.agentId && row.isMeta !== true &&
+    row.isCompactSummary !== true && row.isVisibleInTranscriptOnly !== true &&
+    row.message.stop_reason === 'end_turn' && blocks.some(item =>
+      item?.type === 'text' && typeof item.text === 'string' && item.text.trim());
   return { origin, actor, speakerRole: row.type, text, messageId: row.uuid,
-    timestamp: row.timestamp, nativeSessionId: row.sessionId ?? null };
+    timestamp: row.timestamp, nativeSessionId: row.sessionId ?? null, finalVisible };
 }
 
 function codexTuiSource(meta, sessionId) {
@@ -85,10 +90,14 @@ function codexMessage(row, directUser, tuiUser, sessionId) {
       messageId: payload.id ?? payload.call_id, timestamp: row.timestamp, nativeSessionId: null };
   }
   if (payload.type !== 'message' || !['user', 'assistant'].includes(payload.role)) return null;
+  const finalVisible = payload.role === 'assistant' && payload.phase === 'final_answer' &&
+    Array.isArray(payload.content) && payload.content.length > 0 &&
+    payload.content.every(item => item?.type === 'output_text' &&
+      typeof item.text === 'string' && item.text.trim());
   return { origin: payload.role === 'user' ? directUser && codexDirectUserText(payload)
     ? 'human' : 'unknown' : 'assistant', actor: payload.role,
     speakerRole: payload.role, text: textFrom(payload.content), messageId: payload.id,
-    timestamp: row.timestamp, nativeSessionId: null };
+    timestamp: row.timestamp, nativeSessionId: null, finalVisible };
 }
 
 export async function parsePersistedSlice({ cli, transcriptPath, start = 0, end, sessionId, expectedFile }) {
