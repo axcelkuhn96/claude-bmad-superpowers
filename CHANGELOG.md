@@ -2,6 +2,13 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.13.3] - 2026-10-14
+
+### Corrigido
+- **Sessões Mem0 retomadas:** um hook nativo válido atualiza proprietário e extrator que ficaram vazios antes da adesão, respeitando o consentimento atual e a identidade do projeto. Vínculos de proprietário já registrados não são trocados.
+- **Captura inicial:** o primeiro hook autorizado estabelece um ponto de corte durável; o histórico já presente na transcrição não é reenviado para extração. Mensagens futuras seguem para os checkpoints, sem reiniciar o limite de quatro chamadas Haiku por sessão.
+- **Claude Code em worktrees:** a ativação e os checkpoints usam a raiz ativa da worktree para validar os hooks nativos, mantendo o vínculo com o projeto Git principal.
+
 ## [0.13.2] - 2026-10-14
 
 ### Adicionado
