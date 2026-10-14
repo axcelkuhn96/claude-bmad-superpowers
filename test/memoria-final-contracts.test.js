@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import https from 'node:https';
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createOutbox } from '../base/memoria/outbox.mjs';
 import { externalIdFor } from '../base/memoria/ledger.mjs';
@@ -407,6 +408,62 @@ test('designação Qdrant compartilhada bloqueia leitor e transfere só após ha
     { ...options(b), confirm: true })).kind, 'transferred');
   assert.equal((await assertWriter(b.resolution, auth, options(b))).kind, 'writer');
   assert.equal((await assertWriter(a.resolution, auth, options(a))).reason, 'writer_not_designated');
+});
+
+test('autoridade lê registro por HTTPS com endereço pinado no Node atual', async t => {
+  if (spawnSync('openssl', ['version']).status !== 0) return t.skip('openssl unavailable');
+  const root = await temporary(t, 'writer-pinned-tls');
+  const key = path.join(root, 'key.pem');
+  const cert = path.join(root, 'cert.pem');
+  const generated = spawnSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+    '-keyout', key, '-out', cert, '-days', '1', '-subj', '/CN=localhost',
+    '-addext', 'subjectAltName=DNS:localhost'], { encoding: 'utf8' });
+  assert.equal(generated.status, 0, generated.stderr);
+  const stateDir = path.join(root, 'state', 'project');
+  await fs.mkdir(path.join(stateDir, 'ledger'), { recursive: true, mode: 0o700 });
+  const device = await localDevice(stateDir);
+  assert.equal(device.kind, 'device');
+  await fs.writeFile(path.join(stateDir, 'ledger', 'writer.json'), JSON.stringify({
+    projectId: 'p', collection: 'cbs-p', deviceId: device.deviceId, generation: 1,
+  }), { mode: 0o600 });
+  let reads = 0;
+  const server = https.createServer({ key: await fs.readFile(key), cert: await fs.readFile(cert) },
+    (req, res) => {
+      reads++;
+      assert.equal(req.headers['api-key'], 'fixture-key');
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        const id = JSON.parse(body).ids[0];
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+          result: [{ id, payload: { cbs_control: 'writer_v1', projectId: 'p',
+            collection: 'cbs-p', deviceId: device.deviceId, generation: 1, state: 'active' } }],
+        }));
+      });
+    });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const resolution = { stateDir, projectId: 'p', destination: { collection: 'cbs-p' } };
+  const auth = { key: 'fixture-key', connection: { url: `https://localhost:${server.address().port}`,
+    address: '127.0.0.1' } };
+  const script = `import { assertWriter } from ${JSON.stringify(new URL('../base/memoria/authority.mjs', import.meta.url).href)};
+process.stdout.write(JSON.stringify(await assertWriter(${JSON.stringify(resolution)}, ${JSON.stringify(auth)})));`;
+  const modes = Number(process.versions.node.split('.')[0]) >= 20
+    ? [[], ['--no-network-family-autoselection']] : [[]];
+  for (const flags of modes) {
+    const child = spawn(process.execPath, [...flags, '--input-type=module', '-e', script], {
+      env: { ...process.env, NODE_EXTRA_CA_CERTS: cert }, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    let errors = '';
+    child.stdout.on('data', chunk => { output += chunk; });
+    child.stderr.on('data', chunk => { errors += chunk; });
+    const [code] = await new Promise(resolve => child.once('close', (...args) => resolve(args)));
+    assert.equal(code, 0, errors);
+    assert.equal(JSON.parse(output).kind, 'writer', output + errors);
+  }
+  assert.equal(reads, modes.length);
 });
 
 test('handoff retoma só mesmo bundle após promoção remota e falha local', async t => {

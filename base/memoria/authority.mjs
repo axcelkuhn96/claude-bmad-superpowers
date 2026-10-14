@@ -27,8 +27,9 @@ async function requestQdrant(connection, key, method, endpoint, body) {
     const req = transport.request(target, {
       method, headers: { 'api-key': key, accept: 'application/json',
         ...(body ? { 'content-type': 'application/json' } : {}) }, timeout: 5000,
-      lookup: (_host, _options, callback) => callback(null, connection.address,
-        net.isIP(connection.address)),
+      lookup: (_host, options, callback) => options.all
+        ? callback(null, [{ address: connection.address, family: net.isIP(connection.address) }])
+        : callback(null, connection.address, net.isIP(connection.address)),
     }, response => {
       if (response.statusCode !== 200) { response.resume(); resolve(blocked('authority_unavailable')); return; }
       let data = '';
