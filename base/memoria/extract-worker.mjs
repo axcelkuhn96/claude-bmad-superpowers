@@ -184,6 +184,11 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
             pending++; continue;
           }
         }
+        if (row.automatic === true && row.lastError?.startsWith('extract_failure_') &&
+            (await box.readManifest(row.operationId)).reason === 'missing_manifest') {
+          pending++;
+          continue;
+        }
         if (policy.autoPublish === true && !ready.has(row.operationId)) {
           pending++;
           if (row.automatic === true && Number.isSafeInteger(row.retryAt)) {
@@ -224,13 +229,18 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
           }
         } else {
           pending++;
-          if (policy.autoPublish === true && policy.autoPublishConsent &&
-              result.kind === 'pending' && transientExtractionErrors.has(result.reason) &&
-              (await box.extractionUsage(row.cli, row.sessionId)).calls <
-                (policy.maxCallsPerSession ?? 4)) {
-            const retry = await box.markFailed(row.operationId, result.reason, { automatic: true });
-            if (retry.kind === 'pending') {
-              nextRetryAt = Math.min(nextRetryAt ?? Infinity, retry.retryAt);
+          if (policy.autoPublish === true && policy.autoPublishConsent && result.kind === 'pending') {
+            if (transientExtractionErrors.has(result.reason) &&
+                (await box.extractionUsage(row.cli, row.sessionId)).calls <
+                  (policy.maxCallsPerSession ?? 4)) {
+              const retry = await box.markFailed(row.operationId, result.reason, { automatic: true });
+              if (retry.kind === 'pending') {
+                nextRetryAt = Math.min(nextRetryAt ?? Infinity, retry.retryAt);
+              }
+            } else if (!transientExtractionErrors.has(result.reason)) {
+              const reason = /^[a-z_]{1,48}$/.test(result.reason ?? '')
+                ? result.reason : 'unknown';
+              await box.markFailed(row.operationId, `extract_failure_${reason}`, { automatic: true });
             }
           }
         }

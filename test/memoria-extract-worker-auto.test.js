@@ -447,6 +447,41 @@ test('revoked live consent stops queued automatic row before a paid extraction c
   assert.equal((await box.extractionUsage('claude', 's')).calls, 0);
 });
 
+test('invalid extractor output is recorded and does not spend another call on the same checkpoint', async t => {
+  const { project, stateRoot, box, resolution } = await automaticConsumerFixture(t,
+    { seedRow: false });
+  const messages = [
+    { cli: 'claude', sessionId: 's', messageId: 'u1', timestamp: '2026-10-14T13:00:00Z',
+      origin: 'human', speakerRole: 'user', ownerId: 'fixture-owner',
+      text: 'Preservar este acordo.', start: 0, end: 20 },
+    { cli: 'claude', sessionId: 's', messageId: 'a1', timestamp: '2026-10-14T13:00:01Z',
+      origin: 'assistant', speakerRole: 'assistant', finalVisible: true,
+      text: 'Acordo preservado.', start: 20, end: 40 },
+  ];
+  assert.equal((await box.enqueueConversationSlice({ cli: 'claude', sessionId: 's',
+    start: 0, end: 40, sliceHash: 'a'.repeat(64), messages },
+  { projectId: resolution.projectId, policyVersion: POLICY_VERSION },
+  { event: 'Stop' })).kind, 'staged');
+  assert.equal((await box.flushConversationStage({ cli: 'claude', sessionId: 's',
+    projectId: resolution.projectId, policyVersion: POLICY_VERSION,
+    event: 'SessionEnd', conversationTurns: 5 })).kind, 'queued');
+  let calls = 0;
+  const consume = () => worker.consumeCheckpoints({ cli: 'claude', cwd: project,
+    sessionId: 's', stateRoot, runCli: async () => {
+      calls++;
+      return { kind: 'success', model: 'claude-haiku-5-5',
+        candidates: [], no_facts: false,
+        usage: { inputTokens: 1, outputTokens: 1, costUsd: 0 } };
+    } });
+  const firstRun = await consume();
+  assert.equal(firstRun.nextRetryAt, undefined);
+  const [first] = await box.pending();
+  assert.equal(first.lastError, 'extract_failure_extractor_schema_invalid');
+  await consume();
+  assert.equal(calls, 1);
+  assert.equal((await box.extractionUsage('claude', 's')).calls, 1);
+});
+
 test('changing the capture profile owner blocks paid extraction while signed consent remains valid', async t => {
   const { project, originProfile, stateRoot, box, resolution } = await automaticConsumerFixture(t,
     { originProfileDistinct: true });
