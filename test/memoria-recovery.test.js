@@ -12,10 +12,12 @@ import { captureEvent } from '../base/memoria/checkpoint.mjs';
 import { applyNativeExclusion, restoreNativeExclusion, verifyNativeCapture } from '../base/memoria/native.mjs';
 import { reconcileStore } from '../base/memoria/ledger.mjs';
 import { externalIdFor } from '../base/memoria/ledger.mjs';
-import { inspectConfiguration } from '../base/memoria/provider.mjs';
-import { configureExtractor } from '../base/memoria/policy.mjs';
+import { inspectConfiguration, initializeSession } from '../base/memoria/provider.mjs';
+import { configureExtractor, registerOwner, enableAutoPublish,
+  localDevice } from '../base/memoria/policy.mjs';
 import { consumeCheckpoints } from '../base/memoria/extract-worker.mjs';
 import { trustTuple, writeLocalTrust } from '../base/memoria/trust.mjs';
+import { recordSessionCheckout } from '../base/memoria/session-checkout.mjs';
 
 const fixture = name => path.join(import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname), 'fixtures', name);
 const temp = () => fs.mkdtemp(path.join(os.tmpdir(), 'cbs-mem0-recovery-'));
@@ -1050,6 +1052,69 @@ test('future baseline skips historical bytes, survives replay, and preserves ext
   assert.equal((await box.futureSourceAllowed(row, binding)).kind, 'allowed');
   assert.equal((await box.cursor('claude', 's')).queuedEnd, 24);
   assert.equal((await box.ensureFutureBaseline({ ...binding, ownerId: 'other-owner', cutoffEnd: 40 })).kind, 'blocked');
+});
+
+test('oversized unfinished transcript tail blocks automatic capture before baseline or extraction', async t => {
+  const dir = await temp(); t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const project = path.join(dir, 'project');
+  const profile = path.join(dir, 'profile');
+  const stateRoot = path.join(dir, 'state');
+  await fs.mkdir(path.join(project, '.cbs'), { recursive: true });
+  await fs.mkdir(profile, { mode: 0o700 });
+  await run('git', ['init', '-q', project]);
+  await fs.writeFile(path.join(project, '.cbs/memoria.json'), JSON.stringify({
+    provider: 'mem0', project_id: 'fixture-project',
+    qdrant: { url: 'https://qdrant.internal', collection: 'fixture-memory',
+      api_key_env: 'CBS_AUTO_TEST_KEY' },
+    embedding: { model: 'multilingual-e5-small', dimension: 384,
+      fingerprint: 'ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665:0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39' },
+  }));
+  const resolution = await inspectConfiguration(project, { stateRoot });
+  await writeLocalTrust(resolution.stateDir, trustTuple(resolution));
+  assert.equal((await configureExtractor(resolution, { route: 'haiku', profile,
+    executable: process.execPath })).kind, 'selected');
+  assert.equal((await registerOwner(resolution, 'claude', profile, 'fixture-owner', true)).kind,
+    'registered');
+  const device = await localDevice(resolution.stateDir);
+  const ledger = path.join(resolution.stateDir, 'ledger');
+  await fs.mkdir(ledger, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(ledger, 'writer.json'), JSON.stringify({
+    projectId: resolution.projectId, collection: resolution.destination.collection,
+    deviceId: device.deviceId, generation: 1,
+  }), { mode: 0o600 });
+  assert.equal((await enableAutoPublish(resolution, { ownerId: 'fixture-owner',
+    cli: 'claude', profile })).kind, 'enabled');
+  assert.equal((await applyNativeExclusion(project, { cli: 'claude', stateRoot })).kind,
+    'applied');
+  const session = await initializeSession(project, 's', { event: 'SessionStart', stateRoot,
+    cli: 'claude', profile });
+  assert.equal(session.extractor.autoPublish, true);
+  assert.equal((await recordSessionCheckout(session, 'claude', 's', project, profile)).kind,
+    'bound');
+  const old = { type: 'user', uuid: 'historical', timestamp: '2026-10-01T00:00:00Z',
+    sessionId: 's', message: { role: 'user', content: 'historical preference' },
+    isSidechain: false, userType: 'external' };
+  const transcriptPath = path.join(project, 's.jsonl');
+  await fs.writeFile(transcriptPath, JSON.stringify(old) + '\n' + 'x'.repeat(4 * 1024 * 1024));
+  const previousProfile = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = profile;
+  t.after(() => { if (previousProfile === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = previousProfile; });
+  const result = await captureEvent({ cli: 'claude', event: 'UserPromptSubmit', payload: {
+    cwd: project, session_id: 's', transcript_path: transcriptPath,
+    hook_event_name: 'UserPromptSubmit' }, stateRoot });
+  assert.deepEqual(result, { kind: 'blocked', reason: 'oversized_transcript_record' });
+  const box = createOutbox(resolution.stateDir);
+  assert.deepEqual(await box.cursor('claude', 's'), { queuedEnd: 0, ackedEnd: 0,
+    processedEnd: 0 });
+  assert.equal((await box.pending()).length, 0);
+  assert.equal((await fs.readdir(path.join(resolution.stateDir, 'outbox')))
+    .some(name => name.startsWith('baseline-')), false);
+  let calls = 0;
+  await consumeCheckpoints({ cli: 'claude', cwd: project, sessionId: 's', stateRoot,
+    runCli: async () => { calls++; return { kind: 'error', reason: 'unexpected' }; } });
+  assert.equal(calls, 0);
+  assert.equal((await box.extractionUsage('claude', 's')).calls, 0);
 });
 
 test('Claude capture verifies the active worktree native hook', async t => {

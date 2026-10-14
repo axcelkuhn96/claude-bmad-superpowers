@@ -21,15 +21,17 @@ const blocked = reason => ({ kind: 'blocked', reason });
 
 async function completeTranscriptEnd(transcriptPath, stat) {
   if (!stat) return 0;
+  const maxWindow = 4 * 1024 * 1024;
   if (process.platform === 'win32') {
     for (let end = stat.size; end > 0;) {
-      const start = Math.max(0, end - 4 * 1024 * 1024);
+      const start = Math.max(0, end - maxWindow);
       const observed = await readWindowsBinary(transcriptPath,
         { offset: start, length: end - start, privateState: false });
       if (observed.fileId !== stat.fileId || observed.size < stat.size ||
           observed.bytes.length !== end - start) throw new Error('unsafe_transcript');
       const newline = observed.bytes.lastIndexOf(10);
       if (newline >= 0) return start + newline + 1;
+      if (stat.size >= maxWindow) throw new Error('oversized_transcript_record');
       break;
     }
     return 0;
@@ -41,12 +43,13 @@ async function completeTranscriptEnd(transcriptPath, stat) {
       throw new Error('unsafe_transcript');
     }
     for (let end = stat.size; end > 0;) {
-      const start = Math.max(0, end - 4 * 1024 * 1024);
+      const start = Math.max(0, end - maxWindow);
       const bytes = Buffer.alloc(end - start);
       const { bytesRead } = await handle.read(bytes, 0, bytes.length, start);
       if (bytesRead !== bytes.length) throw new Error('unsafe_transcript');
       const newline = bytes.lastIndexOf(10);
       if (newline >= 0) return start + newline + 1;
+      if (stat.size >= maxWindow) throw new Error('oversized_transcript_record');
       break;
     }
     return 0;
@@ -136,7 +139,8 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   if (session.extractor?.autoPublish === true) {
     let cutoffEnd;
     try { cutoffEnd = await completeTranscriptEnd(transcriptPath, stat); }
-    catch { return blocked('unsafe_transcript'); }
+    catch (error) { return blocked(error.message === 'oversized_transcript_record'
+      ? error.message : 'unsafe_transcript'); }
     try {
       baseline = await outbox.ensureFutureBaseline({ cli, sessionId: payload.session_id,
         projectId: session.projectId, ownerId: session.ownerId,
