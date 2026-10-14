@@ -90,7 +90,7 @@ function renderWithItems(items, maxTokens) {
     const m = item.metadata;
     const condition = typeof m.condition === 'string' && m.condition ? `; condition ${m.condition}` : '';
     const line = generatedConversation({ ...m, projectId: item.projectId }, item.text)
-      ? `[${item.id}; resumo gerado; referências ${m.source_refs.length}; source ${m.source}; date ${m.evidence_at}; actor ${m.actor}; origin ${m.origin}; role ${m.speaker_role}${condition}] ${item.text}`
+      ? `[${item.id}; resumo gerado; referências ${m.source_refs.length}; date ${m.evidence_at.slice(0, 10)}${condition}] ${item.text}`
       : m.type === 'source_note'
       ? `[${item.id}; date ${m.evidence_at.slice(0, 10)}; actor ${m.actor}; origin ${m.origin}] ${item.text}`
       : `[${item.id}; source ${m.source}; date ${m.evidence_at}; actor ${m.actor}; origin ${m.origin}; role ${m.speaker_role}${condition}] ${item.text}`;

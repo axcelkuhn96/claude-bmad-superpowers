@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { selectRecall, renderContext, createRecall } from '../base/memoria/context.mjs';
+import { selectRecall, renderContext, renderRecall, createRecall } from '../base/memoria/context.mjs';
 import { recallForPrompt, recordRecallWindow } from '../base/memoria/hook-recall.mjs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -68,7 +68,34 @@ test('conversation summary is recalled as generated evidence with both speaker r
   const selected = selectRecall([summary, forged, legacy], { projectId: 'p', now });
   assert.deepEqual(selected.map(item => item.sdkId), ['summary']);
   assert.match(renderContext(selected), /resumo gerado; referências 2/);
-  assert.match(renderContext(selected), /origin conversation_summary; role mixed/);
+  assert.match(renderContext(selected), /PostgreSQL was chosen in the conversation/);
+});
+
+test('long generated summary fits recall budget with full condition and negation', async () => {
+  const refs = [
+    { message_id: 'human-20261014-001', role: 'user', origin: 'human', actor: 'owner',
+      offsets: { start: 0, end: 106 }, source_text_sha256: 'a'.repeat(64), excerpt: 'Keep reports manual.' },
+    { message_id: 'assistant-20261014-002', role: 'assistant', origin: 'assistant', actor: 'assistant',
+      offsets: { start: 0, end: 109 }, source_text_sha256: 'b'.repeat(64), excerpt: 'I will keep reports manual.' },
+  ];
+  const text = 'A equipe decidiu manter a sincronização manual de relatórios financeiros até a revisão de outubro. Não publicar automaticamente quando houver divergência entre filial e matriz; registrar o conflito e pedir confirmação ao responsável. Válido neste projeto.';
+  const condition = 'somente após conferência da matriz; nunca publicar divergências';
+  const summary = { ...base, sdkId: '123e4567-e89b-12d3-a456-426614174000', score: 0.99, text,
+    metadata: { ...base.metadata, format_version: 4, source: refs[0].message_id,
+      evidence_at: '2026-10-14T12:34:56Z', actor: 'conversation',
+      origin: 'conversation_summary', speaker_role: 'mixed', type: 'decision', condition,
+      source_offsets: refs[0].offsets, source_text_sha256: refs[0].source_text_sha256,
+      dedup_key: dedupKeyFor({ projectId: 'p', scope: 'project', type: 'decision', text,
+        condition, validFrom: base.metadata.valid_from }), source_refs: refs } };
+  const selected = selectRecall([summary], { projectId: 'p', now: '2026-10-14T13:00:00Z' });
+  assert.deepEqual(selected, [summary]);
+  const rendered = renderRecall(selected, 500);
+  assert.deepEqual(rendered.used, [summary]);
+  assert.ok(Buffer.byteLength(rendered.text, 'utf8') <= 500);
+  assert.ok(rendered.text.includes('123e4567-e89b-12d3-a456-426614174000; resumo gerado; referências 2; date 2026-10-14; condition ' + condition));
+  assert.ok(rendered.text.endsWith(text));
+  assert.equal((await createRecall({ search: async () => ({ kind: 'items', items: [summary] }),
+    now: () => '2026-10-14T13:00:00Z' })({ projectId: 'p' }, 'relatórios')).kind, 'items');
 });
 
 test('episode remains scoped to its project and expires at valid_to', () => {
