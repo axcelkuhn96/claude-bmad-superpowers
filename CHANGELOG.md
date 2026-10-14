@@ -2,6 +2,15 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.14.1] - 2026-10-14
+
+### Adicionado
+- **Gravação explícita em sessão normal:** `cbs_memoria.remember` recebe um pedido direto de guardar memória e envia o conteúdo ao escritor local já autorizado, sem esperar cinco trocas nem chamar Haiku. O resultado `stored` só é devolvido após confirmação do Qdrant; pedidos idênticos retornam `duplicate` com o ID existente. Ausência de consentimento, proprietário, escritor ou projeto confiável produz um resultado tipado sem declarar gravação.
+- **Proveniência do MCP:** a memória de pedido explícito é rotulada como texto fornecido pelo agente ao MCP (`mcp_agent`, `assistant_report`, `explicit_mcp`), sem atribuir o texto literalmente ao usuário ou marcá-lo como revisão humana. O registro local conserva o pedido e o vínculo de projeto para recuperação após falhas.
+
+### Corrigido
+- **Registro do Codex:** a lista permitida de ferramentas do MCP inclui `remember` e a ativação atualiza registros CBS antigos que ainda tinham somente `search`, `get` e `status`. O Claude Code também precisa de uma nova sessão para mostrar a ferramenta instalada.
+
 ## [0.14.0] - 2026-10-14
 
 ### Adicionado
