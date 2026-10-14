@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { nativeProfile } from './native-profile.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const script = fileURLToPath(import.meta.url);
@@ -82,8 +83,9 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
       checkout.projectRoot !== current.projectRoot || checkout.projectId !== current.projectId) {
     return blocked('session_checkout_changed');
   }
-  if (process.platform === 'win32' && checkout.profile !== (cli === 'codex'
-    ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR)) return blocked('session_checkout_changed');
+  if (process.platform === 'win32' && checkout.profile !== nativeProfile(cli)) {
+    return blocked('session_checkout_changed');
+  }
   const native = await verifyNativeCapture(cli === 'codex' ? scope.activeRoot : current.projectRoot,
     { cli, stateRoot, projectRoot: current.projectRoot,
       ...(process.platform === 'win32' ? { profile: checkout.profile } : {}) });

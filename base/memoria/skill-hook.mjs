@@ -11,6 +11,7 @@ import { searchProject } from './bridge.mjs';
 import { selectRecall } from './context.mjs';
 import { recordRecallWindow } from './hook-recall.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
+import { nativeProfile } from './native-profile.mjs';
 
 const unavailable = reason => ({ kind: 'unavailable', reason });
 const output = text => ({ hookSpecificOutput: { hookEventName: 'PreToolUse',
@@ -53,7 +54,7 @@ export async function authenticateSkillHook({ cli, payload, stateRoot } = {}) {
   if (!sameTrustTuple(trustTuple(current), trust)) {
     return unavailable('trust_changed');
   }
-  const owner = await readOwner(current, cli, cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR);
+  const owner = await readOwner(current, cli, nativeProfile(cli));
   const extractor = await readExtractor(current);
   if (owner?.kind === 'blocked' || extractor?.kind === 'blocked' ||
       (owner?.ownerId ?? null) !== (current.ownerId ?? null)) return unavailable('local_policy_changed');

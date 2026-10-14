@@ -10,6 +10,7 @@ import { identifyProject } from './project-id.mjs';
 import { bindLaunch, resolveBoundLaunch } from './launch.mjs';
 import { recordSessionCheckout, readSessionCheckout } from './session-checkout.mjs';
 import { readWindowsBinary } from './windows-security.mjs';
+import { nativeProfile } from './native-profile.mjs';
 
 const events = { claude: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'SessionEnd']),
   codex: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd']) };
@@ -36,7 +37,7 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   const native = await verifyNativeCapture(cli === 'codex' ? scope.activeRoot : current.projectRoot,
     { cli, stateRoot, installedPlugin, projectRoot: current.projectRoot,
       ...(process.platform === 'win32' ? { launchToken: process.env.CBS_MEMORIA_LAUNCH_ID,
-        profile: cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR } : {}) });
+        profile: nativeProfile(cli) } : {}) });
   if (native.kind !== 'verified') return blocked(native.reason);
   const trust = await readLocalTrust(current.stateDir);
   if (!sameTrustTuple(trustTuple(current), trust)) {
@@ -44,7 +45,7 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   }
   const session = event === 'SessionStart'
     ? await initializeSession(payload.cwd, payload.session_id, { ...options, event, cli,
-      profile: cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR }) : resolution;
+      profile: nativeProfile(cli) }) : resolution;
   if (session.provider !== 'mem0') return blocked(session.reason ?? 'unresolved_session');
   const transcriptPath = payload.transcript_path;
   const basename = path.basename(transcriptPath);

@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { ensureWindowsPrivateDirectory, publishWindowsBinary, readWindowsBinary } from './windows-security.mjs';
+import { nativeProfile } from './native-profile.mjs';
 
 const fileFor = (stateDir, cli, sessionId) => path.join(stateDir, 'sessions',
   `${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.checkout.json`);
@@ -34,7 +35,7 @@ export async function readSessionCheckout(stateDir, cli, sessionId) {
 
 export async function recordSessionCheckout(resolution, cli, sessionId, nativeRoot) {
   if (!['claude', 'codex'].includes(cli) || !sessionId || !path.isAbsolute(nativeRoot)) return blocked('invalid_session_checkout');
-  const profile = cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR;
+  const profile = nativeProfile(cli);
   if (process.platform === 'win32' && (!profile || !path.isAbsolute(profile))) {
     return blocked('invalid_session_checkout');
   }

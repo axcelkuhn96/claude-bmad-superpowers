@@ -19,6 +19,7 @@ import { prepareWindowsOverlay, holdWindowsOverlay, removeWindowsOverlay,
   verifyWindowsLaunchOverlay } from './windows-overlay.mjs';
 import { resolveEnrolledWindowsTool } from './windows-enrollment.mjs';
 import { readOwner, readExtractor } from './policy.mjs';
+import { nativeProfile } from './native-profile.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const rootDefault = () => path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
@@ -117,7 +118,7 @@ export async function createLaunch(cwd, cli, { stateRoot } = {}) {
   const trust = await readLocalTrust(current.stateDir);
   const expected = trustTuple(current);
   if (!sameTrustTuple(expected, trust)) return blocked('trust_changed');
-  const profile = cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR;
+  const profile = nativeProfile(cli);
   const owner = await readOwner(current, cli, profile);
   const extractor = await readExtractor(current);
   if (owner?.kind === 'blocked' || extractor?.kind === 'blocked') return blocked('local_policy_changed');
@@ -261,7 +262,7 @@ export async function buildLaunchCommand(cwd, cli, args = [], options = {}, made
       const saved = await verifyWindowsLaunchOverlay({ stateRoot: options.stateRoot, token: made.token,
         cli, nativeRoot: made.record.nativeRoot, projectRoot: made.record.projectRoot });
       if (saved.projectId !== made.record.projectId ||
-          saved.profile !== (cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR)) {
+          saved.profile !== nativeProfile(cli)) {
         return blocked('launch_changed');
       }
       const capture = await verifyNativeCapture(made.record.nativeRoot, {

@@ -12,6 +12,7 @@ import { canonicalWindowsPath, ensureWindowsPrivateDirectory, inspectWindowsPath
   resolveWindowsExecutable, windowsPathKey, withWindowsLock,
   writeWindowsPrivateFile, windowsGitPattern } from './windows-security.mjs';
 import { inspectWindowsCaptureSources, verifyWindowsLaunchOverlay } from './windows-overlay.mjs';
+import { nativeProfile } from './native-profile.mjs';
 
 const run = promisify(execFile);
 const gitEnv = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
@@ -518,7 +519,7 @@ export async function applyNativeExclusion(root, options = {}) {
   if (process.platform === 'win32') {
     try {
       await inspectWindowsCaptureSources({ cli, root, projectRoot: scope.projectRoot,
-        profile: options.profile ?? (cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR) });
+        profile: options.profile ?? nativeProfile(cli) });
       windowsSessionHooks(cli);
       return { kind: 'applied', existing: false, source: 'session' };
     } catch (error) { return blocked(error.message); }
@@ -885,7 +886,7 @@ export async function verifyNativeCapture(root, options = {}) {
       scope.projectRoot !== (options.projectRoot ?? scope.projectRoot) || scope.activeRoot !== root) return blocked('unsupported_git');
   if (process.platform === 'win32') {
     try {
-      const profile = options.profile ?? (cli === 'codex' ? process.env.CODEX_HOME : process.env.CLAUDE_CONFIG_DIR);
+      const profile = options.profile ?? nativeProfile(cli);
       await inspectWindowsCaptureSources({ cli, root, projectRoot: scope.projectRoot, profile });
       if (options.launchToken) {
         const launch = await verifyWindowsLaunchOverlay({ stateRoot: options.stateRoot,
@@ -980,7 +981,7 @@ export async function inspectCodexMainHooks(root, options = {}) {
     try {
       await inspectWindowsCaptureSources({ cli: 'codex', root,
         projectRoot: options.projectRoot ?? root,
-        profile: options.profile ?? process.env.CODEX_HOME });
+        profile: options.profile ?? nativeProfile('codex') });
       return { kind: 'absent' };
     } catch (error) { return blocked(error.message); }
   }

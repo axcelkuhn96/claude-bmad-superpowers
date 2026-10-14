@@ -8,6 +8,7 @@ import { RUNTIME_PINS } from './runtime.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsPrivateFile,
   writeWindowsPrivateFile, readWindowsBinary } from './windows-security.mjs';
 import { readOwner, readExtractor } from './policy.mjs';
+import { nativeProfile } from './native-profile.mjs';
 import { publicIpv4, publicTlsName } from './public-destination.mjs';
 
 const blocked = (reason) => ({ provider: 'blocked', reason });
@@ -176,7 +177,8 @@ export async function initializeSession(cwd, sessionId, options = {}) {
   if (found.saved) return sameSession(found.saved, expected)
     ? Object.freeze({ ...found.current, ownerId: found.saved.ownerId ?? null,
       extractor: found.saved.extractor ?? null }) : blocked('session_changed');
-  const owner = await readOwner(found.current, options.cli, options.profile);
+  const owner = await readOwner(found.current, options.cli,
+    options.profile === undefined ? nativeProfile(options.cli) : options.profile);
   const extractor = await readExtractor(found.current);
   if (owner?.kind === 'blocked' || extractor?.kind === 'blocked') return blocked('local_policy_changed');
   expected.ownerId = owner?.ownerId ?? null;
