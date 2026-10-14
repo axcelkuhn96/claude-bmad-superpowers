@@ -36,10 +36,10 @@ export async function runExclusiveConsumer({ ownerRoot, lockTimeoutMs = 1000, ..
   }
 }
 
-export async function publishManifestIfEnabled(row, resolution, { outbox, publishCheckpoint, cwd } = {}) {
+export async function publishManifestIfEnabled(row, resolution, { outbox, publishCheckpoint, cwd, stateRoot } = {}) {
   if (resolution.extractor?.autoPublish !== true || !resolution.extractor.autoPublishConsent) return null;
   const publish = publishCheckpoint ?? (await import('./auto-publish.mjs')).publishCheckpointAutomatically;
-  const result = await publish(row, resolution, { outbox, cwd });
+  const result = await publish(row, resolution, { outbox, cwd, stateRoot });
   if (result.kind !== 'retry') return result;
   const reason = /^[a-z_]{1,64}$/.test(result.reason ?? '') ? result.reason : 'publication_unavailable';
   const marked = await outbox.markFailed(row.operationId, reason, { automatic: true });
@@ -160,7 +160,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
           manifested++;
           if (result.kind === 'manifested') {
             const publication = await publishManifestIfEnabled(row, fresh, { outbox: box,
-              publishCheckpoint, cwd: original.nativeRoot });
+              publishCheckpoint, cwd: original.nativeRoot, stateRoot });
             if (publication && publication.kind !== 'published') pending++;
             if (publication?.kind === 'retry' && Number.isSafeInteger(publication.nextRetryAt)) {
               nextRetryAt = Math.min(nextRetryAt ?? Infinity, publication.nextRetryAt);

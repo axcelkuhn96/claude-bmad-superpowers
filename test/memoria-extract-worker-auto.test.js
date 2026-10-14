@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import * as worker from '../base/memoria/extract-worker.mjs';
-import { inspectConfiguration, initializeSession } from '../base/memoria/provider.mjs';
+import { inspectConfiguration, initializeSession, resolveProject } from '../base/memoria/provider.mjs';
 import { registerOwner, configureExtractor, enableAutoPublish, localDevice,
   readAutoPublish } from '../base/memoria/policy.mjs';
 import { publishCheckpointAutomatically } from '../base/memoria/auto-publish.mjs';
@@ -253,6 +253,41 @@ test('consumer resumes DNS failure after SessionEnd and stores without another e
   } finally { Date.now = realNow; }
   assert.equal(calls, 1);
   assert.equal(stores, 2);
+});
+
+test('automatic consumer passes its custom state root through publisher and store broker startup', async t => {
+  const { project, stateRoot, box } = await automaticConsumerFixture(t);
+  const device = await localDevice((await inspectConfiguration(project, { stateRoot })).stateDir);
+  let resolved = 0;
+  let brokerStarts = 0;
+  const result = await worker.consumeCheckpoints({ cli: 'claude', cwd: project,
+    sessionId: 's', stateRoot,
+    runCli: async () => ({ kind: 'success', model: 'claude-haiku-5-5',
+      decisions: [{ source_message_id: 'm1', abstain_reason: '', candidates: [{
+        text: 'A release checklist is required.', type: 'rule', scope: 'project' }] }],
+      usage: { inputTokens: 1, outputTokens: 1, costUsd: 0 } }),
+    publishCheckpoint: (row, resolution, options) => publishCheckpointAutomatically(
+      row, resolution, { ...options, readAutoPublish,
+        resolve: async (cwd, sessionId, storeOptions) => {
+          assert.equal(storeOptions.stateRoot, stateRoot);
+          resolved++;
+          return resolveProject(cwd, sessionId, storeOptions);
+        },
+        authorize: async () => ({ kind: 'authorized', key: 'fixture-key',
+          connection: { url: 'https://qdrant.internal' } }),
+        control: async () => ({ kind: 'authority', record: { state: 'active',
+          deviceId: device.deviceId, generation: 1 } }),
+        ensureBrokerReady: async (_cwd, brokerOptions) => {
+          assert.equal(brokerOptions.stateRoot, stateRoot);
+          brokerStarts++;
+          return { kind: 'blocked', reason: 'broker_unavailable' };
+        },
+      }),
+  });
+  assert.equal(result.kind, 'consumed');
+  assert.equal(resolved, 1);
+  assert.equal(brokerStarts, 1);
+  assert.equal((await box.pending()).length, 1);
 });
 
 test('consumer stops after four transient Haiku calls and leaves schema errors for review', async t => {
