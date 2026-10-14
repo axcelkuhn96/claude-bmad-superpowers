@@ -8,8 +8,10 @@ const help = `Uso: cbs skills inventario [--changed] [--json] [--root <diretóri
 
 Lê apenas SKILL.md nas raízes de skills Claude, Codex, .agents e do projeto atual.
 --root pode ser repetido e substitui as raízes padrão. --changed compara hashes com
---snapshot ou com o último snapshot CBS, se existir. O primeiro inventário tem
-baseline desconhecido; ausência de uso medido não significa uso zero.
+--snapshot ou com o último snapshot CBS, se existir, e inclui skills unknown
+quando não é possível confirmar que são novas. O primeiro inventário tem
+baseline desconhecido; varreduras incompletas também deixam novidades unknown.
+Ausência de uso medido não significa uso zero.
 --save-snapshot aceita somente um arquivo no diretório privado
 ~/.local/state/cbs/skills-inventory/; nunca altera skills instaladas.
 `;
@@ -135,13 +137,14 @@ export async function skillsCli(args = []) {
     if (options.save) await saveSnapshot(options.save, report);
     const selected = options.changed ? {
       ...report,
-      skills: report.skills.filter(skill => ['added', 'changed'].includes(skill.change)),
+      skills: report.skills.filter(skill => ['added', 'changed', 'unknown'].includes(skill.change)),
     } : report;
     if (options.json) process.stdout.write(`${JSON.stringify(selected)}\n`);
     else {
       process.stdout.write(`Skills: ${report.summary.total}; baseline: ${report.baseline}; ` +
         `novas: ${report.summary.added}; alteradas: ${report.summary.changed}; ` +
-        `removidas: ${report.summary.deleted}; não observadas: ${report.summary.unobserved}; uso: não medido\n`);
+        `desconhecidas: ${report.summary.unknown}; removidas: ${report.summary.deleted}; ` +
+        `não observadas: ${report.summary.unobserved}; uso: não medido\n`);
       for (const skill of selected.skills) {
         process.stdout.write(`${skill.change}\t${skill.declaredName ?? '(sem nome)'}\t${skill.canonicalPath}\t${skill.hash}\n`);
       }
@@ -149,7 +152,8 @@ export async function skillsCli(args = []) {
       for (const skill of selected.unobserved) process.stdout.write(`unobserved\t${skill.declaredName ?? '(sem nome)'}\t${skill.canonicalPath}\n`);
       for (const root of report.missingRoots) process.stdout.write(`raiz ausente\t${root}\n`);
       if (report.scopeChanged) process.stdout.write('Escopo de comparação diferente; ausências não confirmam remoções.\n');
-      else if (previous && !report.scope.complete) process.stdout.write('Varredura incompleta; ausências não confirmam remoções.\n');
+      if (!report.scope.complete) process.stdout.write('Varredura incompleta; novidades permanecem unknown e ausências não confirmam remoções.\n');
+      if (report.limits.depthLimited) process.stdout.write(`Inventário atingiu o limite de profundidade em ${report.limits.depthLimited} diretório(s).\n`);
       if (report.limits.truncated) process.stdout.write('Inventário truncado pelos limites de leitura.\n');
     }
     return 0;

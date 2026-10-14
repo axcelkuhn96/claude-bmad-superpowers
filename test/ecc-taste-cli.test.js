@@ -68,6 +68,53 @@ test('skills CLI uses a private snapshot for content-hash changes and does not t
   assert.equal(await fs.readFile(skillFile, 'utf8'), '---\nname: sample\n---\n# Second\n');
 });
 
+test('skills --changed keeps unknown results visible on first and incomplete scans', async t => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-skill-partial-cli-'));
+  t.after(() => fs.rm(home, { recursive: true, force: true }));
+  const root = path.join(home, 'skills');
+  for (const name of ['same', 'edited']) {
+    const dir = path.join(root, name);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'SKILL.md'), `---\nname: ${name}\n---\n# First\n`);
+  }
+  const first = run(home, ['skills', 'inventario', '--root', root, '--changed', '--json']);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(JSON.parse(first.stdout).summary.unknown, 2);
+  assert.equal(JSON.parse(first.stdout).skills.length, 2);
+
+  const snapshot = path.join(home, '.local', 'state', 'cbs', 'skills-inventory', 'snapshot.json');
+  const saved = run(home, ['skills', 'inventario', '--root', root, '--save-snapshot', snapshot]);
+  assert.equal(saved.status, 0, saved.stderr);
+  await fs.writeFile(path.join(root, 'edited', 'SKILL.md'), '---\nname: edited\n---\n# Second\n');
+  const addedDir = path.join(root, 'new');
+  await fs.mkdir(addedDir);
+  await fs.writeFile(path.join(addedDir, 'SKILL.md'), '---\nname: new\n---\n# New\n');
+  let nested = root;
+  for (let i = 0; i < 8; i++) {
+    nested = path.join(nested, `level-${i}`);
+    await fs.mkdir(nested);
+  }
+  const changed = run(home, ['skills', 'inventario', '--root', root, '--changed', '--json']);
+  assert.equal(changed.status, 0, changed.stderr);
+  const report = JSON.parse(changed.stdout);
+  assert.equal(report.scope.complete, false);
+  assert.ok(report.limits.depthLimited > 0);
+  assert.deepEqual(report.skills.map(skill => [skill.declaredName, skill.change]).sort(),
+    [['edited', 'changed'], ['new', 'unknown']]);
+  assert.equal(report.summary.total, 3);
+  assert.equal(report.summary.unchanged, 1);
+  assert.equal(report.summary.changed, 1);
+  assert.equal(report.summary.unknown, 1);
+  const text = run(home, ['skills', 'inventario', '--root', root, '--changed']);
+  assert.equal(text.status, 0, text.stderr);
+  assert.match(text.stdout, /desconhecidas: 1/);
+  assert.match(text.stdout, /Varredura incompleta/);
+  assert.match(text.stdout, /limite de profundidade/);
+  assert.match(text.stdout, /unknown\tnew/);
+  const help = run(home, ['skills', 'inventario', '--help']);
+  assert.match(help.stdout, /--changed.*unknown/s);
+});
+
 test('skills CLI rejects arbitrary snapshot writes and malformed snapshots', async t => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-skill-invalid-'));
   t.after(() => fs.rm(home, { recursive: true, force: true }));
