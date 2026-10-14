@@ -15,7 +15,7 @@ async function fixture(t) {
   const project = path.join(dir, 'project');
   const profile = path.join(dir, 'profile');
   await Promise.all([fs.mkdir(bin), fs.mkdir(project), fs.mkdir(profile)]);
-  const fake = `#!/usr/bin/env node
+  const fake = `#!${process.execPath}
 const fs = require('node:fs');
 const path = require('node:path');
 const cli = path.basename(process.argv[1]);
@@ -36,7 +36,7 @@ if (args[1] === 'get') {
     process.exit(1);
   }
   if (cli === 'codex') process.stdout.write(JSON.stringify({ name: 'cbs_memoria', enabled: true, transport: { type: 'stdio', command: value.command, args: value.args, env: null } }));
-  else process.stdout.write('cbs_memoria:\\n  Scope: Local config (private to you in this project)\\n  Type: stdio\\n  Command: ' + value.command + '\\n  Args: ' + value.args.join(' ') + '\\n');
+  else process.stdout.write('cbs_memoria:\\n  Scope: ' + (value.scope === 'local' ? 'Local config (private to you in this project)' : 'User config') + '\\n  Type: stdio\\n  Command: ' + value.command + '\\n  Args: ' + value.args.join(' ') + '\\n');
   process.exit(0);
 }
 if (args[1] === 'add') {
@@ -148,6 +148,72 @@ test('Codex reconhece entrada legada node quando resolve ao mesmo runtime', asyn
   assert.match(await fs.readFile(path.join(f.profile, 'config.toml'), 'utf8'),
     /enabled_tools = \["search", "get", "status"\]/);
   assert.equal((await f.calls()).filter(call => call.args[1] === 'add').length, 0);
+});
+
+test('Claude reconhece entrada local manual com node quando resolve ao mesmo runtime', async t => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.profile, 'servers.json'), JSON.stringify({
+    cbs_memoria: { scope: 'local', command: 'node',
+      args: [mcpScript, '--cli', 'claude', '--project', f.project] } }));
+  assert.equal((await registerReadonlyMcp(f.project, 'claude', { env: f.env })).kind, 'existing');
+  assert.equal((await f.calls()).filter(call => call.args[1] === 'add').length, 0);
+});
+
+test('Claude não aceita entrada global manual com node', async t => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.profile, 'servers.json'), JSON.stringify({
+    cbs_memoria: { scope: 'global', command: 'node',
+      args: [mcpScript, '--cli', 'claude', '--project', f.project] } }));
+  assert.equal((await registerReadonlyMcp(f.project, 'claude', { env: f.env })).reason, 'mcp_conflict');
+});
+
+test('node via symlink canônico é aceito sem executar a resolução', async t => {
+  const f = await fixture(t);
+  const links = path.join(f.dir, 'links');
+  await fs.mkdir(links);
+  await fs.symlink(process.execPath, path.join(links, 'node'));
+  const env = { ...f.env, PATH: `${path.join(f.dir, 'bin')}${path.delimiter}${links}` };
+  await fs.writeFile(path.join(f.profile, 'servers.json'), JSON.stringify({
+    cbs_memoria: { scope: 'local', command: 'node',
+      args: [mcpScript, '--cli', 'claude', '--project', f.project] } }));
+  assert.equal((await registerReadonlyMcp(f.project, 'claude', { env })).kind, 'existing');
+});
+
+test('primeiro node no PATH absoluto ou relativo divergente é recusado sem executar wrapper', async t => {
+  const f = await fixture(t);
+  const wrapperDir = path.join(f.dir, 'wrapper');
+  const realDir = path.join(f.dir, 'real');
+  await Promise.all([fs.mkdir(wrapperDir), fs.mkdir(realDir)]);
+  const marker = path.join(f.dir, 'wrapper-executed');
+  await fs.writeFile(path.join(wrapperDir, 'node'), `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran'); process.stdout.write(${JSON.stringify(process.execPath)});\n`, { mode: 0o755 });
+  await fs.symlink(process.execPath, path.join(realDir, 'node'));
+  const env = { ...f.env, PATH: [path.join(f.dir, 'bin'), wrapperDir, realDir].join(path.delimiter) };
+  await fs.writeFile(path.join(f.profile, 'servers.json'), JSON.stringify({
+    cbs_memoria: { scope: 'global', command: 'node', args: [mcpScript, '--cli', 'codex'] } }));
+  await fs.writeFile(path.join(f.profile, 'config.toml'), '[mcp_servers.cbs_memoria]\ncommand = "node"\n');
+  assert.equal((await registerReadonlyMcp(f.project, 'codex', { env })).reason, 'mcp_conflict');
+  await assert.rejects(fs.access(marker), { code: 'ENOENT' });
+  const relativeEnv = { ...env, PATH: [path.join(f.dir, 'bin'), '../wrapper', realDir].join(path.delimiter) };
+  assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: relativeEnv })).reason, 'mcp_conflict');
+  await assert.rejects(fs.access(marker), { code: 'ENOENT' });
+});
+
+test('node equivalente ainda exige script, args e papel do projeto exatos', async t => {
+  const f = await fixture(t);
+  for (const [cli, scope, args] of [
+    ['claude', 'local', [mcpScript, '--cli', 'claude', '--project', f.project]],
+    ['codex', 'global', [mcpScript, '--cli', 'codex']],
+  ]) {
+    for (const wrong of [
+      { command: 'node', args: ['/other/script.mjs', ...args.slice(1)] },
+      { command: 'node', args: [...args, '--extra'] },
+      { command: 'other', args },
+    ]) {
+      await fs.writeFile(path.join(f.profile, 'servers.json'), JSON.stringify({
+        cbs_memoria: { scope, ...wrong } }));
+      assert.equal((await registerReadonlyMcp(f.project, cli, { env: f.env })).reason, 'mcp_conflict');
+    }
+  }
 });
 
 test('entrada divergente permanece intacta e recebe ação concreta', async t => {

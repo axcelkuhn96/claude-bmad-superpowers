@@ -15,15 +15,28 @@ function run(cli, args, cwd, env) {
   return spawnSync(cli, args, { cwd, env, encoding: 'utf8', timeout: 15000, maxBuffer: 64 * 1024 });
 }
 
-function matches(cli, output, command, args, env) {
+async function matchesLauncher(actual, command, env, cwd) {
+  if (actual === command) return true;
+  if (actual !== 'node' || process.platform === 'win32' || typeof env.PATH !== 'string') return false;
+  for (const entry of env.PATH.split(path.delimiter)) {
+    const candidate = path.resolve(cwd, entry, 'node');
+    try {
+      if (!(await fs.stat(candidate)).isFile()) continue;
+      await fs.access(candidate, fs.constants.X_OK);
+      return await fs.realpath(candidate) === await fs.realpath(command);
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR', 'EACCES'].includes(error.code)) return false;
+    }
+  }
+  return false;
+}
+
+async function matches(cli, output, command, args, env, cwd) {
   if (cli === 'codex') {
     let entry;
     try { entry = JSON.parse(output); } catch { return false; }
     const transport = entry.transport;
-    const legacyNode = transport?.command === 'node'
-      ? run('node', ['-p', 'process.execPath'], process.cwd(), env) : null;
-    const launcher = transport?.command === command ||
-      legacyNode?.status === 0 && legacyNode.stdout.trim() === command;
+    const launcher = await matchesLauncher(transport?.command, command, env, cwd);
     return entry.enabled === true && transport?.type === 'stdio' &&
       launcher && JSON.stringify(transport.args) === JSON.stringify(args) &&
       !transport.cwd && (!transport.env || Object.keys(transport.env).length === 0) &&
@@ -36,7 +49,7 @@ function matches(cli, output, command, args, env) {
   const environment = environmentIndex < 0 ? null : lines.slice(environmentIndex + 1)
     .find(line => line.trim() && !line.startsWith('To remove'));
   return fields.Scope === 'Local config (private to you in this project)' && fields.Type === 'stdio' &&
-    fields.Command === command && fields.Args === args.join(' ') && !environment;
+    await matchesLauncher(fields.Command, command, env, cwd) && fields.Args === args.join(' ') && !environment;
 }
 
 const codexPolicy = [
@@ -101,7 +114,7 @@ export async function registerReadonlyMcp(projectRoot, cli, { env = process.env 
   const found = run(cli, getArgs, projectRoot, env);
   if (found.error) return unavailable('mcp_cli_unavailable', cli, projectRoot);
   if (found.status === 0) {
-    if (!matches(cli, found.stdout, process.execPath, args, env)) return unavailable('mcp_conflict', cli, projectRoot);
+    if (!await matches(cli, found.stdout, process.execPath, args, env, projectRoot)) return unavailable('mcp_conflict', cli, projectRoot);
     if (cli === 'codex' && !await persistCodexPolicy(env)) return unavailable('mcp_registration_failed', cli, projectRoot);
     return { kind: 'existing' };
   }
@@ -116,7 +129,7 @@ export async function registerReadonlyMcp(projectRoot, cli, { env = process.env 
   if (added.error || added.status !== 0) return unavailable('mcp_registration_failed', cli, projectRoot);
   const verified = run(cli, getArgs, projectRoot, env);
   return !verified.error && verified.status === 0 &&
-    matches(cli, verified.stdout, process.execPath, args, env) &&
+    await matches(cli, verified.stdout, process.execPath, args, env, projectRoot) &&
     (cli !== 'codex' || await persistCodexPolicy(env))
     ? { kind: 'registered' } : unavailable('mcp_registration_failed', cli, projectRoot);
 }
