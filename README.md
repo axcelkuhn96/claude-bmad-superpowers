@@ -2,7 +2,7 @@
 
 > Workflow PT-BR para [Claude Code](https://claude.com/claude-code): **refina sua ideia com a memória do projeto e entrega pra uma execução de qualidade** — TDD real, subagents isolados, um task reviewer por task e review final da branch.
 
-Um pacote de **7 skills** e **12 comandos** em português que amarram cinco camadas, cada uma no seu nível:
+Um pacote de **8 skills** e **13 comandos** em português que amarram cinco camadas, cada uma no seu nível:
 
 | Camada | Quem faz | Papel |
 |---|---|---|
@@ -25,7 +25,7 @@ Em vez de competir, cada peça fica no que faz bem: **você refina em português
 - [Modelo por papel (models.yml)](#modelo-por-papel-modelsyml)
 - [Como o pipeline funciona](#como-o-pipeline-funciona)
 - [Exemplo de fluxo real](#exemplo-de-fluxo-real)
-- [As 7 skills](#as-7-skills)
+- [As 8 skills](#as-8-skills)
 - [Memória (claude-mem)](#memória-claude-mem)
 - [Memória opcional (Mem0)](#memória-opcional-mem0)
 - [BMAD + Superpowers: sempre juntos](#bmad--superpowers-sempre-juntos)
@@ -61,7 +61,7 @@ npx claude-bmad-superpowers instalar
 
 Isso faz, em ordem:
 
-1. **Skills + comandos + personas** → copia as 7 skills, 12 comandos e as personas (`ponytail.md`, `dominios/*.md`, `review/*.md`) pra `~/.claude/skills/`, `~/.claude/commands/` e `~/.claude/personas/`; copia `models.yml` pra `~/.claude/cbs-overrides/models.yml` **só se não existir**.
+1. **Skills + comandos + personas** → copia as 8 skills, 13 comandos e as personas (`ponytail.md`, `dominios/*.md`, `review/*.md`) pra `~/.claude/skills/`, `~/.claude/commands/` e `~/.claude/personas/`; copia `models.yml` pra `~/.claude/cbs-overrides/models.yml` **só se não existir**.
 2. **Superpowers** → detecta o plugin; se não estiver instalado, mostra o comando exato pra rodar **dentro do Claude Code** (instalação de plugin não funciona via CLI fora do app).
 3. **BMAD** → instala no diretório atual se você estiver dentro de um projeto (interativo, em PT-BR). Pra pular: `--apenas-global`.
 
@@ -246,7 +246,7 @@ claude: modo: auto
 
 ---
 
-## As 7 skills
+## As 8 skills
 
 - **`refinador-de-prompt`** — transforma ideia crua em prompt premium (tags XML) gravado em `docs/prompts/`. Usa a memória e um subagent Explore, classifica o **tipo de tarefa** (`regra-de-negocio` | `operacional` | `ui` — define a política de teste do executor) e os **domínios previstos**, pergunta só dúvidas **bloqueantes** (uma por vez), e fecha com um único gate (`ok` / ajuste). Etapa interna do `/piloto`; `/refinar` e `/refinar-auto` são aliases.
 
@@ -262,6 +262,8 @@ claude: modo: auto
 
 - **`handoff`** — compacta a conversa num **documento de continuação** pra outro agente/sessão. **Referencia** artefatos, **redige** segredos, sugere próximas skills. Adaptada de [mattpocock/skills](https://github.com/mattpocock/skills).
 
+- **`memoria`** — inicia sob demanda a memória Mem0 nos projetos ativados e consulta o contexto do projeto. Veja [memória opcional](#memória-opcional-mem0).
+
 ---
 
 ## Memória (claude-mem)
@@ -274,21 +276,27 @@ Sem claude-mem, as skills marcam "Memória: não disponível" e seguem normalmen
 
 ## Memória opcional (Mem0)
 
-O **claude-mem continua sendo o padrão**. O CBS também contém uma opção Mem0 por projeto, com seleção e confiança locais explícitas para sessões novas de Claude Code ou Codex. Cada sessão usa um provedor de memória; uma sessão Mem0 não consulta o claude-mem. Não há migração ou sincronização automática entre eles.
+O **claude-mem continua sendo o padrão**. O CBS também contém uma opção Mem0 por projeto, com seleção e confiança locais explícitas para sessões novas de Claude Code ou Codex. Cada sessão usa um provedor de memória; uma sessão Mem0 não consulta o claude-mem. A importação opcional do histórico claude-mem é manual e fica numa coleção separada, sem alimentar o recall automático.
 
 Em um projeto já configurado e ativado para Mem0, abra `claude` ou `codex` normalmente e use `/memoria` ou uma skill do CBS. A skill inicia sob demanda o processo local de embeddings e busca; não é necessário `cbs memoria launch`. A escolha do provedor é feita uma vez por projeto. Se você acabou de trocar o provedor numa CLI já aberta, inicie uma nova sessão normal para aplicar a exclusão do claude-mem. Não há serviço no startup do PC. Após cinco minutos sem uso, o worker encerra; a próxima chamada da skill o inicia novamente.
 
-O recall depende de o gatilho de skill chegar ao contexto nativo da CLI; uma primeira pergunta genérica antes disso pode não consultar a memória. Captura, extração por CLI, SDK Mem0 e embeddings E5 rodam no computador de quem desenvolve pela rota CPU; GPU não é requisito e ainda não foi validada. O servidor executa somente Qdrant privado, autenticado e persistente. O instalador `base/memoria/deploy/install-qdrant.sh` foi preparado para instalação posterior pelo proprietário; o guia operacional está em `/home/axcel/cbs-lab/docs/operacao/qdrant-memoria.md` neste workspace.
+O recall depende de o gatilho de skill chegar ao contexto nativo da CLI; uma primeira pergunta genérica antes disso pode não consultar a memória. Captura, extração por CLI, SDK Mem0 e embeddings E5 rodam no computador de quem desenvolve pela rota CPU; GPU não é requisito e ainda não foi validada. O servidor executa Qdrant autenticado e persistente. O instalador `base/memoria/deploy/install-qdrant.sh` configura o serviço privado; um gateway HTTPS público pode ser usado mediante escolha explícita por projeto.
+
+Na configuração `.cbs/memoria.json`, o destino privado continua sendo o padrão. Para acesso direto pela Internet, defina `qdrant.allow_public: true`, `qdrant.address` com o IPv4 público fixo **real** do servidor e `qdrant.url` com o domínio HTTPS correspondente (por exemplo, `https://memoria.example.com:48677/`). O CBS exige certificado válido pela CA normal, nome TLS correspondente, conexão ao endereço fixado e ausência de redirecionamentos. Mudanças no modo público, endereço, URL ou coleção exigem nova ativação local antes de ler a chave ou acessar a rede. O IPv4 de exemplo da faixa `203.0.113.0/24` é reservado para documentação e será rejeitado pela validação.
+
+A chave pode ser fornecida pela variável `CBS_MEMORIA_QDRANT_KEY` ou, em Linux, pelo arquivo `~/.config/cbs/memoria/qdrant-api-key`: diretórios `.config`, `cbs` e `memoria` pertencentes ao usuário e com permissão `0700`, arquivo pertencente ao usuário e com `0600`. A variável, quando definida, tem precedência. Guarde o segredo fora do Git. `cbs memoria activate --cli claude|codex --project /raiz/git` mostra projeto, destino e coleção para confirmação no terminal. Configuração nativa versionada exige a opção explícita `--allow-tracked-native`; o CBS preserva alterações locais e no índice do Git ao ativar ou reverter.
 
 A extração oferece Sonnet e Haiku como opções explícitas. Na rota Haiku, o modelo seleciona poucas mensagens duráveis e o código gera candidatos com a citação literal completa da fonte curta (até 512 bytes), ator, origem, data e IDs locais. O proprietário revisa no terminal antes do envio ao SDK com `infer=False`. A citação deve preservar todo o texto original, inclusive negações e condições.
 
 `cbs memoria help` lista as ações. `cbs memoria check --project /raiz/git` e `cbs memoria status --project /raiz/git` mostram o estado local. A publicação automática de memórias está desativada: candidatos exigem fonte, ator, data, escopo e revisão antes da gravação.
 
+Para consultar o histórico gerado anteriormente pelo claude-mem, veja [importação e busca manual do histórico](https://github.com/axcelkuhn96/claude-bmad-superpowers/blob/master/docs/memoria/importar-claude-mem.md). A coleção histórica separada guarda registros brutos com origem identificada; não são memórias revisadas nem entram automaticamente no contexto das skills. A importação e a busca usam embeddings locais, sem reescrita por LLM.
+
 Uma avaliação contextual pequena usou uma instrução humana real e uma nova tarefa em sessões nativas de Claude Code e Codex. Nos dois CLIs, a memória lembrou a restrição que os controles omitiram; os controles também permaneceram seguros. As quatro respostas não executaram ferramentas. A auditoria Astra validou esse benefício mínimo, limitado ao caso avaliado.
 
-Um ensaio local isolado completou o ciclo automático em ambas as CLIs: hooks capturaram a fonte, o checkpoint acionou Haiku, a revisão no terminal gravou pelo SDK e uma sessão nova recuperou a memória. Outro ensaio validou correção de memória, indisponibilidade do Qdrant, interrupção de worker próprio e repetição do mesmo checkpoint; a recuperação retornou somente a versão ativa, sem perda ou duplicação no ensaio. A revisão desses ensaios foi automatizada para QA e não substitui o aceite humano do proprietário. O Qdrant de teste era local; a instalação no servidor real ainda será feita pelo proprietário.
+Um ensaio local isolado completou o ciclo automático em ambas as CLIs: hooks capturaram a fonte, o checkpoint acionou Haiku, a revisão no terminal gravou pelo SDK e uma sessão nova recuperou a memória. Outro ensaio validou correção de memória, indisponibilidade do Qdrant, interrupção de worker próprio e repetição do mesmo checkpoint; a recuperação retornou somente a versão ativa, sem perda ou duplicação no ensaio. A revisão desses ensaios foi automatizada para QA e não substitui o aceite humano do proprietário. O transporte HTTPS público do Qdrant também passou por teste remoto limitado de TLS, autenticação e operações SDK; essa prova não cobre o pipeline completo de memórias no servidor remoto.
 
-**Experimental em Linux:** a rota de ativação em sessões normais de Claude Code e Codex passou a prova nativa limitada; os estados locais de confiança e propriedade continuam obrigatórios. Windows segue sem prova de release (`windows_release_unproved`) e será validado por outro responsável. Isso não representa aceite de qualidade geral: julgamento do proprietário, RF-19 completo e operação no Qdrant remoto permanecem pendentes. A operação entre duas máquinas foi adiada pelo proprietário para depois da implantação.
+**Experimental em Linux:** a rota de ativação em sessões normais de Claude Code e Codex passou a prova nativa limitada; os estados locais de confiança e propriedade continuam obrigatórios. Windows segue sem prova de release (`windows_release_unproved`) e será validado por outro responsável. Isso não representa aceite de qualidade geral: julgamento do proprietário, RF-19 completo e pipeline de memórias no Qdrant remoto permanecem pendentes. A operação entre duas máquinas foi adiada pelo proprietário para depois da implantação.
 
 ---
 

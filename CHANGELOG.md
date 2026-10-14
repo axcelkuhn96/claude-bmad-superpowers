@@ -2,16 +2,25 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
-## [Unreleased]
+## [0.13.1] - 2026-10-13
 
 ### Adicionado
-- **Memória Mem0 opcional por projeto (experimental):** seleção local explícita para novas sessões Claude Code/Codex, exclusiva em relação ao claude-mem padrão. Captura, extração por CLI, SDK Mem0 e embeddings E5 ficam no cliente; o servidor executa somente Qdrant privado e autenticado. Candidatos exigem fonte, ator, data, escopo e revisão; a publicação automática permanece desativada.
+- **Memória Mem0 opcional por projeto (experimental):** seleção local explícita para novas sessões Claude Code/Codex, exclusiva em relação ao claude-mem padrão. Captura, extração por CLI, SDK Mem0 e embeddings E5 ficam no cliente; o servidor executa Qdrant autenticado. Candidatos exigem fonte, ator, data, escopo e revisão; a publicação automática permanece desativada.
 - **Extração Haiku opt-in:** seleciona poucas mensagens duráveis; cada candidato deriva `source_note` da citação literal completa e exata da fonte curta (até 512 bytes), com ator, origem, data e IDs locais. O proprietário revisa no TTY antes do envio ao SDK (`infer=False`). A paráfrase do modelo não é usada como fonte.
-- **Instalador privado do Qdrant:** script `.sh` e guia de operação para instalação posterior pelo proprietário, com armazenamento persistente, autenticação e procedimentos de backup/restauração.
+- **Instalador privado do Qdrant:** script `.sh` e guia de operação, com armazenamento persistente, autenticação e procedimentos de backup/restauração.
+- **Destino Qdrant público opcional:** `qdrant.allow_public: true` aceita HTTPS com nome TLS validado e IPv4 público fixo explícito, sem redirecionamentos; o destino privado continua sendo o padrão. Modo, endereço, URL e coleção ficam vinculados à confiança local e exigem nova ativação após mudança.
+- **Chave Qdrant local:** em Linux, aceita `~/.config/cbs/memoria/qdrant-api-key` pertencente ao usuário, com arquivo `0600` e diretórios privados `0700`; `CBS_MEMORIA_QDRANT_KEY` tem precedência. A chave só é lida após a validação do destino confiável.
+- **Configuração nativa versionada:** ativação explícita por `--allow-tracked-native`, com snapshot restrito ao arquivo e ao índice Git para preservar edições existentes e permitir restauração segura.
+- **Histórico claude-mem bruto:** importação opcional para coleção separada por projeto, com consulta e leitura manuais; sem LLM na migração e sem inclusão no recall automático. Veja [o tutorial](docs/memoria/importar-claude-mem.md).
+- **Subagentes nomeados**: todo dispatch das skills e comandos passa `name` curto, kebab-case, único na sessão, no padrão `<papel>-<escopo>` (`impl-t3`, `rev-t3`, `rerev-t3-r2`, `explore-auth`, `rev-final`), pra você falar com o agente por `@nome`/`SendMessage`. Regra canônica em `executor-bmad-superpowers/referencia/dispatch.md` §2; o override de Model Selection passado ao SDD exige `name` em todo implementer e reviewer. Codex: nome do agente de `~/.codex/agents` quando existir; nome da instância no mesmo padrão quando o runtime aceitar.
 
 ### Corrigido
-- **Broker Mem0 em sessões ociosas:** mantém uma conexão autenticada enquanto a CLI lançada está aberta, para preservar o worker de recall após mais de cinco minutos sem prompts e liberar recursos ao encerrar a sessão.
+- **Broker Mem0 em sessões ociosas:** o gatilho nativo acorda o runtime local sob demanda em sessões normais; a conexão autenticada preserva o worker de recall enquanto a CLI está aberta e libera recursos depois.
 - **Probe do plugin claude-mem no Codex:** verifica no JSON da CLI que o plugin está realmente instalado no marketplace esperado, sem confundir "not installed" com instalação.
+- **Compatibilidade Node 24:** a resolução do endereço fixado para ativação e autoridade HTTPS aceita o formato de resposta DNS usado pelo Node 24.
+- **Restauração de configuração versionada:** uma interrupção após escrita parcial retoma a restauração do snapshot; alterações posteriores do usuário ou deriva do índice são recusadas sem sobrescrita.
+- **`cbs-no-verify`, falsos positivos**: as flags só contam dentro da mesma invocação git; `-n` só conta em `commit`/`am`; corpo de heredoc é dado. `pgrep -f "git commit"`, `find -name`, `echo -ne`, `nice -n` e `cherry-pick -n` passam. Medido em 9.993 comandos reais: 116 → 5 bloqueios, nenhum bloqueio novo.
+- **`cbs-format`/`cbs-typecheck`**: ferramenta ou interpretador indisponível (exit 127, ENOENT, EACCES) vira skip silencioso. Acaba o ruído "pint falhou (exit 127)" sem PHP e os bloqueios falsos no Stop. O diretório do node é anexado ao PATH do spawn, então tsc/prettier/biome rodam mesmo com o node fora do PATH.
 - **Gravação manual de memória:** deadline ausente (`null`) não bloqueia a gravação; deadlines `0` ou no passado continuam bloqueados.
 - **Integridade da fonte Haiku:** exige igualdade com a citação literal completa, preservando espaços, caixa e Unicode; não aceita substring editável que possa remover contexto, inclusive uma negação.
 - **Revisão Mem0 com estado isolado:** propaga a raiz de estado escolhida até a gravação no SDK, permitindo concluir a revisão de uma sessão preparada nesse estado.
@@ -21,20 +30,12 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 - Gatilho de skill em sessões normais de Claude Code e Codex alcançou o contexto nativo Mem0 e recuperou a regra congelada nas duas CLIs. A ativação Linux fica experimental, com as verificações locais de confiança e propriedade mantidas; a prova não cobre recall antes do primeiro gatilho nem constitui aceite de qualidade geral.
 - Ciclo automático de captura, checkpoint, extração Haiku, revisão no terminal, gravação e recuperação em sessão nova, uma vez em Claude Code e uma vez na TUI do Codex. No Codex, a própria CLI foi interrompida após o checkpoint durável, antes da revisão.
 - Correção e replay do mesmo checkpoint após interrupção de worker próprio e indisponibilidade temporária do Qdrant: uma versão ativa recuperável, sem perda ou duplicação no ensaio. A revisão no terminal foi automatizada para QA e a fonte desse ensaio era sintética.
+- Transporte HTTPS remoto do Qdrant: TLS com CA/nome, autenticação positiva e negativa e operações SDK com coleção de QA temporária; não equivale à prova do pipeline completo de memórias remoto.
 
 ### Limitações conhecidas
-- Windows permanece sem prova de release (`windows_release_unproved`); a validação física caberá a outro responsável. Julgamento do proprietário, RF-19 completo e operação no Qdrant remoto seguem pendentes.
+- Windows permanece sem prova de release (`windows_release_unproved`); a validação física caberá a outro responsável. Julgamento do proprietário, RF-19 completo e pipeline de memórias no Qdrant remoto seguem pendentes.
 - A prova operacional Haiku confirmou seleção e abstenção no pequeno conjunto real avaliado. Um comparativo contextual com fontes reais e quatro respostas nativas de Claude/Codex demonstrou lembrança útil da regra nos braços com memória, sem ferramentas ou dano material observado. Auditoria Astra: PASS limitado ao caso; os controles também eram seguros. O julgamento do proprietário e RF-19 completo permanecem pendentes. A prova entre duas máquinas foi adiada pelo proprietário para depois da implantação.
-- A rota Sol aguarda prova de isolamento de ferramentas. O proprietário instalará o Qdrant posteriormente.
-
-## [0.13.1] - 2026-09-30
-
-### Corrigido
-- **`cbs-no-verify`, falsos positivos**: as flags só contam dentro da mesma invocação git; `-n` só conta em `commit`/`am`; corpo de heredoc é dado. `pgrep -f "git commit"`, `find -name`, `echo -ne`, `nice -n` e `cherry-pick -n` passam. Medido em 9.993 comandos reais: 116 → 5 bloqueios, nenhum bloqueio novo.
-- **`cbs-format`/`cbs-typecheck`**: ferramenta ou interpretador indisponível (exit 127, ENOENT, EACCES) vira skip silencioso. Acaba o ruído "pint falhou (exit 127)" sem PHP e os bloqueios falsos no Stop. O diretório do node é anexado ao PATH do spawn, então tsc/prettier/biome rodam mesmo com o node fora do PATH.
-
-### Adicionado
-- **Subagentes nomeados**: todo dispatch das skills e comandos passa `name` curto, kebab-case, único na sessão, no padrão `<papel>-<escopo>` (`impl-t3`, `rev-t3`, `rerev-t3-r2`, `explore-auth`, `rev-final`), pra você falar com o agente por `@nome`/`SendMessage`. Regra canônica em `executor-bmad-superpowers/referencia/dispatch.md` §2; o override de Model Selection passado ao SDD exige `name` em todo implementer e reviewer. Codex: nome do agente de `~/.codex/agents` quando existir; nome da instância no mesmo padrão quando o runtime aceitar.
+- A rota Sol aguarda prova de isolamento de ferramentas.
 
 ## [0.13.0] - 2026-09-27
 
