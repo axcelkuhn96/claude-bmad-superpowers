@@ -62,7 +62,7 @@ process.exit(2);
   return { dir, project, profile, env, state, calls };
 }
 
-test('Codex persists scoped read-only policy and preserves unrelated TOML byte for byte', async t => {
+test('Codex exposes remember and preserves unrelated TOML byte for byte', async t => {
   const f = await fixture(t);
   const config = path.join(f.profile, 'config.toml');
   const other = '[other]\nvalue = "keep me"\n\n';
@@ -71,19 +71,19 @@ test('Codex persists scoped read-only policy and preserves unrelated TOML byte f
   const after = await fs.readFile(config, 'utf8');
   assert.ok(after.startsWith(other));
   assert.ok(after.endsWith('[tail]\nx = 1\n'));
-  assert.match(after, /\[mcp_servers\.cbs_memoria\][\s\S]*enabled_tools = \["search", "get", "status"\]/);
+  assert.match(after, /\[mcp_servers\.cbs_memoria\][\s\S]*enabled_tools = \["search", "get", "status", "remember"\]/);
   assert.match(after, /\[mcp_servers\.cbs_memoria\][\s\S]*default_tools_approval_mode = "writes"/);
   assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).kind, 'existing');
   assert.equal(await fs.readFile(config, 'utf8'), after);
   assert.ok((await f.calls()).every(call => !call.args.includes('-c')));
 });
 
-test('Codex repairs policy drift on owned entry, but leaves a conflicting server unchanged', async t => {
+test('Codex migrates the exact legacy allowlist and leaves conflicting servers unchanged', async t => {
   const f = await fixture(t);
   const config = path.join(f.profile, 'config.toml');
-  await fs.writeFile(config, '[mcp_servers.cbs_memoria]\nenabled_tools = ["search", "write"]\ndefault_tools_approval_mode = "approve"\n');
+  await fs.writeFile(config, '[mcp_servers.cbs_memoria]\nenabled_tools = ["search", "get", "status"]\ndefault_tools_approval_mode = "writes"\n');
   assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).kind, 'registered');
-  assert.match(await fs.readFile(config, 'utf8'), /enabled_tools = \["search", "get", "status"\]/);
+  assert.match(await fs.readFile(config, 'utf8'), /enabled_tools = \["search", "get", "status", "remember"\]/);
   assert.match(await fs.readFile(config, 'utf8'), /default_tools_approval_mode = "writes"/);
   const current = await fs.readFile(config, 'utf8');
   const state = await f.state();
@@ -91,6 +91,24 @@ test('Codex repairs policy drift on owned entry, but leaves a conflicting server
   await fs.writeFile(path.join(f.profile, 'servers.json'), JSON.stringify(state));
   assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).reason, 'mcp_conflict');
   assert.equal(await fs.readFile(config, 'utf8'), current);
+});
+
+test('Codex leaves a customized tool allowlist and approval mode untouched', async t => {
+  const f = await fixture(t);
+  const config = path.join(f.profile, 'config.toml');
+  const before = '[other]\nkeep = "yes"\n[mcp_servers.cbs_memoria]\nenabled_tools = ["search", "write"]\ndefault_tools_approval_mode = "approve"\n';
+  await fs.writeFile(config, before);
+  assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).reason, 'mcp_registration_failed');
+  assert.equal(await fs.readFile(config, 'utf8'), before);
+});
+
+test('Codex does not replace a custom approval mode on an otherwise legacy policy', async t => {
+  const f = await fixture(t);
+  const config = path.join(f.profile, 'config.toml');
+  const before = '[mcp_servers.cbs_memoria]\nenabled_tools = ["search", "get", "status"]\ndefault_tools_approval_mode = "approve"\n';
+  await fs.writeFile(config, before);
+  assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).reason, 'mcp_registration_failed');
+  assert.equal(await fs.readFile(config, 'utf8'), before);
 });
 
 test('Codex fails closed if its owned TOML stanza is absent or ambiguous', async t => {
@@ -146,7 +164,7 @@ test('Codex reconhece entrada legada node quando resolve ao mesmo runtime', asyn
   await fs.writeFile(path.join(f.profile, 'config.toml'), '[mcp_servers.cbs_memoria]\ncommand = "node"\n');
   assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).kind, 'existing');
   assert.match(await fs.readFile(path.join(f.profile, 'config.toml'), 'utf8'),
-    /enabled_tools = \["search", "get", "status"\]/);
+    /enabled_tools = \["search", "get", "status", "remember"\]/);
   assert.equal((await f.calls()).filter(call => call.args[1] === 'add').length, 0);
 });
 

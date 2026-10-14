@@ -53,9 +53,11 @@ async function matches(cli, output, command, args, env, cwd) {
 }
 
 const codexPolicy = [
-  ['enabled_tools', '["search", "get", "status"]'],
+  ['enabled_tools', '["search", "get", "status", "remember"]'],
   ['default_tools_approval_mode', '"writes"'],
 ];
+const legacyCodexTools = '["search","get","status"]';
+const currentCodexTools = '["search","get","status","remember"]';
 
 async function persistCodexPolicy(env) {
   const profile = env.CODEX_HOME ?? path.join(env.HOME ?? os.homedir(), '.codex');
@@ -85,8 +87,11 @@ async function persistCodexPolicy(env) {
       if (matches.length > 1) return false;
       if (matches.length === 1) {
         const current = matches[0][2].trim();
-        if (key === 'enabled_tools' && !(current.startsWith('[') && current.endsWith(']')) ||
-            key === 'default_tools_approval_mode' && !/^"[^"\r\n]*"$/.test(current)) return false;
+        if (key === 'enabled_tools') {
+          let parsed;
+          try { parsed = JSON.stringify(JSON.parse(current)); } catch { return false; }
+          if (parsed !== legacyCodexTools && parsed !== currentCodexTools) return false;
+        } else if (current !== value) return false;
         section = section.replace(pattern, `$1${value}$3`);
       } else {
         section = `${section}${section.endsWith(newline) || !section ? '' : newline}${key} = ${value}${newline}`;
