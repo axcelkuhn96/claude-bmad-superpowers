@@ -42,7 +42,7 @@ def send(value):
 
 
 def execute_one(request, secret):
-    if not secret or request.get('op') not in ('search', 'find', 'read', 'add', 'activate',
+    if not secret or request.get('op') not in ('search', 'find', 'read', 'dedup_find', 'add', 'activate',
                                                'raw_search', 'readonly_get'):
         return {'kind': 'blocked', 'reason': 'invalid_operation'}
     state = Path(request['state']).resolve()

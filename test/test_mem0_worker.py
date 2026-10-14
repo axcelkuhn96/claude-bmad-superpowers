@@ -28,6 +28,23 @@ def responses(data):
 
 
 class WorkerReadinessTest(unittest.TestCase):
+    def test_exact_duplicate_lookup_reaches_adapter_without_writing(self):
+        adapter = ModuleType('mem0_adapter')
+        adapter.PinnedTransport = lambda connection: httpx.MockTransport(
+            lambda request: httpx.Response(200, json={}))
+        calls = []
+        adapter.execute = lambda request, client, state: calls.append(request['op']) or {'kind': 'clear'}
+        script = Path(__file__).resolve().parents[1] / 'base/memoria/python/worker.py'
+        spec = importlib.util.spec_from_file_location('mem0_worker_dedup_test', script)
+        worker = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'mem0_adapter': adapter}):
+            spec.loader.exec_module(worker)
+            result = worker.execute_one(
+                {'op': 'dedup_find', 'state': '/tmp',
+                 'connection': {'url': 'https://fixture.invalid/'}}, b'fixture-key')
+        self.assertEqual(result, {'kind': 'clear'})
+        self.assertEqual(calls, ['dedup_find'])
+
     def test_remote_client_sets_sdk_read_timeout_above_five_seconds(self):
         adapter = ModuleType('mem0_adapter')
         adapter.PinnedTransport = lambda connection: httpx.MockTransport(
