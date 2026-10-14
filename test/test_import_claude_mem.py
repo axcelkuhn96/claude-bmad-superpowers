@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'base/memoria/import-claude-mem.py'
 spec = importlib.util.spec_from_file_location('import_claude_mem', SCRIPT)
@@ -290,6 +292,170 @@ class ImportClaudeMemTest(unittest.TestCase):
         self.assertNotEqual(client.retrieve(name, ids=[point.id])[0].payload['embedding_fingerprint'],
                             'old-e5')
         client.close()
+
+    def test_adjacent_rows_share_retrieve_and_upsert_with_bounded_point_batch(self):
+        from qdrant_client import QdrantClient
+        out = self.raw_snapshot()
+        real = QdrantClient(':memory:')
+
+        class CountingClient:
+            retrieves = []
+            upserts = []
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def retrieve(self, collection, ids, **kwargs):
+                self.retrieves.append((collection, list(ids)))
+                return real.retrieve(collection, ids, **kwargs)
+
+            def upsert(self, collection, points, **kwargs):
+                self.upserts.append((collection, [point.id for point in points]))
+                return real.upsert(collection, points, **kwargs)
+
+        client = CountingClient()
+        count = module.import_snapshot(self.options(out, batch_size=3), client,
+                                       self.fake_embedder())
+        self.assertEqual(count, 4)
+        self.assertEqual([len(ids) for _, ids in client.upserts], [3, 1])
+        self.assertEqual([len(ids) for _, ids in client.retrieves], [3, 1])
+        self.assertEqual(real.count('cbs-projeto-a_claude_mem_raw', exact=True).count, 4)
+        real.close()
+
+    def test_ambiguous_upsert_timeout_retries_same_ids_without_duplicate(self):
+        from qdrant_client import QdrantClient
+        from qdrant_client.http.exceptions import ResponseHandlingException
+        out = self.raw_snapshot()
+        real = QdrantClient(':memory:')
+
+        class AmbiguousClient:
+            calls = []
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def upsert(self, collection, points, **kwargs):
+                self.calls.append([point.id for point in points])
+                result = real.upsert(collection, points, **kwargs)
+                if len(self.calls) == 1:
+                    raise ResponseHandlingException(httpx.ReadTimeout('response_lost'))
+                return result
+
+        client = AmbiguousClient()
+        count = module.import_snapshot(self.options(out, batch_size=2), client,
+                                       self.fake_embedder())
+        self.assertEqual(count, 4)
+        self.assertEqual(client.calls[0], client.calls[1])
+        self.assertEqual(real.count('cbs-projeto-a_claude_mem_raw', exact=True).count, 4)
+        self.assertEqual(json.loads(Path(self.options(out).checkpoint).read_text())['line'], 2)
+        real.close()
+
+    def test_partial_window_ack_does_not_advance_checkpoint_and_replays_all_ids(self):
+        from qdrant_client import QdrantClient
+        out = self.raw_snapshot()
+        real = QdrantClient(':memory:')
+        original = module.save_checkpoint
+        writes = 0
+
+        def fail_second_checkpoint(*args):
+            nonlocal writes
+            writes += 1
+            if writes == 2:
+                raise RuntimeError('crash_after_second_window_ack')
+            return original(*args)
+
+        with patch.object(module, 'save_checkpoint', fail_second_checkpoint):
+            with self.assertRaisesRegex(RuntimeError, 'crash_after_second_window_ack'):
+                module.import_snapshot(self.options(out, batch_size=2), real,
+                                       self.fake_embedder())
+        checkpoint = json.loads(Path(self.options(out).checkpoint).read_text())
+        self.assertEqual((checkpoint['line'], checkpoint['offset']), (1, 0))
+        self.assertEqual(real.count('cbs-projeto-a_claude_mem_raw', exact=True).count, 4)
+        self.assertEqual(module.import_snapshot(self.options(out, batch_size=2), real,
+                                                self.fake_embedder()), 0)
+        self.assertEqual(real.count('cbs-projeto-a_claude_mem_raw', exact=True).count, 4)
+        real.close()
+
+    def test_failed_ack_in_second_collection_replays_without_advancing_checkpoint(self):
+        from qdrant_client import QdrantClient
+        out = self.root / 'multiple.jsonl'
+        first = 'cbs-projeto-a_claude_mem_raw'
+        second = 'cbs-subprojeto_claude_mem_raw'
+        module.snapshot(self.db, [
+            {'source_project': 'Projeto-A', 'collection': first},
+            {'source_project': 'Projeto-A/subprojeto', 'collection': second},
+        ], out)
+        real = QdrantClient(':memory:')
+
+        class IncompleteClient:
+            failed = False
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def upsert(self, collection, points, **kwargs):
+                result = real.upsert(collection, points, **kwargs)
+                if collection == second and not self.failed:
+                    self.failed = True
+                    return SimpleNamespace(status='acknowledged')
+                return result
+
+        options = self.options(out, batch_size=3)
+        with self.assertRaisesRegex(RuntimeError, 'upsert_not_acknowledged'):
+            module.import_snapshot(options, IncompleteClient(), self.fake_embedder())
+        checkpoint = json.loads(Path(options.checkpoint).read_text())
+        self.assertEqual((checkpoint['line'], checkpoint['offset']), (1, 0))
+        self.assertEqual(real.count(first, exact=True).count, 2)
+        self.assertEqual(real.count(second, exact=True).count, 1)
+        self.assertEqual(module.import_snapshot(options, real, self.fake_embedder()), 2)
+        self.assertEqual(real.count(first, exact=True).count, 4)
+        self.assertEqual(real.count(second, exact=True).count, 1)
+        real.close()
+
+    def test_snapshot_tamper_rejected_before_key_or_network(self):
+        out = self.raw_snapshot()
+        options = self.options(out)
+        from qdrant_client import QdrantClient
+        real = QdrantClient(':memory:')
+        module.import_snapshot(options, real, self.fake_embedder())
+        out.write_text(out.read_text().replace('Olá memória', 'Oi memória'))
+        with patch.object(module, 'client_for', side_effect=AssertionError('key_or_network')):
+            with self.assertRaisesRegex(ValueError, 'checkpoint_snapshot_mismatch'):
+                module.import_snapshot(options, embedder=self.fake_embedder())
+        real.close()
+
+    def test_public_client_sets_explicit_rest_timeout(self):
+        options = self.options(self.raw_snapshot(), api_key_file=str(self.root / 'key'))
+        with patch.object(module, 'safe_key', return_value='private-token'), \
+                patch('mem0_adapter.PinnedTransport') as transport, \
+                patch('qdrant_client.QdrantClient') as constructor:
+            module.client_for(options)
+        self.assertEqual(constructor.call_args.kwargs['timeout'], 30)
+        self.assertIs(constructor.call_args.kwargs['transport'], transport.return_value)
+
+    def test_transport_retry_is_bounded_and_validation_is_not_retried(self):
+        attempts = 0
+
+        def timeout():
+            nonlocal attempts
+            attempts += 1
+            raise httpx.ReadTimeout('still_unavailable')
+
+        with patch.object(module.time, 'sleep') as sleep:
+            with self.assertRaises(httpx.ReadTimeout):
+                module.retry_transport(timeout)
+        self.assertEqual(attempts, 3)
+        self.assertEqual(sleep.call_count, 2)
+        attempts = 0
+
+        def validation():
+            nonlocal attempts
+            attempts += 1
+            raise ValueError('invalid_request')
+
+        with self.assertRaisesRegex(ValueError, 'invalid_request'):
+            module.retry_transport(validation)
+        self.assertEqual(attempts, 1)
 
 
 if __name__ == '__main__':

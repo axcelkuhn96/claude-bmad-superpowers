@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import time
 import uuid
 from urllib.parse import urlsplit
 
@@ -243,7 +244,7 @@ def client_for(options):
         key = safe_key(options.api_key_file)
         return QdrantClient(url=connection['url'], api_key=key, transport=transport,
                             trust_env=False, follow_redirects=False,
-                            prefer_grpc=False, check_compatibility=False)
+                            prefer_grpc=False, check_compatibility=False, timeout=30)
     except Exception:
         transport.close()
         raise
@@ -333,6 +334,19 @@ def owned_point(point, anchor, ordinal):
         raise ValueError('raw_point_ownership_mismatch')
 
 
+def retry_transport(operation):
+    import httpx
+    from qdrant_client.http.exceptions import ResponseHandlingException
+    for attempt in range(3):
+        try:
+            return operation()
+        except Exception as error:
+            cause = error.source if isinstance(error, ResponseHandlingException) else error
+            if not isinstance(cause, httpx.TransportError) or attempt == 2:
+                raise
+            time.sleep((0.3, 0.8)[attempt])
+
+
 def import_snapshot(options, client=None, embedder=None):
     import mem0_adapter as adapter
     from qdrant_client.models import PointStruct
@@ -375,71 +389,81 @@ def import_snapshot(options, client=None, embedder=None):
         embedder.tokenizer.no_truncation()
         count = 0
         checked = set()
+
+        def write_window(name, entries):
+            nonlocal count
+            if name not in checked:
+                ensure_raw_collection(client, name)
+                checked.add(name)
+            existing = {str(point.id): point for point in retry_transport(lambda:
+                client.retrieve(name, ids=[part['id'] for part, _, _, _ in entries],
+                                with_payload=True, with_vectors=False))}
+            for part, _, _, _ in entries:
+                remote = existing.get(part['id'])
+                if remote:
+                    owned_point(remote, part['payload']['anchor_id'],
+                                part['payload']['chunk_ordinal'])
+            for part, _, _, row_identity in entries:
+                if part['payload']['chunk_ordinal'] != 0:
+                    continue
+                anchor = part['id']
+                old_anchor = existing.get(anchor)
+                old_count = old_anchor.payload.get('chunk_count', 0) if old_anchor else 0
+                if type(old_count) is not int or old_count < 0:
+                    raise ValueError('raw_chunk_count_invalid')
+                new_count = part['payload']['chunk_count']
+                for start in range(new_count, old_count, options.batch_size):
+                    old_ids = [chunk_id(row_identity, index) for index in
+                               range(start, min(start + options.batch_size, old_count))]
+                    obsolete = retry_transport(lambda: client.retrieve(
+                        name, ids=old_ids, with_payload=True, with_vectors=False))
+                    for point in obsolete:
+                        owned_point(point, anchor, start + old_ids.index(str(point.id)))
+                    if obsolete:
+                        acknowledged(retry_transport(lambda: client.delete(
+                            name, points_selector=[point.id for point in obsolete], wait=True)),
+                            'delete')
+            points = []
+            for part, _, _, _ in entries:
+                remote = existing.get(part['id'])
+                if remote and remote.payload.get('embedding_text_sha256') == \
+                        part['payload']['embedding_text_sha256'] and \
+                        remote.payload.get('embedding_fingerprint') == \
+                        part['payload']['embedding_fingerprint']:
+                    if remote.payload != part['payload']:
+                        acknowledged(retry_transport(lambda: client.overwrite_payload(
+                            name, payload=part['payload'], points=[part['id']], wait=True)),
+                            'payload')
+                    continue
+                if len(embedder.tokenizer.encode('passage: ' + part['text']).ids) > 512:
+                    raise ValueError('chunk_exceeds_model_context')
+                points.append(PointStruct(id=part['id'],
+                    vector=embedder.embed(part['text'], 'add'), payload=part['payload']))
+            if points:
+                acknowledged(retry_transport(lambda: client.upsert(
+                    name, points=points, wait=True)), 'upsert')
+                count += len(points)
+            _, line, offset, _ = entries[-1]
+            save_checkpoint(checkpoint, digest, line, offset, identity)
+
+        pending = []
+        pending_name = None
         with source.open('r', encoding='utf-8') as stream:
             for line_index, line in enumerate(stream):
                 item = json.loads(line)
                 name = item['collection']
-                if name not in checked:
-                    ensure_raw_collection(client, name)
-                    checked.add(name)
                 pieces = points_for_row(item, embedder.tokenizer)
-                anchor = pieces[0]['id']
-                first_batch = pieces[:options.batch_size]
-                first_existing = {str(point.id): point for point in client.retrieve(
-                    name, ids=[part['id'] for part in first_batch], with_payload=True,
-                    with_vectors=False)}
-                old_anchor = [first_existing[anchor]] if anchor in first_existing else []
-                old_count = 0
-                if old_anchor:
-                    owned_point(old_anchor[0], anchor, 0)
-                    old_count = old_anchor[0].payload.get('chunk_count', 0)
-                    if type(old_count) is not int or old_count < 0:
-                        raise ValueError('raw_chunk_count_invalid')
-                if old_count > len(pieces):
-                    row_identity = source_identity(item)
-                    old_ids = [chunk_id(row_identity, index)
-                               for index in range(len(pieces), old_count)]
-                    obsolete = client.retrieve(name, ids=old_ids, with_payload=True,
-                                               with_vectors=False)
-                    for point in obsolete:
-                        owned_point(point, anchor, old_ids.index(str(point.id)) + len(pieces))
-                    if obsolete:
-                        acknowledged(client.delete(name, points_selector=[point.id for point in obsolete],
-                                                   wait=True), 'delete')
-                for offset in range(0, len(pieces), options.batch_size):
-                    batch = pieces[offset:offset + options.batch_size]
-                    existing = first_existing if offset == 0 else {
-                        str(point.id): point for point in client.retrieve(
-                            name, ids=[part['id'] for part in batch], with_payload=True,
-                            with_vectors=False)}
-                    points = []
-                    for part in batch:
-                        remote = existing.get(part['id'])
-                        if remote:
-                            owned_point(remote, anchor, part['payload']['chunk_ordinal'])
-                            if remote.payload.get('embedding_text_sha256') == \
-                                    part['payload']['embedding_text_sha256'] and \
-                                    remote.payload.get('embedding_fingerprint') == \
-                                    part['payload']['embedding_fingerprint']:
-                                if remote.payload != part['payload']:
-                                    acknowledged(client.overwrite_payload(
-                                        name, payload=part['payload'], points=[part['id']],
-                                        wait=True), 'payload')
-                                continue
-                        if len(embedder.tokenizer.encode('passage: ' + part['text']).ids) > 512:
-                            raise ValueError('chunk_exceeds_model_context')
-                        points.append(PointStruct(id=part['id'],
-                            vector=embedder.embed(part['text'], 'add'),
-                            payload=part['payload']))
-                    if points:
-                        result = client.upsert(name, points=points, wait=True)
-                        acknowledged(result, 'upsert')
-                        count += len(points)
-                    next_offset = offset + len(batch)
-                    save_checkpoint(checkpoint, digest,
-                                    line_index + (next_offset >= len(pieces)),
-                                    0 if next_offset >= len(pieces) else next_offset,
-                                    identity)
+                row_identity = source_identity(item)
+                for offset, part in enumerate(pieces, 1):
+                    if pending and (name != pending_name or len(pending) == options.batch_size):
+                        write_window(pending_name, pending)
+                        pending = []
+                    pending_name = name
+                    end_of_row = offset == len(pieces)
+                    pending.append((part, line_index + end_of_row,
+                                    0 if end_of_row else offset, row_identity))
+            if pending:
+                write_window(pending_name, pending)
         return count
     finally:
         if owned_client:
