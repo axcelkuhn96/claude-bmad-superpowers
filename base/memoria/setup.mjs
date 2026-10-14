@@ -24,7 +24,7 @@ export async function activateProject(cwd, deps = {}) {
   if (!await current()) return blocked('config_changed');
   const scope = await identifyProject(cwd);
   if (scope.kind !== 'git' || scope.projectRoot !== resolution.projectRoot) return blocked('unsupported_git');
-  const nativeRoot = deps.cli === 'codex' ? scope.activeRoot : resolution.projectRoot;
+  const nativeRoot = scope.activeRoot;
   const nativeOptions = { ...deps, projectRoot: resolution.projectRoot };
   const applyNative = deps.applyNative ?? ((root) => applyNativeExclusion(root, nativeOptions));
   const native = await applyNative(nativeRoot);
