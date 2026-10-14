@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { dedupKeyFor } from './dedup-key.mjs';
 
 // Conservative interim floor; Task7 must calibrate it against frozen negative queries.
 export const MIN_RECALL_SCORE = 0.85;
@@ -13,6 +14,35 @@ function date(value) {
   if (value == null) return null;
   if (typeof value !== 'string' || !/(Z|[+-]\d\d:\d\d)$/.test(value)) return NaN;
   return Date.parse(value);
+}
+
+function generatedConversation(metadata, text) {
+  const refs = metadata.source_refs;
+  let expectedKey;
+  try { expectedKey = dedupKeyFor({ projectId: metadata.project_id ?? metadata.projectId,
+    scope: metadata.scope, ownerId: metadata.owner_id, type: metadata.type,
+    text, condition: metadata.condition, validFrom: metadata.valid_from,
+    validTo: metadata.valid_to }); }
+  catch { return false; }
+  return metadata.format_version === 4 && metadata.origin === 'conversation_summary' &&
+    metadata.speaker_role === 'mixed' && metadata.actor === 'conversation' &&
+    Array.isArray(refs) && refs.length >= 2 && refs.length <= 10 &&
+    metadata.source === refs[0]?.message_id &&
+    metadata.source_offsets?.start === refs[0]?.offsets?.start &&
+    metadata.source_offsets?.end === refs[0]?.offsets?.end &&
+    metadata.source_text_sha256 === refs[0]?.source_text_sha256 &&
+    metadata.dedup_key === expectedKey &&
+    refs.every(ref => ref && typeof ref.message_id === 'string' && ref.message_id &&
+      (ref.origin === 'human' && ref.role === 'user' ||
+        ref.origin === 'assistant' && ref.role === 'assistant') &&
+      typeof ref.actor === 'string' && ref.actor &&
+      Number.isSafeInteger(ref.offsets?.start) && ref.offsets.start >= 0 &&
+      Number.isSafeInteger(ref.offsets?.end) && ref.offsets.end > ref.offsets.start &&
+      /^[a-f0-9]{64}$/.test(ref.source_text_sha256 ?? '') &&
+      typeof ref.excerpt === 'string' && ref.excerpt.trim() &&
+      Buffer.byteLength(ref.excerpt, 'utf8') <= 512) &&
+    refs.some(ref => ref?.origin === 'human' && ref.role === 'user') &&
+    refs.some(ref => ref?.origin === 'assistant' && ref.role === 'assistant');
 }
 
 export function selectRecall(results, { projectId, now, ownerId } = {}) {
@@ -31,7 +61,8 @@ export function selectRecall(results, { projectId, now, ownerId } = {}) {
       ((m.origin === 'user_direct' && m.speaker_role === 'user') ||
         (m.origin === 'assistant_report' && m.speaker_role === 'assistant') ||
         (m.origin === 'tool_observation' && m.speaker_role === 'tool') ||
-        (m.origin === 'external_reference' && m.speaker_role === 'external')) &&
+        (m.origin === 'external_reference' && m.speaker_role === 'external') ||
+        generatedConversation({ ...m, projectId: item.projectId }, item.text)) &&
       Number.isFinite(date(m.evidence_at)) &&
       (m.scope === 'project' || m.scope === 'personal' && ownerId && m.owner_id === ownerId ||
         m.scope === 'episode' && Number.isFinite(to)) &&
@@ -58,7 +89,9 @@ function renderWithItems(items, maxTokens) {
     const item = fields(row);
     const m = item.metadata;
     const condition = typeof m.condition === 'string' && m.condition ? `; condition ${m.condition}` : '';
-    const line = m.type === 'source_note'
+    const line = generatedConversation({ ...m, projectId: item.projectId }, item.text)
+      ? `[${item.id}; resumo gerado; referências ${m.source_refs.length}; source ${m.source}; date ${m.evidence_at}; actor ${m.actor}; origin ${m.origin}; role ${m.speaker_role}${condition}] ${item.text}`
+      : m.type === 'source_note'
       ? `[${item.id}; date ${m.evidence_at.slice(0, 10)}; actor ${m.actor}; origin ${m.origin}] ${item.text}`
       : `[${item.id}; source ${m.source}; date ${m.evidence_at}; actor ${m.actor}; origin ${m.origin}; role ${m.speaker_role}${condition}] ${item.text}`;
     if (!append(line)) continue;

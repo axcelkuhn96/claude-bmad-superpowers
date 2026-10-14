@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createMcp } from '../base/memoria/mcp.mjs';
+import { dedupKeyFor } from '../base/memoria/dedup-key.mjs';
 
 const now = '2026-10-01T00:00:00Z';
 const base = { projectId: 'p', status: 'active', score: 0.9, scoreSource: 'mem0_sdk_search',
@@ -43,6 +44,31 @@ test('recall requires trusted origin and role and cites report provenance and co
   assert.match(text, /origin user_direct; role user; condition only on Fridays/);
   assert.match(text, /origin assistant_report; role assistant/);
   assert.match(text, /Current human instruction takes precedence/);
+});
+
+test('conversation summary is recalled as generated evidence with both speaker references', () => {
+  const refs = [
+    { message_id: 'human-1', role: 'user', origin: 'human', actor: 'user',
+      offsets: { start: 0, end: 20 }, source_text_sha256: 'a'.repeat(64), excerpt: 'Use PostgreSQL.' },
+    { message_id: 'assistant-1', role: 'assistant', origin: 'assistant', actor: 'assistant',
+      offsets: { start: 21, end: 70 }, source_text_sha256: 'b'.repeat(64), excerpt: 'I will use PostgreSQL.' },
+  ];
+  const summary = { ...base, sdkId: 'summary', text: 'PostgreSQL was chosen in the conversation.',
+    metadata: { ...base.metadata, format_version: 4, source: 'human-1',
+      actor: 'conversation', origin: 'conversation_summary', speaker_role: 'mixed',
+      type: 'decision', source_offsets: refs[0].offsets,
+      source_text_sha256: refs[0].source_text_sha256,
+      dedup_key: dedupKeyFor({ projectId: 'p', scope: 'project', type: 'decision',
+        text: 'PostgreSQL was chosen in the conversation.',
+        validFrom: base.metadata.valid_from }), source_refs: refs } };
+  const forged = { ...summary, sdkId: 'forged', metadata: { ...summary.metadata,
+    speaker_role: 'user' } };
+  const legacy = { ...summary, sdkId: 'legacy', metadata: { ...summary.metadata,
+    format_version: 3 } };
+  const selected = selectRecall([summary, forged, legacy], { projectId: 'p', now });
+  assert.deepEqual(selected.map(item => item.sdkId), ['summary']);
+  assert.match(renderContext(selected), /resumo gerado; referências 2/);
+  assert.match(renderContext(selected), /origin conversation_summary; role mixed/);
 });
 
 test('episode remains scoped to its project and expires at valid_to', () => {

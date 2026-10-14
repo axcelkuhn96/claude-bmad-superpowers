@@ -70,6 +70,110 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(memory.call_args.kwargs['history_db_path'], ':memory:')
             self.assertEqual((history.read_bytes(), history.stat().st_mtime_ns), before)
 
+    def test_curated_readonly_get_labels_conversation_summary_and_rejects_false_roles(self):
+        identifier = '64eef286-9f7e-4326-b137-5658f0286c46'
+        refs = [{'message_id': 'user-1', 'role': 'user', 'origin': 'human', 'actor': 'user',
+                 'offsets': {'start': 0, 'end': 20}, 'source_text_sha256': 'a' * 64,
+                 'excerpt': 'Use PostgreSQL.'},
+                {'message_id': 'assistant-1', 'role': 'assistant', 'origin': 'assistant',
+                 'actor': 'assistant', 'offsets': {'start': 21, 'end': 70},
+                 'source_text_sha256': 'b' * 64, 'excerpt': 'I will use PostgreSQL.'}]
+        metadata = {'scope': 'project', 'origin': 'conversation_summary',
+                    'speaker_role': 'mixed', 'actor': 'conversation', 'format_version': 4,
+                    'source_refs': refs, 'source': 'user-1', 'type': 'decision',
+                    'source_offsets': refs[0]['offsets'],
+                    'source_text_sha256': refs[0]['source_text_sha256'],
+                    'evidence_at': '2026-10-01T00:00:00Z'}
+        metadata['dedup_key'] = adapter._dedup_key('project', metadata, 'Conversation summary')
+        row = {'projectId': 'project', 'status': 'active', 'text': 'Conversation summary',
+               'metadata': metadata}
+        memory = SimpleNamespace(embedding_model=object(), get=lambda _: {'id': identifier})
+        with patch.object(adapter, 'verify_collection'), \
+             patch.object(adapter, '_memory', return_value=memory), \
+             patch.object(adapter, '_row', side_effect=lambda *args: row):
+            request = {'op': 'readonly_get', 'collection': 'native', 'projectId': 'project',
+                       'memoryId': identifier, 'source': 'curated', 'connection': {}}
+            result = adapter.execute_readonly(request, None, Path('/tmp'))
+            self.assertEqual(result['item']['provenance']['origin'], 'conversation_summary')
+            self.assertEqual(result['item']['provenance']['source_ref_count'], 2)
+            row['metadata'] = {**metadata, 'speaker_role': 'user'}
+            self.assertEqual(adapter.execute_readonly(request, None, Path('/tmp'))['reason'],
+                             'source_unavailable')
+
+    def test_v4_exact_duplicate_is_found_before_another_mem0_add(self):
+        metadata = {'scope': 'project', 'owner_id': None, 'type': 'decision',
+                    'condition': None, 'valid_from': None, 'valid_to': None,
+                    'source': 'm1', 'actor': 'conversation', 'origin': 'conversation_summary',
+                    'evidence_at': '2026-10-01T00:00:00Z', 'format_version': 4}
+        text = 'Use PostgreSQL.'
+        metadata['dedup_key'] = adapter._dedup_key('p', metadata, text)
+        self.assertEqual(metadata['dedup_key'],
+                         '97ea1f73c9937d6685e61d1278d867cedce8dd5f024b062475862a831d9ffcee')
+        first_id = '64eef286-9f7e-4326-b137-5658f0286c46'
+        point = SimpleNamespace(id=first_id, payload={**metadata, 'project_id': 'p',
+            'user_id': 'p', 'data': text, 'source_record_id': 'src-first', 'status': 'active'})
+        class Client:
+            def scroll(self, **kwargs):
+                constraints = {entry.key: entry.match.value for entry in kwargs['scroll_filter'].must}
+                self_test.assertEqual(kwargs['with_vectors'], False)
+                return ([point] if all(point.payload.get(key) == value
+                        for key, value in constraints.items()) else [], None)
+        self_test = self
+        second = {'op': 'add', 'collection': 'native', 'projectId': 'p',
+                  'externalId': 'src-second', 'sessionId': 'later', 'text': text,
+                  'connection': {}, 'metadata': metadata}
+        memory = SimpleNamespace(add=lambda *args, **kwargs: self.fail('duplicate reached Mem0.add'))
+        with patch.object(adapter, 'verify_collection'), \
+             patch.object(adapter, '_memory', return_value=memory):
+            result = adapter.execute(second, Client(), Path('/tmp'))
+        self.assertEqual(result['kind'], 'duplicate')
+        self.assertEqual(result['duplicateOf']['sdkId'], first_id)
+        self.assertEqual(result['duplicateOf']['externalId'], 'src-first')
+        self.assertRegex(result['evidenceDigest'], r'^[a-f0-9]{64}$')
+        self.assertEqual(adapter._find_duplicate(Client(), 'native',
+            {**second, 'text': 'Do not use PostgreSQL.', 'metadata': {
+                **metadata, 'dedup_key': adapter._dedup_key('p', metadata,
+                    'Do not use PostgreSQL.')}})['kind'], 'clear')
+
+    def test_v4_two_batches_store_one_point_then_preserve_changed_claim(self):
+        points = []
+        calls = []
+        class Client:
+            def scroll(self, **kwargs):
+                constraints = {entry.key: entry.match.value for entry in kwargs['scroll_filter'].must}
+                return ([point for point in points if all(point.payload.get(key) == value
+                         for key, value in constraints.items())], None)
+        class Memory:
+            def add(self, text, *, user_id, run_id, metadata, infer):
+                self_test.assertFalse(infer)
+                calls.append(text)
+                identifier = f'64eef286-9f7e-4326-b137-{len(calls):012d}'
+                points.append(SimpleNamespace(id=identifier, payload={**metadata,
+                    'user_id': user_id, 'data': text, 'run_id': run_id}))
+                return {'results': [{'id': identifier}]}
+        self_test = self
+        client = Client()
+        metadata = {'scope': 'project', 'owner_id': None, 'type': 'decision',
+            'source': 'm1', 'actor': 'conversation', 'origin': 'conversation_summary',
+            'evidence_at': '2026-10-01T00:00:00Z', 'format_version': 4}
+        text = 'Use PostgreSQL.'
+        metadata['dedup_key'] = adapter._dedup_key('p', metadata, text)
+        first = {'op': 'add', 'collection': 'native', 'projectId': 'p',
+            'externalId': 'src-first', 'sessionId': 'session-one', 'text': text,
+            'connection': {}, 'metadata': metadata}
+        with patch.object(adapter, 'verify_collection'), \
+             patch.object(adapter, '_memory', return_value=Memory()):
+            self.assertEqual(adapter.execute(first, client, Path('/tmp'))['kind'], 'pending')
+            points[0].payload['status'] = 'active'
+            second = {**first, 'externalId': 'src-second', 'sessionId': 'session-two'}
+            self.assertEqual(adapter.execute(second, client, Path('/tmp'))['kind'], 'duplicate')
+            negation = 'Do not use PostgreSQL.'
+            third = {**second, 'externalId': 'src-third', 'text': negation,
+                'metadata': {**metadata, 'dedup_key': adapter._dedup_key('p', metadata, negation)}}
+            self.assertEqual(adapter.execute(third, client, Path('/tmp'))['kind'], 'pending')
+        self.assertEqual(calls, [text, negation])
+        self.assertEqual(len(points), 2)
+
     def test_search_uses_ephemeral_history_but_write_path_keeps_persistent_history(self):
         class Memory:
             embedding_model = object()

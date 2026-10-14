@@ -3,6 +3,8 @@ import { storeMemory } from './bridge.mjs';
 import { storeOperation, validateCandidate, containsSecret, redactSource } from './candidates.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
 import { POLICY_VERSION } from './transcript.mjs';
+import { validateConversationProof } from './conversation-proof.mjs';
+import { dedupKeyFor } from './dedup-key.mjs';
 
 const blocked = reason => ({ kind: 'blocked', published: 0, pending: 0, reason });
 const sameConsent = (frozen, live, projectId) => frozen?.version === 1 &&
@@ -69,16 +71,26 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
   let published = 0;
   let pending = 0;
   for (const entry of manifest.candidates) {
-    if (entry.status === 'remote_acked') continue;
+    if (entry.status === 'remote_acked' || entry.status === 'duplicate') continue;
     if (entry.status !== 'pending') { pending++; continue; }
     const payload = await outbox.readCandidatePayload(row.operationId, entry.candidateKey);
     const source = checkpointRow.messages?.find(message => message.messageId === payload.source_message_id &&
       message.start === payload.source_offsets?.start && message.end === payload.source_offsets?.end);
+    let conversationValid = false;
+    if (payload.format_version === 4) {
+      try {
+        conversationValid = validateConversationProof(payload, checkpointRow).eligible &&
+          payload.dedup_key === dedupKeyFor({ projectId: payload.project_id,
+            scope: payload.scope, ownerId: payload.owner_id, type: payload.type,
+            text: payload.text, condition: payload.condition,
+            validFrom: payload.valid_from, validTo: payload.valid_to });
+      } catch { conversationValid = false; }
+    }
+    const literalValid = payload.format_version === 3 && source?.origin === 'human' &&
+      validateCandidate(payload, source).eligible && redactSource(source.text) === source.text &&
+      source.text.includes(payload.text) && !/\?/.test(payload.text);
     if (payload.kind === 'blocked' || payload.policy_version !== POLICY_VERSION ||
-        payload.format_version !== 3 || source?.origin !== 'human' ||
-        !validateCandidate(payload, source).eligible ||
-        containsSecret(payload) || redactSource(source.text) !== source.text ||
-        !source.text.includes(payload.text) || /\?/.test(payload.text)) {
+        containsSecret(payload) || !literalValid && !conversationValid) {
       pending++;
       continue;
     }
@@ -115,6 +127,16 @@ export async function publishCheckpointAutomatically(row, resolution, options = 
       row.sessionId, op, options.readSecret ?? readQdrantSecret, { ...options, ackLocal: ack,
         autoPublishConsent: frozen }));
     const result = await store(operation, ackLocal);
+    if (result?.kind === 'duplicate' && conversationValid) {
+      if (result.dedupKey !== payload.dedup_key) return { kind: 'blocked', published, pending,
+        reason: 'duplicate_proof_mismatch' };
+      const disposed = await outbox.duplicateCandidate(row.operationId, entry.candidateKey,
+        { projectId: row.projectId, dedupKey: payload.dedup_key,
+          duplicateOf: result.duplicateOf, evidenceDigest: result.evidenceDigest });
+      if (disposed?.kind !== 'duplicate') return { kind: 'retry', published, pending,
+        reason: disposed?.reason ?? 'duplicate_unconfirmed' };
+      continue;
+    }
     if (result?.kind === 'blocked') return {
       kind: ['destination_unavailable', 'broker_unavailable'].includes(result.reason)
         ? 'retry' : 'blocked',

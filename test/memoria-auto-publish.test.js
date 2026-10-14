@@ -10,6 +10,7 @@ import { publishCheckpointAutomatically } from '../base/memoria/auto-publish.mjs
 import { externalIdFor, reconcileStore } from '../base/memoria/ledger.mjs';
 import { storeMemory } from '../base/memoria/bridge.mjs';
 import { POLICY_VERSION } from '../base/memoria/transcript.mjs';
+import { dedupKeyFor } from '../base/memoria/dedup-key.mjs';
 
 const source = { origin: 'human', actor: 'user', speakerRole: 'user',
   ownerId: 'owner-123',
@@ -138,6 +139,120 @@ test('automatic publisher refuses persisted ownerless source before store', asyn
   });
   assert.equal(result.reason, 'source_policy_unproved');
   assert.equal(stores, 0);
+});
+
+test('bridge rejects an automatic conversation summary without a sealed local source', async t => {
+  const { stateDir, row } = await fixture(t);
+  const identity = { projectId: 'p', originCli: row.cli, sessionId: row.sessionId,
+    start: row.start, end: row.end, sliceHash: row.sliceHash,
+    policyVersion: POLICY_VERSION, candidateKey: 'summary-0' };
+  const operation = { externalId: externalIdFor(identity), projectId: 'p',
+    sessionId: row.sessionId, sourceIdentity: identity, text: 'A conversa definiu PostgreSQL.',
+    approval: { kind: 'approved', mode: 'automatic' }, metadata: {
+      source: 'm1', source_offsets: { start: source.start, end: source.end },
+      checkpoint_id: row.operationId, actor: 'conversation', origin: 'conversation_summary',
+      speaker_role: 'mixed', scope: 'project', evidence_at: source.timestamp,
+      format_version: 4, review_mode: 'automatic', auto_actor: 'project_auto_publisher',
+      auto_consent_hash: consent.consentHash, type: 'decision',
+      dedup_key: dedupKeyFor({ projectId: 'p', scope: 'project', ownerId: null,
+        type: 'decision', text: 'A conversa definiu PostgreSQL.' }),
+    } };
+  let authorized = 0;
+  const result = await storeMemory('/project', row.sessionId, operation, () => 'secret', {
+    resolve: async () => resolution(stateDir), readAutoPublish: async () => consent,
+    autoPublishConsent: consent,
+    authorize: async () => { authorized++; throw Error('unproved write reached destination'); },
+  });
+  assert.deepEqual(result, { kind: 'blocked', reason: 'source_review_unproved' });
+  assert.equal(authorized, 0);
+});
+
+test('real v4 outbox publishes a paraphrased conversation with local multi-source proof', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-auto-conversation-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const outbox = createOutbox(root);
+  assert.equal((await outbox.ensureFutureBaseline({ cli: 'claude', sessionId: 'session',
+    projectId: 'p', ownerId: consent.ownerId, consentHash: consent.consentHash,
+    policyVersion: POLICY_VERSION, cutoffEnd: 0, initialSize: 0 })).kind, 'baselined');
+  const messages = [
+    { ...source, cli: 'claude', sessionId: 'session', origin: 'human',
+      speakerRole: 'user', start: 0, end: 44 },
+    { ...source, cli: 'claude', sessionId: 'session', origin: 'assistant',
+      actor: 'assistant', speakerRole: 'assistant',
+      ownerId: null, start: 45, end: 100, messageId: 'm2', finalVisible: true,
+      text: 'PostgreSQL was configured for persistence.' },
+  ];
+  assert.equal((await outbox.enqueueConversationSlice({ cli: 'claude', sessionId: 'session',
+    start: 0, end: 100, sliceHash: 'c'.repeat(64), messages },
+  { projectId: 'p', policyVersion: POLICY_VERSION }, { event: 'SessionEnd' })).kind, 'queued');
+  const [row] = await outbox.pending();
+  const summarized = 'The conversation chose PostgreSQL for persistence.';
+  const extracted = await extractCheckpoint(row, { route: 'haiku', mode: 'conversation',
+    maxCallsPerSession: 100, autoPublish: true, autoPublishConsent: consent }, {
+    outbox, runCli: async () => ({ kind: 'success', no_facts: false,
+      model: 'claude-haiku-5-5', usage: { inputTokens: 10, outputTokens: 10, costUsd: 0 },
+      candidates: [{ text: summarized, type: 'decision', scope: 'project', evidence: [
+        { source_message_id: 'm1', excerpt: source.text },
+        { source_message_id: 'm2', excerpt: 'PostgreSQL was configured' },
+      ] }] }) });
+  assert.equal(extracted.kind, 'manifested', JSON.stringify(extracted));
+  const revoked = await publish(row, resolution(root), { outbox,
+    readAutoPublish: async () => null,
+    store: async () => { throw Error('revoked summary reached remote store'); } });
+  assert.equal(revoked.reason, 'auto_publish_revoked');
+  let stored;
+  const result = await publish(row, resolution(root), { outbox,
+    readAutoPublish: async () => consent,
+    store: async (operation, ackLocal) => {
+      stored = operation;
+      const ack = await ackLocal(operation.externalId, { externalId: operation.externalId,
+        projectId: 'p', sdkId: 'sdk-conversation', qdrantId: 'q-conversation',
+        status: 'active' });
+      assert.equal(ack.kind, 'acked');
+      return { kind: 'stored' };
+    } });
+  assert.equal(result.kind, 'published', JSON.stringify(result));
+  assert.equal(result.published, 1);
+  assert.equal(stored.text, summarized);
+  assert.equal(stored.metadata.origin, 'conversation_summary');
+  assert.equal(stored.metadata.source_refs.length, 2);
+  assert.equal((await outbox.sourceForRemote({ ...stored, status: 'active' })).kind, 'local_source');
+  assert.equal((await outbox.ensureFutureBaseline({ cli: 'claude', sessionId: 'later',
+    projectId: 'p', ownerId: consent.ownerId, consentHash: consent.consentHash,
+    policyVersion: POLICY_VERSION, cutoffEnd: 0, initialSize: 0 })).kind, 'baselined');
+  const laterMessages = messages.map(message => ({ ...message, sessionId: 'later' }));
+  assert.equal((await outbox.enqueueConversationSlice({ cli: 'claude', sessionId: 'later',
+    start: 0, end: 100, sliceHash: 'd'.repeat(64), messages: laterMessages },
+  { projectId: 'p', policyVersion: POLICY_VERSION }, { event: 'SessionEnd' })).kind, 'queued');
+  const later = (await outbox.pending()).find(item => item.sessionId === 'later');
+  assert.equal((await extractCheckpoint(later, { route: 'haiku', mode: 'conversation',
+    maxCallsPerSession: 100, autoPublish: true, autoPublishConsent: consent }, {
+    outbox, runCli: async () => ({ kind: 'success', no_facts: false,
+      model: 'claude-haiku-5-5', usage: { inputTokens: 10, outputTokens: 10, costUsd: 0 },
+      candidates: [{ text: summarized, type: 'decision', scope: 'project', evidence: [
+        { source_message_id: 'm1', excerpt: source.text },
+        { source_message_id: 'm2', excerpt: 'PostgreSQL was configured' },
+      ] }] }) })).kind, 'manifested');
+  let duplicateStores = 0;
+  const repeated = await publish(later, resolution(root), { outbox,
+    readAutoPublish: async () => consent,
+    store: async operation => {
+      duplicateStores++;
+      assert.equal(operation.metadata.dedup_key, stored.metadata.dedup_key);
+      return { kind: 'duplicate', dedupKey: operation.metadata.dedup_key,
+        duplicateOf: { externalId: stored.externalId, sdkId: 'sdk-conversation',
+          qdrantId: 'q-conversation', status: 'active' }, evidenceDigest: 'b'.repeat(64) };
+    } });
+  assert.equal(repeated.kind, 'published', JSON.stringify(repeated));
+  assert.equal(repeated.published, 0);
+  assert.equal(duplicateStores, 1);
+  const disposition = await outbox.readDisposition(later.operationId);
+  assert.equal(disposition.candidates[0].status, 'duplicate');
+  assert.equal(disposition.candidates[0].sdkId, undefined);
+  assert.equal((await publish(later, resolution(root), { outbox,
+    readAutoPublish: async () => consent,
+    store: async () => { throw Error('terminal duplicate replayed'); } })).kind, 'published');
+  assert.equal(duplicateStores, 1);
 });
 
 test('ownerless historical source cannot seal an automatic review directly', async t => {

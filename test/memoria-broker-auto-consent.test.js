@@ -53,6 +53,25 @@ test('broker gate rejects revoked or mismatched automatic consent and preserves 
   { kind: 'blocked', reason: 'auto_publish_revoked' });
 });
 
+test('broker accepts conversation summaries only with explicit generated origin', async () => {
+  const summary = { ...add, metadata: { ...add.metadata, format_version: 4,
+    origin: 'conversation_summary', speaker_role: 'mixed', actor: 'conversation',
+    source_refs: [{ origin: 'human' }, { origin: 'assistant' }],
+    dedup_key: 'c'.repeat(64) } };
+  assert.equal((await authorizeAutomaticBrokerWrite(resolution, summary, consent,
+    async () => consent)).kind, 'allowed');
+  for (const metadata of [
+    { ...summary.metadata, origin: 'user_direct' },
+    { ...summary.metadata, speaker_role: 'user' },
+    { ...summary.metadata, actor: 'user' },
+    { ...summary.metadata, source_refs: [] },
+    { ...summary.metadata, dedup_key: null },
+    { ...summary.metadata, format_version: 5 },
+  ]) assert.deepEqual(await authorizeAutomaticBrokerWrite(resolution,
+    { ...summary, metadata }, consent, async () => consent),
+  { kind: 'blocked', reason: 'auto_publish_unproved' });
+});
+
 test('broker checks the private origin checkout again before automatic dispatch', async () => {
   const current = { ...resolution, stateDir: '/state', projectRoot: '/project' };
   const checkout = { kind: 'bound', nativeRoot: '/worktree', projectRoot: '/project',

@@ -14,6 +14,7 @@ import { authorizeCurrentDestination } from './setup.mjs';
 import { assertWriter } from './authority.mjs';
 import { readAutoPublish, readOwner } from './policy.mjs';
 import { readSessionCheckout } from './session-checkout.mjs';
+import { createOutbox } from './outbox.mjs';
 import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
 import { openArtifactIdentity, runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { withProjectLock } from './ledger.mjs';
@@ -45,7 +46,15 @@ export async function authorizeAutomaticBrokerWrite(current, operation, consent,
   if (operation.op === 'add' &&
       (operation.approval?.kind !== 'approved' || operation.approval?.mode !== 'automatic' ||
         operation.metadata?.review_mode !== 'automatic' ||
-        operation.metadata?.format_version !== 3 ||
+        ![3, 4].includes(operation.metadata?.format_version) ||
+        operation.metadata?.format_version === 4 &&
+          (operation.metadata?.origin !== 'conversation_summary' ||
+            operation.metadata?.speaker_role !== 'mixed' ||
+            operation.metadata?.actor !== 'conversation' ||
+            !Array.isArray(operation.metadata?.source_refs) ||
+            operation.metadata.source_refs.length < 2 ||
+            operation.metadata.source_refs.length > 10 ||
+            !/^[a-f0-9]{64}$/.test(operation.metadata?.dedup_key ?? '')) ||
         operation.metadata?.auto_actor !== 'project_auto_publisher' ||
         operation.metadata?.auto_consent_hash !== consent.consentHash)) {
     return denied('auto_publish_unproved');
@@ -612,6 +621,15 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     const autoConsent = value.autoPublishConsent;
     const automatic = writing && (autoConsent || operation.approval?.mode === 'automatic' ||
       operation.metadata?.review_mode === 'automatic' || operation.metadata?.auto_consent_hash != null);
+    const automaticSummary = automatic && operation.op === 'add' &&
+      operation.metadata?.format_version === 4;
+    const summarySourceAllowed = async stateDir => {
+      if (!automaticSummary) return { kind: 'allowed' };
+      try {
+        const source = await createOutbox(stateDir).sourceForRemote(operation);
+        return source.kind === 'local_source' ? { kind: 'allowed' } : denied('source_review_unproved');
+      } catch { return denied('source_review_unproved'); }
+    };
     if (writing) {
       const writer = await assertWriter(current, authorized, { stateRoot });
       if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
@@ -620,6 +638,8 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
       if (automatic) {
         const origin = await authorizeAutomaticOrigin(current, cwd, sessionId, operation);
         if (origin.kind !== 'allowed') return origin;
+        const source = await summarySourceAllowed(current.stateDir);
+        if (source.kind !== 'allowed') return source;
       }
     }
     const request = { ...operation, projectId: current.projectId, state: current.stateDir,
@@ -634,8 +654,9 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
         const writer = await assertWriter(live, authorized, { stateRoot });
         if (writer.kind !== 'writer') return denied(writer.reason ?? 'writer_not_designated');
         const consent = await authorizeAutomaticBrokerWrite(live, operation, autoConsent);
-        return consent.kind === 'allowed'
-          ? authorizeAutomaticOrigin(live, cwd, sessionId, operation) : consent;
+        if (consent.kind !== 'allowed') return consent;
+        const origin = await authorizeAutomaticOrigin(live, cwd, sessionId, operation);
+        return origin.kind === 'allowed' ? summarySourceAllowed(live.stateDir) : origin;
       } : undefined;
     return bridge.request(request, secret, deadlineAt, beforeDispatch);
   }

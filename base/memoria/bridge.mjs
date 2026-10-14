@@ -9,6 +9,7 @@ import { createLedger, externalIdFor, reconcileStore, withProjectLock } from './
 import { assertWriter } from './authority.mjs';
 import { targetVersion } from './correction.mjs';
 import { createOutbox } from './outbox.mjs';
+import { dedupKeyFor } from './dedup-key.mjs';
 
 const blocked = reason => ({ kind: 'blocked', reason });
 const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'python', 'mem0_adapter.py');
@@ -71,14 +72,29 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
   if (resolution.provider !== 'mem0' || resolution.projectId !== operation.projectId) return blocked('project_mismatch');
   if (operation.metadata.review_mode === 'automatic' || operation.approval?.mode === 'automatic') {
     if (operation.metadata.review_mode !== 'automatic' || operation.approval?.mode !== 'automatic' ||
-        operation.metadata.format_version !== 3 ||
+        ![3, 4].includes(operation.metadata.format_version) ||
+        operation.metadata.format_version === 4 &&
+          (operation.metadata.origin !== 'conversation_summary' ||
+            operation.metadata.speaker_role !== 'mixed' ||
+            operation.metadata.actor !== 'conversation') ||
         operation.metadata.auto_actor !== 'project_auto_publisher' ||
         operation.metadata.auto_consent_hash !== options.autoPublishConsent?.consentHash ||
         !await autoConsentCurrent(resolution, options.autoPublishConsent, options)) {
       return blocked('auto_publish_unproved');
     }
   }
-  if ([2, 3].includes(operation.metadata.format_version)) {
+  const conversation = operation.metadata.format_version === 4;
+  if (conversation) {
+    let expected;
+    try { expected = dedupKeyFor({ projectId: operation.projectId,
+      scope: operation.metadata.scope, ownerId: operation.metadata.owner_id,
+      type: operation.metadata.type, text: operation.text,
+      condition: operation.metadata.condition, validFrom: operation.metadata.valid_from,
+      validTo: operation.metadata.valid_to }); }
+    catch { return blocked('dedup_key_mismatch'); }
+    if (operation.metadata.dedup_key !== expected) return blocked('dedup_key_mismatch');
+  }
+  if ([2, 3, 4].includes(operation.metadata.format_version)) {
     const source = await createOutbox(resolution.stateDir).sourceForRemote(operation);
     if (source.kind !== 'local_source') return blocked('source_review_unproved');
   }
@@ -100,6 +116,22 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
       } catch { return blocked('broker_unavailable'); }
       if (ready?.kind !== 'ready') return ready?.kind === 'blocked'
         ? ready : blocked('broker_unavailable');
+    }
+    if (conversation) {
+      const duplicate = await bridge({ op: 'dedup_find', projectId: operation.projectId,
+        externalId: operation.externalId, sessionId: operation.sessionId,
+        text: operation.text, metadata: operation.metadata });
+      if (duplicate.kind === 'duplicate') {
+        if (duplicate.dedupKey !== operation.metadata.dedup_key ||
+            duplicate.duplicateOf?.externalId === operation.externalId ||
+            duplicate.duplicateOf?.status !== 'active' ||
+            !/^[a-f0-9]{64}$/.test(duplicate.evidenceDigest ?? '')) {
+          return blocked('dedup_proof_mismatch');
+        }
+        return duplicate;
+      }
+      if (duplicate.kind === 'pending') return duplicate;
+      if (duplicate.kind !== 'clear') return blocked(duplicate.reason ?? 'dedup_lookup_failed');
     }
     const checkTarget = async () => {
       const targetId = operation.metadata.supersedes_id;

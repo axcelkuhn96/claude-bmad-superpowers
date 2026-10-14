@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import ssl
 import sys
+import unicodedata
 import uuid
 from urllib.parse import urlsplit
 
@@ -237,6 +238,75 @@ def _find(memory, client, collection: str, project: str, external: str) -> list[
     raise ValueError('remote_inventory_saturated')
 
 
+def _dedup_key(project: str, metadata: dict, text: str) -> str:
+    fields = [project, metadata.get('scope'), metadata.get('owner_id') or '',
+              metadata.get('type'), text, metadata.get('condition') or '',
+              metadata.get('valid_from') or '', metadata.get('valid_to') or '']
+    if not all(isinstance(value, str) for value in fields) or \
+            not all(fields[index] for index in (0, 1, 3, 4)):
+        raise ValueError('invalid_dedup_claim')
+    fields[4] = re.sub(r'[ \t\r\n]+', ' ', unicodedata.normalize('NFC', fields[4])).strip(' ')
+    fields[5] = re.sub(r'[ \t\r\n]+', ' ', unicodedata.normalize('NFC', fields[5])).strip(' ')
+    fields[4] = re.sub(r'[A-Z]', lambda match: match.group().lower(), fields[4])
+    fields[5] = re.sub(r'[A-Z]', lambda match: match.group().lower(), fields[5])
+    digest = hashlib.sha256(b'cbs-dedup-v1\x00')
+    for field in fields:
+        data = field.encode('utf-8')
+        digest.update(str(len(data)).encode('ascii') + b':' + data)
+    return digest.hexdigest()
+
+
+def _find_duplicate(client, collection: str, request: dict) -> dict:
+    """Exact metadata lookup; no semantic search or extra embedding."""
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+    metadata = request['metadata']
+    project = request['projectId']
+    key = metadata.get('dedup_key')
+    if metadata.get('format_version') != 4 or \
+            key != _dedup_key(project, metadata, request['text']):
+        raise ValueError('dedup_key_mismatch')
+    points, next_page = client.scroll(collection_name=collection,
+        scroll_filter=Filter(must=[
+            FieldCondition(key='project_id', match=MatchValue(value=project)),
+            FieldCondition(key='dedup_key', match=MatchValue(value=key))]),
+        limit=3, with_payload=True, with_vectors=False)
+    if next_page is not None or len(points) > 2:
+        raise ValueError('dedup_inventory_ambiguous')
+    active = []
+    pending = False
+    for point in points:
+        payload = point.payload or {}
+        if payload.get('project_id') != project or payload.get('user_id') != project or \
+                payload.get('dedup_key') != key or not isinstance(payload.get('data'), str) or \
+                not isinstance(payload.get('source_record_id'), str) or \
+                _dedup_key(project, payload, payload['data']) != key:
+            raise ValueError('dedup_remote_mismatch')
+        if payload['source_record_id'] == request.get('externalId'):
+            continue  # Same source is reconciled by its existing external ID.
+        if payload.get('status') == 'pending':
+            pending = True
+        elif payload.get('status') == 'active':
+            try:
+                identifier = str(uuid.UUID(str(point.id)))
+            except (ValueError, TypeError, AttributeError):
+                raise ValueError('dedup_remote_mismatch') from None
+            active.append((identifier, payload))
+    if len(active) != 1:
+        if len(active) > 1:
+            raise ValueError('dedup_inventory_ambiguous')
+        return {'kind': 'pending', 'reason': 'duplicate_pending'} if pending else {'kind': 'clear'}
+    identifier, payload = active[0]
+    evidence = [project, payload.get('scope'), payload.get('owner_id') or '',
+                payload.get('type'), payload['data'], payload.get('condition') or '',
+                payload.get('valid_from') or '', payload.get('valid_to') or '',
+                payload['source_record_id'], identifier, 'active']
+    evidence_digest = hashlib.sha256(json.dumps(evidence, ensure_ascii=False,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+    return {'kind': 'duplicate', 'dedupKey': key, 'evidenceDigest': evidence_digest,
+            'duplicateOf': {'externalId': payload['source_record_id'],
+                            'sdkId': identifier, 'qdrantId': identifier, 'status': 'active'}}
+
+
 def _page(value: str, offset: int) -> dict:
     if type(offset) is not int or offset < 0 or offset > 16 * 1024 * 1024:
         raise ValueError('invalid_offset')
@@ -285,6 +355,44 @@ def _raw_payload(payload: dict, collection: str, identifier) -> bool:
         isinstance(payload.get('source_project'), str) and \
         isinstance(payload.get('source_id'), int) and \
         isinstance(payload.get('evidence_at'), str)
+
+
+def _conversation_summary(metadata: dict, text: str, project: str) -> bool:
+    refs = metadata.get('source_refs')
+    def valid_ref(ref):
+        if not isinstance(ref, dict):
+            return False
+        offsets = ref.get('offsets')
+        excerpt = ref.get('excerpt')
+        return isinstance(ref.get('message_id'), str) and bool(ref['message_id']) and \
+            (ref.get('origin'), ref.get('role')) in (('human', 'user'),
+                ('assistant', 'assistant')) and \
+            isinstance(ref.get('actor'), str) and bool(ref['actor']) and \
+            isinstance(offsets, dict) and type(offsets.get('start')) is int and \
+            type(offsets.get('end')) is int and 0 <= offsets['start'] < offsets['end'] and \
+            isinstance(ref.get('source_text_sha256'), str) and \
+            re.fullmatch(r'[a-f0-9]{64}', ref['source_text_sha256']) is not None and \
+            isinstance(excerpt, str) and bool(excerpt.strip()) and \
+            len(excerpt.encode('utf-8')) <= 512
+    try:
+        expected_key = _dedup_key(project, metadata, text)
+    except ValueError:
+        return False
+    first = refs[0] if isinstance(refs, list) and refs else None
+    return metadata.get('format_version') == 4 and \
+        metadata.get('origin') == 'conversation_summary' and \
+        metadata.get('speaker_role') == 'mixed' and \
+        metadata.get('actor') == 'conversation' and \
+        isinstance(refs, list) and 2 <= len(refs) <= 10 and isinstance(first, dict) and \
+        metadata.get('source') == first.get('message_id') and \
+        metadata.get('source_offsets') == first.get('offsets') and \
+        metadata.get('source_text_sha256') == first.get('source_text_sha256') and \
+        metadata.get('dedup_key') == expected_key and \
+        all(valid_ref(ref) for ref in refs) and \
+        any(isinstance(ref, dict) and ref.get('origin') == 'human' and
+            ref.get('role') == 'user' for ref in refs) and \
+        any(isinstance(ref, dict) and ref.get('origin') == 'assistant' and
+            ref.get('role') == 'assistant' for ref in refs)
 
 
 def execute_readonly(request: dict, client, state: Path) -> dict:
@@ -360,17 +468,20 @@ def execute_readonly(request: dict, client, state: Path) -> dict:
             metadata.get('scope') == 'episode' and not metadata.get('valid_to') or \
             metadata.get('valid_from') and _time(metadata['valid_from']) > now or \
             metadata.get('valid_to') and _time(metadata['valid_to']) <= now or \
-            metadata.get('origin') not in ('user_direct', 'assistant_report',
-                'tool_observation', 'external_reference') or \
-            metadata.get('speaker_role') != {'user_direct': 'user', 'assistant_report': 'assistant',
-                'tool_observation': 'tool', 'external_reference': 'external'}.get(metadata.get('origin')) or \
+            not (_conversation_summary(metadata, row['text'], project) or
+                metadata.get('speaker_role') == {'user_direct': 'user', 'assistant_report': 'assistant',
+                    'tool_observation': 'tool', 'external_reference': 'external'}.get(metadata.get('origin'))) or \
             not metadata.get('source') or not metadata.get('actor') or \
             not metadata.get('evidence_at'):
         return {'kind': 'blocked', 'reason': 'source_unavailable'}
     page = _page(row['text'], request.get('offset', 0))
+    provenance = {key: metadata.get(key) for key in
+        ('source', 'actor', 'origin', 'speaker_role', 'evidence_at', 'scope')}
+    if _conversation_summary(metadata, row['text'], project):
+        provenance.update({'generated': True, 'source_ref_count': len(metadata['source_refs']),
+                           'source_refs': metadata['source_refs']})
     return {'kind': 'item', 'item': {'projectId': project, 'source': 'curated',
-        'memoryId': identifier, 'provenance': {key: metadata.get(key) for key in
-            ('source', 'actor', 'origin', 'speaker_role', 'evidence_at', 'scope')}, **page}}
+        'memoryId': identifier, 'provenance': provenance, **page}}
 
 
 def execute(request: dict, client, state: Path) -> dict:
@@ -390,6 +501,8 @@ def execute(request: dict, client, state: Path) -> dict:
         if row is not None and row['projectId'] != project:
             raise ValueError('project_mismatch')
         return {'kind': 'item', 'item': row}
+    if op == 'dedup_find':
+        return _find_duplicate(client, collection, request)
     if op == 'add':
         metadata = request['metadata']
         if any(key in metadata for key in ('status', 'source_record_id', 'project_id', 'expiration_date')):
@@ -405,6 +518,10 @@ def execute(request: dict, client, state: Path) -> dict:
             _time(metadata['valid_from'])
         if metadata.get('valid_to'):
             _time(metadata['valid_to'])
+        if metadata.get('format_version') == 4:
+            duplicate = _find_duplicate(client, collection, request)
+            if duplicate['kind'] != 'clear':
+                return duplicate
         metadata = {**metadata, 'status': 'pending', 'source_record_id': external, 'project_id': project}
         result = memory.add(request['text'], user_id=project, run_id=request['sessionId'],
                             metadata=metadata, infer=False)

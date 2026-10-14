@@ -9,6 +9,7 @@ import { createReadonlyMcp, installReadonlyShutdown, readonlyDefinitions } from 
 import { inspectConfiguration } from '../base/memoria/provider.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
+import { dedupKeyFor } from '../base/memoria/dedup-key.mjs';
 
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-mcp-ro-'));
@@ -171,6 +172,43 @@ test('active automatic v3 memory remains searchable as curated source', async t 
   assert.doesNotMatch(found.context, /human.review/i);
   const read = await mcp.call('get', { memory_id: id, source: 'curated' });
   assert.equal(read.item.text, automatic.text);
+  await mcp.close();
+});
+
+test('active conversation summary is labelled as generated in MCP search and get', async t => {
+  const f = await fixture(t);
+  const id = '64eef286-9f7e-4326-b137-5658f0286c46';
+  const sourceRefs = [
+    { message_id: 'm1', role: 'user', origin: 'human', actor: 'user',
+      offsets: { start: 0, end: 20 }, source_text_sha256: 'a'.repeat(64),
+      excerpt: 'Use PostgreSQL.' },
+    { message_id: 'm2', role: 'assistant', origin: 'assistant', actor: 'assistant',
+      offsets: { start: 21, end: 70 }, source_text_sha256: 'b'.repeat(64),
+      excerpt: 'I will use PostgreSQL.' },
+  ];
+  const summary = { ...item, sdkId: id, text: 'The conversation chose PostgreSQL.',
+    metadata: { ...item.metadata, source: 'm1', actor: 'conversation',
+      origin: 'conversation_summary', speaker_role: 'mixed', format_version: 4,
+      type: 'decision', source_offsets: sourceRefs[0].offsets,
+      source_text_sha256: sourceRefs[0].source_text_sha256,
+      dedup_key: dedupKeyFor({ projectId: 'project-one', scope: 'project',
+        type: 'decision', text: 'The conversation chose PostgreSQL.' }),
+      source_refs: sourceRefs } };
+  const mcp = createReadonlyMcp({ cwd: f.root, cli: 'claude', stateRoot: f.stateRoot,
+    verifyNative: async () => ({ kind: 'verified' }),
+    authorize: async () => ({ kind: 'authorized', key: 'private', connection: {} }),
+    search: async () => ({ kind: 'items', items: [summary] }),
+    get: async ({ projectId }) => ({ kind: 'item', item: { projectId, source: 'curated',
+      memoryId: id, text: summary.text, provenance: { generated: true,
+        origin: 'conversation_summary', source_refs: sourceRefs },
+      offset: 0, nextOffset: null } }) });
+  const found = await mcp.call('search', { query: 'PostgreSQL', source: 'curated' });
+  assert.equal(found.kind, 'items');
+  assert.match(found.context, /resumo gerado; referências 2/);
+  assert.match(found.context, /Current human instruction takes precedence/);
+  const read = await mcp.call('get', { memory_id: id, source: 'curated' });
+  assert.equal(read.item.provenance.generated, true);
+  assert.deepEqual(read.item.provenance.source_refs, sourceRefs);
   await mcp.close();
 });
 
