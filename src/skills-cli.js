@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { inventorySkills } from './skill-inventory.js';
 
 const help = `Uso: cbs skills inventario [--changed] [--json] [--root <diretório>] [--snapshot <arquivo.json>] [--save-snapshot <arquivo.json>]
@@ -65,9 +65,18 @@ async function readSnapshot(file, optional = false) {
   let prior;
   try { prior = JSON.parse(await fs.readFile(file, 'utf8')); }
   catch { throw new Error('invalid_snapshot'); }
-  if (prior?.formatVersion !== 1 || !Array.isArray(prior.skills) || prior.skills.length > 1000 ||
+  if (![1, 2].includes(prior?.formatVersion) || !Array.isArray(prior.skills) || prior.skills.length > 1000 ||
       prior.skills.some(skill => typeof skill.canonicalPath !== 'string' ||
         !path.isAbsolute(skill.canonicalPath) || !/^[a-f0-9]{64}$/.test(skill.hash))) {
+    throw new Error('invalid_snapshot');
+  }
+  if (prior.formatVersion === 1) return { ...prior, scope: undefined };
+  const roots = prior.scope?.roots;
+  if (!Array.isArray(roots) || roots.length > 1000 || typeof prior.scope.complete !== 'boolean' ||
+      roots.some(root => typeof root.path !== 'string' || !path.isAbsolute(root.path) ||
+        (root.canonicalPath !== null && (typeof root.canonicalPath !== 'string' || !path.isAbsolute(root.canonicalPath))) ||
+        !['directory', 'file', 'missing', 'unreadable', 'unsupported'].includes(root.kind)) ||
+      createHash('sha256').update(JSON.stringify(roots)).digest('hex') !== prior.scope.fingerprint) {
     throw new Error('invalid_snapshot');
   }
   return prior;
@@ -132,12 +141,15 @@ export async function skillsCli(args = []) {
     else {
       process.stdout.write(`Skills: ${report.summary.total}; baseline: ${report.baseline}; ` +
         `novas: ${report.summary.added}; alteradas: ${report.summary.changed}; ` +
-        `removidas: ${report.summary.deleted}; uso: não medido\n`);
+        `removidas: ${report.summary.deleted}; não observadas: ${report.summary.unobserved}; uso: não medido\n`);
       for (const skill of selected.skills) {
         process.stdout.write(`${skill.change}\t${skill.declaredName ?? '(sem nome)'}\t${skill.canonicalPath}\t${skill.hash}\n`);
       }
       for (const skill of selected.deleted) process.stdout.write(`deleted\t${skill.declaredName ?? '(sem nome)'}\t${skill.canonicalPath}\n`);
+      for (const skill of selected.unobserved) process.stdout.write(`unobserved\t${skill.declaredName ?? '(sem nome)'}\t${skill.canonicalPath}\n`);
       for (const root of report.missingRoots) process.stdout.write(`raiz ausente\t${root}\n`);
+      if (report.scopeChanged) process.stdout.write('Escopo de comparação diferente; ausências não confirmam remoções.\n');
+      else if (previous && !report.scope.complete) process.stdout.write('Varredura incompleta; ausências não confirmam remoções.\n');
       if (report.limits.truncated) process.stdout.write('Inventário truncado pelos limites de leitura.\n');
     }
     return 0;

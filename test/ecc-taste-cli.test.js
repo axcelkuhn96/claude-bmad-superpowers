@@ -88,6 +88,39 @@ test('skills CLI rejects arbitrary snapshot writes and malformed snapshots', asy
   assert.match(help.stdout, /snapshot/i);
 });
 
+test('skills CLI keeps absent skills unobserved when scan scope changes or snapshot is legacy', async t => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-skill-scope-cli-'));
+  t.after(() => fs.rm(home, { recursive: true, force: true }));
+  const root = path.join(home, 'first');
+  const other = path.join(home, 'other');
+  await fs.mkdir(path.join(root, 'sample'), { recursive: true });
+  await fs.mkdir(other);
+  await fs.writeFile(path.join(root, 'sample', 'SKILL.md'), '---\nname: sample\n---\n# First\n');
+  const snapshot = path.join(home, '.local', 'state', 'cbs', 'skills-inventory', 'snapshot.json');
+  const first = run(home, ['skills', 'inventario', '--root', root, '--save-snapshot', snapshot, '--json']);
+  assert.equal(first.status, 0, first.stderr);
+  const changed = run(home, ['skills', 'inventario', '--root', other, '--changed', '--json']);
+  assert.equal(changed.status, 0, changed.stderr);
+  const report = JSON.parse(changed.stdout);
+  assert.equal(report.scopeChanged, true);
+  assert.equal(report.summary.deleted, 0);
+  assert.equal(report.unobserved.length, 1);
+  const text = run(home, ['skills', 'inventario', '--root', other, '--changed']);
+  assert.equal(text.status, 0, text.stderr);
+  assert.match(text.stdout, /não observadas: 1/);
+  assert.match(text.stdout, /unobserved\tsample/);
+  const old = JSON.parse(await fs.readFile(snapshot, 'utf8'));
+  delete old.scope;
+  old.formatVersion = 1;
+  const legacy = path.join(home, 'old.json');
+  await fs.writeFile(legacy, JSON.stringify(old));
+  await fs.rm(path.join(root, 'sample'), { recursive: true });
+  const legacyScan = run(home, ['skills', 'inventario', '--root', root, '--snapshot', legacy, '--json']);
+  assert.equal(legacyScan.status, 0, legacyScan.stderr);
+  assert.equal(JSON.parse(legacyScan.stdout).summary.deleted, 0);
+  assert.equal(JSON.parse(legacyScan.stdout).summary.unobserved, 1);
+});
+
 test('default skill inventory includes bounded Claude and Codex plugin caches as disk evidence', async t => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-skill-default-'));
   t.after(() => fs.rm(home, { recursive: true, force: true }));

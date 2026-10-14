@@ -69,7 +69,7 @@ function matchingContracts(skill, reviewedSources) {
     || (source.name && source.name === skill.declaredName)
   )).map((source) => {
     const actualHeadings = new Set(skill.headings.map((heading) => heading.toLowerCase()));
-    const actualReferences = new Set(skill.references.map((reference) => reference.path).filter(Boolean));
+    const actualReferences = new Set(skill.references.filter((reference) => reference.status === 'available').map((reference) => reference.path));
     return {
       name: source.name || null,
       reviewedHashMatch: typeof source.sha256 === 'string' && /^[a-f\d]{64}$/i.test(source.sha256)
@@ -81,7 +81,7 @@ function matchingContracts(skill, reviewedSources) {
   });
 }
 
-async function skillAt(directory, root, byCanonical, limits) {
+async function skillAt(directory, root, byCanonical, limits, allowedCanonicalRoot, explicitFile = null) {
   const file = path.join(directory, 'SKILL.md');
   let canonicalPath; let stat;
   try {
@@ -94,6 +94,7 @@ async function skillAt(directory, root, byCanonical, limits) {
     return false;
   }
   if (!stat.isFile()) return false;
+  if (explicitFile ? canonicalPath !== explicitFile : !isWithin(canonicalPath, allowedCanonicalRoot)) return false;
   const canonicalDirectory = path.dirname(canonicalPath);
   if (stat.size > MAX_SKILL_BYTES || byCanonical.size >= MAX_SKILLS) {
     limits.skipped++;
@@ -142,8 +143,8 @@ export async function inventorySkills({ roots, previous, reviewedSources = [] } 
   if (!Array.isArray(reviewedSources)) throw new TypeError('reviewedSources must be an array');
   const byCanonical = new Map();
   const missingRoots = [];
+  const scopeRoots = [];
   const limits = { skipped: 0, unreadable: 0, directories: 0, depthLimited: 0, truncated: false, maxDepth: MAX_DEPTH, maxDirectories: MAX_DIRS, maxSkills: MAX_SKILLS, maxSkillBytes: MAX_SKILL_BYTES };
-  const seenDirs = new Set();
   for (const item of roots) {
     const root = typeof item === 'string' ? { path: item } : item;
     if (!root || typeof root.path !== 'string' || !path.isAbsolute(root.path)) throw new TypeError('each root needs an absolute path');
@@ -151,27 +152,65 @@ export async function inventorySkills({ roots, previous, reviewedSources = [] } 
     if (rootPath === path.parse(rootPath).root || rootPath === os.homedir()) throw new TypeError('root is too broad for a bounded inventory');
     let stat;
     try { stat = await fs.stat(rootPath); } catch (error) {
-      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') { missingRoots.push(rootPath); continue; }
-      limits.unreadable++; continue;
-    }
-    if (stat.isFile()) {
-      if (path.basename(rootPath) === 'SKILL.md') await skillAt(path.dirname(rootPath), root, byCanonical, limits);
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+        missingRoots.push(rootPath);
+        scopeRoots.push({ path: rootPath, canonicalPath: null, kind: 'missing' });
+        continue;
+      }
+      limits.unreadable++;
+      scopeRoots.push({ path: rootPath, canonicalPath: null, kind: 'unreadable' });
       continue;
     }
-    if (!stat.isDirectory()) continue;
-    const rootCanonical = await fs.realpath(rootPath);
+    let rootCanonical;
+    try { rootCanonical = await fs.realpath(rootPath); } catch {
+      limits.unreadable++;
+      scopeRoots.push({ path: rootPath, canonicalPath: null, kind: 'unreadable' });
+      continue;
+    }
+    if (rootCanonical === path.parse(rootCanonical).root || rootCanonical === os.homedir()) {
+      throw new TypeError('root is too broad for a bounded inventory');
+    }
+    if (stat.isFile()) {
+      scopeRoots.push({ path: rootPath, canonicalPath: rootCanonical, kind: 'file' });
+      if (path.basename(rootPath) === 'SKILL.md') await skillAt(path.dirname(rootPath), root, byCanonical, limits, path.dirname(rootCanonical), rootCanonical);
+      else limits.skipped++;
+      continue;
+    }
+    if (!stat.isDirectory()) {
+      scopeRoots.push({ path: rootPath, canonicalPath: rootCanonical, kind: 'unsupported' });
+      limits.skipped++;
+      continue;
+    }
+    scopeRoots.push({ path: rootPath, canonicalPath: rootCanonical, kind: 'directory' });
+    const seenDirs = new Set();
     const queue = [{ directory: rootPath, depth: 0 }];
     while (queue.length && limits.directories < MAX_DIRS && byCanonical.size < MAX_SKILLS) {
       const { directory, depth } = queue.shift();
-      await skillAt(directory, root, byCanonical, limits);
       let canonical;
       try { canonical = await fs.realpath(directory); } catch { limits.unreadable++; continue; }
+      if (!isWithin(canonical, rootCanonical)) continue;
+      await skillAt(directory, root, byCanonical, limits, rootCanonical);
       if (seenDirs.has(canonical)) continue;
       seenDirs.add(canonical);
       limits.directories++;
-      if (depth >= MAX_DEPTH) { limits.depthLimited++; continue; }
       let children;
       try { children = await fs.readdir(directory, { withFileTypes: true }); } catch { limits.unreadable++; continue; }
+      if (depth >= MAX_DEPTH) {
+        for (const child of children) {
+          if (child.name.startsWith('.') && child.name !== '.agents' && child.name !== '.claude' && child.name !== '.codex') continue;
+          if (child.isDirectory()) { limits.depthLimited++; break; }
+          if (child.isSymbolicLink()) {
+            const next = path.join(directory, child.name);
+            try {
+              const target = await fs.realpath(next);
+              if (isWithin(target, rootCanonical) && !seenDirs.has(target) && (await fs.stat(target)).isDirectory()) {
+                limits.depthLimited++; break;
+              }
+            } catch { /* dangling alias */ }
+          }
+        }
+        continue;
+      }
       for (const child of children) {
         if (child.name.startsWith('.') && child.name !== '.agents' && child.name !== '.claude' && child.name !== '.codex') continue;
         if (child.isDirectory()) queue.push({ directory: path.join(directory, child.name), depth: depth + 1 });
@@ -180,10 +219,7 @@ export async function inventorySkills({ roots, previous, reviewedSources = [] } 
           try {
             if (!(await fs.stat(next)).isDirectory()) continue;
             const target = await fs.realpath(next);
-            if (!isWithin(target, rootCanonical)) {
-              const marker = await fs.stat(path.join(next, 'SKILL.md')).catch(() => null);
-              if (!marker?.isFile()) continue;
-            }
+            if (!isWithin(target, rootCanonical)) continue;
             queue.push({ directory: next, depth: depth + 1 });
           } catch { /* dangling alias */ }
         }
@@ -192,13 +228,26 @@ export async function inventorySkills({ roots, previous, reviewedSources = [] } 
     if (queue.length) limits.truncated = true;
   }
   if (byCanonical.size >= MAX_SKILLS) limits.truncated = true;
+  const scopedRoots = [...new Map(scopeRoots.map((entry) => [entry.path, entry])).values()]
+    .sort((a, b) => a.path.localeCompare(b.path));
+  const scope = {
+    roots: scopedRoots,
+    fingerprint: createHash('sha256').update(JSON.stringify(scopedRoots)).digest('hex'),
+    complete: limits.unreadable === 0 && limits.skipped === 0
+      && limits.depthLimited === 0 && !limits.truncated,
+  };
   const previousSkills = new Map((Array.isArray(previous?.skills) ? previous.skills : [])
     .filter((skill) => typeof skill.canonicalPath === 'string')
     .map((skill) => [skill.canonicalPath, skill]));
   const hasPrevious = previous != null;
+  const scopeChanged = hasPrevious && previous?.scope?.fingerprint !== scope.fingerprint;
+  const comparableScope = hasPrevious && !scopeChanged && scope.complete && previous?.scope?.complete === true;
+  const inCurrentScope = (canonicalPath) => scopedRoots.some((root) => root.kind === 'directory'
+    ? isWithin(canonicalPath, root.canonicalPath)
+    : root.kind === 'file' && canonicalPath === root.canonicalPath);
   const skills = [...byCanonical.values()].sort((a, b) => a.canonicalPath.localeCompare(b.canonicalPath)).map((skill) => {
     const prior = previousSkills.get(skill.canonicalPath);
-    const change = !hasPrevious ? 'unknown' : !prior ? 'added' : prior.hash === skill.hash ? 'unchanged' : 'changed';
+    const change = prior ? (prior.hash === skill.hash ? 'unchanged' : 'changed') : comparableScope ? 'added' : 'unknown';
     const bodyChangedSincePrior = !hasPrevious || !prior || !prior.bodyHash ? null : prior.bodyHash !== skill.bodyHash;
     return {
       ...skill,
@@ -210,9 +259,14 @@ export async function inventorySkills({ roots, previous, reviewedSources = [] } 
       contracts: matchingContracts(skill, reviewedSources),
     };
   });
-  const deleted = hasPrevious ? [...previousSkills.values()]
-    .filter((skill) => !byCanonical.has(skill.canonicalPath))
-    .map(({ canonicalPath, declaredName, hash }) => ({ canonicalPath, declaredName, hash, change: 'deleted' })) : [];
+  const absent = hasPrevious ? [...previousSkills.values()]
+    .filter((skill) => !byCanonical.has(skill.canonicalPath)) : [];
+  const deleted = absent
+    .filter((skill) => comparableScope && inCurrentScope(skill.canonicalPath))
+    .map(({ canonicalPath, declaredName, hash }) => ({ canonicalPath, declaredName, hash, change: 'deleted' }));
+  const unobserved = absent
+    .filter((skill) => !comparableScope || !inCurrentScope(skill.canonicalPath))
+    .map(({ canonicalPath, declaredName, hash }) => ({ canonicalPath, declaredName, hash, change: 'unobserved' }));
   const groups = new Map();
   for (const skill of skills.filter((entry) => entry.declaredName)) {
     if (!groups.has(skill.declaredName)) groups.set(skill.declaredName, []);
@@ -221,10 +275,13 @@ export async function inventorySkills({ roots, previous, reviewedSources = [] } 
   const divergences = [...groups].filter(([, group]) => group.length > 1 && new Set(group.map((skill) => skill.hash)).size > 1)
     .map(([declaredName, group]) => ({ declaredName, severity: 'info', paths: group.map((skill) => skill.canonicalPath), reason: 'content_hash_differs' }));
   return {
-    formatVersion: 1,
-    baseline: hasPrevious ? 'compared' : 'unknown',
+    formatVersion: 2,
+    baseline: comparableScope ? 'compared' : 'unknown',
+    scope,
+    scopeChanged,
     skills,
     deleted,
+    unobserved,
     divergences,
     missingRoots: missingRoots.sort(),
     summary: {
@@ -234,6 +291,7 @@ export async function inventorySkills({ roots, previous, reviewedSources = [] } 
       changed: skills.filter((skill) => skill.change === 'changed').length,
       unchanged: skills.filter((skill) => skill.change === 'unchanged').length,
       deleted: deleted.length,
+      unobserved: unobserved.length,
     },
     limits,
   };
