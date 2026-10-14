@@ -13,8 +13,10 @@ os.environ['MEM0_TELEMETRY'] = '0'
 for key in ('OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_ORGANIZATION', 'OPENAI_PROJECT'):
     os.environ.pop(key, None)
 
+import httpx
 import mem0_adapter as adapter
 from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import ApiException
 
 MAX_JSON = 4 * 1024 * 1024
 MAX_SECRET = 8 * 1024
@@ -78,7 +80,8 @@ def main():
             request = json.loads(exact(json_length).decode('utf-8'))
             secret = exact(secret_length)
             result = execute_one(request, secret)
-        except (ValueError, KeyError, RuntimeError, OSError, EOFError):
+        except (ValueError, KeyError, RuntimeError, OSError, EOFError,
+                httpx.HTTPError, ApiException):
             result = {'kind': 'blocked', 'reason': 'worker_operation_failed'}
         finally:
             if 'secret' in locals():
