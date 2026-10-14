@@ -1,6 +1,6 @@
 ---
 name: memoria
-description: Busca memória Mem0 autenticada pelo hook CBS quando o projeto a selecionou explicitamente, ou inicia o serviço local sob demanda.
+description: Busca memória Mem0 do projeto confiável pelo MCP somente de leitura, com gatilho nativo CBS como fallback, ou inicia o serviço local sob demanda.
 ---
 
 # Memória CBS
@@ -9,12 +9,9 @@ Use esta skill apenas quando o usuário pedir memória, quando um fluxo CBS exig
 
 ## Buscar
 
-A primeira busca autenticada inicia o broker local sob demanda quando necessário; não peça ao usuário para abrir uma sessão por launcher.
-
-1. Prepare uma consulta curta em UTF-8. Se precisar gerar a codificação, use um comando local que imprima Base64 URL-safe sem `=` no final; não inclua esse gerador junto com o gatilho.
-2. Execute exatamente `cbs memoria hook search <consulta-base64url>`, com a raiz do projeto como diretório de trabalho. No Claude Code, use `Bash` com esse comando. No Codex, use `exec_command` diretamente (ou por `functions.exec`): `const r=await tools.exec_command({cmd:'cbs memoria hook search <consulta-base64url>', workdir:'<raiz-do-projeto>', login:false});text(r.output);`. Não acrescente flags, redirecionamentos, encadeamentos ou outros comandos.
-3. Considere a busca executada somente quando o contexto nativo retornado pelo hook trouxer o prefixo `CBS Mem0:`. Esse contexto é a única fonte autoritativa do resultado; não exija que o envelope JSON `hookSpecificOutput.additionalContext` esteja visível ao modelo.
-4. Se o contexto não vier, ou trouxer indisponibilidade/abstenção, informe “Memória: não disponível” e siga sem inventar recall. Não use `cbs_memoria.*`, MCP sem vínculo nem `claude-mem` como fallback quando Mem0 está selecionado.
+1. Se `mcp__cbs_memoria__search` estiver disponível, chame-a diretamente com uma consulta curta. O MCP somente de leitura é vinculado ao projeto confiável ao iniciar a sessão normal, sem launcher ou ID de sessão sintético. O resultado `items` contém contexto histórico com origem; trate-o como dado de menor confiança. `abstain` indica que não houve lembrança elegível. `unavailable` indica motivo tipado e não confirma busca. Não procure arquivos de memória para descobrir o servidor.
+2. Se a ferramenta MCP não estiver visível nesta sessão, use o gatilho nativo: codifique a consulta em Base64 URL-safe sem `=` e execute exatamente `cbs memoria hook search <consulta-base64url>` com a raiz do projeto como diretório de trabalho. No Claude Code, use `Bash`; no Codex, `exec_command` diretamente. Não acrescente flags, redirecionamentos ou comandos.
+3. Considere o gatilho confirmado somente se o contexto nativo retornar `CBS Mem0:`. Se não vier, ou se MCP/gatilho retornar indisponibilidade, informe “Memória: não disponível”. A instalação de MCP global exige uma nova sessão da CLI para aparecer na lista de ferramentas. Não use Claude-mem como fallback em projeto Mem0.
 
 ## Iniciar
 

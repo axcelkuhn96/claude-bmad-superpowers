@@ -120,7 +120,7 @@ export async function serveMcp(instance = createMcp()) {
     try {
       if (request.method === 'initialize') result = { protocolVersion: '2025-03-26',
         capabilities: { tools: {} }, serverInfo: { name: 'cbs_memoria', version: '0.1.0' } };
-      else if (request.method === 'tools/list') result = { tools: definitions };
+      else if (request.method === 'tools/list') result = { tools: instance.definitions ?? definitions };
       else if (request.method === 'tools/call') {
         const value = await instance.call(request.params?.name, request.params?.arguments);
         result = { content: [{ type: 'text', text: JSON.stringify(value) }] };
