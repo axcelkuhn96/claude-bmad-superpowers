@@ -2,6 +2,7 @@
 """Explicit, resumable Claude-mem raw archive import. Never calls an LLM."""
 
 import argparse
+from collections import OrderedDict
 import hashlib
 import ipaddress
 import json
@@ -33,6 +34,22 @@ class CharacterTokenizer:
 
     def no_truncation(self):
         pass
+
+
+class EmbeddingCache:
+    def __init__(self, embedder, capacity=4096):
+        self.embedder = embedder
+        self.capacity = capacity
+        self.vectors = OrderedDict()
+
+    def get(self, text):
+        if text in self.vectors:
+            self.vectors.move_to_end(text)
+        else:
+            self.vectors[text] = tuple(self.embedder.embed(text, 'add'))
+            if len(self.vectors) > self.capacity:
+                self.vectors.popitem(last=False)
+        return list(self.vectors[text])
 
 
 def valid_collection(value):
@@ -252,23 +269,33 @@ def client_for(options):
 
 def ensure_raw_collection(client, name):
     from qdrant_client.models import Distance, HnswConfigDiff, VectorParams
+    from qdrant_client.http.exceptions import ResponseHandlingException
     import mem0_adapter as adapter
+    import httpx
     if not valid_collection(name):
         raise ValueError('invalid_raw_collection')
-    try:
-        adapter.verify_collection(client, name, adapter.FINGERPRINT)
-    except Exception:
-        if client.collection_exists(name):
-            raise
-        client.create_collection(collection_name=name,
-                                 vectors_config=VectorParams(size=384, distance=Distance.COSINE,
-                                                             on_disk=True),
-                                 on_disk_payload=True, hnsw_config=HnswConfigDiff(on_disk=True),
-                                 metadata={'cbs_embedding_fingerprint': adapter.FINGERPRINT,
-                                           'cbs_source': 'claude-mem-raw-v1'})
-        adapter.verify_collection(client, name, adapter.FINGERPRINT)
-    if (client.get_collection(name).config.metadata or {}).get('cbs_source') != 'claude-mem-raw-v1':
-        raise ValueError('raw_collection_marker_mismatch')
+
+    def ensure():
+        try:
+            adapter.verify_collection(client, name, adapter.FINGERPRINT)
+        except Exception as error:
+            if isinstance(error, (httpx.TransportError, ResponseHandlingException,
+                                  httpx.HTTPStatusError)) or \
+                    getattr(error, 'status_code', 404) != 404:
+                raise
+            if client.collection_exists(name):
+                raise
+            client.create_collection(collection_name=name,
+                                     vectors_config=VectorParams(size=384, distance=Distance.COSINE,
+                                                                 on_disk=True),
+                                     on_disk_payload=True, hnsw_config=HnswConfigDiff(on_disk=True),
+                                     metadata={'cbs_embedding_fingerprint': adapter.FINGERPRINT,
+                                               'cbs_source': 'claude-mem-raw-v1'})
+            adapter.verify_collection(client, name, adapter.FINGERPRINT)
+        if (client.get_collection(name).config.metadata or {}).get('cbs_source') != 'claude-mem-raw-v1':
+            raise ValueError('raw_collection_marker_mismatch')
+
+    retry_transport(ensure)
 
 
 def snapshot_digest(path):
@@ -387,10 +414,11 @@ def import_snapshot(options, client=None, embedder=None):
             os.environ['CBS_MEMORIA_TOKENIZER'] = str(Path(options.tokenizer).resolve(strict=True))
             embedder = adapter.E5Embedder()
         embedder.tokenizer.no_truncation()
+        embedding_cache = EmbeddingCache(embedder)
         count = 0
         checked = set()
 
-        def write_window(name, entries):
+        def write_collection(name, entries):
             nonlocal count
             if name not in checked:
                 ensure_raw_collection(client, name)
@@ -438,32 +466,36 @@ def import_snapshot(options, client=None, embedder=None):
                 if len(embedder.tokenizer.encode('passage: ' + part['text']).ids) > 512:
                     raise ValueError('chunk_exceeds_model_context')
                 points.append(PointStruct(id=part['id'],
-                    vector=embedder.embed(part['text'], 'add'), payload=part['payload']))
+                    vector=embedding_cache.get(part['text']), payload=part['payload']))
             if points:
                 acknowledged(retry_transport(lambda: client.upsert(
                     name, points=points, wait=True)), 'upsert')
                 count += len(points)
+
+        def write_window(entries):
+            by_collection = {}
+            for entry in entries:
+                by_collection.setdefault(entry[0]['payload']['collection'], []).append(entry)
+            for name, collection_entries in by_collection.items():
+                write_collection(name, collection_entries)
             _, line, offset, _ = entries[-1]
             save_checkpoint(checkpoint, digest, line, offset, identity)
 
         pending = []
-        pending_name = None
         with source.open('r', encoding='utf-8') as stream:
             for line_index, line in enumerate(stream):
                 item = json.loads(line)
-                name = item['collection']
                 pieces = points_for_row(item, embedder.tokenizer)
                 row_identity = source_identity(item)
                 for offset, part in enumerate(pieces, 1):
-                    if pending and (name != pending_name or len(pending) == options.batch_size):
-                        write_window(pending_name, pending)
+                    if len(pending) == options.batch_size:
+                        write_window(pending)
                         pending = []
-                    pending_name = name
                     end_of_row = offset == len(pieces)
                     pending.append((part, line_index + end_of_row,
                                     0 if end_of_row else offset, row_identity))
             if pending:
-                write_window(pending_name, pending)
+                write_window(pending)
         return count
     finally:
         if owned_client:

@@ -151,6 +151,93 @@ class ImportClaudeMemTest(unittest.TestCase):
 
         return Embedder()
 
+    def test_embedding_cache_uses_exact_text_and_returns_independent_vectors(self):
+        class Embedder:
+            calls = []
+
+            def embed(self, value, action):
+                self.calls.append((value, action))
+                return [float(len(self.calls)), 0.0]
+
+        embedder = Embedder()
+        cache = module.EmbeddingCache(embedder, 2)
+        first = cache.get('same')
+        first[0] = 99.0
+        self.assertEqual(cache.get('same'), [1.0, 0.0])
+        self.assertEqual(cache.get('Same'), [2.0, 0.0])
+        cache.get('other')
+        self.assertEqual(cache.get('same'), [4.0, 0.0])
+        self.assertEqual(embedder.calls, [('same', 'add'), ('Same', 'add'),
+                                          ('other', 'add'), ('same', 'add')])
+
+    def test_embedding_cache_evicts_after_4096_distinct_texts(self):
+        class Embedder:
+            calls = 0
+
+            def embed(self, value, action):
+                self.calls += 1
+                return [float(self.calls)]
+
+        embedder = Embedder()
+        cache = module.EmbeddingCache(embedder)
+        for index in range(4097):
+            cache.get(f'text {index}')
+        self.assertEqual(cache.get('text 1'), [2.0])
+        self.assertEqual(cache.get('text 0'), [4098.0])
+
+    def test_import_reuses_equal_chunk_embeddings_only_within_invocation(self):
+        from qdrant_client import QdrantClient
+        with sqlite3.connect(self.db) as db:
+            db.execute('UPDATE observations SET facts=text WHERE id=1')
+        out = self.raw_snapshot()
+        client = QdrantClient(':memory:')
+        embedder = self.fake_embedder()
+        self.assertEqual(module.import_snapshot(self.options(out), client, embedder), 4)
+        self.assertEqual(embedder.calls, 3)
+        client.delete_collection('cbs-projeto-a_claude_mem_raw')
+        self.assertEqual(module.import_snapshot(self.options(out), client, embedder), 4)
+        self.assertEqual(embedder.calls, 6)
+        client.close()
+
+    def test_interleaved_collections_batch_by_global_point_window(self):
+        from qdrant_client import QdrantClient
+        out = self.root / 'interleaved.jsonl'
+        first = 'cbs-projeto-a_claude_mem_raw'
+        second = 'cbs-subprojeto_claude_mem_raw'
+        rows = []
+        for index in range(8):
+            project, collection = ('Projeto-A', first) if index % 2 == 0 else \
+                                  ('Projeto-A/subprojeto', second)
+            rows.append({'source_project': project, 'source_table': 'observations',
+                         'collection': collection,
+                         'row': {'id': index + 1, 'memory_session_id': 's',
+                                 'created_at': '2024', 'text': f'piece {index}'}})
+        out.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        out.chmod(0o600)
+        real = QdrantClient(':memory:')
+
+        class CountingClient:
+            retrieves = []
+            upserts = []
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def retrieve(self, collection, ids, **kwargs):
+                self.retrieves.append((collection, len(ids)))
+                return real.retrieve(collection, ids, **kwargs)
+
+            def upsert(self, collection, points, **kwargs):
+                self.upserts.append((collection, len(points)))
+                return real.upsert(collection, points, **kwargs)
+
+        client = CountingClient()
+        self.assertEqual(module.import_snapshot(self.options(out, batch_size=8), client,
+                                                self.fake_embedder()), 8)
+        self.assertEqual(client.retrieves, [(first, 4), (second, 4)])
+        self.assertEqual(client.upserts, [(first, 4), (second, 4)])
+        real.close()
+
     def test_completed_checkpoint_rejects_changed_destination_before_key_or_network(self):
         from qdrant_client import QdrantClient
         out = self.raw_snapshot()
@@ -403,8 +490,7 @@ class ImportClaudeMemTest(unittest.TestCase):
         options = self.options(out, batch_size=3)
         with self.assertRaisesRegex(RuntimeError, 'upsert_not_acknowledged'):
             module.import_snapshot(options, IncompleteClient(), self.fake_embedder())
-        checkpoint = json.loads(Path(options.checkpoint).read_text())
-        self.assertEqual((checkpoint['line'], checkpoint['offset']), (1, 0))
+        self.assertFalse(Path(options.checkpoint).exists())
         self.assertEqual(real.count(first, exact=True).count, 2)
         self.assertEqual(real.count(second, exact=True).count, 1)
         self.assertEqual(module.import_snapshot(options, real, self.fake_embedder()), 2)
@@ -456,6 +542,75 @@ class ImportClaudeMemTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'invalid_request'):
             module.retry_transport(validation)
         self.assertEqual(attempts, 1)
+
+    def test_ensure_retries_transient_read_timeout(self):
+        from qdrant_client import QdrantClient
+        real = QdrantClient(':memory:')
+        name = 'cbs-retry_claude_mem_raw'
+
+        class TimeoutClient:
+            reads = 0
+
+            def __getattr__(self, key):
+                return getattr(real, key)
+
+            def get_collection(self, collection):
+                self.reads += 1
+                if self.reads == 1:
+                    raise httpx.ReadTimeout('temporary')
+                return real.get_collection(collection)
+
+        client = TimeoutClient()
+        with patch.object(module.time, 'sleep'):
+            module.ensure_raw_collection(client, name)
+        self.assertTrue(real.collection_exists(name))
+        self.assertGreaterEqual(client.reads, 2)
+        real.close()
+
+    def test_ensure_recovers_ambiguous_create_timeout_and_validates_marker(self):
+        from qdrant_client import QdrantClient
+        real = QdrantClient(':memory:')
+        name = 'cbs-retry_claude_mem_raw'
+
+        class TimeoutClient:
+            creates = 0
+
+            def __getattr__(self, key):
+                return getattr(real, key)
+
+            def create_collection(self, **kwargs):
+                self.creates += 1
+                real.create_collection(**kwargs)
+                raise httpx.ReadTimeout('response_lost')
+
+        client = TimeoutClient()
+        with patch.object(module.time, 'sleep'):
+            module.ensure_raw_collection(client, name)
+        self.assertEqual(client.creates, 1)
+        self.assertTrue(real.collection_exists(name))
+        real.close()
+
+    def test_ensure_does_not_retry_auth_failure(self):
+        from qdrant_client import QdrantClient
+        real = QdrantClient(':memory:')
+        name = 'cbs-retry_claude_mem_raw'
+
+        class AuthClient:
+            reads = 0
+
+            def __getattr__(self, key):
+                return getattr(real, key)
+
+            def get_collection(self, collection):
+                self.reads += 1
+                raise httpx.HTTPStatusError('unauthorized', request=httpx.Request('GET',
+                    'https://qdrant.example.org/collections'), response=httpx.Response(401))
+
+        client = AuthClient()
+        with self.assertRaises(httpx.HTTPStatusError):
+            module.ensure_raw_collection(client, name)
+        self.assertEqual(client.reads, 1)
+        real.close()
 
 
 if __name__ == '__main__':
