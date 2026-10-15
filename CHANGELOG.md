@@ -2,6 +2,11 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.15.4] - 2026-10-15
+
+### Corrigido
+- **MCP e encoder compartilhado:** no Linux, buscas, leituras e pedidos explícitos de gravação usam o broker local, preservando um único encoder e a proteção de exclusividade. Corrige `worker_exited` causado pela rota MCP que iniciava um worker sem o lock obrigatório. O broker verifica o vínculo do projeto e a autorização; gravações preservam a prova do pedido e o consentimento em cada suboperação.
+
 ## [0.15.3] - 2026-10-15
 
 ### Corrigido
