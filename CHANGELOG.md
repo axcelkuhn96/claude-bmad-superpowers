@@ -2,6 +2,12 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.15.1] - 2026-10-15
+
+### Corrigido
+- **Retomada da fila em sessões longas:** na publicação automática por conversa, o teto de extração passa a valer por sessão e dia UTC. O histórico acumulado é preservado e o consumo diário persiste sob o lock do outbox, inclusive após reinício; um relógio que recua não renova o orçamento. Na migração, consumo antigo sem data comprovada é carregado para o dia atual.
+- **Limite como adiamento:** lotes que atingiram o teto voltam a ser considerados nos hooks após a renovação ou aumento autorizado do orçamento. Manifestos já extraídos podem ser publicados sem nova chamada ao modelo. Erros de formato e de prova da fonte continuam retidos, preservando confiança, consentimento, deduplicação e confirmação remota.
+
 ## [0.15.0] - 2026-10-14
 
 ### Adicionado

@@ -25,6 +25,7 @@ do extrator exigem declaração local explícita; publicação automática exige
 por projeto, owner e writer designado.
 Activate aceita --allow-tracked-native para configuração nativa versionada autorizada.
 Avaliar é offline: cbs memoria avaliar --outputs arquivo.json [--corpus arquivo.json] [--split dev|holdout|all].
+No automático por conversa, --max-calls vale por sessão/dia UTC; o histórico de chamadas é preservado.
 `;
 const value = (args, flag) => args.includes(flag) ? args[args.indexOf(flag) + 1] : null;
 const readSecret = readQdrantSecret;
@@ -143,7 +144,7 @@ export async function main(args = []) {
     const result = await configureExtractionSchedule(resolution, {
       maxCallsPerSession: /^(?:[1-9]\d{0,3})$/.test(calls ?? '') ? Number(calls) : NaN,
       mode, conversationTurns: /^(?:[1-9]\d{0,2})$/.test(turns ?? '') ? Number(turns) : NaN });
-    process.stdout.write(`${result.kind}: ${result.reason ?? `${result.mode} every ${result.conversationTurns} turns; ${result.maxCallsPerSession} calls/session`}\n`);
+    process.stdout.write(`${result.kind}: ${result.reason ?? `${result.mode} every ${result.conversationTurns} turns; ${result.maxCallsPerSession} calls/session (daily UTC in automatic conversation mode)`}\n`);
     return result.kind === 'configured' ? 0 : 1;
   }
   if (action === 'auto-publish-disable') {
