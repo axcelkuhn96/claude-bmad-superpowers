@@ -2,6 +2,12 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.15.5] - 2026-10-15
+
+### Documentação
+- **Crédito ao Mem0:** atribuição ao projeto e à licença Apache 2.0 no README.
+- **Memória compartilhada:** esclarece o uso do Qdrant central por diferentes projetos e usuários, com memórias de projeto, filtro de proprietário para memórias pessoais e contexto separado por coleção.
+
 ## [0.15.4] - 2026-10-15
 
 ### Corrigido

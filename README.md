@@ -279,6 +279,8 @@ Sem claude-mem, as skills marcam "Memória: não disponível" e seguem normalmen
 
 O **claude-mem continua sendo o padrão**. O CBS também contém uma opção Mem0 por projeto, com seleção e confiança locais explícitas para sessões novas de Claude Code ou Codex. Cada sessão usa um provedor de memória; uma sessão Mem0 não consulta o claude-mem. A importação opcional do histórico claude-mem é manual e fica numa coleção separada, sem alimentar o recall automático.
 
+A memória fica no Qdrant central, que pode atender diferentes projetos e usuários. Memórias de escopo `project` são compartilhadas no respectivo projeto; as de escopo `personal` são filtradas pelo proprietário configurado. Cada projeto mantém sua coleção e seu contexto nas consultas.
+
 Na curadoria por conversa, o extrator avalia cada lote de cinco trocas completas — uma fala humana e a resposta final visível da LLM — e pode selecionar zero ou várias decisões, regras, correções ou soluções duráveis. Referências verificáveis acompanham cada seleção; resumos brutos não são obrigatórios nem publicados, e respostas da LLM nunca são tratadas como fala humana, revisão humana ou fato verificado. `PreCompact` e `SessionEnd` fazem flush do lote restante com menos de cinco trocas. O `Interrupt` do Codex persiste progresso e solicita flush assíncrono. Após encerramento abrupto, lotes parciais persistidos são recuperados no próximo hook depois de 30 minutos de inatividade; uma fala humana sem resposta final permanece pendente. Na publicação automática por conversa, o teto padrão é de 100 chamadas por sessão/dia UTC; o consumo da janela e o total histórico persistem ao reiniciar ou retomar a sessão.
 
 Para configurar o cronograma pelo CLI, mantendo a adesão Mem0 e as identidades locais já configuradas:
@@ -593,3 +595,4 @@ MIT — veja [LICENSE](LICENSE).
 - [Superpowers](https://github.com/obra/superpowers) — Jesse Vincent (obra)
 - [Claude Code](https://claude.com/claude-code) — Anthropic
 - [ECC](https://github.com/affaan-m/ECC) — Affaan Mustafa (MIT): hooks, regras de persona e casos de teste portados do commit `e482e57`
+- [Mem0](https://github.com/mem0ai/mem0) — Mem0 (Apache 2.0): SDK utilizado no armazenamento e na recuperação da memória persistente com Qdrant.
