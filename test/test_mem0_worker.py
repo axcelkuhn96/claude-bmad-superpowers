@@ -92,7 +92,8 @@ class WorkerReadinessTest(unittest.TestCase):
         worker = importlib.util.module_from_spec(spec)
         with patch.dict(sys.modules, {'qdrant_client': qdrant, 'mem0_adapter': adapter}):
             spec.loader.exec_module(worker)
-            with patch.object(worker, 'send', side_effect=lambda value: events.append(value['kind'])), \
+            with patch.object(worker, 'acquire_worker_lifetime_lock'), \
+                 patch.object(worker, 'send', side_effect=lambda value: events.append(value['kind'])), \
                  patch.object(sys, 'stdin', SimpleNamespace(buffer=io.BytesIO())):
                 self.assertEqual(worker.main(), 0)
             self.assertIn('import', events)
@@ -134,7 +135,8 @@ class WorkerReadinessTest(unittest.TestCase):
                             raise failure
                         return {'kind': 'items', 'items': [{'id': request['id']}]}
 
-                    with patch.object(worker, 'execute_one', side_effect=execute), \
+                    with patch.object(worker, 'acquire_worker_lifetime_lock'), \
+                         patch.object(worker, 'execute_one', side_effect=execute), \
                          patch.object(sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(incoming))), \
                          patch.object(sys, 'stdout', SimpleNamespace(buffer=outgoing)):
                         self.assertEqual(worker.main(), 0)

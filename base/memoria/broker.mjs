@@ -167,6 +167,83 @@ export async function claimBrokerWorker(root) {
     throw new Error('unsafe_worker_guard');
   }
   const file = path.join(directory, 'encoder-worker.guard');
+  if (process.platform === 'linux') {
+    const syncDirectory = async () => {
+      const dir = await fs.open(directory, 'r');
+      try { await dir.sync(); } finally { await dir.close(); }
+    };
+    let previous = null;
+    let previousIdentity;
+    try {
+      const handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      try {
+        const stat = await handle.stat();
+        if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) ||
+            stat.size > 512 || stat.size < 1) throw new Error('unsafe_worker_guard');
+        const bytes = await handle.readFile('utf8');
+        previous = JSON.parse(bytes);
+        if (previous.version !== 2 || previous.protocol !== 'worker-flock-v1' ||
+            previous.state !== 'worker_may_be_live' ||
+            !/^[a-f0-9-]{36}$/.test(previous.generation ?? '') ||
+            !/^\d+$/.test(previous.lockIdentity?.dev ?? '') ||
+            !/^\d+$/.test(previous.lockIdentity?.ino ?? '')) throw new Error('unsafe_worker_guard');
+        const pathname = await fs.lstat(file);
+        if (pathname.dev !== stat.dev || pathname.ino !== stat.ino) throw new Error('unsafe_worker_guard');
+        previousIdentity = { dev: stat.dev, ino: stat.ino };
+      } finally { await handle.close(); }
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw new Error('unsafe_worker_guard');
+    }
+    const lockPath = path.join(directory, 'encoder-process.lock');
+    let lockHandle;
+    try {
+      lockHandle = await fs.open(lockPath, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW |
+        (previous ? 0 : fsConstants.O_CREAT), 0o600);
+      const stat = await lockHandle.stat();
+      const pathname = await fs.lstat(lockPath);
+      if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) ||
+          stat.nlink !== 1 || pathname.dev !== stat.dev || pathname.ino !== stat.ino) {
+        throw new Error('unsafe_worker_lock');
+      }
+      const lockIdentity = { dev: String(stat.dev), ino: String(stat.ino) };
+      if (previous && (previous.lockIdentity.dev !== lockIdentity.dev ||
+          previous.lockIdentity.ino !== lockIdentity.ino)) throw new Error('unsafe_worker_lock');
+      await lockHandle.sync();
+      if (!previous) await syncDirectory();
+      const bytes = JSON.stringify({ version: 2, protocol: 'worker-flock-v1',
+        state: 'worker_may_be_live', generation: randomUUID(), lockIdentity }) + '\n';
+      const temp = `${file}.${randomUUID()}.tmp`;
+      let identity;
+      const tempHandle = await fs.open(temp, 'wx', 0o600);
+      try {
+        identity = await tempHandle.stat();
+        await tempHandle.writeFile(bytes);
+        await tempHandle.sync();
+      } finally { await tempHandle.close(); }
+      try {
+        if (previous) {
+          const current = await fs.lstat(file);
+          if (!current.isFile() || current.uid !== process.getuid() ||
+              current.dev !== previousIdentity.dev || current.ino !== previousIdentity.ino) {
+            throw new Error('worker_guard_changed');
+          }
+          await fs.rename(temp, file);
+        } else await fs.link(temp, file);
+      } finally { await fs.rm(temp, { force: true }); }
+      await syncDirectory();
+      return { lockPath, async release(confirmedClosed) {
+        if (!confirmedClosed) return false;
+        const current = await fs.lstat(file);
+        if (!current.isFile() || current.uid !== process.getuid() ||
+            current.dev !== identity.dev || current.ino !== identity.ino) {
+          throw new Error('worker_guard_changed');
+        }
+        await fs.unlink(file);
+        await syncDirectory();
+        return true;
+      } };
+    } finally { await lockHandle?.close(); }
+  }
   const handle = await fs.open(file, 'wx', 0o600);
   let identity;
   try {
@@ -523,19 +600,21 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
       PATH: [path.dirname(runtimePython(resolution.stateDir)),
         path.join(windowsSystem.windows, 'System32')].join(path.delimiter),
     } : {}), CBS_MEMORIA_MODEL: model, CBS_MEMORIA_TOKENIZER: tokenizer,
+      ...(process.platform === 'linux' ? { CBS_MEMORIA_WORKER_LOCK: guard.lockPath } : {}),
       OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1', MKL_NUM_THREADS: '1' },
   }), { onFatal: () => {
     for (const socket of leaseSockets) socket.destroy();
     if (server?.listening) server.close();
   } });
-  async function closeOwnedWorker() {
+  async function closeOwnedWorker(readyWasObserved = true) {
     const confirmedClosed = await bridge.close();
-    try { await guard.release(confirmedClosed); }
+    try { await guard.release(confirmedClosed && readyWasObserved); }
     finally { runtimeRelease(); await artifacts.close(); }
   }
   const ready = await bridge.start();
   if (ready.kind !== 'ready' || !await artifacts.unchanged()) {
-    await closeOwnedWorker(); return ready.kind === 'ready' ? blocked('artifact_changed') : ready;
+    await closeOwnedWorker(process.platform !== 'linux');
+    return ready.kind === 'ready' ? blocked('artifact_changed') : ready;
   }
   let queued = 0;
   let chain = Promise.resolve();

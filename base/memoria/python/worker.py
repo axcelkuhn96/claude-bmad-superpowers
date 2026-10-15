@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import stat
 import struct
 import sys
 
@@ -21,6 +22,37 @@ from qdrant_client.http.exceptions import ApiException
 MAX_JSON = 4 * 1024 * 1024
 MAX_SECRET = 8 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
+_WORKER_LOCK_FD = None
+
+
+def acquire_worker_lifetime_lock():
+    global _WORKER_LOCK_FD
+    if sys.platform != 'linux':
+        return
+    if _WORKER_LOCK_FD is not None:
+        raise RuntimeError('worker_lock_already_held')
+    lock_path = os.environ.get('CBS_MEMORIA_WORKER_LOCK', '')
+    if not os.path.isabs(lock_path):
+        raise RuntimeError('worker_lock_missing')
+    import fcntl
+    fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        pathname = os.lstat(lock_path)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid() or
+                opened.st_mode & 0o077 or opened.st_nlink != 1 or
+                (opened.st_dev, opened.st_ino) != (pathname.st_dev, pathname.st_ino)):
+            raise RuntimeError('worker_lock_unsafe')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        pathname = os.lstat(lock_path)
+        if (opened.st_dev, opened.st_ino) != (pathname.st_dev, pathname.st_ino):
+            raise RuntimeError('worker_lock_changed')
+        # Keep the descriptor open through Python finalizers and atexit. The kernel
+        # releases it only when this process exits, after the embedder is gone.
+        _WORKER_LOCK_FD = fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def exact(length):
@@ -65,6 +97,7 @@ def execute_one(request, secret):
 
 
 def main():
+    acquire_worker_lifetime_lock()
     adapter._WARM_EMBEDDER = adapter.E5Embedder()
     send({'kind': 'ready', 'fingerprint': adapter.FINGERPRINT})
     while True:
