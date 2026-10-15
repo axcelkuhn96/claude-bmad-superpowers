@@ -7,6 +7,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { FrameReader, encodeFrame } from './frame.mjs';
 import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
@@ -15,7 +16,10 @@ import { assertWriter } from './authority.mjs';
 import { readAutoPublish, readOwner } from './policy.mjs';
 import { readSessionCheckout } from './session-checkout.mjs';
 import { createOutbox } from './outbox.mjs';
-import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
+import { readLocalTrust, sameTrustTuple, trustTuple, authorizeDestination } from './trust.mjs';
+import { pinDestination } from './activation.mjs';
+import { verifyNativeCapture } from './native.mjs';
+import { sourceForExplicitMcp } from './mcp-request-proof.mjs';
 import { openArtifactIdentity, runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { withProjectLock } from './ledger.mjs';
 import { createBrokerWorker } from './broker-worker.mjs';
@@ -35,6 +39,43 @@ const sameAutoConsent = (frozen, live, current) => frozen?.version === 1 &&
     .every(key => typeof frozen[key] === 'string' && frozen[key] && frozen[key] === live[key]) &&
   ['consentHash', 'destinationHash', 'ownerId', 'deviceId', 'enabledAt']
     .every(key => current.extractor.autoPublishConsent?.[key] === frozen[key]);
+export function mcpOperationMatches(operation, source, observed) {
+  const keys = {
+    dedup_find: ['op', 'projectId', 'externalId', 'sessionId', 'text', 'metadata'],
+    find: ['op', 'projectId', 'externalId'],
+    read: ['op', 'projectId', 'sdkId'],
+    activate: ['op', 'projectId', 'externalId', 'sdkId'],
+  };
+  if (operation.op === 'add') return isDeepStrictEqual(operation, source);
+  if (!keys[operation.op] || !isDeepStrictEqual(Object.keys(operation).sort(),
+    keys[operation.op].sort()) || operation.projectId !== source.projectId) return false;
+  if (operation.op === 'dedup_find') return operation.externalId === source.externalId &&
+    operation.sessionId === source.sessionId && operation.text === source.text &&
+    isDeepStrictEqual(operation.metadata, source.metadata);
+  if (operation.op === 'find') return operation.externalId === source.externalId;
+  if (operation.op === 'read') return typeof operation.sdkId === 'string' &&
+    observed?.has(operation.sdkId) === true;
+  if (operation.op === 'activate') return operation.externalId === source.externalId &&
+    typeof operation.sdkId === 'string' && observed?.get(operation.sdkId) === true;
+  return false;
+}
+function mcpRowMatches(row, source) {
+  return row?.projectId === source.projectId && row.externalId === source.externalId &&
+    row.sessionId === source.sessionId && row.text === source.text &&
+    typeof row.sdkId === 'string' && !!row.sdkId &&
+    typeof row.qdrantId === 'string' && !!row.qdrantId &&
+    Object.entries(source.metadata ?? {}).every(([key, value]) =>
+      isDeepStrictEqual(row.metadata?.[key], value));
+}
+export function mcpBindingMatches(current, binding, ownerId, fingerprint) {
+  return current?.provider === 'mem0' && binding &&
+    current.projectRoot === binding.projectRoot &&
+    current.projectId === binding.projectId &&
+    current.embeddingFingerprint === binding.embeddingFingerprint &&
+    current.embeddingFingerprint === fingerprint &&
+    isDeepStrictEqual(current.destination, binding.destination) &&
+    ownerId === binding.ownerId;
+}
 
 export async function authorizeAutomaticBrokerWrite(current, operation, consent,
   readConsent = readAutoPublish) {
@@ -623,6 +664,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
   let idle;
   let discovery;
   let discoveryIdentity;
+  const mcpObserved = new Map();
   server = net.createServer(socket => {
     active++;
     clearTimeout(idle);
@@ -687,8 +729,12 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
       if (server.listening) server.close();
       return blocked('artifact_changed');
     }
+    if (value.origin === 'mcp') return handleMcp(value, secret, signal);
     const { cwd, sessionId, operation } = value;
     if (!cwd || !sessionId || !operation || typeof operation !== 'object') return blocked('invalid_request');
+    if (operation.metadata?.review_mode === 'explicit_mcp' ||
+        operation.metadata?.format_version === 5 ||
+        operation.approval?.mode === 'explicit_mcp') return blocked('explicit_mcp_unproved');
     const current = await resolveProject(cwd, sessionId, { stateRoot });
     if (current.provider !== 'mem0' || current.embeddingFingerprint !== resolution.embeddingFingerprint) return blocked('project_mismatch');
     const deadlineAt = Math.min(Number(value.deadlineAt), Date.now() + 120000);
@@ -738,6 +784,132 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
         return origin.kind === 'allowed' ? summarySourceAllowed(live.stateDir) : origin;
       } : undefined;
     return bridge.request(request, secret, deadlineAt, beforeDispatch);
+  }
+  async function handleMcp(value, secret, signal) {
+    const { cwd, cli, profile, binding, operation, sourceOperation } = value;
+    if (typeof cwd !== 'string' || !path.isAbsolute(cwd) ||
+        !['claude', 'codex'].includes(cli) || typeof profile !== 'string' ||
+        !path.isAbsolute(profile) || !binding || typeof binding !== 'object' ||
+        !operation || typeof operation !== 'object' ||
+        Array.isArray(operation)) return blocked('invalid_request');
+    const writes = ['find', 'dedup_find', 'read', 'add', 'activate'];
+    const isWriteFlow = writes.includes(operation.op);
+    if (!isWriteFlow && (!['search', 'raw_search', 'readonly_get'].includes(operation.op) ||
+        sourceOperation !== undefined)) return blocked('invalid_operation');
+    const readonlyKeys = { search: ['op', 'query', 'ownerId'],
+      raw_search: ['op', 'query'],
+      readonly_get: ['op', 'memoryId', 'source', 'offset', 'ownerId'] };
+    if (!isWriteFlow && (!isDeepStrictEqual(Object.keys(operation).sort(),
+      readonlyKeys[operation.op].sort()) || operation.op === 'search' &&
+        (typeof operation.query !== 'string' || !operation.query.trim()) ||
+        operation.op === 'raw_search' &&
+        (typeof operation.query !== 'string' || !operation.query.trim()))) {
+      return blocked('invalid_operation');
+    }
+    if (isWriteFlow && (!sourceOperation || typeof sourceOperation !== 'object')) {
+      return blocked('explicit_mcp_unproved');
+    }
+    const deadlineAt = Math.min(Number(value.deadlineAt), Date.now() + 120000);
+    if (!Number.isFinite(deadlineAt) || deadlineAt <= Date.now() || signal.aborted) return blocked('deadline');
+    const validate = async () => {
+      if (signal.aborted || deadlineAt <= Date.now()) return blocked('deadline');
+      const scope = await identifyProject(cwd);
+      if (scope.kind !== 'git' || scope.activeRoot !== cwd) return blocked('unsupported_git');
+      const current = await inspectConfiguration(cwd, { stateRoot });
+      if (current.provider !== 'mem0' ||
+          current.embeddingFingerprint !== resolution.embeddingFingerprint) {
+        return blocked('project_mismatch');
+      }
+      if (!sameTrustTuple(trustTuple(current), await readLocalTrust(current.stateDir))) {
+        return blocked('trust_changed');
+      }
+      const native = await verifyNativeCapture(scope.activeRoot,
+        { cli, profile, projectRoot: current.projectRoot, stateRoot });
+      if (native.kind !== 'verified') return blocked(native.reason ?? 'native_unavailable');
+      const owner = await readOwner(current, cli, profile);
+      if (owner?.kind === 'blocked') return blocked(owner.reason ?? 'owner_changed');
+      const bound = { ...current, ownerId: owner?.ownerId ?? null };
+      if (!mcpBindingMatches(current, binding, bound.ownerId,
+        resolution.embeddingFingerprint)) return blocked('project_mismatch');
+      if (operation.projectId !== undefined && operation.projectId !== current.projectId ||
+          operation.ownerId !== undefined && operation.ownerId !== bound.ownerId) {
+        return blocked('project_mismatch');
+      }
+      if (isWriteFlow) {
+        const consent = await readAutoPublish(current);
+        if (!bound.ownerId || !sameAutoConsent(consent, consent,
+          { ...bound, extractor: { autoPublish: true, autoPublishConsent: consent } })) {
+          return blocked('auto_publish_revoked');
+        }
+        bound.extractor = { autoPublish: true, autoPublishConsent: consent };
+        const source = await sourceForExplicitMcp(sourceOperation, bound);
+        if (source.kind !== 'local_source' || source.record.cli !== cli ||
+            source.record.profile !== profile ||
+            !mcpOperationMatches(operation, sourceOperation,
+              mcpObserved.get(sourceOperation.externalId))) return blocked('explicit_mcp_unproved');
+      }
+      return bound;
+    };
+    const current = await validate();
+    if (current.provider !== 'mem0') return current;
+    const authorize = async live => {
+      const pin = await pinDestination(live.destination.url, { address: live.destination.address,
+        allowPublic: live.destination.allowPublic });
+      if (pin.kind !== 'pinned') return blocked(pin.reason ?? 'destination_unavailable');
+      const checked = await validate();
+      if (checked.provider !== 'mem0') return checked;
+      const auth = authorizeDestination(checked,
+        await readLocalTrust(checked.stateDir), () => secret.toString('utf8'));
+      return auth.kind === 'authorized' ? { ...auth, connection: pin.connection } : auth;
+    };
+    const auth = await authorize(current);
+    if (auth.kind !== 'authorized') return blocked(auth.reason ?? 'authorization_failed');
+    if (isWriteFlow) {
+      const writer = await assertWriter(current, auth, { stateRoot });
+      if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+    }
+    const request = { ...operation, projectId: current.projectId, state: current.stateDir,
+      collection: current.destination.collection, connection: auth.connection };
+    const beforeDispatch = async () => {
+      if (!await artifacts.unchanged()) return blocked('artifact_changed');
+      const live = await validate();
+      if (live.provider !== 'mem0') return live;
+      const freshAuth = await authorize(live);
+      if (freshAuth.kind !== 'authorized') return freshAuth;
+      if (!isDeepStrictEqual(freshAuth.connection, auth.connection)) {
+        return blocked('destination_changed');
+      }
+      if (isWriteFlow) {
+        const writer = await assertWriter(live, freshAuth, { stateRoot });
+        if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+      }
+      return { kind: 'allowed' };
+    };
+    const result = await bridge.request(request, secret, deadlineAt, beforeDispatch);
+    if (operation.op === 'activate' && result.kind === 'item' &&
+        (!mcpRowMatches(result.item, sourceOperation) ||
+          result.item.sdkId !== operation.sdkId || result.item.status !== 'active')) {
+      return blocked('explicit_mcp_unproved');
+    }
+    if (isWriteFlow && ['find', 'add', 'read'].includes(operation.op)) {
+      const ids = mcpObserved.get(sourceOperation.externalId) ?? new Map();
+      if (operation.op === 'add' && result.kind === 'pending' && typeof result.sdkId === 'string') {
+        ids.set(result.sdkId, false);
+      }
+      if (operation.op === 'find' && result.kind === 'items') {
+        for (const item of result.items ?? []) {
+          if (mcpRowMatches(item, sourceOperation)) ids.set(item.sdkId, false);
+        }
+      }
+      if (operation.op === 'read' && result.kind === 'item') {
+        if (!mcpRowMatches(result.item, sourceOperation) ||
+            result.item.sdkId !== operation.sdkId) return blocked('explicit_mcp_unproved');
+        ids.set(operation.sdkId, true);
+      }
+      mcpObserved.set(sourceOperation.externalId, ids);
+      if (mcpObserved.size > 256) mcpObserved.delete(mcpObserved.keys().next().value);
+    }
+    return result;
   }
   try {
     await new Promise((resolve, reject) => {

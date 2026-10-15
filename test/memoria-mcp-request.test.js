@@ -11,6 +11,7 @@ import { inspectConfiguration } from '../base/memoria/provider.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
 import { localDevice } from '../base/memoria/policy.mjs';
+import { mcpOperationMatches, mcpBindingMatches } from '../base/memoria/broker.mjs';
 
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-mcp-write-'));
@@ -68,6 +69,59 @@ test('explicit MCP request has durable private provenance, stable id and honest 
     bound)).kind, 'blocked');
   assert.notEqual((await createExplicitMcpRequest({ ...fields, cli: 'codex' })).requestId,
     one.requestId);
+});
+
+test('broker binds every write suboperation to its original MCP source', async t => {
+  const f = await fixture(t);
+  const source = (await createExplicitMcpRequest({ resolution: f.resolution,
+    cli: 'claude', profile: '/profiles/claude', ownerId: f.consent.ownerId,
+    consent: f.consent, text: 'Remember RPO order.' })).operation;
+  const ids = new Map([['sdk-owned', true]]);
+  assert.equal(mcpOperationMatches(source, source), true);
+  assert.equal(mcpOperationMatches({ ...source, text: 'substituted' }, source), false);
+  assert.equal(mcpOperationMatches({ op: 'dedup_find', projectId: source.projectId,
+    externalId: source.externalId, sessionId: source.sessionId, text: source.text,
+    metadata: source.metadata }, source), true);
+  assert.equal(mcpOperationMatches({ op: 'dedup_find', projectId: source.projectId,
+    externalId: source.externalId, sessionId: source.sessionId, text: 'substituted',
+    metadata: source.metadata }, source), false);
+  assert.equal(mcpOperationMatches({ op: 'find', projectId: source.projectId,
+    externalId: source.externalId }, source), true);
+  assert.equal(mcpOperationMatches({ op: 'find', projectId: source.projectId,
+    externalId: 'other' }, source), false);
+  assert.equal(mcpOperationMatches({ op: 'find', projectId: source.projectId,
+    externalId: source.externalId, collection: 'other' }, source), false);
+  assert.equal(mcpOperationMatches({ op: 'read', projectId: source.projectId,
+    sdkId: 'sdk-owned' }, source, ids), true);
+  assert.equal(mcpOperationMatches({ op: 'read', projectId: source.projectId,
+    sdkId: 'sdk-other' }, source, ids), false);
+  assert.equal(mcpOperationMatches({ op: 'activate', projectId: source.projectId,
+    externalId: source.externalId,
+    sdkId: 'sdk-owned' }, source, ids), true);
+  assert.equal(mcpOperationMatches({ op: 'activate', projectId: source.projectId,
+    externalId: 'other',
+    sdkId: 'sdk-owned' }, source, ids), false);
+  assert.equal(mcpOperationMatches({ op: 'activate', projectId: source.projectId,
+    externalId: source.externalId,
+    sdkId: 'sdk-other' }, source, ids), false);
+});
+
+test('one broker fingerprint accepts distinct frozen MCP projects', async t => {
+  const first = await fixture(t);
+  const second = await fixture(t);
+  second.config.project_id = 'project-two';
+  second.config.qdrant.collection = 'cbs-project-two';
+  await fs.writeFile(second.configFile, JSON.stringify(second.config));
+  const other = await inspectConfiguration(second.root, { stateRoot: second.stateRoot });
+  const binding = resolution => ({ projectRoot: resolution.projectRoot,
+    projectId: resolution.projectId, embeddingFingerprint: resolution.embeddingFingerprint,
+    destination: resolution.destination, ownerId: 'same-owner' });
+  assert.equal(mcpBindingMatches(first.resolution, binding(first.resolution), 'same-owner',
+    first.resolution.embeddingFingerprint), true);
+  assert.equal(mcpBindingMatches(other, binding(other), 'same-owner',
+    first.resolution.embeddingFingerprint), true);
+  assert.equal(mcpBindingMatches(other, binding(first.resolution), 'same-owner',
+    first.resolution.embeddingFingerprint), false);
 });
 
 test('MCP write returns saved only with remote ACK, uses active binding for both CLIs', async t => {
@@ -136,7 +190,11 @@ test('normal MCP remember uses bridge and confirms remote activation before repo
     writer: async () => ({ kind: 'writer' }),
     writerControl: async () => ({ kind: 'authority', record: {
       state: 'active', deviceId: device.deviceId, generation: 1 } }),
-    workerFactory: () => ({ close: async () => {}, request: async (request, _auth, beforeDispatch) => {
+    workerFactory: () => ({ close: async () => {}, request: async (request, _auth, beforeDispatch, sourceOperation) => {
+      assert.equal(sourceOperation.op, 'add');
+      assert.equal(sourceOperation.metadata.format_version, 5);
+      assert.equal(sourceOperation.metadata.review_mode, 'explicit_mcp');
+      assert.equal(sourceOperation.externalId, request.externalId ?? sourceOperation.externalId);
       if (beforeDispatch) assert.equal((await beforeDispatch()).kind, 'allowed');
       if (request.op === 'dedup_find') return { kind: 'clear' };
       if (request.op === 'find') return { kind: 'items', items: rows.filter(row =>
@@ -162,6 +220,40 @@ test('normal MCP remember uses bridge and confirms remote activation before repo
   assert.deepEqual(await mcp.call('remember', args),
     { kind: 'stored', memoryId: id, qdrantId: id });
   assert.equal(adds, 1);
+  await mcp.close();
+});
+
+test('default Linux MCP search dispatches through shared broker envelope', async t => {
+  if (process.platform !== 'linux') return;
+  const f = await fixture(t);
+  const frames = [];
+  const mcp = createReadonlyMcp({ cwd: f.root, cli: 'codex', stateRoot: f.stateRoot,
+    verifyNative: async () => ({ kind: 'verified' }),
+    authorize: async () => ({ kind: 'authorized', key: 'fixture', connection: {} }),
+    brokerReady: async (cwd, options) => {
+      assert.equal(cwd, f.root);
+      assert.equal(options.stateRoot, f.stateRoot);
+      assert.equal(options.bootstrapSessionId, undefined);
+      return { kind: 'ready' };
+    },
+    brokerRequest: async (frame, key, options) => {
+      frames.push(frame);
+      assert.equal(key, 'fixture');
+      assert.equal(options.stateRoot, f.stateRoot);
+      return { kind: 'items', items: [] };
+    },
+  });
+  assert.equal((await mcp.call('search', { query: 'RPO', source: 'curated' })).kind, 'abstain');
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0].origin, 'mcp');
+  assert.equal(frames[0].cli, 'codex');
+  assert.equal(frames[0].cwd, f.root);
+  assert.equal(frames[0].operation.op, 'search');
+  assert.equal(frames[0].operation.query, 'RPO');
+  assert.equal(frames[0].binding.projectId, f.resolution.projectId);
+  assert.equal(frames[0].sessionId, undefined);
+  assert.equal(frames[0].operation.collection, undefined);
+  assert.equal(frames[0].operation.connection, undefined);
   await mcp.close();
 });
 

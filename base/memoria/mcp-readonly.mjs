@@ -13,6 +13,8 @@ import { assertWriter } from './authority.mjs';
 import { pinDestination } from './activation.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
 import { selectRecall, renderRecall } from './context.mjs';
+import { ensureBrokerReady } from './broker-start.mjs';
+import { requestBroker } from './broker.mjs';
 import { runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { createBrokerWorker } from './broker-worker.mjs';
 import { serveMcp } from './mcp.mjs';
@@ -57,7 +59,7 @@ for (const definition of readonlyDefinitions) definition.annotations = {
 readonlyDefinitions.at(-1).annotations = { readOnlyHint: false, destructiveHint: false,
   idempotentHint: true, openWorldHint: true };
 
-function createSearchWorker(resolution) {
+function createLocalSearchWorker(resolution) {
   const model = path.join(resolution.stateDir, 'artifacts', 'model.onnx');
   const tokenizer = path.join(resolution.stateDir, 'artifacts', 'tokenizer.json');
   const env = Object.fromEntries(['PATH', 'HOME', 'SYSTEMROOT', 'WINDIR', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'CBS_MEMORIA_CA_FILE']
@@ -82,11 +84,33 @@ function createSearchWorker(resolution) {
   }, close: () => worker.close() };
 }
 
+function createSearchWorker(resolution, { cwd, cli, profile, stateRoot,
+  ownerId,
+  brokerReady = ensureBrokerReady, brokerRequest = requestBroker }) {
+  if (process.platform !== 'linux') return createLocalSearchWorker(resolution);
+  return { async request(operation, auth, beforeDispatch, sourceOperation) {
+    if (beforeDispatch) {
+      const allowed = await beforeDispatch();
+      if (allowed.kind !== 'allowed') return allowed;
+    }
+    const ready = await brokerReady(cwd, { stateRoot });
+    if (ready.kind !== 'ready') return blocked(ready.reason ?? 'broker_unavailable');
+    const { collection: _collection, connection: _connection, state: _state,
+      ...safeOperation } = operation;
+    return brokerRequest({ origin: 'mcp', cwd, cli, profile,
+      binding: { projectRoot: resolution.projectRoot, projectId: resolution.projectId,
+        embeddingFingerprint: resolution.embeddingFingerprint,
+        destination: resolution.destination, ownerId }, operation: safeOperation,
+      ...(sourceOperation ? { sourceOperation } : {}) }, auth.key, { stateRoot });
+  }, close: async () => {} };
+}
+
 export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
   inspect = inspectConfiguration, identify = identifyProject,
   trust = readLocalTrust, verifyNative = verifyNativeCapture,
   owner = readOwner, autoPublish = readAutoPublish,
   writer = assertWriter, writerControl, workerFactory = createSearchWorker,
+  brokerReady, brokerRequest,
   authorize, search, legacySearch, get, remember } = {}) {
   let frozen;
   let worker;
@@ -112,7 +136,8 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
     if (current.provider !== 'mem0') return blocked(current.reason ?? 'not_mem0');
     if (!sameProject(started.resolution, current)) return blocked('project_changed');
     if (!sameTrustTuple(trustTuple(current), await trust(current.stateDir))) return blocked('trust_changed');
-    const native = await verifyNative(scope.activeRoot, { cli, projectRoot: current.projectRoot, stateRoot });
+    const native = await verifyNative(scope.activeRoot, { cli, profile,
+      projectRoot: current.projectRoot, stateRoot });
     if (native.kind !== 'verified') return blocked(native.reason ?? 'native_unavailable');
     if (profileFor(cli) !== profile) return blocked('profile_changed');
     const read = await owner(current, cli, profile);
@@ -163,10 +188,12 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
       await trust(ready.resolution.stateDir), readQdrantSecret);
     return authorized.kind === 'authorized' ? { ...authorized, connection: pin.connection } : authorized;
   }
-  async function dispatch(value, auth, beforeDispatch) {
+  async function dispatch(value, auth, beforeDispatch, sourceOperation) {
     clearTimeout(idle);
-    worker ??= workerFactory((await initial).resolution);
-    try { return await worker.request(value, auth, beforeDispatch); }
+    worker ??= workerFactory((await initial).resolution,
+      { cwd, cli, profile, stateRoot, ownerId: frozen?.ownerId,
+        brokerReady, brokerRequest });
+    try { return await worker.request(value, auth, beforeDispatch, sourceOperation); }
     finally {
       idle = setTimeout(() => { const stale = worker; worker = undefined; void stale?.close(); }, 5 * 60 * 1000);
       idle.unref?.();
@@ -254,7 +281,7 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
             ...(writerControl ? { control: writerControl } : {}),
             ackLocal: (id, proof) => ackExplicitMcpRequest(operation, live.resolution, id, proof),
             run: (_python, _script, request, _env, key) => dispatch(request,
-              { ...auth, key }, beforeDispatch),
+              { ...auth, key }, beforeDispatch, operation),
           });
         if (result?.kind === 'duplicate' && result.duplicateOf?.sdkId &&
             result.duplicateOf?.qdrantId) return { kind: 'duplicate',
