@@ -1,6 +1,6 @@
 ---
 name: cbs-final-reviewer
-description: Revisão final da branch antes da conclusão: integração entre tasks, testes, segurança, cobertura e prontidão da entrega. Read-only.
+description: "Revisão final da branch antes da conclusão: integração entre tasks, testes, segurança, cobertura e prontidão da entrega. Read-only."
 model: opus
 effort: xhigh
 tools: Read, Grep, Glob, WebFetch

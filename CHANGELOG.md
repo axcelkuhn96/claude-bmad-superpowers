@@ -2,6 +2,11 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.15.3] - 2026-10-15
+
+### Corrigido
+- **YAML do agente de revisão final:** descrição de `cbs-final-reviewer.md` entre aspas para permitir leitura por parsers YAML estritos.
+
 ## [0.15.2] - 2026-10-15
 
 ### Corrigido
