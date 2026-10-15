@@ -619,6 +619,86 @@ test('automatic retry remains scheduled after four calls when live session budge
   assert.ok(Number.isSafeInteger(result.nextRetryAt));
 });
 
+test('automatic extraction limit defers to UTC midnight and a raised cap reopens a saved row', async t => {
+  const { project, stateRoot, box, resolution } = await automaticConsumerFixture(t,
+    { maxCallsPerSession: 2 });
+  const [row] = await box.pending();
+  for (let n = 0; n < 2; n++) {
+    assert.equal((await box.claimExtraction(row.operationId, 2,
+      { automaticDaily: true })).kind, 'claimed');
+  }
+  let paidCalls = 0;
+  const exhausted = await worker.consumeCheckpoints({ cli: 'claude', cwd: project,
+    sessionId: 's', stateRoot, runCli: async () => { paidCalls++; throw Error('unexpected'); } });
+  const nextMidnight = (Math.floor(Date.now() / 86400000) + 1) * 86400000;
+  assert.equal(paidCalls, 0);
+  assert.equal(exhausted.nextRetryAt, nextMidnight);
+  assert.equal((await box.pending())[0].lastError, 'extraction_call_limit');
+  assert.equal((await box.extractionUsage('claude', 's')).calls, 2);
+  assert.equal((await configureExtractionSchedule(resolution,
+    { maxCallsPerSession: 3, mode: 'conversation', conversationTurns: 5 })).kind,
+  'configured');
+  const resumed = await worker.consumeCheckpoints({ cli: 'claude', cwd: project,
+    sessionId: 's', stateRoot, runCli: async () => {
+      paidCalls++;
+      return { kind: 'error', reason: 'cli_unavailable' };
+    } });
+  assert.equal(paidCalls, 1);
+  assert.equal((await box.extractionUsage('claude', 's')).calls, 3);
+  assert.ok(Number.isSafeInteger(resumed.nextRetryAt));
+});
+
+test('a later hook resumes a deferred row after UTC midnight without resetting lifetime calls', async t => {
+  const { project, stateRoot, box } = await automaticConsumerFixture(t,
+    { maxCallsPerSession: 1 });
+  const [row] = await box.pending();
+  assert.equal((await box.claimExtraction(row.operationId, 1,
+    { automaticDaily: true })).kind, 'claimed');
+  const limited = await worker.consumeCheckpoints({ cli: 'claude', cwd: project,
+    sessionId: 's', stateRoot, runCli: async () => { throw Error('before midnight'); } });
+  assert.ok(Number.isSafeInteger(limited.nextRetryAt));
+  let paidCalls = 0;
+  await worker.consumeCheckpoints({ cli: 'claude', cwd: project, sessionId: 's', stateRoot,
+    now: () => limited.nextRetryAt + 1000,
+    runCli: async () => { paidCalls++; return { kind: 'error', reason: 'cli_unavailable' }; } });
+  assert.equal(paidCalls, 1);
+  assert.equal((await box.extractionUsage('claude', 's')).calls, 2);
+});
+
+test('an old terminal extraction limit reopens under the automatic daily policy', async t => {
+  const { project, stateRoot, box } = await automaticConsumerFixture(t,
+    { maxCallsPerSession: 3 });
+  const [row] = await box.pending();
+  assert.equal((await box.markFailed(row.operationId,
+    'extract_failure_extraction_call_limit', { automatic: true })).kind, 'pending');
+  let paidCalls = 0;
+  await worker.consumeCheckpoints({ cli: 'claude', cwd: project, sessionId: 's', stateRoot,
+    now: () => Date.now() + 10000,
+    runCli: async () => { paidCalls++; return { kind: 'error', reason: 'cli_unavailable' }; } });
+  assert.equal(paidCalls, 1);
+  assert.equal((await box.extractionUsage('claude', 's')).calls, 1);
+});
+
+test('a prepared manifest publishes while the automatic extraction budget is exhausted', async t => {
+  const { project, stateRoot, box } = await automaticConsumerFixture(t,
+    { maxCallsPerSession: 1 });
+  const [row] = await box.pending();
+  assert.equal((await box.claimExtraction(row.operationId, 1,
+    { automaticDaily: true })).kind, 'claimed');
+  assert.equal((await box.recordManifest(row.operationId, [])).kind, 'manifested');
+  let publications = 0;
+  const result = await worker.consumeCheckpoints({ cli: 'claude', cwd: project,
+    sessionId: 's', stateRoot,
+    runCli: async () => { throw Error('must not spend another call'); },
+    publishCheckpoint: async () => {
+      publications++;
+      return { kind: 'published', published: 0, pending: 0 };
+    } });
+  assert.equal(result.manifested, 1);
+  assert.equal(publications, 1);
+  assert.equal((await box.extractionUsage('claude', 's')).calls, 1);
+});
+
 test('consumer resumes DNS failure after SessionEnd and stores without another extraction', async t => {
   const { project, stateRoot } = await automaticConsumerFixture(t);
   let calls = 0;

@@ -189,7 +189,8 @@ async function extractConversationCheckpoint(row, cliPolicy, options = {}) {
     const manifest = await outbox.recordManifest(row.operationId, []);
     return manifest.kind === 'manifested' ? outbox.completeCheckpoint(row.operationId) : manifest;
   }
-  const claim = await outbox.claimExtraction(row.operationId, cliPolicy.maxCallsPerSession ?? 4);
+  const claim = await outbox.claimExtraction(row.operationId, cliPolicy.maxCallsPerSession ?? 4,
+    { automaticDaily: true });
   if (claim.kind !== 'claimed') return claim.kind === 'full' ? pending('outbox_full') : claim;
   const context = await readExistingMemories(row, cliPolicy, { ...options,
     isSafe: text => redact(text) === text && !sensitive(text) });
@@ -307,7 +308,8 @@ async function extractCheckpointInner(checkpoint, cliPolicy, options = {}) {
     haiku && cliPolicy.autoPublish === true && !!cliPolicy.autoPublishConsent);
   if (prompt === null) return pending('unsafe_source_secret');
   const claim = await outbox.claimExtraction(checkpoint.operationId,
-    cliPolicy.maxCallsPerSession ?? 4);
+    cliPolicy.maxCallsPerSession ?? 4,
+    { automaticDaily: automatic && cliPolicy.mode === 'conversation' });
   if (claim.kind !== 'claimed') return claim.kind === 'full' ? pending('outbox_full') : claim;
   const began = Date.now();
   let response;

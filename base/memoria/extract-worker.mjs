@@ -111,7 +111,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
   if (!sameTrustTuple(trustTuple(current), trust)) {
     return blocked('trust_changed');
   }
-  const box = createOutbox(current.stateDir);
+  const box = createOutbox(current.stateDir, { now });
   const ownerRoot = path.dirname(current.stateDir);
   try {
     return await withProjectLock(ownerRoot, async () => {
@@ -189,13 +189,20 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
             pending++; continue;
           }
         }
+        const automaticDaily = policy.autoPublish === true && policy.mode === 'conversation';
+        const budgetLimited = automaticDaily &&
+          ['extraction_call_limit', 'extract_failure_extraction_call_limit'].includes(row.lastError);
         if (row.automatic === true && row.lastError?.startsWith('extract_failure_') &&
+            !budgetLimited &&
             !recoverableExtractionErrors.has(row.lastError.slice('extract_failure_'.length)) &&
             (await box.readManifest(row.operationId)).reason === 'missing_manifest') {
           pending++;
           continue;
         }
-        if (policy.autoPublish === true && !ready.has(row.operationId)) {
+        const budgetReopened = budgetLimited &&
+          (await box.extractionBudget(row.cli, row.sessionId,
+            policy.maxCallsPerSession ?? 4, { automaticDaily: true })).available === true;
+        if (policy.autoPublish === true && !ready.has(row.operationId) && !budgetReopened) {
           pending++;
           if (row.automatic === true && Number.isSafeInteger(row.retryAt)) {
             nextRetryAt = Math.min(nextRetryAt ?? Infinity, row.retryAt);
@@ -238,9 +245,16 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
           pending++;
           if (policy.autoPublish === true && policy.autoPublishConsent &&
               ['pending', 'blocked'].includes(result.kind)) {
-            if (result.kind === 'pending' && recoverableExtractionErrors.has(result.reason) &&
-                (await box.extractionUsage(row.cli, row.sessionId)).calls <
-                  (policy.maxCallsPerSession ?? 4)) {
+            if (automaticDaily && result.reason === 'extraction_call_limit' &&
+                Number.isSafeInteger(result.retryAt)) {
+              const retry = await box.markFailed(row.operationId, result.reason,
+                { automatic: true, retryAt: result.retryAt });
+              if (retry.kind === 'pending') {
+                nextRetryAt = Math.min(nextRetryAt ?? Infinity, retry.retryAt);
+              }
+            } else if (result.kind === 'pending' && recoverableExtractionErrors.has(result.reason) &&
+                (automaticDaily || (await box.extractionUsage(row.cli, row.sessionId)).calls <
+                  (policy.maxCallsPerSession ?? 4))) {
               const retry = await box.markFailed(row.operationId, result.reason, { automatic: true });
               if (retry.kind === 'pending') {
                 nextRetryAt = Math.min(nextRetryAt ?? Infinity, retry.retryAt);

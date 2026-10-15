@@ -908,7 +908,43 @@ export function createOutbox(stateDir, options = {}) {
       return { kind: 'persisted', externalId, payloadRef: { sha256: digest } };
     });
   }
-  async function claimExtraction(operationId, maxCallsPerSession = 4) {
+  const budgetDayMs = 24 * 60 * 60 * 1000;
+  const budgetClock = () => options.now?.() ?? Date.now();
+  async function dailyWindow(counter, file, now) {
+    const today = Math.floor(now / budgetDayMs);
+    if (counter?.budgetDay !== undefined) {
+      if (!Number.isSafeInteger(counter.budgetDay) || counter.budgetDay < 0 ||
+          !Number.isSafeInteger(counter.windowCalls) || counter.windowCalls < 0 ||
+          counter.windowCalls > counter.calls) throw new Error('corrupt_extraction_budget');
+      const day = Math.max(today, counter.budgetDay);
+      return { day, calls: day === counter.budgetDay ? counter.windowCalls : 0 };
+    }
+    // A legacy counter has no per-call dates. Only a file proven older than this
+    // UTC day can start at zero; otherwise carry every lifetime call conservatively.
+    const stat = counter ? await fs.stat(file).catch(() => null) : null;
+    return { day: today, calls: stat && stat.mtimeMs < today * budgetDayMs
+      ? 0 : (counter?.calls ?? 0) };
+  }
+  async function extractionBudget(cli, sessionId, maxCallsPerSession = 4,
+    budgetOptions = {}) {
+    if (!Number.isSafeInteger(maxCallsPerSession) || maxCallsPerSession < 1 ||
+        maxCallsPerSession > 1000) return blocked('invalid_extraction_limit');
+    return withLock(async () => {
+      const file = extractionFile(cli, sessionId);
+      const counter = await read(file);
+      if (budgetOptions.automaticDaily !== true) {
+        return { kind: 'budget', available: (counter?.calls ?? 0) < maxCallsPerSession,
+          calls: counter?.calls ?? 0 };
+      }
+      const now = budgetClock();
+      if (!Number.isSafeInteger(now) || now < 0) return blocked('invalid_retry_clock');
+      const window = await dailyWindow(counter, file, now);
+      return { kind: 'budget', available: window.calls < maxCallsPerSession,
+        calls: counter?.calls ?? 0, windowCalls: window.calls,
+        budgetDay: window.day, retryAt: (window.day + 1) * budgetDayMs };
+    });
+  }
+  async function claimExtraction(operationId, maxCallsPerSession = 4, budgetOptions = {}) {
     if (!validId(operationId)) return blocked('invalid_operation');
     if (!Number.isSafeInteger(maxCallsPerSession) || maxCallsPerSession < 1 ||
         maxCallsPerSession > 1000) return blocked('invalid_extraction_limit');
@@ -920,10 +956,20 @@ export function createOutbox(stateDir, options = {}) {
       if (prior && (prior.projectId !== row.projectId || prior.policyVersion !== row.policyVersion)) {
         return blocked('extraction_session_mismatch');
       }
-      if ((prior?.calls ?? 0) >= maxCallsPerSession) return blocked('extraction_call_limit');
+      const daily = budgetOptions.automaticDaily === true || prior?.budgetDay !== undefined;
+      const now = budgetClock();
+      if (daily && (!Number.isSafeInteger(now) || now < 0)) return blocked('invalid_retry_clock');
+      const window = daily ? await dailyWindow(prior, file, now) : null;
+      if (budgetOptions.automaticDaily === true && window.calls >= maxCallsPerSession) {
+        return { ...blocked('extraction_call_limit'), retryAt: (window.day + 1) * budgetDayMs };
+      }
+      if (budgetOptions.automaticDaily !== true && (prior?.calls ?? 0) >= maxCallsPerSession) {
+        return blocked('extraction_call_limit');
+      }
       const count = { cli: row.cli, sessionId: row.sessionId, projectId: row.projectId,
         policyVersion: row.policyVersion, calls: (prior?.calls ?? 0) + 1,
-        results: prior?.results ?? [] };
+        results: prior?.results ?? [],
+        ...(daily ? { budgetDay: window.day, windowCalls: window.calls + 1 } : {}) };
       if (!await fits(count)) return { kind: 'full', operationId };
       await durable(file, count);
       return { kind: 'claimed', calls: count.calls };
@@ -1564,6 +1610,10 @@ export function createOutbox(stateDir, options = {}) {
     if (!validId(operationId) || typeof reason !== 'string' || !/^[a-z_]{1,64}$/.test(reason)) {
       return blocked('invalid_failure');
     }
+    if (options.retryAt !== undefined &&
+        (!Number.isSafeInteger(options.retryAt) || options.retryAt < 0)) {
+      return blocked('invalid_retry_clock');
+    }
     return withLock(async () => {
       if (await read(ackFile(operationId))) return { kind: 'acked', operationId };
       if (!await read(itemFile(operationId))) return blocked('missing_operation');
@@ -1575,8 +1625,12 @@ export function createOutbox(stateDir, options = {}) {
       const automatic = options.automatic === true;
       if (previous && (previous.automatic === true) !== automatic) return blocked('retry_mode_mismatch');
       const attempts = automatic ? (previous?.attempts ?? 0) + 1 : Math.min(5, (previous?.attempts ?? 0) + 1);
-      const retryAt = Date.now() + Math.min(automatic ? 300000 : 60000,
-        1000 * 2 ** Math.min(attempts - 1, 20));
+      const now = budgetClock();
+      if (!Number.isSafeInteger(now) || now < 0) return blocked('invalid_retry_clock');
+      const retryAt = options.retryAt === undefined
+        ? now + Math.min(automatic ? 300000 : 60000,
+          1000 * 2 ** Math.min(attempts - 1, 20))
+        : Math.max(now, options.retryAt);
       const retry = { attempts, retryAt, lastError: reason, ...(automatic ? { automatic: true } : {}) };
       if (!await fits(retry)) return { kind: 'full', operationId };
       await durable(retryFile(operationId), retry);
@@ -1673,7 +1727,7 @@ export function createOutbox(stateDir, options = {}) {
     listConversationStages,
     ensureFutureBaseline, readFutureBaseline, futureSourceAllowed,
     ackVerified, recordManifest, persistCandidatePayload, sourceForRemote,
-    claimExtraction, recordExtractionUsage, extractionUsage, readCandidatePayload, readReview, sealReview,
+    claimExtraction, extractionBudget, recordExtractionUsage, extractionUsage, readCandidatePayload, readReview, sealReview,
     readManifest,
     ackCandidate: (id, key, proof) => updateCandidate(id, key, 'remote_acked', null, proof),
     duplicateCandidate,
