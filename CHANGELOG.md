@@ -2,11 +2,13 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
-## [0.15.1] - 2026-10-15
+## [0.15.2] - 2026-10-15
 
 ### Corrigido
 - **Retomada da fila em sessões longas:** na publicação automática por conversa, o teto de extração passa a valer por sessão e dia UTC. O histórico acumulado é preservado e o consumo diário persiste sob o lock do outbox, inclusive após reinício; um relógio que recua não renova o orçamento. Na migração, consumo antigo sem data comprovada é carregado para o dia atual.
 - **Limite como adiamento:** lotes que atingiram o teto voltam a ser considerados no próximo gatilho elegível após a renovação ou aumento autorizado do orçamento. Manifestos já extraídos podem ser publicados sem nova chamada ao modelo. Erros de formato e de prova da fonte continuam retidos, preservando confiança, consentimento, deduplicação e confirmação remota.
+
+- **Recuperação do serviço local no Linux:** o worker mantém um `flock` exclusivo durante toda a sua vida, adquirido antes de carregar E5. Guardas novas são publicadas atomicamente e podem ser reconciliadas após queda sem permitir dois encoders; o inode do lock permanece estável. Guardas legadas ou malformadas continuam bloqueadas até diagnóstico seguro. O protocolo Windows permanece inalterado.
 
 ## [0.15.0] - 2026-10-14
 
