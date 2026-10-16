@@ -5,6 +5,32 @@ import { createBrokerQueue } from '../base/memoria/broker-queue.mjs';
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const frame = (deadlineAt, value) => ({ value: { deadlineAt, value }, secret: Buffer.alloc(32, 7) });
 
+test('the queue forwards its admission deadline without changing the received frame', async t => {
+  let now = 1000000;
+  t.mock.method(Date, 'now', () => now);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const dispatched = [];
+  const queue = createBrokerQueue(async value => {
+    dispatched.push(value);
+    if (value.value === 'a') await gate;
+    return { kind: 'done' };
+  });
+  const a = frame(now + 100000, 'a');
+  const b = frame(now + 3600000, 'b');
+  const receivedDeadline = b.value.deadlineAt;
+  const admittedDeadline = now + 120000;
+  queue.enqueue(a, new AbortController().signal, () => {});
+  queue.enqueue(b, new AbortController().signal, () => {});
+  now += 90000;
+  release();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(dispatched[1].deadlineAt, admittedDeadline);
+  assert.equal(dispatched[1].deadlineAt - now, 30000);
+  assert.equal(b.value.deadlineAt, receivedDeadline);
+  assert.equal(b.secret.every(byte => byte === 0), true);
+});
+
 test('a request waits past 100ms and runs once within its original deadline', async () => {
   let release;
   const gate = new Promise(resolve => { release = resolve; });

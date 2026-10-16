@@ -27,7 +27,7 @@ export function createBrokerQueue(handle) {
       try {
         if (signal.aborted) return;
         respond(deadlineAt <= Date.now() ? blocked('queue_timeout') :
-          await handle(frame.value, frame.secret, signal));
+          await handle({ ...frame.value, deadlineAt }, frame.secret, signal));
       } catch { respond(blocked('broker_failed')); }
       finally { frame.secret.fill(0); running = false; next(); }
     })();

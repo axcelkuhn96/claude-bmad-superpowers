@@ -2,6 +2,12 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.15.6] - 2026-10-16
+
+### Corrigido
+- **Fila do serviço de memória:** chamadas simultâneas aguardam dentro do prazo absoluto da operação, em lugar do corte fixo de 100 ms. Mantém um único encoder, até duas chamadas em espera e rejeição de pedidos expirados ou cancelados antes da execução.
+- **Diagnóstico de gravação:** erros conhecidos de fila, prazo e indisponibilidade do worker são preservados na fase de inclusão; a reconciliação mantém a identidade do pedido quando a confirmação falha após a gravação.
+
 ## [0.15.5] - 2026-10-15
 
 ### Documentação
