@@ -193,6 +193,33 @@ test('timeout remains pending and cross writer is blocked', async (t) => {
     { kind: 'pending', reason: 'writer_mismatch' });
 });
 
+test('typed add failure is preserved and exact replay observes committed remote row without another add', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-ledger-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await seedLedger(root);
+  const operation = { externalId: 'source-queue-timeout', projectId: 'p',
+    sessionId: 's', text: 'rule', metadata: { origin: 'user_direct' } };
+  const ledger = createLedger(root, 'writer-a', 1);
+  const rows = [];
+  let adds = 0;
+  const deps = {
+    ledger, findRemote: async () => rows,
+    addViaSdk: async () => {
+      adds++;
+      rows.push({ ...operation, sdkId: 'sdk-1', qdrantId: 'q-1', status: 'pending' });
+      throw Object.assign(new Error('arbitrary secret'), { code: 'queue_timeout' });
+    },
+    readRemote: async () => rows[0],
+    activateViaSdk: async () => { rows[0].status = 'active'; },
+    ackLocal: async externalId => ({ kind: 'acked', operationId: externalId }),
+  };
+  assert.deepEqual(await reconcileStore(operation, deps),
+    { kind: 'pending', reason: 'queue_timeout' });
+  assert.equal((await ledger.read(operation.externalId)).lastError, 'queue_timeout');
+  assert.equal(await reconcileStore(operation, deps).then(value => value.kind), 'stored');
+  assert.equal(adds, 1);
+});
+
 test('bridge reauthorizes every operation and never serializes the key', async () => {
   let authorizations = 0;
   const requests = [];

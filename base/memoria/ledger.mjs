@@ -8,6 +8,9 @@ import { createWindowsState } from './windows-state.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const pending = reason => ({ kind: 'pending', reason });
+const addFailureReason = error =>
+  ['queue_timeout', 'queue_full', 'deadline', 'worker_unavailable'].includes(error?.code)
+    ? error.code : 'remote_error';
 
 export function externalIdFor(source) {
   if (!source || !['claude', 'codex'].includes(source.originCli) ||
@@ -171,8 +174,9 @@ export async function reconcileStore(operation, deps) {
         if (!deps.addViaSdk) return pending('remote_missing');
         try { await deps.addViaSdk(operation); }
         catch (error) {
-          if (ledger) { local.attempts++; local.lastError = 'remote_error'; await ledger.save(local); }
-          return error.conflict ? { kind: 'conflict', reason: error.code } : pending('remote_error');
+          const reason = addFailureReason(error);
+          if (ledger) { local.attempts++; local.lastError = reason; await ledger.save(local); }
+          return error.conflict ? { kind: 'conflict', reason: error.code } : pending(reason);
         }
         const refreshed = await deps.findRemote(operation.externalId);
         candidates.push(...(Array.isArray(refreshed) ? refreshed : refreshed ? [refreshed] : [])

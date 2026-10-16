@@ -23,6 +23,7 @@ import { sourceForExplicitMcp } from './mcp-request-proof.mjs';
 import { openArtifactIdentity, runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { withProjectLock } from './ledger.mjs';
 import { createBrokerWorker } from './broker-worker.mjs';
+import { createBrokerQueue } from './broker-queue.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsBinary, publishWindowsBinary,
   deleteWindowsBinary, hashWindowsFile, holdWindowsHash,
   windowsSystemLocations } from './windows-security.mjs';
@@ -504,13 +505,13 @@ export async function openBrokerLease(cwd, digest, secret, { stateRoot, deadline
 }
 
 export async function requestBroker(request, secret, { stateRoot, deadlineMs = 120000 } = {}) {
+  const deadlineAt = Date.now() + Math.max(1, Math.min(deadlineMs, 120000));
   if (process.platform === 'win32') {
     const root = stateRoot ?? path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
     const key = Buffer.from(secret ?? '');
     let socket;
     try {
       const discovery = (await windowsDiscovery(root)).value;
-      const deadlineAt = Date.now() + Math.max(1, Math.min(deadlineMs, 120000));
       socket = net.createConnection({ host: '127.0.0.1', port: discovery.port });
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => { socket.destroy(); reject(new Error('deadline')); },
@@ -549,7 +550,7 @@ export async function requestBroker(request, secret, { stateRoot, deadlineMs = 1
         socket.resume();
         socket.write(encodeFrame({ ...request, deadlineAt }, key));
       });
-    } catch { return blocked('broker_unavailable'); }
+    } catch (error) { return blocked(error.message === 'deadline' ? 'deadline' : 'broker_unavailable'); }
     finally { key.fill(0); socket?.destroy(); }
   }
   const file = brokerPath(stateRoot);
@@ -565,8 +566,12 @@ export async function requestBroker(request, secret, { stateRoot, deadlineMs = 1
     return await new Promise(resolve => {
       let settled = false;
       const finish = value => { if (!settled) { settled = true; clearTimeout(timer); socket.destroy(); resolve(value); } };
-      const timer = setTimeout(() => finish(blocked('deadline')), deadlineMs);
-      socket.once('connect', () => socket.write(encodeFrame({ ...request, deadlineAt: Date.now() + deadlineMs }, key)));
+      const timer = setTimeout(() => finish(blocked('deadline')),
+        Math.max(1, deadlineAt - Date.now()));
+      socket.once('connect', () => {
+        if (Date.now() >= deadlineAt) { finish(blocked('deadline')); return; }
+        socket.write(encodeFrame({ ...request, deadlineAt }, key));
+      });
       socket.on('data', chunk => {
         try { const frames = parser.push(chunk); if (frames.length) finish(frames[0].value); }
         catch { finish(blocked('broker_protocol')); }
@@ -657,8 +662,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     await closeOwnedWorker(process.platform !== 'linux');
     return ready.kind === 'ready' ? blocked('artifact_changed') : ready;
   }
-  let queued = 0;
-  let chain = Promise.resolve();
+  const queue = createBrokerQueue(handle);
   let active = 0;
   let leases = 0;
   let idle;
@@ -697,23 +701,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
         })();
         return;
       }
-      if (queued >= 2) {
-        frame.secret.fill(0);
-        connection.respond(blocked('queue_full'));
-        return;
-      }
-      const enqueuedAt = Date.now();
-      queued++;
-      chain = chain.then(async () => {
-        queued--;
-        const { value, secret } = frame;
-        if (connection.signal.aborted) { secret.fill(0); return; }
-        try {
-          const result = Date.now() - enqueuedAt > 100 ? blocked('queue_timeout') :
-            await handle(value, secret, connection.signal);
-          connection.respond(result);
-        } finally { secret.fill(0); }
-      }).catch(() => { connection.respond(blocked('broker_failed')); });
+      queue.enqueue(frame, connection.signal, value => connection.respond(value));
     };
     if (process.platform === 'win32') {
       if (!discovery) socket.destroy();
@@ -769,7 +757,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     }
     const request = { ...operation, projectId: current.projectId, state: current.stateDir,
       collection: current.destination.collection, connection: authorized.connection };
-    if (deadlineAt <= Date.now()) return blocked('deadline');
+    if (signal.aborted || deadlineAt <= Date.now()) return blocked('deadline');
     const beforeDispatch = automatic
       ? async () => {
         if (signal.aborted || deadlineAt <= Date.now()) return denied('deadline');
@@ -781,7 +769,8 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
         const consent = await authorizeAutomaticBrokerWrite(live, operation, autoConsent);
         if (consent.kind !== 'allowed') return consent;
         const origin = await authorizeAutomaticOrigin(live, cwd, sessionId, operation);
-        return origin.kind === 'allowed' ? summarySourceAllowed(live.stateDir) : origin;
+        const source = origin.kind === 'allowed' ? await summarySourceAllowed(live.stateDir) : origin;
+        return signal.aborted || deadlineAt <= Date.now() ? denied('deadline') : source;
       } : undefined;
     return bridge.request(request, secret, deadlineAt, beforeDispatch);
   }
@@ -883,7 +872,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
         const writer = await assertWriter(live, freshAuth, { stateRoot });
         if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
       }
-      return { kind: 'allowed' };
+      return signal.aborted || deadlineAt <= Date.now() ? blocked('deadline') : { kind: 'allowed' };
     };
     const result = await bridge.request(request, secret, deadlineAt, beforeDispatch);
     if (operation.op === 'activate' && result.kind === 'item' &&
