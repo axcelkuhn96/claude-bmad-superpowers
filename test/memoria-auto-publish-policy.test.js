@@ -78,6 +78,32 @@ test('opt-in exige owner registrado e writer designado, e congela consentimento 
   assert.equal(unrelated.extractor.autoPublish, false);
 });
 
+test('consentimento e sessão nova sobrevivem à remoção da versão selecionada da CLI', async t => {
+  const f = await fixture(t);
+  await designated(f);
+  await registerOwner(f.resolution, 'claude', f.profile, 'axcel-local', true);
+  assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
+    cli: 'claude', profile: f.profile })).kind, 'enabled');
+  const original = await readAutoPublish(f.resolution);
+  const selected = path.join(f.home, 'selected-claude');
+  await fs.writeFile(selected, '#!/bin/sh\n', { mode: 0o700 });
+  assert.equal((await configureExtractor(f.resolution, { route: 'haiku', profile: f.profile,
+    executable: selected })).kind, 'selected');
+  // A new explicit selection clears consent; enable it again before the simulated update.
+  assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
+    cli: 'claude', profile: f.profile })).kind, 'enabled');
+  const consent = await readAutoPublish(f.resolution);
+  await fs.rm(selected);
+  assert.equal((await readAutoPublish(f.resolution)).consentHash, consent.consentHash);
+  assert.equal((await readExtractor(f.resolution)).executable, selected);
+  const started = await initializeSession(f.project, 'after-update', { event: 'SessionStart',
+    stateRoot: f.stateRoot, cli: 'claude', profile: f.profile });
+  assert.equal(started.extractor.autoPublishConsent.consentHash, consent.consentHash);
+  assert.notEqual(original.consentHash, consent.consentHash);
+  await disableAutoPublish(f.resolution);
+  assert.equal(await readAutoPublish(f.resolution), null);
+});
+
 test('orçamento novo usa 100 chamadas e cinco trocas; migração preserva consentimento', async t => {
   const f = await fixture(t);
   assert.equal((await readExtractor(f.resolution)).maxCallsPerSession, 100);

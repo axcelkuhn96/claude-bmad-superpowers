@@ -7,6 +7,7 @@ import { extractionSchema, validateExtractionOutput, haikuExtractionSchema,
 import { identifyProject } from './project-id.mjs';
 import { ensureWindowsPrivateDirectory, inspectWindowsPath } from './windows-security.mjs';
 import { resolveEnrolledWindowsTool } from './windows-enrollment.mjs';
+import { resolveClaudeExecutable } from './claude-executable.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
@@ -33,10 +34,12 @@ async function runClaudeExtraction(prompt, policy, route) {
   const scope = await identifyProject(process.cwd());
   if (scope.kind !== 'git') return { kind: 'error', reason: 'cli_project_unresolved' };
   let profile;
+  let selectedExecutable;
   try {
     if (!path.isAbsolute(configuredProfile)) throw new Error('relative profile');
     profile = await fs.realpath(configuredProfile);
-    if (profile !== configuredProfile || await fs.realpath(policy.executable) !== policy.executable) {
+    if (profile !== configuredProfile || process.platform === 'win32' &&
+        await fs.realpath(policy.executable) !== policy.executable) {
       throw new Error('selected paths changed');
     }
     const metadata = process.platform === 'win32'
@@ -48,6 +51,11 @@ async function runClaudeExtraction(prompt, policy, route) {
       throw new Error('untrusted profile');
     }
   } catch { return { kind: 'error', reason: 'cli_profile_untrusted' }; }
+  if (process.platform !== 'win32') {
+    const resolved = await resolveClaudeExecutable(policy.executable);
+    if (resolved.kind !== 'resolved') return { kind: 'error', reason: resolved.reason };
+    selectedExecutable = resolved.executable;
+  }
   const windows = process.platform === 'win32';
   const conversation = route === 'haiku' && policy.mode === 'conversation';
   const stateRoot = policy.stateRoot ?? process.env.CBS_MEMORIA_STATE_ROOT;
@@ -76,7 +84,7 @@ async function runClaudeExtraction(prompt, policy, route) {
         USERPROFILE: cwd, CLAUDE_CONFIG_DIR: profile } :
         { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: cwd,
           CLAUDE_CONFIG_DIR: profile, LANG: 'C.UTF-8' };
-      const child = spawn(tool?.executable ?? policy.executable, args,
+      const child = spawn(tool?.executable ?? selectedExecutable ?? policy.executable, args,
         { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
       let output = '';
       let oversized = false;

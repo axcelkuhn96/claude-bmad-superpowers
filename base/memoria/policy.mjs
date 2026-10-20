@@ -142,8 +142,16 @@ export async function readExtractor(resolution) {
         (value.autoPublish !== false && value.autoPublish !== true) ||
         value.autoPublish === true && value.route !== 'haiku' ||
         value.autoPublish === false && value.autoPublishConsent != null) throw new Error('extractor_binding_changed');
-    const [profile, executable] = await Promise.all([fs.realpath(value.profile), fs.realpath(value.executable)]);
-    if (profile !== value.profile || executable !== value.executable) throw new Error('extractor_path_changed');
+    const profile = await fs.realpath(value.profile);
+    if (profile !== value.profile || typeof value.executable !== 'string' ||
+        !path.isAbsolute(value.executable)) throw new Error('extractor_path_changed');
+    // The selected CLI version can disappear during an official update. Its availability
+    // is checked when extracting; it does not revoke a project/owner/writer consent.
+    let executable;
+    try { executable = await fs.lstat(value.executable); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (executable && (!executable.isFile() ||
+        await fs.realpath(value.executable) !== value.executable)) throw new Error('extractor_path_changed');
     return value.autoPublish === true && !await validConsent(resolution, value.autoPublishConsent)
       ? { ...value, autoPublish: false, autoPublishConsent: null } : value;
   } catch { return blocked('extractor_binding_changed'); }

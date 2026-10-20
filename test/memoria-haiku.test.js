@@ -79,6 +79,45 @@ test('explicit Haiku policy is frozen and CLI enforces isolated model and schema
   }
 });
 
+test('frozen Haiku selection uses the trusted updated Claude version after the old version disappears', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-haiku-update-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const oldHome = process.env.HOME;
+  process.env.HOME = root;
+  t.after(() => { if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome; });
+  const profile = path.join(root, 'profile');
+  const versions = path.join(root, '.local', 'share', 'claude', 'versions');
+  const bin = path.join(root, '.local', 'bin');
+  await fs.mkdir(profile, { mode: 0o700 });
+  await fs.mkdir(versions, { recursive: true, mode: 0o700 });
+  await fs.mkdir(bin, { mode: 0o700 });
+  const oldVersion = path.join(versions, '2.1.299');
+  const newVersion = path.join(versions, '2.1.305');
+  const launcher = path.join(bin, 'claude');
+  await fs.writeFile(newVersion, `#!${process.execPath}\n` +
+    `process.stdin.resume(); process.stdin.on('end',()=>process.stdout.write(JSON.stringify({\n` +
+    `subtype:'success',structured_output:{decisions:[{source_message_id:'m1',candidates:[],abstain_reason:'no fact'}]},\n` +
+    `modelUsage:{haiku:{canonicalModel:'claude-haiku-5-5'}},usage:{input_tokens:2,output_tokens:3}})));`,
+  { mode: 0o700 });
+  await fs.symlink(newVersion, launcher);
+  const frozen = { route: 'haiku', profile, executable: oldVersion };
+  assert.equal((await runHaikuExtraction('{}', frozen)).kind, 'success');
+  assert.equal(frozen.executable, oldVersion);
+  await fs.symlink(newVersion, oldVersion);
+  assert.equal((await runHaikuExtraction('{}', frozen)).reason, 'cli_executable_untrusted');
+  await fs.rm(oldVersion);
+  await fs.rm(launcher);
+  await fs.symlink(process.execPath, launcher);
+  assert.equal((await runHaikuExtraction('{}', frozen)).reason, 'cli_executable_untrusted');
+  await fs.rm(launcher);
+  await fs.symlink(newVersion, launcher);
+  await fs.chmod(newVersion, 0o722);
+  assert.equal((await runHaikuExtraction('{}', frozen)).reason, 'cli_executable_untrusted');
+  await fs.chmod(newVersion, 0o700);
+  assert.equal((await runHaikuExtraction('{}', { ...frozen,
+    executable: path.join(root, 'unrelated-version') })).reason, 'cli_executable_untrusted');
+});
+
 test('Haiku abstention is explicit and an invented nested secret leaves no manifest', async t => {
   const { outbox, checkpoint } = await fixture(t);
   const abstained = await extractCheckpoint(checkpoint, { route: 'haiku' }, { outbox,
