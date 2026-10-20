@@ -2,6 +2,12 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.15.7] - 2026-10-20
+
+### Corrigido
+- **Escrita manual Mem0 após atualização do Claude Code:** a remoção do executável de extração selecionado deixa de invalidar o consentimento de publicação automática já válido. `remember` e o estado de escrita manual continuam disponíveis nos projetos Mem0 conhecidos quando proprietário, escritor, projeto, destino e consentimento permanecem válidos, sem nova configuração do extrator ou reinício da CLI.
+- **Extração automática após atualização oficial:** o runtime pode resolver o executável atual na mesma instalação e perfil para retomar lotes já capturados, inclusive em sessões iniciadas antes da atualização. O vínculo do projeto, as provas da fonte, a autorização, o destino e os contadores permanecem sujeitos às verificações existentes; caminhos de outra instalação ou perfil não são aceitos.
+
 ## [0.15.6] - 2026-10-16
 
 ### Corrigido

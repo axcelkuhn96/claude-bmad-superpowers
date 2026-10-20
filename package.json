@@ -1,6 +1,6 @@
 {
   "name": "claude-bmad-superpowers",
-  "version": "0.15.6",
+  "version": "0.15.7",
   "description": "Workflow PT-BR para Claude Code: refina ideias com memória e executa sempre com Superpowers (motor) + BMAD (disciplina) integrados — TDD, subagents isolados e dois reviewers por task.",
   "type": "module",
   "bin": {
@@ -20,7 +20,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test --test-concurrency=1 test/smoke.js test/gate-gitleaks.test.js test/gate-achados-revisados.test.js test/gate-agentshield.test.js test/settings-merge.test.js test/hooks.test.js test/memoria-provider.test.js test/memoria-public.test.js test/memoria-key.test.js test/memoria-tracked-native.test.js test/memoria-setup-worktree.test.js test/memoria-cli-status.test.js test/memoria-store.test.js test/memoria-recovery.test.js test/memoria-auto-publish.test.js test/memoria-extract-worker-auto.test.js test/memoria-broker-auto-consent.test.js test/memoria-extract.test.js test/memoria-haiku.test.js test/memoria-recall.test.js test/memoria-integration.test.js test/memoria-broker-worker.test.js test/memoria-broker-lease.test.js test/memoria-broker-start.test.js test/memoria-skill-hook.test.js test/memoria-codex-config-toml.test.js test/memoria-windows-security.test.js test/memoria-windows-state.test.js test/memoria-windows-transport.test.js test/memoria-final-contracts.test.js test/memoria-mcp-readonly.test.js test/memoria-mcp-request.test.js test/memoria-mcp-registration.test.js test/memoria-conversation-batches.test.js test/memoria-conversation-contract.test.js test/memoria-conversation-proof.test.js test/memoria-curation-policy.test.js test/memoria-evaluation.test.js test/skill-inventory.test.js test/ecc-taste-cli.test.js test/memoria-extraction-budget.test.js test/memoria-broker-queue.test.js"
+    "test": "node --test --test-concurrency=1 test/smoke.js test/gate-gitleaks.test.js test/gate-achados-revisados.test.js test/gate-agentshield.test.js test/settings-merge.test.js test/hooks.test.js test/memoria-provider.test.js test/memoria-public.test.js test/memoria-key.test.js test/memoria-tracked-native.test.js test/memoria-setup-worktree.test.js test/memoria-cli-status.test.js test/memoria-store.test.js test/memoria-recovery.test.js test/memoria-auto-publish.test.js test/memoria-auto-publish-policy.test.js test/memoria-extract-worker-auto.test.js test/memoria-broker-auto-consent.test.js test/memoria-extract.test.js test/memoria-haiku.test.js test/memoria-recall.test.js test/memoria-integration.test.js test/memoria-broker-worker.test.js test/memoria-broker-lease.test.js test/memoria-broker-start.test.js test/memoria-skill-hook.test.js test/memoria-codex-config-toml.test.js test/memoria-windows-security.test.js test/memoria-windows-state.test.js test/memoria-windows-transport.test.js test/memoria-final-contracts.test.js test/memoria-mcp-readonly.test.js test/memoria-mcp-request.test.js test/memoria-mcp-registration.test.js test/memoria-conversation-batches.test.js test/memoria-conversation-contract.test.js test/memoria-conversation-proof.test.js test/memoria-curation-policy.test.js test/memoria-evaluation.test.js test/skill-inventory.test.js test/ecc-taste-cli.test.js test/memoria-extraction-budget.test.js test/memoria-broker-queue.test.js"
   },
   "keywords": [
     "claude-code",
