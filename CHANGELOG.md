@@ -2,6 +2,13 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.15.8] - 2026-10-21
+
+### Atualizado
+- **`/investigar` orientado por evidências:** apura dúvidas, suspeitas e ideias no ambiente pertinente ao relato, inclusive produção quando houver acesso read-only já autorizado. Distingue fatos confirmados, hipóteses e pontos não verificados; uma investigação pode concluir que não encontrou defeito no escopo observado.
+- **Memória como pista histórica:** consulta o provedor pertinente antes da conclusão, confirma itens relevantes no estado atual e registra indisponibilidade sem inventar lembranças ou usar outro provedor como substituto.
+- **Resposta proporcional:** apresenta achados, fontes e limites antes de oferecer sugestão de correção quando cabível. Deixa de impor tabela de alternativas, análise de impacto, PRD e relatório para toda investigação; `docs/analises/` é usado quando útil ou solicitado. O fluxo permanece read-only para código, dados, configuração e serviços.
+
 ## [0.15.7] - 2026-10-20
 
 ### Corrigido
