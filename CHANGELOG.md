@@ -2,6 +2,12 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.15.9] - 2026-10-21
+
+### Adicionado
+- **Reprocessamento controlado da extração automática:** uma operação privada vinculada ao projeto, destino, proprietário, consentimento e perfil de execução permite retomar checkpoints elegíveis com a conta Haiku selecionada. A execução registra seu próprio perfil e consumo, preservando a proveniência, as filas e os contadores anteriores; um crédito adicional por operação e checkpoint é deduplicado sem zerar o histórico.
+- **Limites explícitos do replay:** a operação limita linhas e chamadas de extração e mantém as verificações de origem, vínculo, autorização e publicação. Checkpoints com prova quebrada ou outros impedimentos continuam retidos; a presença na fila não comprova memória publicada.
+
 ## [0.15.8] - 2026-10-21
 
 ### Atualizado
