@@ -81,3 +81,27 @@ test('a midnight race makes a deferred extraction immediately retryable', async 
   assert.equal(retry.kind, 'pending');
   assert.ok(retry.retryAt >= Date.parse('2026-10-16T00:00:01.000Z'));
 });
+
+test('replay grants one durable extra claim per authorized operation after 200 calls', async t => {
+  const f = await fixture(t);
+  const second = await f.box().enqueueCheckpoint({ cli: 'codex', sessionId: 's', start: 10,
+    end: 20, sliceHash: 'b'.repeat(64), messages: [] }, identity);
+  for (let n = 0; n < 200; n++) {
+    assert.equal((await f.box().claimExtraction(f.id, 200,
+      { automaticDaily: true })).calls, n + 1);
+  }
+  assert.equal((await f.box().claimExtraction(f.id, 200,
+    { automaticDaily: true })).reason, 'extraction_call_limit');
+  assert.equal((await f.box().claimExtraction(f.id, 200,
+    { automaticDaily: true, replayRunId: 'run-1' })).calls, 201);
+  assert.equal((await f.box().claimExtraction(f.id, 200,
+    { automaticDaily: true, replayRunId: 'run-1' })).reason, 'replay_already_claimed');
+  assert.equal((await f.box().claimExtraction(second.operationId, 200,
+    { automaticDaily: true, replayRunId: 'run-1' })).calls, 202);
+  assert.equal((await f.box().extractionUsage('codex', 's')).calls, 202);
+  assert.equal((await f.box().claimExtraction(second.operationId, 200,
+    { automaticDaily: true })).reason, 'extraction_call_limit');
+  const saved = JSON.parse(await fs.readFile(f.extraction, 'utf8'));
+  assert.equal(saved.replayClaims[`run-1:${f.id}`], 201);
+  assert.equal(saved.replayClaims[`run-1:${second.operationId}`], 202);
+});

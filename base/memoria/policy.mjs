@@ -21,6 +21,9 @@ const consentDigest = consent => digest([consent.version, consent.enabled, conse
   consent.enabledAt, consent.nonce, ...(consent.ownerProfileHash ? [consent.ownerProfileHash] : [])]);
 const withExtractorLock = (resolution, callback) =>
   withProjectLock(resolution.stateDir, callback, 'extractor-policy.lock');
+const replayIdValid = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value);
+const replayFile = (resolution, runId) => path.join(resolution.stateDir,
+  `extraction-replay-${runId}.json`);
 
 async function readPrivate(file) {
   if (process.platform === 'win32') {
@@ -188,6 +191,68 @@ export async function currentExtractionSchedule(resolution, frozen) {
         (frozen.autoPublishConsent?.consentHash ?? null)) return frozen;
   return { ...frozen, maxCallsPerSession: live.maxCallsPerSession,
     mode: live.mode, conversationTurns: live.conversationTurns };
+}
+
+// Local operator declaration for a bounded replay. The selected Claude profile pays
+// for extraction; it never changes the native source profile or its human owner.
+export async function registerExtractionReplay(resolution,
+  { runId, cli, profile, ownerId, operationIds } = {}, attested) {
+  if (attested !== true) return blocked('replay_attestation_required');
+  if (!replayIdValid(runId) || cli !== 'claude' || !ownerValid(ownerId) ||
+      typeof profile !== 'string' || !path.isAbsolute(profile) ||
+      !Array.isArray(operationIds) || operationIds.length < 1 || operationIds.length > 1000 ||
+      new Set(operationIds).size !== operationIds.length ||
+      operationIds.some(id => typeof id !== 'string' || !/^src-[a-f0-9]{64}$/.test(id))) {
+    return blocked('replay_selection_invalid');
+  }
+  try {
+    const selected = await readExtractor(resolution);
+    if (!selected || selected.kind === 'blocked' || selected.route !== 'haiku' ||
+        selected.autoPublish !== true || selected.profile !== profile ||
+        !selected.autoPublishConsent || selected.autoPublishConsent.ownerId !== ownerId ||
+        await fs.realpath(profile) !== profile) return blocked('replay_selection_changed');
+    const stat = await fs.lstat(profile);
+    if (!stat.isDirectory() || process.platform !== 'win32' &&
+        (!process.getuid || stat.uid !== process.getuid() || (stat.mode & 0o022))) {
+      return blocked('replay_profile_untrusted');
+    }
+    const { createOutbox } = await import('./outbox.mjs');
+    const pending = await createOutbox(resolution.stateDir).pending();
+    const byId = new Map(pending.map(row => [row.operationId, row]));
+    if (operationIds.some(id => byId.get(id)?.projectId !== resolution.projectId)) {
+      return blocked('replay_source_unavailable');
+    }
+    const record = { version: 1, runId, projectId: resolution.projectId,
+      binding: binding(resolution), cli, executionProfile: profile, ownerId,
+      consentHash: selected.autoPublishConsent.consentHash,
+      operationIds, registeredAt: new Date().toISOString() };
+    await writePrivate(replayFile(resolution, runId), record);
+    return { kind: 'registered', runId, count: operationIds.length };
+  } catch { return blocked('unsafe_replay_state'); }
+}
+
+export async function readExtractionReplay(resolution, runId) {
+  if (!replayIdValid(runId)) return blocked('replay_selection_invalid');
+  try {
+    const [record, selected] = await Promise.all([
+      readPrivate(replayFile(resolution, runId)), readExtractor(resolution),
+    ]);
+    if (!record || !selected || selected.kind === 'blocked' ||
+        record.version !== 1 || record.runId !== runId ||
+        record.projectId !== resolution.projectId || record.binding !== binding(resolution) ||
+        record.cli !== 'claude' || !ownerValid(record.ownerId) ||
+        selected.route !== 'haiku' || selected.autoPublish !== true ||
+        selected.profile !== record.executionProfile ||
+        selected.autoPublishConsent?.ownerId !== record.ownerId ||
+        selected.autoPublishConsent?.consentHash !== record.consentHash ||
+        !Array.isArray(record.operationIds) || record.operationIds.length < 1 ||
+        record.operationIds.length > 1000 ||
+        new Set(record.operationIds).size !== record.operationIds.length ||
+        record.operationIds.some(id => typeof id !== 'string' || !/^src-[a-f0-9]{64}$/.test(id))) {
+      return blocked('replay_selection_changed');
+    }
+    return { kind: 'authorized', ...record, selected };
+  } catch { return blocked('unsafe_replay_state'); }
 }
 
 async function validConsent(resolution, consent) {

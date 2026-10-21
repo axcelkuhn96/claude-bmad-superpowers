@@ -9,6 +9,7 @@ import { inspectConfiguration, initializeSession, resolveProject,
   refreshSessionPolicyForCapture } from '../base/memoria/provider.mjs';
 import { registerOwner, configureExtractor, enableAutoPublish, localDevice,
   readAutoPublish, disableAutoPublish, configureExtractionSchedule } from '../base/memoria/policy.mjs';
+import { registerExtractionReplay } from '../base/memoria/policy.mjs';
 import { publishCheckpointAutomatically } from '../base/memoria/auto-publish.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
@@ -793,4 +794,80 @@ test('configured four-call budget stops transient Haiku retries and leaves schem
     assert.equal(calls, ['cli_timeout', 'cli_failed', 'cli_not_enrolled'].includes(response.reason) ? 4 : 1);
     assert.equal((await box.extractionUsage('claude', 's')).calls, calls);
   }
+});
+
+test('attested replay uses selected execution profile once without changing frozen capture or resetting usage', async t => {
+  const { project, profile, stateRoot, box, resolution } = await automaticConsumerFixture(t,
+    { maxCallsPerSession: 1 });
+  const [row] = await box.pending();
+  const first = await worker.consumeCheckpoints({ cli: 'claude', cwd: project,
+    sessionId: 's', stateRoot, runCli: async () => ({ kind: 'error', reason: 'cli_unavailable' }) });
+  assert.equal(first.kind, 'consumed');
+  assert.equal((await box.extractionUsage('claude', 's')).calls, 1);
+  const selected = path.join(path.dirname(profile), 'selected-profile');
+  await fs.mkdir(selected, { mode: 0o700 });
+  const file = path.join(resolution.stateDir, 'extractor.json');
+  const live = JSON.parse(await fs.readFile(file, 'utf8'));
+  await fs.writeFile(file, JSON.stringify({ ...live, profile: selected }));
+  assert.deepEqual(await registerExtractionReplay(resolution, { runId: 'run-1',
+    cli: 'claude', profile: selected, ownerId: 'fixture-owner',
+    operationIds: [row.operationId] }, false),
+  { kind: 'blocked', reason: 'replay_attestation_required' });
+  assert.equal((await registerExtractionReplay(resolution, { runId: 'run-1',
+    cli: 'claude', profile: selected, ownerId: 'fixture-owner',
+    operationIds: [row.operationId] }, true)).kind, 'registered');
+  let invoked = 0;
+  await worker.consumeCheckpoints({ cli: 'claude', cwd: project, sessionId: 's',
+    stateRoot, replayRunId: 'run-1', maxExtractionCalls: 1,
+    runCli: async (_prompt, policy) => {
+      invoked++;
+      assert.equal(policy.profile, selected);
+      return { kind: 'error', reason: 'cli_unavailable' };
+    } });
+  assert.equal(invoked, 1);
+  assert.equal((await box.extractionUsage('claude', 's')).calls, 2);
+  const counterFile = (await fs.readdir(path.join(resolution.stateDir, 'outbox')))
+    .find(name => name.startsWith('extract-'));
+  const counter = JSON.parse(await fs.readFile(path.join(resolution.stateDir,
+    'outbox', counterFile), 'utf8'));
+  assert.equal(counter.results.at(-1).executionProfile, selected);
+  assert.equal(counter.results.at(-1).frozenProfile, profile);
+  assert.equal(counter.results.at(-1).replayRunId, 'run-1');
+  await worker.consumeCheckpoints({ cli: 'claude', cwd: project, sessionId: 's',
+    stateRoot, replayRunId: 'run-1', maxExtractionCalls: 1,
+    runCli: async () => { invoked++; return { kind: 'error', reason: 'cli_unavailable' }; } });
+  assert.equal(invoked, 1);
+  const after = await resolveProject(project, 's', { stateRoot });
+  assert.equal(after.extractor.profile, profile);
+  await fs.writeFile(file, JSON.stringify(live));
+  assert.equal((await worker.consumeCheckpoints({ cli: 'claude', cwd: project,
+    sessionId: 's', stateRoot, replayRunId: 'run-1',
+    runCli: async () => { throw new Error('stale replay ran'); } })).reason,
+  'replay_selection_changed');
+});
+
+test('Claude replay credential can extract a Codex-origin checkpoint without changing its owner', async t => {
+  const { project, profile, stateRoot, box, resolution } = await automaticConsumerFixture(t,
+    { cli: 'codex' });
+  const [row] = await box.pending();
+  const selected = path.join(path.dirname(profile), 'claude-execution');
+  await fs.mkdir(selected, { mode: 0o700 });
+  const file = path.join(resolution.stateDir, 'extractor.json');
+  const live = JSON.parse(await fs.readFile(file, 'utf8'));
+  await fs.writeFile(file, JSON.stringify({ ...live, profile: selected }));
+  assert.equal((await registerExtractionReplay(resolution, { runId: 'codex-replay',
+    cli: 'claude', profile: selected, ownerId: 'fixture-owner',
+    operationIds: [row.operationId] }, true)).kind, 'registered');
+  let calls = 0;
+  const result = await worker.consumeCheckpoints({ cli: 'codex', cwd: project,
+    sessionId: 's', stateRoot, replayRunId: 'codex-replay', maxExtractionCalls: 1,
+    runCli: async (_prompt, policy) => {
+      calls++;
+      assert.equal(policy.profile, selected);
+      return { kind: 'error', reason: 'cli_unavailable' };
+    } });
+  assert.equal(result.kind, 'consumed');
+  assert.equal(calls, 1);
+  assert.equal((await box.extractionUsage('codex', 's')).calls, 1);
+  assert.equal((await resolveProject(project, 's', { stateRoot })).ownerId, 'fixture-owner');
 });

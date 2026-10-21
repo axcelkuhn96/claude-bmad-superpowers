@@ -960,15 +960,22 @@ export function createOutbox(stateDir, options = {}) {
       const now = budgetClock();
       if (daily && (!Number.isSafeInteger(now) || now < 0)) return blocked('invalid_retry_clock');
       const window = daily ? await dailyWindow(prior, file, now) : null;
-      if (budgetOptions.automaticDaily === true && window.calls >= maxCallsPerSession) {
+      const replayRunId = budgetOptions.replayRunId;
+      const replay = typeof replayRunId === 'string' &&
+        /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(replayRunId);
+      const replayKey = replay ? `${replayRunId}:${operationId}` : null;
+      if (replay && prior?.replayClaims?.[replayKey]) return blocked('replay_already_claimed');
+      if (!replay && budgetOptions.automaticDaily === true && window.calls >= maxCallsPerSession) {
         return { ...blocked('extraction_call_limit'), retryAt: (window.day + 1) * budgetDayMs };
       }
-      if (budgetOptions.automaticDaily !== true && (prior?.calls ?? 0) >= maxCallsPerSession) {
+      if (!replay && budgetOptions.automaticDaily !== true && (prior?.calls ?? 0) >= maxCallsPerSession) {
         return blocked('extraction_call_limit');
       }
       const count = { cli: row.cli, sessionId: row.sessionId, projectId: row.projectId,
         policyVersion: row.policyVersion, calls: (prior?.calls ?? 0) + 1,
         results: prior?.results ?? [],
+        ...(replay || prior?.replayClaims ? { replayClaims: {
+          ...(prior?.replayClaims ?? {}), ...(replay ? { [replayKey]: (prior?.calls ?? 0) + 1 } : {}) } } : {}),
         ...(daily ? { budgetDay: window.day, windowCalls: window.calls + 1 } : {}) };
       if (!await fits(count)) return { kind: 'full', operationId };
       await durable(file, count);
@@ -999,6 +1006,9 @@ export function createOutbox(stateDir, options = {}) {
         : null;
       counter.results.push({ callIndex, operationId, inputTokens: number(usage.inputTokens),
         outputTokens: number(usage.outputTokens), costUsd: number(usage.costUsd), latencyMs,
+        ...(context?.replayRunId && context?.executionProfile && context?.frozenProfile ? {
+          replayRunId: context.replayRunId, executionProfile: context.executionProfile,
+          frozenProfile: context.frozenProfile } : {}),
         ...(contextStatus ? { context: contextStatus } : {}) });
       if (!await fits(counter)) return { kind: 'full', operationId };
       await durable(file, counter);

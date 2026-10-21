@@ -72,14 +72,18 @@ export function scheduleExtraction({ cli, event, payload, result, stateRoot, spa
 }
 
 export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCli,
-  publishCheckpoint, now = Date.now } = {}) {
+  publishCheckpoint, now = Date.now, replayRunId, maxExtractionCalls, maxRows } = {}) {
   if (!['claude', 'codex'].includes(cli) || !cwd || !sessionId) {
     return blocked('invalid_consumer_identity');
   }
+  if ((maxExtractionCalls !== undefined && (!Number.isSafeInteger(maxExtractionCalls) ||
+      maxExtractionCalls < 1 || maxExtractionCalls > 1000)) ||
+      (maxRows !== undefined && (!Number.isSafeInteger(maxRows) ||
+      maxRows < 1 || maxRows > 1000))) return blocked('invalid_consumer_limit');
   const [{ identifyProject }, { resolveProject }, { verifyNativeCapture },
     { readSessionCheckout }, { readLocalTrust, sameTrustTuple, trustTuple }, { createOutbox },
     { extractCheckpoint }, { withProjectLock }, { POLICY_VERSION },
-    { readOwner, readAutoPublish, currentExtractionSchedule }] = await Promise.all([
+    { readOwner, readAutoPublish, currentExtractionSchedule, readExtractionReplay }] = await Promise.all([
     import('./project-id.mjs'), import('./provider.mjs'), import('./native.mjs'),
     import('./session-checkout.mjs'), import('./trust.mjs'), import('./outbox.mjs'),
     import('./candidates.mjs'), import('./ledger.mjs'), import('./transcript.mjs'),
@@ -116,9 +120,13 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
   try {
     return await withProjectLock(ownerRoot, async () => {
       let nextRetryAt;
+      const replay = replayRunId === undefined ? null :
+        await readExtractionReplay(current, replayRunId);
+      if (replay?.kind === 'blocked') return replay;
+      const replayIds = replay ? new Set(replay.operationIds) : null;
       const staged = await box.listConversationStages({ cli, projectId: current.projectId });
       if (staged.kind !== 'stages') return staged;
-      for (const stage of staged.stages) {
+      for (const stage of replay ? [] : staged.stages) {
         if (stage.sessionId === sessionId || stage.completedPairs < 1 ||
             !Number.isFinite(stage.updatedAtMs)) continue;
         const eligibleAt = Math.ceil(stage.updatedAtMs + abandonedStageIdleMs);
@@ -157,7 +165,14 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
         .map(row => row.operationId));
       let manifested = 0;
       let pending = 0;
+      let attempted = 0;
+      let considered = 0;
+      let stoppedReason;
       for (const row of rows) {
+        if (replayIds && !replayIds.has(row.operationId)) continue;
+        if (maxRows !== undefined && considered >= maxRows ||
+            maxExtractionCalls !== undefined && attempted >= maxExtractionCalls) break;
+        considered++;
         const original = await readSessionCheckout(current.stateDir, row.cli, row.sessionId);
         if (original.kind !== 'bound' || original.projectId !== current.projectId ||
             original.projectRoot !== current.projectRoot) { pending++; continue; }
@@ -189,6 +204,16 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
             pending++; continue;
           }
         }
+        if (replay && (policy.route !== 'haiku' || policy.autoPublish !== true ||
+            policy.autoPublishConsent?.consentHash !== replay.consentHash ||
+            replay.ownerId !== fresh.ownerId ||
+            replay.selected.route !== policy.route ||
+            replay.selected.mode !== policy.mode ||
+            replay.selected.conversationTurns !== policy.conversationTurns ||
+            replay.selected.maxCallsPerSession !== policy.maxCallsPerSession ||
+            replay.selected.maxCandidatesPerCheckpoint !== policy.maxCandidatesPerCheckpoint)) {
+          pending++; continue;
+        }
         const automaticDaily = policy.autoPublish === true && policy.mode === 'conversation';
         const budgetLimited = automaticDaily &&
           ['extraction_call_limit', 'extract_failure_extraction_call_limit'].includes(row.lastError);
@@ -202,7 +227,7 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
         const budgetReopened = budgetLimited &&
           (await box.extractionBudget(row.cli, row.sessionId,
             policy.maxCallsPerSession ?? 4, { automaticDaily: true })).available === true;
-        if (policy.autoPublish === true && !ready.has(row.operationId) && !budgetReopened) {
+        if (!replay && policy.autoPublish === true && !ready.has(row.operationId) && !budgetReopened) {
           pending++;
           if (row.automatic === true && Number.isSafeInteger(row.retryAt)) {
             nextRetryAt = Math.min(nextRetryAt ?? Infinity, row.retryAt);
@@ -211,8 +236,9 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
         }
         let profile;
         try {
-          profile = await fs.realpath(policy.profile);
-          if (profile !== policy.profile || (await identifyProject(profile)).kind === 'git') throw new Error('profile');
+          profile = await fs.realpath(replay?.executionProfile ?? policy.profile);
+          if (profile !== (replay?.executionProfile ?? policy.profile) ||
+              (await identifyProject(profile)).kind === 'git') throw new Error('profile');
           if (process.platform === 'win32') {
             const { inspectWindowsPath } = await import('./windows-security.mjs');
             if (!(await inspectWindowsPath(profile, 'directory')).ok) throw new Error('profile');
@@ -223,13 +249,24 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
           }
         } catch { pending++; continue; }
         let result;
+        attempted++;
         const previousCwd = process.cwd();
         try {
           // This dedicated extraction child is serialized by extract.lock; the broker cwd never changes.
           if (!runCli) process.chdir(original.nativeRoot);
+          const extractionOutbox = replay ? { ...box,
+            claimExtraction: (id, limit, options) => box.claimExtraction(id, limit,
+              { ...options, replayRunId: replay.runId }),
+            recordExtractionUsage: (id, callIndex, usage, latencyMs, context) =>
+              box.recordExtractionUsage(id, callIndex, usage, latencyMs, {
+                ...context, replayRunId: replay.runId,
+                executionProfile: replay.executionProfile, frozenProfile: policy.profile }),
+          } : box;
           result = await extractCheckpoint(row, { ...policy,
+            ...(replay ? { profile: replay.executionProfile,
+              executable: replay.selected.executable } : {}),
             embeddingFingerprint: fresh.embeddingFingerprint, stateRoot }, {
-            outbox: box, runCli, contextCwd: original.nativeRoot, stateRoot });
+            outbox: extractionOutbox, runCli, contextCwd: original.nativeRoot, stateRoot });
         } finally { if (!runCli) process.chdir(previousCwd); }
         if (result.kind === 'manifested' || result.kind === 'processed') {
           manifested++;
@@ -243,6 +280,10 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
           }
         } else {
           pending++;
+          if (replay) {
+            stoppedReason = result.reason ?? result.kind;
+            break;
+          }
           if (policy.autoPublish === true && policy.autoPublishConsent &&
               ['pending', 'blocked'].includes(result.kind)) {
             if (automaticDaily && result.reason === 'extraction_call_limit' &&
@@ -268,6 +309,8 @@ export async function consumeCheckpoints({ cli, cwd, sessionId, stateRoot, runCl
         }
       }
       return { kind: 'consumed', manifested, pending,
+        ...(replay ? { runId: replay.runId, attempted,
+          ...(stoppedReason ? { stoppedReason } : {}) } : {}),
         ...(nextRetryAt === undefined ? {} : { nextRetryAt }) };
     }, 'extract.lock');
   } catch { return blocked('consumer_unavailable'); }
