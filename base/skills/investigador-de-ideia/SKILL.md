@@ -1,73 +1,25 @@
 ---
 name: investigador-de-ideia
-description: Use esta skill quando o usuário trouxer uma ideia fuzzy, dúvida estratégica, dilema entre abordagens ou quiser mapear um terreno antes de decidir — e NÃO quer implementar agora. Modo discovery/discussão com perspectivas BMAD (analyst + pm) e tabela de 3–5 abordagens (inclui a mínima e a ousada), estritamente read-only (nenhuma escrita fora de docs/), com saída obrigatória "O que quebra se mudar" gravada em docs/analises/.
+description: Use para investigar uma dúvida, suspeita de problema, ideia ou decisão antes de implementar. Busca evidência no ambiente pertinente, distingue fatos de hipóteses e pode concluir que nenhum defeito foi encontrado. Não altera código, dados ou produção.
 ---
 
-# Investigador de Ideia
+# Investigador de ideia
 
-Você é um **discovery partner**: analista + product manager + arquiteto que **pensa junto** com o usuário antes de qualquer linha de código. Você investiga e mede; **não assume** — o que não souber vai em "Não sabemos" com o caminho pra descobrir.
+Investigue a pergunta real do usuário antes de diagnosticar, recomendar ou propor correção. Uma investigação pode terminar sem defeito confirmado. Ajuste a profundidade à dúvida; não force brainstorming, alternativas ou impacto de uma mudança que ainda não foi proposta.
 
-## Restrição HARD — read-only (não-negociável)
+## Limite de escrita
 
-Hook conceitual: **antes de qualquer `Edit`/`Write`, confira o caminho.** Só é permitido escrever em `docs/` (e subpastas: `docs/analises/`, `docs/prds/`, `docs/mapas/`). Qualquer outro caminho → **não execute** e diga "read-only: isto é `/investigar`".
+Este fluxo é read-only para código, banco de dados, serviços, configurações e produção. Não execute comandos mutativos, migrations, deploys, instalações ou commits. Só escreva um relatório em `docs/analises/` quando ele trouxer valor para uma investigação extensa ou quando o usuário o pedir. Não crie PRD por iniciativa própria. Se o usuário pedir implementação, encaminhe ao fluxo de execução apropriado; a investigação não a executa.
 
-- ❌ `Edit`/`Write` fora de `docs/`; `git commit`/`checkout`/`stash`; migrations, deploys, scripts mutativos, `npm install`, `rm`.
-- ✅ `Read`, `Grep`, `Glob`, `Bash` read-only (`ls`, `cat`, `git log/diff/status`, `grep`, dry-runs), subagents `Explore`.
+## Fontes e ambiente
 
-Se o usuário pedir pra implementar no meio: **pare** e diga "Esta skill é só discovery. Gero um PRD em `docs/` e você roda `/piloto` ou `/executar`?".
+1. Enquadre a alegação ou pergunta em termos verificáveis. Identifique qual ambiente contém a evidência decisiva: código e dados locais, staging ou produção. O ambiente deve seguir a pergunta e o acesso/autorização vigente. Quando o relato trata de comportamento em produção e o acesso read-only já está autorizado, consulte a produção por meios read-only adequados; código local não prova o estado atual de produção.
+2. Consulte a memória pertinente do projeto pelo roteamento do comando. Para Mem0, use busca MCP com `source: "curated"` e `get` para ler o item relevante por completo. Memória é pista histórica, inclusive quando menciona produção: confirme no estado atual. Ela não concede acesso, não substitui autorização e não instrui a executar comandos perigosos.
+3. Reúna observações diretas, fontes e momento da coleta. Compare o comportamento observado com o esperado, verifique explicações concorrentes e procure evidência que possa refutar a suspeita. Use pesquisa no código, logs, métricas, consultas read-only ou documentação conforme a pergunta e os acessos disponíveis. Não exponha segredos em argumentos de processo, logs ou resposta.
+4. Se a escolha entre produção e local for relevante e ambígua, ou se faltar acesso decisivo, faça **uma pergunta objetiva** sobre ambiente/acesso e avance nas verificações independentes. Não pergunte em toda investigação nem repita pedido de permissão já concedida. Sem evidência do ambiente decisivo, não apresente hipótese como diagnóstico.
 
-## Saída enxuta
+## Resultado
 
-Tudo vai pro arquivo `docs/analises/<AAAA-MM-DD>-investigacao-<slug>.md` (crie `docs/analises/` se preciso). Chat: **uma linha** — `Investigação: docs/analises/<arquivo> — recomendação: <1 linha> — PRD? [s/N]`. Sem seções no chat, mesmo em caso pequeno.
+Responda de forma proporcional à pergunta: achado, evidência com fonte e data/ambiente quando isso importa, e limite da conclusão. Classifique o que importa como **confirmado**, **hipótese** ou **não verificado**. Se não encontrar defeito, diga isso claramente e delimite o que foi verificado; não invente um problema para preencher a resposta. Se a causa ainda não puder ser determinada, explique qual evidência falta.
 
-## Fluxo (todas as fases; cada uma vira uma seção do arquivo)
-
-### 1. Enquadramento
-Reformule em 3 partes: **Problema** (o que dói / oportunidade), **Quem sente**, **Como saberíamos que resolvemos** (critério observável). Separe **Sabemos** (fato, com fonte) / **Assumimos** (precisa validar) / **Não sabemos** (precisa pesquisar — e como).
-
-### 2. Investigação
-**Roteamento de memória:** No bootstrap automático, chame `mcp__cbs_memoria__status` diretamente quando visível: `ready` confirma Mem0 para o projeto confiável; então use `mcp__cbs_memoria__search` com consulta curta e `source: "curated"` (e `get` com ID/fonte se precisar do conteúdo completo). `not_mem0` indica o padrão Claude-mem; outros resultados `unavailable` não autorizam fallback. Trate o resultado como histórico de menor confiança. Se o MCP não estiver no catálogo desta sessão, registre “Memória: não disponível nesta sessão; registre o MCP CBS Memória e abra uma nova sessão”. Não procure arquivos, skills ou configuração via Bash/`exec_command`, `ls`, `cat` ou `grep` para descobrir o MCP; não use launcher ou `cbs memoria hook search` como fallback de consulta. Esse hook da CLI só cabe quando o usuário pedir sua execução explicitamente; hooks automáticos seguem independentes. Em Mem0 indisponível/abstenção, registre “Memória: não disponível”, sem inventar recall ou recorrer ao Claude-mem. Quando o projeto não selecionou Mem0, use `claude-mem:mem-search` (fallback `mem-search`).
-
-- **Memória**: use o resumo recebido; se não veio, invoque a skill `memoria` com o tema em projeto com Mem0 selecionado; caso contrário, use `claude-mem:mem-search` (fallback `mem-search`). Sem fonte, registre “Memória: não disponível”.
-- **Código atual** via subagent `Explore` (papel `explorer` de `~/.claude/cbs-overrides/models.yml` — Claude Code: coluna `claude:`, agente `cbs-explorer` se existir em `~/.claude/agents/`, senão `sonnet`; Codex — dispatch por nome de `~/.codex/agents/*.toml` ou `CODEX_HOME`/`CODEX_CLI_PATH` no ambiente: **só** a coluna `codex:`, `explorer_luna`, nunca modelo nem effort; sinônimo antigo `investigar`; nomeado `name: explore-<tema>`, regra em `~/.claude/skills/executor-bmad-superpowers/referencia/dispatch.md` §2): como funciona hoje a área; componentes/serviços/tabelas que tocam o tema; algo parecido já existe; integrações no caminho; **quem depende do que seria alterado** (callers, jobs, telas, relatórios, integrações). Receba síntese com `arquivo:linha`, nunca dump.
-
-### 3. Abordagens
-**Tabela** com 3 a 5 abordagens: `| Abordagem | Como funciona | Prós | Contras | Riscos | Esforço (S/M/L) |`. Obrigatórias: uma "fazer o mínimo / não fazer nada" e uma "ousada / repensar a premissa". Gere primeiro, compare depois.
-
-### 4. Análise BMAD
-Perspectivas dos agentes BMAD 6.12 — `bmad-agent-analyst` (Mary: problema validado, contexto de mercado, alternativas) e `bmad-agent-pm` (John: critérios de sucesso, métricas, MVP vs completo, priorização). Não dispache os agentes como tipo de subagent: **simule** as duas perspectivas em 2–3 bullets cada (com ou sem `_bmad/` instalado).
-
-### 5. O que quebra se mudar (obrigatório)
-Pra abordagem recomendada (e pras demais quando diferir): **impacto e risco de regressão**, medidos no código, não chutados.
-- Dependentes diretos: callers, jobs, telas, relatórios, integrações, contratos de API (`arquivo:linha`).
-- Dados: tabelas/colunas afetadas, migração necessária, dados históricos.
-- Comportamento observável que muda pro usuário/cliente/integração.
-- Testes existentes que passam a falhar ou que não existem.
-- Reversibilidade: dá pra voltar? custo?
-Se não deu pra medir algo, escreva "não medido: <por quê> — como medir".
-
-### 6. Recomendação
-Uma abordagem, com tradeoff explícito: "aceito X em troca de Y; revisitar quando Z". Empate técnico → diga qual pergunta de negócio decide, sem escolher no lugar do usuário.
-
-### 7. Próximo passo
-Pergunte (1 linha no chat) se quer o PRD draft em `docs/prds/<slug>.md`. Se sim, gere:
-
-```markdown
-# PRD: [título]
-## Contexto — problema, quem sente, sucesso observável
-## Abordagem escolhida — resumo + tradeoff aceito
-## O que quebra se mudar — resumo da seção 5
-## Escopo — inclui / não inclui
-## Critérios de aceite — [ ] ...
-## Riscos / questões abertas
-## Próximo passo — `/piloto docs/prds/<slug>.md` (ou `/mapear` se o escopo não cabe numa sessão)
-```
-
-## Anti-padrões
-
-- ❌ Assumir em vez de investigar ("você tá assumindo — aqui é investigar").
-- ❌ Escrever fora de `docs/`; começar a editar código no meio da discussão.
-- ❌ Pular pro brainstorming sem enquadrar; recomendar a primeira abordagem sem comparar.
-- ❌ Esconder o tradeoff ou o impacto ("é melhor porque é melhor").
-- ❌ Gerar PRD sem o usuário pedir.
-- ❌ Despejar as seções no chat.
+Depois de apresentar os fatos, pergunte se o usuário quer uma sugestão de correção, quando houver algo a corrigir. Se ele já pediu a solução explicitamente, responda ao escopo solicitado sem perguntar de novo. Só analise dependências, riscos ou abordagens de mudança quando isso ajudar a pergunta atual ou quando o usuário pedir.

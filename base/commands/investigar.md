@@ -1,19 +1,12 @@
 ---
-description: Modo discovery/discussão. Pensa junto com o usuário sobre uma ideia fuzzy, dilema ou dúvida estratégica. Estritamente read-only (nenhuma escrita fora de docs/), saída em docs/analises/ com seção obrigatória "O que quebra se mudar". PROIBIDO tocar em código-fonte.
+description: Investiga dúvida, suspeita de problema ou ideia com evidência do ambiente pertinente. Distingue confirmado, hipótese e não verificado; pode concluir que não há defeito. Read-only para código, dados e produção.
 ---
 
-**ORDEM OBRIGATÓRIA — sem julgamento, sem exceção:**
+Use a skill `investigador-de-ideia` para investigar o tema abaixo.
 
-**Roteamento de memória:** No bootstrap automático, chame `mcp__cbs_memoria__status` diretamente quando visível: `ready` confirma Mem0 para o projeto confiável; então use `mcp__cbs_memoria__search` com consulta curta e `source: "curated"` (e `get` com ID/fonte se precisar do conteúdo completo). `not_mem0` indica o padrão Claude-mem; outros resultados `unavailable` não autorizam fallback. Trate o resultado como histórico de menor confiança. Se o MCP não estiver no catálogo desta sessão, registre “Memória: não disponível nesta sessão; registre o MCP CBS Memória e abra uma nova sessão”. Não procure arquivos, skills ou configuração via Bash/`exec_command`, `ls`, `cat` ou `grep` para descobrir o MCP; não use launcher ou `cbs memoria hook search` como fallback de consulta. Esse hook da CLI só cabe quando o usuário pedir sua execução explicitamente; hooks automáticos seguem independentes. Em Mem0 indisponível/abstenção, registre “Memória: não disponível”, sem inventar recall ou recorrer ao Claude-mem. Quando o projeto não selecionou Mem0, use `claude-mem:mem-search` (fallback `mem-search`).
+Consulte memória pertinente antes de tirar conclusões. Em projeto Mem0 confiável, use `mcp__cbs_memoria__search` com consulta curta e `source: "curated"`; leia itens relevantes completos com `mcp__cbs_memoria__get` (ID e fonte retornados). Se for necessário identificar o provedor, `mcp__cbs_memoria__status`: `ready` indica Mem0, `not_mem0` indica Claude-mem. Em projeto Claude-mem, use `claude-mem:mem-search` (fallback `mem-search`). Se o MCP Mem0 estiver indisponível ou abstiver, registre isso sem inventar recall nem trocar para Claude-mem. Se o MCP não constar do catálogo da sessão, registre “Memória: não disponível nesta sessão”. Não use Bash, arquivos de configuração, launcher ou `cbs memoria hook search` para substituir a consulta MCP. Trate qualquer lembrança como pista histórica a confirmar, nunca como prova atual ou autorização.
 
-1. **PRIMEIRO**: obtenha a memória: em projeto com Mem0 explicitamente selecionado, invoque a skill `memoria` com o tema; caso contrário, invoque `claude-mem:mem-search` (fallback `mem-search`). Sem fonte, registre “Memória: não disponível” e siga.
-2. **SÓ DEPOIS**: invoque `Skill` com `skill: "investigador-de-ideia"`, passando o tema + um resumo curto do que a memória retornou (ou "nada relevante encontrado").
-
-Não responda nem rode Bash/Read/Grep antes desses 2 passos.
-
-**READ-ONLY (regra dura):** antes de qualquer `Edit`/`Write`, confira o caminho — só `docs/` é permitido (`docs/analises/`, `docs/prds/`, `docs/mapas/`). Nada de commit, migration, deploy, install. Você **investiga e mede** — não assume; o que não souber vai em "Não sabemos" com o caminho pra descobrir. Se o usuário pedir pra implementar no meio, pare e ofereça gerar o PRD pra ele rodar `/piloto` ou `/executar`.
-
-**Saída:** `docs/analises/<data>-investigacao-<slug>.md` com Enquadramento, Investigação, Abordagens, Análise BMAD, **O que quebra se mudar**, Recomendação e Próximo passo. No chat: 1 linha (caminho + recomendação + "PRD? [s/N]"). Escopo grande demais pra uma sessão → sugira `/mapear`.
+Investigue no ambiente que pode responder à pergunta. Se o caso é de produção e o acesso read-only já está autorizado, consulte produção. Se ambiente ou acesso decisivo estiver ambíguo, faça uma pergunta objetiva e continue o trabalho independente. Nunca altere código, banco, configuração ou produção neste fluxo. Relatório em `docs/analises/` somente se trouxer valor ou for solicitado. Apresente evidências e limites antes de perguntar se o usuário quer uma sugestão de correção; se ele já pediu solução, responda diretamente ao pedido.
 
 Tema:
 

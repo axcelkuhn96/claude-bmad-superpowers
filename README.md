@@ -87,7 +87,7 @@ cbs status
 
 | Você tem... | Use | O que acontece |
 |---|---|---|
-| Ideia fuzzy, dúvida estratégica | `/investigar <tema>` | Pensa junto, mapeia o código, brainstorm, **"o que quebra se mudar"**, recomenda. Grava em `docs/analises/`. **Estritamente read-only.** |
+| Dúvida, suspeita de problema ou ideia a investigar | `/investigar <tema>` | Busca evidência no ambiente pertinente, distingue fato de hipótese e pode concluir que não há defeito. Read-only; relatório em `docs/analises/` só quando útil ou solicitado. |
 | Trabalho grande demais pra 1 sessão | `/mapear <ideia>` | Cartografa um mapa de decisões em `docs/mapas/`, resolve ticket por ticket (wayfinder). O `/investigar` e a grelha do `/piloto` encaminham pra cá. **Não toca em código.** |
 | Quer stress-testar um plano/decisão | `/grelhar <tema>` | Interrogatório, uma pergunta por vez **no seletor do CLI**, até entendimento compartilhado. Roda por dentro do `/piloto`. **Não implementa.** |
 | Ideia clara mas crua | `/refinar <ideia>` | Alias de `/piloto --so-refinar`: grelha + prompt premium em `docs/prompts/`, sem executar |
@@ -163,10 +163,10 @@ O executor repassa isso ao `subagent-driven-development` como override da seçã
 ## Como o pipeline funciona
 
 ```
-/investigar  →  discovery (read-only, só escreve em docs/)
-                mem-search → enquadra → Explore subagent → abordagens →
-                análise BMAD (analyst/pm) → O QUE QUEBRA SE MUDAR →
-                recomendação → docs/analises/<data>-investigacao-<slug>.md → opcional PRD
+/investigar  →  investigação read-only
+                memória pertinente → evidência no ambiente adequado →
+                confirmado / hipótese / não verificado → limites da conclusão →
+                pergunta se quer sugestão de correção, quando cabível
 
 /mapear      →  discovery de escopo grande (sem código)
                 mem-search → nomeia destino (grelhar) → mapa de decisões em
@@ -222,27 +222,20 @@ O executor repassa isso ao `subagent-driven-development` como override da seçã
 ## Exemplo de fluxo real
 
 ```text
-você: /investigar vale a pena adicionar régua de cobrança pós-vencimento?
+você: /investigar a cobrança pós-vencimento está falhando em produção?
 
-claude: Investigação: docs/analises/2026-09-10-investigacao-regua.md — recomendação: job diário
-        + templates por faixa (quebra: relatório X e webhook Y) — PRD? [s/N]
+claude: Não encontrei falha nos eventos consultados em produção entre 9h e 10h;
+        o caso do cliente citado ainda não foi verificado. Quer que eu investigue esse caso?
 
-você: s
+você: sim, e sugira uma correção se confirmar a falha
 
-claude: PRD: docs/prds/regua-pos-vencimento.md
+claude: Falha confirmada no caso citado: [evidência]. A causa provável é [hipótese];
+        sugiro [correção], sujeita à verificação [pendente].
 
-você: /piloto --auto docs/prds/regua-pos-vencimento.md
+você: /refinar essa correção
 
-claude: modo: auto
-        Grelha fechada: 4 decisões (SUPOSIÇÃO)
-        Prompt: docs/prompts/2026-09-10-regua.md — tipo regra-de-negocio+ui, domínios laravel+database; frontend
-        Fase 1 — intake ok — branch feat/regua, models sonnet/opus/opus
-        Fase 3 — 2 stories, 5 tasks — docs/superpowers/plans/2026-09-10-regua.md
-        Fase 5 — task 1/5 ok — commits a1b2c3d..d4e5f6a
-        ...
-        Fase 6 — revisão: 2 achados (🔴 0) — docs/analises/2026-09-10-revisao-regua.md
-        Fase 7 — entrega: testes 41/41 — docs/analises/2026-09-10-entrega-regua.md — aguardando opção de integração
-        1. Merge em main  2. Push + PR  3. Manter a branch
+claude: Prompt: docs/prompts/2026-09-10-regua.md
+
 ```
 
 ---
@@ -251,7 +244,7 @@ claude: modo: auto
 
 - **`refinador-de-prompt`** — transforma ideia crua em prompt premium (tags XML) gravado em `docs/prompts/`. Usa a memória e um subagent Explore, classifica o **tipo de tarefa** (`regra-de-negocio` | `operacional` | `ui` — define a política de teste do executor) e os **domínios previstos**, pergunta só dúvidas **bloqueantes** (uma por vez), e fecha com um único gate (`ok` / ajuste). Etapa interna do `/piloto`; `/refinar` e `/refinar-auto` são aliases.
 
-- **`investigador-de-ideia`** — modo discovery/discussão, **estritamente read-only** (só escreve em `docs/`; confere o caminho antes de qualquer Edit/Write). Enquadramento → investigação (Explore) → 3-5 abordagens → análise BMAD (analyst/pm) → **"O que quebra se mudar"** (dependentes, dados, testes, reversibilidade — medidos no código) → recomendação → opcional PRD. Saída em `docs/analises/`.
+- **`investigador-de-ideia`** — investiga dúvidas, suspeitas e ideias com evidência do ambiente pertinente. Classifica confirmado, hipótese e não verificado, inclusive quando não encontra defeito. Read-only para código, dados e produção; relatório em `docs/analises/` só quando útil ou solicitado.
 
 - **`executor-bmad-superpowers`** — orquestrador que **não implementa inline**. Modo `--auto`, `models.yml`, branch `feat/<slug>` se estava em main. Stories BMAD → `writing-plans` → roteamento por domínio e tipo por task → `subagent-driven-development` com personas **por caminho** → `revisor` como gate final condicional → `verification-before-completion` → entrega em `docs/analises/` → `finishing-a-development-branch`. Tabelas e templates em `referencia/` (roteamento, dispatch, persona-dev, entrega).
 
@@ -365,9 +358,9 @@ Um ensaio local isolado completou o ciclo automático em ambas as CLIs: hooks ca
 
 ## BMAD + Superpowers: sempre juntos
 
-BMAD e Superpowers **rodam sempre em conjunto**, em camadas — não são alternativas e não há flag pra desligar:
+Na execução, BMAD e Superpowers **rodam em conjunto**, em camadas — não são alternativas e não há flag pra desligar:
 
-1. **Discovery** (`/investigar`) — perspectivas dos agentes `bmad-agent-analyst` (Mary) e `bmad-agent-pm` (John), simuladas em bullets.
+1. **Investigação** (`/investigar`) — apura fatos e limites antes de recomendar ou propor mudança.
 2. **Execução** (`/executar`, `/piloto`) — BMAD gera as stories antes do plano, e a persona dev é lida por cada implementer do Superpowers.
 
 ### Como BMAD entra sem virar uma persona solta
