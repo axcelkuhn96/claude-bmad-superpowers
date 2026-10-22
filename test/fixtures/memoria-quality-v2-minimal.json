@@ -1,0 +1,42 @@
+{
+  "version": 2,
+  "revision": "2.1.1",
+  "cases": [
+    {
+      "id": "synthetic-two-relevant",
+      "split": "dev",
+      "query": "Onde estão ALPHA_42 e BETA_42?",
+      "projectId": "synthetic-project",
+      "source": {
+        "cli": "codex",
+        "path": "synthetic/session.jsonl",
+        "session_id": "synthetic-session",
+        "message_id": "synthetic-message",
+        "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "excerpt": "Onde estão ALPHA_42 e BETA_42?",
+        "origin": "human"
+      },
+      "expected": { "relevant_ids": ["a", "b"], "abstain": false, "reason": "Dois itens sintéticos são relevantes." },
+      "tags": ["exact_identifier"],
+      "adjudication": { "source": "agent_reviewed", "independent_review": "reviewed" }
+    },
+    {
+      "id": "synthetic-abstain",
+      "split": "holdout",
+      "query": "Existe GAMMA_99?",
+      "projectId": "synthetic-project",
+      "source": {
+        "cli": "claude",
+        "path": "synthetic/session.jsonl",
+        "session_id": "synthetic-session",
+        "message_id": "synthetic-other-message",
+        "source_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "excerpt": "Existe GAMMA_99?",
+        "origin": "human"
+      },
+      "expected": { "relevant_ids": [], "abstain": true, "reason": "Nenhum item sintético é relevante." },
+      "tags": ["abstention"],
+      "adjudication": { "source": "agent_reviewed", "independent_review": "reviewed" }
+    }
+  ]
+}

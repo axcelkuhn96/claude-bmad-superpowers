@@ -54,6 +54,39 @@ export function validateMemoryCorpus(corpus) {
   return true;
 }
 
+// V2 is a retrieval corpus. Its source labels describe agent review, not human
+// verification of the underlying claim or of any extracted memory.
+export function validateMemoryCorpusV2(corpus) {
+  if (!corpus || corpus.version !== 2 || !Array.isArray(corpus.cases) ||
+      corpus.cases.length < 1 || corpus.cases.length > 100 ||
+      byteSize(corpus) > CORPUS_LIMIT ||
+      !unique(corpus.cases.map(item => item?.id))) return false;
+  for (const entry of corpus.cases) {
+    const source = entry?.source;
+    const expected = entry?.expected;
+    const review = entry?.adjudication;
+    if (!nonEmpty(entry?.id) || !['dev', 'holdout'].includes(entry.split) ||
+        !nonEmpty(entry.query) || Buffer.byteLength(entry.query, 'utf8') > 2048 ||
+        !nonEmpty(entry.projectId) || !source ||
+        !['claude', 'codex'].includes(source.cli) ||
+        !nonEmpty(source.path) || !nonEmpty(source.session_id) ||
+        !nonEmpty(source.message_id) || !validSha(source.source_sha256) ||
+        !nonEmpty(source.excerpt) || Buffer.byteLength(source.excerpt, 'utf8') > 4096 ||
+        containsSecret(source.excerpt) || containsSecret(entry.query) ||
+        !expected || !Array.isArray(expected.relevant_ids) ||
+        !unique(expected.relevant_ids) ||
+        expected.relevant_ids.some(id => !nonEmpty(id)) ||
+        typeof expected.abstain !== 'boolean' ||
+        expected.abstain !== (expected.relevant_ids.length === 0) ||
+        !nonEmpty(expected.reason) ||
+        !Array.isArray(entry.tags) || !entry.tags.every(nonEmpty) ||
+        !review || !['agent_proposed', 'agent_reviewed', 'human'].includes(review.source) ||
+        review.source === 'agent_reviewed' && review.independent_review !== 'reviewed' ||
+        review.source === 'human' && !validSha(review.human_review_receipt_sha256)) return false;
+  }
+  return true;
+}
+
 function validateRun(run) {
   if (run === undefined) return true;
   if (!run || typeof run !== 'object' || Array.isArray(run) ||
@@ -120,7 +153,7 @@ async function loadJson(file, limit, label, validate) {
 }
 
 export const loadMemoryCorpus = file => loadJson(file, CORPUS_LIMIT, 'corpus',
-  validateMemoryCorpus);
+  value => validateMemoryCorpus(value) || validateMemoryCorpusV2(value));
 export const loadMemoryOutputs = file => loadJson(file, OUTPUTS_LIMIT, 'outputs',
   validateMemoryOutputs);
 
@@ -162,6 +195,37 @@ const ratio = (count, denominator) => ({ count, denominator });
 // This analyzes supplied extractor output only. Adjudication is a declaration in
 // the input file; the evaluator cannot establish its author or semantic accuracy.
 export function evaluateMemoryOutputs(corpus, outputs, { split = 'all' } = {}) {
+  if (corpus?.version === 2) {
+    if (!validateMemoryCorpusV2(corpus)) fail('invalid_corpus');
+    if (!validateMemoryOutputs(outputs)) fail('invalid_outputs');
+    if (!['all', 'dev', 'holdout'].includes(split)) fail('invalid_split');
+    const selected = corpus.cases.filter(entry => split === 'all' || entry.split === split);
+    const ids = new Set(corpus.cases.map(entry => entry.id));
+    if (outputs.results.some(item => !ids.has(item.case_id))) fail('unknown_case');
+    const submitted = outputs.results.filter(item => selected.some(entry => entry.id === item.case_id));
+    const usage = { provided_cases: 0, input_tokens: null, output_tokens: null,
+      duration_ms: null, cost_usd: null,
+      field_cases: { input_tokens: 0, output_tokens: 0, duration_ms: 0, cost_usd: 0 } };
+    for (const item of submitted) {
+      if (!item.usage) continue;
+      usage.provided_cases++;
+      for (const key of Object.keys(usage.field_cases)) {
+        if (item.usage[key] === undefined) continue;
+        usage[key] = (usage[key] ?? 0) + item.usage[key];
+        usage.field_cases[key]++;
+      }
+    }
+    const labelStatus = selected.some(entry => entry.adjudication.source === 'agent_proposed') ?
+      'agent_proposed_provisional' : 'agent_reviewed_provisional';
+    return { version: 2, split, corpus_sha256: sha256(JSON.stringify(corpus)),
+      outputs_sha256: sha256(JSON.stringify(outputs)),
+      assessment_scope: 'supplied_extractor_outputs_without_v2_curation_truth',
+      label_status: labelStatus,
+      coverage: { selected: selected.length, submitted: submitted.length, adjudicated: 0 },
+      semantic: { status: 'unmeasured', false_save: null, missed_durable: null,
+        duplicate: null, correction_retention: null, scope_error: null, type_error: null },
+      usage };
+  }
   if (!validateMemoryCorpus(corpus)) fail('invalid_corpus');
   if (!validateMemoryOutputs(outputs)) {
     if (outputs?.results?.some(item => !validateUsage(item?.usage))) fail('invalid_usage');
