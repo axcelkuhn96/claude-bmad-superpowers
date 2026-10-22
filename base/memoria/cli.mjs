@@ -16,7 +16,7 @@ import { administrativeSession, assertWriter, bootstrapWriter, beginWriterTransf
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const help = `Uso: cbs memoria <ação> [opções]
-Ações: avaliar, status, check, indexar-texto, provision, activate, launch, review-correct, deactivate,
+Ações: avaliar, status, check, indexar-texto, exportar, historico, provision, activate, launch, review-correct, deactivate,
        owner-register, extractor-select, extractor-schedule,
        auto-publish-enable, auto-publish-disable,
        writer-device, writer-bootstrap,
@@ -65,6 +65,29 @@ export async function main(args = []) {
   }
   const project = value(rest, '--project');
   if (!project || project.startsWith('--')) { process.stderr.write(help); return 2; }
+  if (action === 'exportar' || action === 'historico') {
+    const target = value(rest, action === 'exportar' ? '--output' : '--snapshot');
+    const id = value(rest, '--id');
+    const cli = value(rest, '--cli');
+    const profile = value(rest, '--profile');
+    const allowed = action === 'exportar' ? ['--project', '--output', '--cli', '--profile']
+      : ['--project', '--snapshot', '--id', '--cli', '--profile'];
+    if (!path.isAbsolute(project) || !target || !path.isAbsolute(target) ||
+        action === 'historico' && !id || cli && !['claude', 'codex'].includes(cli) ||
+        profile && (!cli || !path.isAbsolute(profile)) ||
+        rest.length % 2 || rest.some((arg, index) => index % 2 === 0 && !allowed.includes(arg))) return 2;
+    try {
+      const { exportProject, historyProject } = await import('./export.mjs');
+      const options = { cli, profile };
+      const result = action === 'exportar' ? await exportProject(project, target, options)
+        : await historyProject(project, target, id, options);
+      process.stdout.write(JSON.stringify(result) + '\n');
+      return 0;
+    } catch (error) {
+      process.stdout.write(`blocked: ${error.code ?? 'export_failed'}\n`);
+      return 1;
+    }
+  }
   if (action === 'indexar-texto') {
     if (rest.length !== 2 || rest[0] !== '--project' || !path.isAbsolute(project)) return 2;
     const result = await indexTextProject(project);

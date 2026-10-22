@@ -608,6 +608,41 @@ def validate_curated_payload(point, project: str, owner: str | None,
                if purpose == 'history' else {})}
 
 
+def history_page(client, collection: str, project: str, owner: str | None,
+                 offset: str | None, limit: int = 64) -> dict:
+    """One bounded Qdrant page; invalid records still consume the scan budget."""
+    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+    if type(limit) is not int or not 1 <= limit <= 64:
+        raise ValueError('page_limit_invalid')
+    if offset is not None:
+        offset = str(uuid.UUID(offset))
+    points, next_offset = client.scroll(collection_name=collection,
+        scroll_filter=Filter(must=[
+            FieldCondition(key='project_id', match=MatchValue(value=project)),
+            FieldCondition(key='user_id', match=MatchValue(value=project)),
+            FieldCondition(key='status', match=MatchAny(any=['active', 'superseded']))]),
+        limit=limit, offset=offset, with_payload=True, with_vectors=False)
+    if len(points) > limit:
+        raise ValueError('page_limit_exceeded')
+    items = [row for point in points
+             if (row := validate_curated_payload(point, project, owner, 'history')) is not None]
+    result = {'kind': 'page', 'items': items, 'scanned': len(points),
+              'nextOffset': str(next_offset) if next_offset is not None else None}
+    if len(json.dumps(result, ensure_ascii=False).encode('utf-8')) > 4 * 1024 * 1024:
+        raise ValueError('page_oversized')
+    return result
+
+
+def history_get(client, collection: str, project: str, owner: str | None,
+                identifier: str) -> dict:
+    identifier = str(uuid.UUID(identifier))
+    points = client.retrieve(collection_name=collection, ids=[identifier],
+                             with_payload=True, with_vectors=False)
+    row = validate_curated_payload(points[0], project, owner, 'history') if len(points) == 1 else None
+    return {'kind': 'item', 'item': row} if row and row['qdrantId'] == identifier else \
+        {'kind': 'blocked', 'reason': 'source_unavailable'}
+
+
 def _text_index_present(client, collection: str) -> bool:
     schema = (client.get_collection(collection).payload_schema or {}).get('data')
     if schema is None:
@@ -810,6 +845,12 @@ def execute(request: dict, client, state: Path) -> dict:
     op = request['op']
     if op == 'index_text':
         return ensure_text_index(client, collection)
+    if op == 'history_page':
+        return history_page(client, collection, project, request.get('ownerId'),
+                            request.get('offset'), request.get('limit', 64))
+    if op == 'history_get':
+        return history_get(client, collection, project, request.get('ownerId'),
+                           request['memoryId'])
     memory = _memory(client, collection, state, request['connection'], history_db_path=':memory:') \
         if op == 'search' else _memory(client, collection, state, request['connection'])
     if op == 'find':
