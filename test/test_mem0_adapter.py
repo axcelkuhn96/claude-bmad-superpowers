@@ -765,6 +765,49 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(result['vector_degradation'], 'vector_saturated')
         self.assertEqual(top_ks, [20, 40, 80, 160, 320, 640, 1280, 2048])
 
+    def test_search_saturation_preserves_partial_vector_prefix_without_lexical(self):
+        bad = {'projectId': 'p', 'status': 'active', 'score': .9, 'sdkId': 'bad', 'metadata':
+               {'source': 's', 'actor': 'a', 'scope': 'personal', 'owner_id': 'other'}}
+        good = {'projectId': 'p', 'status': 'active', 'score': .9, 'sdkId': 'good', 'metadata':
+                {'source': 's', 'actor': 'a', 'scope': 'project'}}
+        rows = [bad] * 2047 + [good]
+        class Memory:
+            embedding_model = object()
+            def search(self, query, *, filters, top_k, threshold):
+                return {'results': rows[:top_k]}
+        with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_memory', return_value=Memory()), \
+             patch.object(adapter, '_row', side_effect=lambda row, *args: row), \
+             patch.object(adapter, 'lexical_candidates', return_value={
+                 'kind': 'vector_only', 'reason': 'index_missing', 'items': []}):
+            result = adapter.execute({'op': 'search', 'collection': 'c', 'projectId': 'p',
+                'connection': {}, 'query': 'fact'}, None, Path('/tmp'))
+        self.assertEqual(result['kind'], 'items')
+        self.assertEqual([row['sdkId'] for row in result['items']], ['good'])
+        self.assertEqual([row['retrievalEvidence']['vectorRank'] for row in result['items']], [1])
+        self.assertEqual(result['vector_degradation'], 'vector_saturated')
+        self.assertEqual(result['lexical_degradation'], 'index_missing')
+
+    def test_search_saturation_preserves_nineteen_vectors_before_lexical(self):
+        bad = {'projectId': 'p', 'status': 'active', 'score': .9, 'sdkId': 'bad', 'metadata':
+               {'source': 's', 'actor': 'a', 'scope': 'personal', 'owner_id': 'other'}}
+        good = [{'projectId': 'p', 'status': 'active', 'score': .9, 'sdkId': f'good-{i}', 'metadata':
+                 {'source': 's', 'actor': 'a', 'scope': 'project'}} for i in range(19)]
+        rows = [bad] * 2029 + good
+        lexical = {'kind': 'items', 'items': [{'sdkId': 'lex', 'scoreSource': 'lexical_verified'}]}
+        class Memory:
+            embedding_model = object()
+            def search(self, query, *, filters, top_k, threshold):
+                return {'results': rows[:top_k]}
+        with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_memory', return_value=Memory()), \
+             patch.object(adapter, '_row', side_effect=lambda row, *args: row), \
+             patch.object(adapter, 'lexical_candidates', return_value=lexical):
+            result = adapter.execute({'op': 'search', 'collection': 'c', 'projectId': 'p',
+                'connection': {}, 'query': 'ERR42'}, None, Path('/tmp'))
+        self.assertEqual(result['kind'], 'items')
+        self.assertEqual([row['sdkId'] for row in result['items']], [f'good-{i}' for i in range(19)])
+        self.assertEqual(result['lexical_items'], lexical['items'])
+        self.assertEqual(result['vector_degradation'], 'vector_saturated')
+
     def test_reconciliation_includes_expired_sdk_rows_and_rejects_expiration_on_add(self):
         class Memory:
             def get_all(self, **kwargs):

@@ -137,6 +137,43 @@ test('private per-session state selects ended newest and receipt is separate fro
   assert.notEqual((await prepareHandoff(state, { ...a, now: at })).sourceSessionId, 'source-a');
 });
 
+test('older ended session without safe handoff does not suppress newer safe source', async t => {
+  const { state, identity } = await fixture(t);
+  const old = await identity('old');
+  const newer = await identity('newer');
+  const target = await identity('target');
+  await saveHandoff(state, { identity: old, event: 'SessionEnd', at: '2026-10-22T11:50:00.000Z' });
+  await record(state, newer, [msg('human', 'Quero continuar o plano.')],
+    'SessionEnd', '2026-10-22T11:55:00.000Z');
+  const selected = await loadHandoff(state, { ...target, now: at });
+  assert.equal(selected.kind, 'selected');
+  assert.equal(selected.sourceSessionId, 'newer');
+});
+
+test('older active competitor still blocks newer safe handoff', async t => {
+  const { state, identity } = await fixture(t);
+  const old = await identity('old');
+  const newer = await identity('newer');
+  const target = await identity('target');
+  await saveHandoff(state, { identity: old, event: 'UserPromptSubmit',
+    at: '2026-10-22T11:57:00.000Z' });
+  await record(state, newer, [msg('human', 'Quero continuar o plano.')],
+    'SessionEnd', '2026-10-22T11:59:00.000Z');
+  assert.equal((await loadHandoff(state, { ...target, now: at })).reason, 'active_competitor');
+});
+
+test('newest ended session without safe handoff abstains instead of using older source', async t => {
+  const { state, identity } = await fixture(t);
+  const old = await identity('old');
+  const newer = await identity('newer');
+  const target = await identity('target');
+  await record(state, old, [msg('human', 'Quero continuar o plano.')],
+    'SessionEnd', '2026-10-22T11:50:00.000Z');
+  await saveHandoff(state, { identity: newer, event: 'SessionEnd',
+    at: '2026-10-22T11:55:00.000Z' });
+  assert.equal((await loadHandoff(state, { ...target, now: at })).reason, 'no_safe_handoff');
+});
+
 test('active competitor, equal candidates, changed owner and expired history abstain without deletion', async t => {
   const { state, identity } = await fixture(t);
   const a = await identity('a');

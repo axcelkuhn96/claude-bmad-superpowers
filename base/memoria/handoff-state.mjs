@@ -297,13 +297,13 @@ export async function loadHandoff(stateDir, identity) {
     const age = now - Date.parse(row.at);
     if (age < 0 || age > TTL) continue;
     if (!terminal.has(row.event) && age < IDLE) return blocked('active_competitor');
-    if (!row.handoff) return blocked('no_safe_handoff');
     eligible.push({ ...row, age });
   }
   if (!eligible.length) return blocked('no_eligible_source');
   eligible.sort((a, b) => a.age - b.age);
   if (eligible.length > 1 && eligible[0].age === eligible[1].age) return blocked('tie');
   const chosen = eligible[0];
+  if (!chosen.handoff) return blocked('no_safe_handoff');
   try {
     const head = await git(identity.nativeRoot, 'rev-parse', 'HEAD');
     if (chosen.identity.branch === null) {

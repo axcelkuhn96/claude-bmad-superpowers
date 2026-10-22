@@ -954,13 +954,16 @@ def execute(request: dict, client, state: Path) -> dict:
                         row['metadata'].get('owner_id') == request['ownerId'])) and
                     (not row['metadata'].get('valid_from') or _time(row['metadata']['valid_from']) <= now) and
                     (not row['metadata'].get('valid_to') or now < _time(row['metadata']['valid_to']))]
-                if len(eligible) >= 20 or len(result['results']) < limit:
+                if len(eligible) >= 20 or len(result['results']) < limit or (limit == 2048 and eligible):
                     ranked_vector = [{**row, 'retrievalEvidence': {'vectorScore': row['score'],
                                        'vectorRank': index}}
                                      for index, row in enumerate(eligible[:20], 1)]
-                    return {'kind': 'items', 'items': ranked_vector,
-                            'lexical_items': lexical['items'],
-                            'lexical_degradation': lexical.get('reason')}
+                    answer = {'kind': 'items', 'items': ranked_vector,
+                              'lexical_items': lexical['items'],
+                              'lexical_degradation': lexical.get('reason')}
+                    if limit == 2048 and len(result['results']) == limit and len(eligible) < 20:
+                        answer['vector_degradation'] = 'vector_saturated'
+                    return answer
                 if limit == 2048:
                     break
                 limit = min(limit * 2, 2048)
