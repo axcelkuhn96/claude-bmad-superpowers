@@ -113,20 +113,65 @@ class E5Embedder:
         import onnxruntime as ort
         from tokenizers import Tokenizer
         self.np = np
-        model = Path(os.environ['CBS_MEMORIA_MODEL'])
+        self.ort = ort
+        self.model = Path(os.environ['CBS_MEMORIA_MODEL'])
         tokenizer = Path(os.environ['CBS_MEMORIA_TOKENIZER'])
-        if _digest(model) != MODEL_SHA256 or _digest(tokenizer) != TOKENIZER_SHA256:
+        if _digest(self.model) != MODEL_SHA256 or _digest(tokenizer) != TOKENIZER_SHA256:
             raise ValueError('embedding_fingerprint_mismatch')
         self.tokenizer = Tokenizer.from_file(str(tokenizer))
         self.tokenizer.enable_truncation(max_length=512)
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = 2
-        options.inter_op_num_threads = 1
-        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        options.add_session_config_entry('session.intra_op.allow_spinning', '0')
-        options.add_session_config_entry('session.inter_op.allow_spinning', '0')
-        self.session = ort.InferenceSession(str(model), sess_options=options, providers=['CPUExecutionProvider'])
-        self.input_names = {item.name for item in self.session.get_inputs()}
+        device = os.environ.get('CBS_MEMORIA_EMBEDDING_DEVICE', 'auto').lower()
+        if device not in ('auto', 'cpu', 'cuda', 'directml'):
+            raise ValueError('embedding_device_invalid')
+        available = set(ort.get_available_providers())
+        candidates = []
+        if device in ('auto', 'cuda') and 'CUDAExecutionProvider' in available:
+            candidates.append('CUDAExecutionProvider')
+        if (device == 'directml' or (device == 'auto' and sys.platform == 'win32')) and \
+                'DmlExecutionProvider' in available:
+            candidates.append('DmlExecutionProvider')
+        self.fallback_reason = 'provider_unavailable' if device != 'cpu' and not candidates else None
+        self.candidates = candidates + ['CPUExecutionProvider']
+        self._open_session(0)
+
+    def _open_session(self, start: int) -> None:
+        for index in range(start, len(self.candidates)):
+            provider = self.candidates[index]
+            options = self.ort.SessionOptions()
+            options.intra_op_num_threads = 2
+            options.inter_op_num_threads = 1
+            options.execution_mode = self.ort.ExecutionMode.ORT_SEQUENTIAL
+            options.add_session_config_entry('session.intra_op.allow_spinning', '0')
+            options.add_session_config_entry('session.inter_op.allow_spinning', '0')
+            if provider == 'DmlExecutionProvider':
+                options.enable_mem_pattern = False
+            providers = ['CPUExecutionProvider']
+            if provider == 'CUDAExecutionProvider':
+                providers.insert(0, ('CUDAExecutionProvider', {'use_tf32': '0'}))
+            elif provider == 'DmlExecutionProvider':
+                providers.insert(0, provider)
+            try:
+                if provider == 'CUDAExecutionProvider' and hasattr(self.ort, 'preload_dlls'):
+                    self.ort.preload_dlls(cuda=True, cudnn=True, msvc=True, directory='')
+                session = self.ort.InferenceSession(str(self.model), sess_options=options,
+                                                    providers=providers)
+                if provider != 'CPUExecutionProvider':
+                    session.disable_fallback()
+                    if session.get_providers()[0] != provider:
+                        self.fallback_reason = 'provider_inactive'
+                        continue
+                input_names = {item.name for item in session.get_inputs()}
+            except Exception:
+                if provider == 'CPUExecutionProvider':
+                    raise
+                self.fallback_reason = 'provider_init_failed'
+                continue
+            self.session = session
+            self.provider = provider
+            self._candidate_index = index
+            self.input_names = input_names
+            return
+        raise RuntimeError('embedding_provider_unavailable')
 
     def embed(self, text: str, memory_action: str = 'add') -> list[float]:
         if memory_action not in ('add', 'update', 'search'):
@@ -136,7 +181,15 @@ class E5Embedder:
         ids = self.np.asarray([encoded.ids], dtype=self.np.int64)
         mask = self.np.asarray([encoded.attention_mask], dtype=self.np.int64)
         values = {'input_ids': ids, 'attention_mask': mask, 'token_type_ids': self.np.zeros_like(ids)}
-        output = self.session.run(None, {key: values[key] for key in self.input_names})[0]
+        while True:
+            try:
+                output = self.session.run(None, {key: values[key] for key in self.input_names})[0]
+                break
+            except Exception:
+                if self.provider == 'CPUExecutionProvider':
+                    raise
+                self.fallback_reason = 'provider_run_failed'
+                self._open_session(self._candidate_index + 1)
         pooled = (output * mask[:, :, None]).sum(axis=1) / mask.sum(axis=1)[:, None]
         norm = self.np.linalg.norm(pooled, axis=1, keepdims=True)
         if not self.np.isfinite(norm).all() or norm[0, 0] == 0 or pooled.shape[-1] != 384:

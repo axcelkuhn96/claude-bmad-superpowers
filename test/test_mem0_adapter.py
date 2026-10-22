@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 MODULE = Path(__file__).resolve().parents[1] / 'base/memoria/python/mem0_adapter.py'
 spec = importlib.util.spec_from_file_location('mem0_adapter', MODULE)
 adapter = importlib.util.module_from_spec(spec)
@@ -17,6 +19,55 @@ spec.loader.exec_module(adapter)
 
 
 class AdapterTest(unittest.TestCase):
+    def _fake_e5(self, device, available, *, platform='linux', fail_create=(), fail_run=(),
+                 effective=None):
+        sessions = []
+        preloads = []
+        class Options:
+            def __init__(self):
+                self.entries = {}
+                self.enable_mem_pattern = True
+            def add_session_config_entry(self, name, value):
+                self.entries[name] = value
+        class Session:
+            def __init__(self, model, *, sess_options, providers):
+                self.provider = providers[0][0] if isinstance(providers[0], tuple) else providers[0]
+                self.providers = providers
+                self.options = sess_options
+                self.preloads = list(preloads)
+                sessions.append(self)
+                if self.provider in fail_create:
+                    raise RuntimeError('provider initialization failed')
+            def get_providers(self):
+                if self.provider == effective:
+                    return ['CPUExecutionProvider']
+                return [self.provider, 'CPUExecutionProvider']
+            def disable_fallback(self):
+                self.fallback_disabled = True
+            def get_inputs(self):
+                return [SimpleNamespace(name='input_ids'), SimpleNamespace(name='attention_mask')]
+            def run(self, outputs, inputs):
+                if self.provider in fail_run:
+                    raise RuntimeError('provider inference failed')
+                return [np.ones((1, len(inputs['input_ids'][0]), 384), dtype=np.float32)]
+        tokenizer = SimpleNamespace(enable_truncation=lambda **kwargs: None,
+                                    encode=lambda text: SimpleNamespace(ids=[1, 2], attention_mask=[1, 1]))
+        fake_ort = SimpleNamespace(SessionOptions=Options, InferenceSession=Session,
+                                   get_available_providers=lambda: available,
+                                   preload_dlls=lambda **kwargs: preloads.append(kwargs),
+                                   ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL='sequential'))
+        fake_tokenizers = SimpleNamespace(Tokenizer=SimpleNamespace(from_file=lambda path: tokenizer))
+        with patch.dict(sys.modules, {'onnxruntime': fake_ort, 'tokenizers': fake_tokenizers}), \
+             patch.dict(os.environ, {'CBS_MEMORIA_MODEL': '/tmp/model.onnx',
+                                     'CBS_MEMORIA_TOKENIZER': '/tmp/tokenizer.json',
+                                     'CBS_MEMORIA_EMBEDDING_DEVICE': device}), \
+             patch.object(sys, 'platform', platform), \
+             patch.object(adapter, '_digest', side_effect=[adapter.MODEL_SHA256,
+                                                            adapter.TOKENIZER_SHA256]):
+            embedder = adapter.E5Embedder()
+            vector = embedder.embed('fact', 'search')
+        return embedder, vector, sessions
+
     def test_explicit_mcp_record_is_curated_with_honest_provenance(self):
         identifier = '64eef286-9f7e-4326-b137-5658f0286c46'
         text = 'Compilar no HML_TRIPEX_COMP antes da promoção do RPO.'
@@ -265,12 +316,14 @@ class AdapterTest(unittest.TestCase):
                 return []
         tokenizer = SimpleNamespace(enable_truncation=lambda **kwargs: None)
         fake_ort = SimpleNamespace(SessionOptions=Options, InferenceSession=Session,
+                                   get_available_providers=lambda: ['CPUExecutionProvider'],
                                    ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL='sequential'))
         fake_tokenizers = SimpleNamespace(Tokenizer=SimpleNamespace(from_file=lambda path: tokenizer))
         with patch.dict(sys.modules, {'numpy': SimpleNamespace(), 'onnxruntime': fake_ort,
                                       'tokenizers': fake_tokenizers}), \
              patch.dict(os.environ, {'CBS_MEMORIA_MODEL': '/tmp/model.onnx',
-                                     'CBS_MEMORIA_TOKENIZER': '/tmp/tokenizer.json'}), \
+                                     'CBS_MEMORIA_TOKENIZER': '/tmp/tokenizer.json',
+                                     'CBS_MEMORIA_EMBEDDING_DEVICE': 'cpu'}), \
              patch.object(adapter, '_digest', side_effect=[adapter.MODEL_SHA256, adapter.TOKENIZER_SHA256]):
             adapter.E5Embedder()
         self.assertEqual(len(sessions), 1)
@@ -281,6 +334,46 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(options.entries, {'session.intra_op.allow_spinning': '0',
                                            'session.inter_op.allow_spinning': '0'})
         self.assertEqual(providers, ['CPUExecutionProvider'])
+
+    def test_e5_auto_tries_cuda_then_uses_cpu_after_first_inference_failure(self):
+        embedder, vector, sessions = self._fake_e5('auto',
+            ['CUDAExecutionProvider', 'CPUExecutionProvider'], fail_run=('CUDAExecutionProvider',))
+        self.assertEqual([session.provider for session in sessions],
+                         ['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        self.assertTrue(sessions[0].fallback_disabled)
+        self.assertEqual(sessions[0].preloads, [{'cuda': True, 'cudnn': True,
+                                                 'msvc': True, 'directory': ''}])
+        self.assertEqual(embedder.provider, 'CPUExecutionProvider')
+        self.assertEqual(embedder.fallback_reason, 'provider_run_failed')
+        self.assertEqual(len(vector), 384)
+        self.assertAlmostEqual(sum(value * value for value in vector), 1.0, places=5)
+
+    def test_e5_auto_skips_silent_cpu_downgrade_and_falls_through_to_directml_on_windows(self):
+        embedder, _, sessions = self._fake_e5('auto',
+            ['CUDAExecutionProvider', 'DmlExecutionProvider', 'CPUExecutionProvider'],
+            platform='win32', effective='CUDAExecutionProvider')
+        self.assertEqual([session.provider for session in sessions],
+                         ['CUDAExecutionProvider', 'DmlExecutionProvider'])
+        self.assertEqual(embedder.provider, 'DmlExecutionProvider')
+        self.assertEqual(embedder.fallback_reason, 'provider_inactive')
+        self.assertFalse(sessions[1].options.enable_mem_pattern)
+        self.assertEqual(sessions[1].options.execution_mode, 'sequential')
+
+    def test_e5_explicit_cpu_never_creates_gpu_session(self):
+        embedder, _, sessions = self._fake_e5('cpu',
+            ['CUDAExecutionProvider', 'DmlExecutionProvider', 'CPUExecutionProvider'])
+        self.assertEqual([session.provider for session in sessions], ['CPUExecutionProvider'])
+        self.assertEqual(embedder.provider, 'CPUExecutionProvider')
+        self.assertIsNone(embedder.fallback_reason)
+
+    def test_e5_explicit_directml_falls_back_when_session_creation_fails(self):
+        embedder, _, sessions = self._fake_e5('directml',
+            ['DmlExecutionProvider', 'CPUExecutionProvider'], platform='win32',
+            fail_create=('DmlExecutionProvider',))
+        self.assertEqual([session.provider for session in sessions],
+                         ['DmlExecutionProvider', 'CPUExecutionProvider'])
+        self.assertEqual(embedder.provider, 'CPUExecutionProvider')
+        self.assertEqual(embedder.fallback_reason, 'provider_init_failed')
 
     def test_direct_entry_caps_inherited_threads_before_sdk_import(self):
         values_at_import = []
