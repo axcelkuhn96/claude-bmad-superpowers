@@ -9,9 +9,13 @@ const runFile = promisify(execFile);
 const sha = text => createHash('sha256').update(text).digest('hex');
 const blocked = reason => ({ kind: 'abstain', reason });
 const rootFor = stateDir => path.join(stateDir, 'handoff-auto');
-const nameFor = identity => sha(JSON.stringify([identity.cli, identity.sourceSessionId]));
+const scopeFor = identity => sha(JSON.stringify([identity.projectId, identity.ownerId,
+  identity.nativeRoot, identity.projectRoot, identity.commonGitDir, identity.worktreeGitDir,
+  identity.branch, identity.checkoutFingerprint]));
+const nameFor = identity => `${scopeFor(identity)}-${sha(JSON.stringify([identity.cli, identity.sourceSessionId]))}`;
 const metadataFile = (dir, identity) => path.join(dir, `${nameFor(identity)}.json`);
-const markdownFile = (dir, identity) => path.join(dir, `${nameFor(identity)}.md`);
+const markdownFile = (dir, identity, contentHash) => path.join(dir,
+  `${nameFor(identity)}-${contentHash}.md`);
 const receiptDir = dir => path.join(dir, 'receipts');
 const receiptFile = (dir, key) => path.join(receiptDir(dir), `${key}.json`);
 const TTL = 7 * 24 * 60 * 60 * 1000;
@@ -116,42 +120,41 @@ async function atomicWrite(file, content) {
 async function readRow(dir, identity) {
   try {
     const row = JSON.parse(await privateRead(metadataFile(dir, identity), 64 * 1024));
-    if (row.version !== 1 || !validIdentity(row.identity) ||
-        row.identity.cli !== identity.cli || row.identity.sourceSessionId !== identity.sourceSessionId ||
+    if (row.version !== 2 || !validIdentity(row.identity) ||
+        nameFor(row.identity) !== nameFor(identity) ||
         !events.has(row.event) || !Number.isFinite(Date.parse(row.at)) ||
         row.handoff && (!/^[a-f0-9]{64}$/.test(row.handoff.sourceHash ?? '') ||
           !/^[a-f0-9]{64}$/.test(row.handoff.contentHash ?? ''))) return null;
     if (row.handoff) {
-      const content = await privateRead(markdownFile(dir, identity));
+      const content = await privateRead(markdownFile(dir, identity, row.handoff.contentHash));
       if (sha(content) !== row.handoff.contentHash) return null;
-      row.file = markdownFile(dir, identity);
+      row.file = markdownFile(dir, identity, row.handoff.contentHash);
     }
     return row;
   } catch { return null; }
 }
 
 async function cleanupExpired(dir, identity, now) {
-  const names = [];
+  let removed = 0;
   const listing = await fs.opendir(dir);
   for await (const entry of listing) {
-    names.push(entry.name);
-    if (names.length > 128) return;
-  }
-  for (const name of names) {
-    if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+    if (removed >= 128) break;
+    const name = entry.name;
+    if (!name.startsWith(`${scopeFor(identity)}-`) || !/^[a-f0-9]{64}-[a-f0-9]{64}\.json$/.test(name)) continue;
     let row;
     try {
       const raw = JSON.parse(await privateRead(path.join(dir, name), 64 * 1024));
       const source = raw?.identity;
       if (!validIdentity(source) || name !== `${nameFor(source)}.json` ||
-          source.projectId !== identity.projectId || source.ownerId !== identity.ownerId ||
+          scopeFor(source) !== scopeFor(identity) ||
           source.sourceSessionId === identity.sourceSessionId) continue;
       row = await readRow(dir, source);
     } catch { continue; }
     if (!row || now - Date.parse(row.at) <= TTL) continue;
     try {
-      if (row.handoff) await fs.unlink(markdownFile(dir, row.identity));
       await fs.unlink(metadataFile(dir, row.identity));
+      if (row.file) await fs.unlink(row.file);
+      removed++;
     } catch { /* A concurrent change is left for a later write. */ }
   }
 }
@@ -166,7 +169,7 @@ export async function saveHandoff(stateDir, { identity, handoff, event, at = new
   catch { return blocked('unsafe_state'); }
   const prior = await readRow(dir, identity);
   if (!prior) {
-    for (const file of [metadataFile(dir, identity), markdownFile(dir, identity)]) {
+    for (const file of [metadataFile(dir, identity)]) {
       const exists = await fs.lstat(file).then(() => true, error =>
         error.code === 'ENOENT' ? false : Promise.reject(error)).catch(() => true);
       if (exists) return blocked('unsafe_existing_state');
@@ -180,14 +183,25 @@ export async function saveHandoff(stateDir, { identity, handoff, event, at = new
       Buffer.byteLength(handoff.markdown) > 64 * 1024 || Buffer.byteLength(handoff.summary) > 300)) {
     return blocked('invalid_handoff');
   }
-  const row = { version: 1, identity, event, at,
+  const row = { version: 2, identity, event, at,
     handoff: handoff ? { summary: handoff.summary, sourceHash: handoff.sourceHash,
       contentHash: sha(handoff.markdown) } : active.has(event) ? null : prior?.handoff ?? null };
   try {
-    if (handoff) await atomicWrite(markdownFile(dir, identity), handoff.markdown);
+    if (handoff) {
+      const file = markdownFile(dir, identity, row.handoff.contentHash);
+      try {
+        if (sha(await privateRead(file)) !== row.handoff.contentHash) return blocked('unsafe_existing_state');
+      } catch (error) {
+        if (error.code !== 'ENOENT') return blocked('unsafe_existing_state');
+        await atomicWrite(file, handoff.markdown);
+      }
+    }
     await atomicWrite(metadataFile(dir, identity), JSON.stringify(row) + '\n');
+    if (prior?.file && prior.file !== markdownFile(dir, identity, row.handoff?.contentHash)) {
+      await fs.unlink(prior.file).catch(() => {});
+    }
     await cleanupExpired(dir, identity, Date.parse(at));
-    return { kind: 'saved', file: row.handoff ? markdownFile(dir, identity) : null };
+    return { kind: 'saved', file: row.handoff ? markdownFile(dir, identity, row.handoff.contentHash) : null };
   } catch { return blocked('write_failed'); }
 }
 
@@ -201,6 +215,8 @@ export async function loadHandoff(stateDir, identity) {
   try {
     const listing = await fs.opendir(dir);
     for await (const entry of listing) {
+      if (!entry.name.startsWith(`${scopeFor(identity)}-`) ||
+          !/^[a-f0-9]{64}-[a-f0-9]{64}\.json$/.test(entry.name)) continue;
       names.push(entry.name);
       if (names.length > 128) return blocked('state_saturated');
     }
@@ -208,14 +224,12 @@ export async function loadHandoff(stateDir, identity) {
   const now = Date.parse(identity.now);
   const eligible = [];
   for (const name of names) {
-    if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
     const lookup = { cli: identity.cli, sourceSessionId: '' };
     let row;
     try {
       const raw = JSON.parse(await privateRead(path.join(dir, name), 64 * 1024));
-      lookup.cli = raw?.identity?.cli;
-      lookup.sourceSessionId = raw?.identity?.sourceSessionId;
-      if (name !== `${nameFor(lookup)}.json`) continue;
+      Object.assign(lookup, raw?.identity);
+      if (name !== `${nameFor(lookup)}.json`) return blocked('corrupt_state');
       row = await readRow(dir, lookup);
     } catch { return blocked('corrupt_state'); }
     if (!row) return blocked('corrupt_state');
@@ -286,16 +300,13 @@ export async function acknowledgeHandoff(stateDir, receipt) {
   catch { return blocked('unsafe_receipt_dir'); }
   const file = receiptFile(dir, receipt.key);
   try {
-    const handle = await fs.open(file, 'wx', 0o600);
-    try { await handle.writeFile(JSON.stringify(receipt) + '\n'); await handle.sync(); }
-    finally { await handle.close(); }
-    const parent = await fs.open(receiptDir(dir), 'r');
-    try { await parent.sync(); } finally { await parent.close(); }
-    return { kind: 'acked' };
+    const saved = JSON.parse(await privateRead(file, 8192));
+    return JSON.stringify(saved) === JSON.stringify(receipt)
+      ? { kind: 'acked' } : blocked('receipt_changed');
   } catch (error) {
-    if (error.code !== 'EEXIST') return blocked('receipt_write_failed');
-    try { return JSON.stringify(JSON.parse(await privateRead(file, 8192))) === JSON.stringify(receipt)
-      ? { kind: 'acked' } : blocked('receipt_changed'); }
-    catch { return blocked('unsafe_receipt'); }
+    if (error.code !== 'ENOENT') return blocked('unsafe_receipt');
   }
+  try { await atomicWrite(file, JSON.stringify(receipt) + '\n'); }
+  catch { return blocked('receipt_write_failed'); }
+  return { kind: 'acked' };
 }
