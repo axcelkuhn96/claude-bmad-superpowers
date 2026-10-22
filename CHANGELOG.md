@@ -2,6 +2,12 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.15.10] - 2026-10-22
+
+### Adicionado
+- **Embeddings locais com GPU quando disponível:** o instalador seleciona o pacote ONNX Runtime para CUDA no Linux com NVIDIA detectada e DirectML no Windows compatível. Se a instalação ou a verificação da variante GPU falhar, instala a variante CPU e registra a seleção e o motivo em `runtime-selection.json` no estado local. A preferência pode ser definida por `CBS_MEMORIA_EMBEDDING_DEVICE` (`auto`, `cpu`, `cuda` ou `directml`).
+- **Fallback na execução:** o encoder tenta o provedor acelerado disponível e usa CPU quando o provedor não inicializa. A rota Windows ainda não tem validação física de release.
+
 ## [0.15.9] - 2026-10-21
 
 ### Adicionado
