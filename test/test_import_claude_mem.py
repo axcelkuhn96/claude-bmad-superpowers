@@ -123,6 +123,75 @@ class ImportClaudeMemTest(unittest.TestCase):
             module.read_raw(client, 'other_claude_mem_raw', selected.id)
         client.close()
 
+    def test_resume_from_mid_row_skips_acknowledged_chunks_and_advances_absolute_cursor(self):
+        from qdrant_client import QdrantClient
+        out = self.raw_snapshot()
+        options = self.options(out, batch_size=1)
+        items = [json.loads(line) for line in out.read_text().splitlines()]
+        first_row = module.points_for_row(items[0], module.CharacterTokenizer())
+        self.assertEqual(len(first_row), 2)
+        identity = module.import_identity(options, module.snapshot_mapping(out))
+        module.save_checkpoint(options.checkpoint, module.snapshot_digest(out), 0, 1, identity)
+        client = QdrantClient(':memory:')
+        self.assertEqual(module.import_snapshot(options, client, self.fake_embedder()), 3)
+        name = 'cbs-projeto-a_claude_mem_raw'
+        self.assertEqual(client.count(name, exact=True).count, 3)
+        self.assertEqual(client.retrieve(name, ids=[first_row[0]['id']]), [])
+        checkpoint = json.loads(Path(options.checkpoint).read_text())
+        self.assertEqual((checkpoint['line'], checkpoint['offset']), (2, 0))
+        client.close()
+
+    def test_resume_from_next_line_skips_preceding_rows(self):
+        from qdrant_client import QdrantClient
+        out = self.raw_snapshot()
+        options = self.options(out, batch_size=1)
+        identity = module.import_identity(options, module.snapshot_mapping(out))
+        module.save_checkpoint(options.checkpoint, module.snapshot_digest(out), 1, 0, identity)
+        client = QdrantClient(':memory:')
+        self.assertEqual(module.import_snapshot(options, client, self.fake_embedder()), 2)
+        self.assertEqual(client.count('cbs-projeto-a_claude_mem_raw', exact=True).count, 2)
+        client.close()
+
+    def test_resume_mid_row_after_ack_reconciles_uncertain_next_chunk(self):
+        from qdrant_client import QdrantClient
+        out = self.raw_snapshot()
+        options = self.options(out, batch_size=1)
+        client = QdrantClient(':memory:')
+        original = module.save_checkpoint
+        calls = 0
+
+        def interrupt_after_second_ack(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError('interrupted_after_second_ack')
+            return original(*args)
+
+        with patch.object(module, 'save_checkpoint', interrupt_after_second_ack):
+            with self.assertRaisesRegex(RuntimeError, 'interrupted_after_second_ack'):
+                module.import_snapshot(options, client, self.fake_embedder())
+        checkpoint = json.loads(Path(options.checkpoint).read_text())
+        self.assertEqual((checkpoint['line'], checkpoint['offset']), (0, 1))
+        self.assertEqual(client.count('cbs-projeto-a_claude_mem_raw', exact=True).count, 2)
+        self.assertEqual(module.import_snapshot(options, client, self.fake_embedder()), 2)
+        self.assertEqual(client.count('cbs-projeto-a_claude_mem_raw', exact=True).count, 4)
+        client.close()
+
+    def test_resume_rejects_cursor_outside_snapshot_before_remote_write(self):
+        from qdrant_client import QdrantClient
+        out = self.raw_snapshot()
+        options = self.options(out)
+        identity = module.import_identity(options, module.snapshot_mapping(out))
+        module.save_checkpoint(options.checkpoint, module.snapshot_digest(out), 3, 0, identity)
+        client = QdrantClient(':memory:')
+        with self.assertRaisesRegex(ValueError, 'checkpoint_cursor_out_of_range'):
+            module.import_snapshot(options, client, self.fake_embedder())
+        module.save_checkpoint(options.checkpoint, module.snapshot_digest(out), 0, 3, identity)
+        with self.assertRaisesRegex(ValueError, 'checkpoint_cursor_out_of_range'):
+            module.import_snapshot(options, client, self.fake_embedder())
+        self.assertFalse(client.collection_exists('cbs-projeto-a_claude_mem_raw'))
+        client.close()
+
     def options(self, snapshot, **changes):
         model = self.root / 'model.onnx'
         tokenizer = self.root / 'tokenizer.json'

@@ -310,10 +310,12 @@ def file_digest(path):
     return snapshot_digest(Path(path).resolve(strict=True))
 
 
-def snapshot_mapping(path):
+def snapshot_mapping(path, with_count=False):
     mapping = {}
+    count = 0
     with Path(path).open('r', encoding='utf-8') as stream:
         for line in stream:
+            count += 1
             item = json.loads(line)
             project, collection = item['source_project'], item['collection']
             if not isinstance(project, str) or not project or not valid_collection(collection):
@@ -321,7 +323,7 @@ def snapshot_mapping(path):
             if project in mapping and mapping[project] != collection:
                 raise ValueError('inconsistent_snapshot_mapping')
             mapping[project] = collection
-    return mapping
+    return (mapping, count) if with_count else mapping
 
 
 def import_identity(options, mapping):
@@ -385,7 +387,8 @@ def import_snapshot(options, client=None, embedder=None):
                             source.stat().st_mode & 0o777 != 0o600):
         raise ValueError('private_snapshot_required')
     digest = snapshot_digest(source)
-    identity = import_identity(options, snapshot_mapping(source))
+    mapping, line_count = snapshot_mapping(source, with_count=True)
+    identity = import_identity(options, mapping)
     cursor = {'line': 0, 'offset': 0, 'snapshot_sha256': digest}
     if checkpoint.exists():
         if os.name != 'nt' and (checkpoint.stat().st_uid != os.getuid() or
@@ -402,6 +405,12 @@ def import_snapshot(options, client=None, embedder=None):
                 type(cursor.get('line')) is not int or cursor['line'] < 0 or \
                 type(cursor.get('offset')) is not int or cursor['offset'] < 0:
             raise ValueError('checkpoint_snapshot_mismatch')
+        if cursor['line'] > line_count or \
+                (cursor['line'] == line_count and cursor['offset'] != 0):
+            raise ValueError('checkpoint_cursor_out_of_range')
+    # A completed checkpoint still verifies and repairs the remote snapshot.
+    resume_line, resume_offset = (0, 0) if cursor['line'] == line_count else \
+        (cursor['line'], cursor['offset'])
     owned_client = client is None
     if owned_client:
         client = client_for(options)
@@ -484,10 +493,17 @@ def import_snapshot(options, client=None, embedder=None):
         pending = []
         with source.open('r', encoding='utf-8') as stream:
             for line_index, line in enumerate(stream):
+                if line_index < resume_line:
+                    continue
                 item = json.loads(line)
                 pieces = points_for_row(item, embedder.tokenizer)
+                if line_index == resume_line and resume_offset >= len(pieces) and \
+                        resume_offset != 0:
+                    raise ValueError('checkpoint_cursor_out_of_range')
                 row_identity = source_identity(item)
                 for offset, part in enumerate(pieces, 1):
+                    if line_index == resume_line and offset <= resume_offset:
+                        continue
                     if len(pending) == options.batch_size:
                         write_window(pending)
                         pending = []
