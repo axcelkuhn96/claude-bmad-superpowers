@@ -2,7 +2,7 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
-## [Unreleased]
+## [0.16.0] - Candidato não publicado (2026-10-22)
 
 ### Adicionado
 - **Busca híbrida com índice textual nativo:** `cbs memoria indexar-texto --project /raiz/git` prepara a coleção Qdrant existente em uma operação administrativa. Identificadores técnicos ASCII encontrados literalmente podem acrescentar resultados distintos após o prefixo vetorial elegível, até 20 resultados; o recall automático permanece em 500 bytes. O E5 local, a dimensão 384, o fingerprint e o fallback GPU/CPU permanecem os mesmos.
