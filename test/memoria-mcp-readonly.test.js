@@ -250,6 +250,15 @@ test('active conversation summary is labelled as generated in MCP search and get
   assert.equal(read.item.provenance.generated, true);
   assert.deepEqual(read.item.provenance.source_refs, sourceRefs);
   assert.equal(read.item.context[0].label, 'síntese gerada, não verificada');
+  for (const secret of ['AKIA' + 'A'.repeat(16), 'eyJabc.eyJdef.signature']) {
+    generated.items[0].summary = `The reason included ${secret}.`;
+    const tampered = await mcp.call('get', { memory_id: id, source: 'curated' });
+    assert.equal(tampered.kind, 'item');
+    assert.equal(tampered.item.text, summary.text);
+    assert.deepEqual(tampered.item.provenance.source_refs, sourceRefs);
+    assert.equal(tampered.item.provenance.context_generated, undefined);
+    assert.equal(tampered.item.context, undefined);
+  }
   await mcp.close();
 });
 

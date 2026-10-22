@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { contextFromCandidate, verifiedGeneratedContext } from '../base/memoria/generated-context.mjs';
 import { renderRecall } from '../base/memoria/context.mjs';
 import { dedupKeyFor } from '../base/memoria/dedup-key.mjs';
+import { containsSecret } from '../base/memoria/candidates.mjs';
 
 const refs = [
   { message_id: 'u1', origin: 'human', source_text_sha256: 'a'.repeat(64), excerpt: 'Use tenant filters.' },
@@ -35,6 +36,34 @@ test('invalid model context drops the field while leaving the fact available', (
     [{ ...context[0], kind: 'rule' }],
   ]) assert.equal(contextFromCandidate(invalid, refs, safe), undefined);
   assert.equal(contextFromCandidate(context, refs, safe, ['a1']), undefined);
+});
+
+test('remote secret tampering drops generated context while retaining the qualified fact', () => {
+  const qualifiedRefs = refs.map((ref, index) => ({ ...ref,
+    role: index ? 'assistant' : 'user', actor: index ? 'assistant' : 'user',
+    offsets: { start: index * 20, end: index * 20 + 19 } }));
+  const factText = 'Use tenant filters.';
+  for (const secret of ['AKIA' + 'A'.repeat(16), 'eyJabc.eyJdef.signature']) {
+    const items = [{ ...context[0], summary: `The reason included ${secret}.` }];
+    assert.equal(contextFromCandidate(items, qualifiedRefs, value => !containsSecret(value)), undefined);
+    const tampered = { version: 1, items, trust: 'generated_unverified',
+      source_refs_sha256: refsHash(qualifiedRefs) };
+    assert.equal(verifiedGeneratedContext(tampered, qualifiedRefs, () => true), undefined);
+    const row = { sdkId: 'fact-1', projectId: 'project', status: 'active', text: factText,
+      metadata: { format_version: 4, source: 'u1', actor: 'conversation',
+        origin: 'conversation_summary', speaker_role: 'mixed', scope: 'project',
+        type: 'decision', evidence_at: '2026-10-01T00:00:00Z',
+        source_offsets: qualifiedRefs[0].offsets,
+        source_text_sha256: qualifiedRefs[0].source_text_sha256,
+        source_refs: qualifiedRefs,
+        dedup_key: dedupKeyFor({ projectId: 'project', scope: 'project',
+          type: 'decision', text: factText }), context_generated: tampered } };
+    const rendered = renderRecall([row], 500);
+    assert.deepEqual(rendered.used, [row]);
+    assert.match(rendered.text, /Use tenant filters/);
+    assert.doesNotMatch(rendered.text, /contexto gerado/);
+    assert.doesNotMatch(rendered.text, new RegExp(secret.replaceAll('.', '\\.')));
+  }
 });
 
 test('recall never promotes context on an unqualified fact', () => {

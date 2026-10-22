@@ -432,9 +432,11 @@ def _valid_generated_context(value, refs) -> bool:
     items = value['items']
     if not isinstance(items, list) or not 1 <= len(items) <= 4:
         return False
-    secret = re.compile(r'(?i)(?:api[_ -]?key|private[_ -]?key|token|password|secret|bearer)' \
-        r'["\']?\s*[:= ]\s*\S+|\bsk-[a-z0-9-]{16,}|\bgh[opusr]_[A-Za-z0-9_]{16,}|' \
-        r'-----BEGIN [A-Z ]*PRIVATE KEY-----')
+    secret = re.compile(r'["\']?\b(?:[A-Za-z][A-Za-z0-9_-]*[_-])?'
+        r'(?:api[_ -]?key|private[_ -]?key|token|password|secret|bearer)'
+        r'["\']?\s*[:= ]\s*\S+|\bsk-[a-z0-9-]{16,}|\bgh[opusr]_[A-Za-z0-9_]{16,}|'
+        r'\bAKIA[A-Z0-9]{16}\b|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b|'
+        r'-----BEGIN [A-Z ]*PRIVATE KEY-----', re.I)
     for item in items:
         if not isinstance(item, dict) or set(item) != {'kind', 'summary', 'source_message_ids'} or \
                 item['kind'] not in ('problem', 'reason', 'attempt', 'pending') or \

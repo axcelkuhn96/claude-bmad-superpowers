@@ -322,9 +322,15 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
         const generated = args.source === 'curated' && provenance?.generated === true
           ? verifiedGeneratedContext(provenance.context_generated, provenance.source_refs,
             () => true) : undefined;
-        return generated ? { ...answer, item: { ...answer.item,
+        if (generated) return { ...answer, item: { ...answer.item,
           context: generated.items.map(entry => ({ ...entry,
-            label: 'síntese gerada, não verificada' })) } } : answer;
+            label: 'síntese gerada, não verificada' })) } };
+        if (provenance && Object.hasOwn(provenance, 'context_generated')) {
+          const { context_generated: _discarded, ...safeProvenance } = provenance;
+          const { context: _discardedContext, ...item } = answer.item;
+          return { ...answer, item: { ...item, provenance: safeProvenance } };
+        }
+        return answer;
       }
       const source = args.source ?? 'all';
       let curated = { kind: 'items', items: [] };

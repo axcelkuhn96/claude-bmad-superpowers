@@ -351,6 +351,16 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(adapter.execute_readonly(request, None, Path('/tmp'))['kind'], 'item')
             self.assertNotIn('context_generated', adapter.execute_readonly(
                 request, None, Path('/tmp'))['item']['provenance'])
+            for secret in ('AKIA' + 'A' * 16, 'eyJabc.eyJdef.signature'):
+                row['metadata'] = {**metadata, 'context_generated': {
+                    **metadata['context_generated'], 'items': [{
+                        **metadata['context_generated']['items'][0],
+                        'summary': 'The reason included ' + secret + '.'}]}}
+                result = adapter.execute_readonly(request, None, Path('/tmp'))
+                self.assertEqual(result['kind'], 'item')
+                self.assertEqual(result['item']['text'], 'Conversation summary')
+                self.assertEqual(result['item']['provenance']['source_refs'], refs)
+                self.assertNotIn('context_generated', result['item']['provenance'])
             row['metadata'] = {**metadata, 'speaker_role': 'user'}
             self.assertEqual(adapter.execute_readonly(request, None, Path('/tmp'))['reason'],
                              'source_unavailable')
