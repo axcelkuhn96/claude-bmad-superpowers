@@ -278,16 +278,40 @@ async function readHandoffEvidence(file, identity, allowExpired = false) {
 
 async function cleanupHandoffEvidence(stateDir, identity, began) {
   const dir = path.join(stateDir, 'sessions');
-  const names = await fs.readdir(dir);
-  let examined = 0;
-  for (const name of names) {
-    if (!/^[a-f0-9]{64}\.handoff-evidence\.json$/.test(name)) continue;
-    if (++examined > 128 || performance.now() - began > 750) break;
+  const cursor = path.join(dir, `${createHash('sha256').update(JSON.stringify([
+    identity.ownerId, identity.checkoutFingerprint])).digest('hex')}.handoff-gc-cursor`);
+  let after = '';
+  try {
+    const before = await fs.lstat(cursor);
+    if (!before.isFile() || before.uid !== process.getuid() || (before.mode & 0o077) ||
+        before.size > 128) return;
+    const handle = await fs.open(cursor, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try { after = (await handle.readFile('utf8')).trim(); }
+    finally { await handle.close(); }
+    if (after && !/^[a-f0-9]{64}\.handoff-evidence\.json$/.test(after)) return;
+  } catch (error) { if (error.code !== 'ENOENT') return; }
+  if (performance.now() - began > 750) return;
+  const names = (await fs.readdir(dir)).filter(name =>
+    /^[a-f0-9]{64}\.handoff-evidence\.json$/.test(name)).sort();
+  if (!names.length || performance.now() - began > 750) return;
+  const first = names.findIndex(name => name > after);
+  const ordered = first < 0 ? names : [...names.slice(first), ...names.slice(0, first)];
+  let last = after;
+  for (const name of ordered.slice(0, 128)) {
+    if (performance.now() - began > 750) break;
     const file = path.join(dir, name);
     const value = await readHandoffEvidence(file, identity, true);
+    if (performance.now() - began > 750) break;
     if (value && Date.now() - Date.parse(value.at) > 7 * 24 * 60 * 60 * 1000) {
       await fs.rm(file, { force: true });
     }
+    last = name;
+  }
+  if (last !== after && performance.now() - began <= 750) {
+    const temporary = `${cursor}.${randomUUID()}.tmp`;
+    await fs.writeFile(temporary, `${last}\n`, { mode: 0o600, flag: 'wx' });
+    try { await fs.rename(temporary, cursor); }
+    catch (error) { await fs.rm(temporary, { force: true }); throw error; }
   }
 }
 
@@ -306,27 +330,31 @@ async function writeHandoffEvidence(file, value) {
 export async function updateHandoffFromCapture({ cli, event, payload, result,
   stateRoot: _stateRoot, began = performance.now() } = {}) {
   const proof = authenticatedHandoffCapture({ cli, event, payload, result });
-  if (!proof || process.platform === 'win32' || performance.now() - began > 800) return null;
+  const hasTime = () => performance.now() - began < 800;
+  if (!proof || process.platform === 'win32' || !hasTime()) return null;
   const lockName = `handoff-${createHash('sha256').update(JSON.stringify([cli, proof.sessionId]))
     .digest('hex').slice(0, 32)}.lock`;
   try {
     return await withProjectLock(proof.stateDir, async () => {
       const file = evidenceFile(proof.stateDir, cli, proof.sessionId);
       const prior = await readHandoffEvidence(file, proof.identity);
+      if (!hasTime()) return null;
       if (!prior && await fs.lstat(file).then(() => true, error =>
         error.code === 'ENOENT' ? false : Promise.reject(error))) return null;
+      if (!hasTime()) return null;
       if (prior && Date.parse(proof.capturedAt) < Date.parse(prior.at)) return null;
-      let messages = ['SessionStart', 'UserPromptSubmit'].includes(event)
-        ? [] : [...(prior?.messages ?? [])];
+      let messages = event === 'SessionStart' ? [] : [...(prior?.messages ?? [])];
       let operationId = prior?.operationId;
       const outbox = createOutbox(proof.stateDir);
       for (const ref of [...new Set(proof.sourceRefs)]) {
-        if (performance.now() - began > 800) return null;
+        if (!hasTime()) return null;
         const source = await outbox.handoffSource({ cli, sessionId: proof.sessionId,
           projectId: proof.identity.projectId, ownerId: proof.identity.ownerId,
           operationId: ref });
+        if (!hasTime()) return null;
         if (source.kind !== 'source') continue;
         operationId = source.operationId;
+        if (source.messages.some(item => item.origin === 'human')) messages = [];
         for (const item of source.messages) {
           if (typeof item.text !== 'string' || Buffer.byteLength(item.text) > 160) continue;
           // Persist only excerpts the formatter itself permits. Rejected source
@@ -344,18 +372,19 @@ export async function updateHandoffFromCapture({ cli, event, payload, result,
         ownerId: proof.identity.ownerId, cli, sessionId: proof.sessionId,
         at: proof.capturedAt, operationId,
         messages: messages.slice(-2) };
-      if (performance.now() - began > 800) return null;
+      if (!hasTime()) return null;
       await writeHandoffEvidence(file, value);
+      if (!hasTime()) return null;
       let handoff;
       if (operationId && messages.length) {
         handoff = formatHandoff({ ...proof.identity,
           checkpoint: { operationId, messages }, now: proof.capturedAt });
       }
       const saved = await saveHandoff(proof.stateDir, { identity: proof.identity,
-        handoff, event, at: proof.capturedAt });
-      if (saved.kind === 'saved' && ['SessionEnd', 'Interrupt'].includes(event)) {
+        handoff, event, at: proof.capturedAt, hasTime });
+      if (saved.kind === 'saved' && hasTime() && ['SessionEnd', 'Interrupt'].includes(event)) {
         await fs.rm(file, { force: true }).catch(() => {});
-      } else if (saved.kind === 'saved' && event === 'SessionStart') {
+      } else if (saved.kind === 'saved' && hasTime() && event === 'SessionStart') {
         await cleanupHandoffEvidence(proof.stateDir, proof.identity, began).catch(() => {});
       }
       return saved;

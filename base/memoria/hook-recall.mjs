@@ -39,7 +39,7 @@ export async function deliverHandoffAtSessionStart({ cli, payload, result,
   if (!proof || process.platform === 'win32' ||
       typeof payload?.prompt === 'string' && payload.prompt.trim()) return null;
   const remaining = () => Math.floor(900 - (performance.now() - began));
-  if (remaining() <= 0) return null;
+  if (remaining() < 75) return null;
   let timer;
   try {
     const prepared = await Promise.race([
@@ -162,7 +162,7 @@ export async function recallForPrompt({ cli, event = 'UserPromptSubmit', payload
   if (event !== 'UserPromptSubmit' && event !== 'PreCompact') return null;
   try {
     // Leave room for native transport and final rendering after this component returns.
-    const remaining = () => Math.floor(900 - (performance.now() - began));
+    const remaining = () => Math.floor(825 - (performance.now() - began));
     if (remaining() <= 0) return fail('deadline');
     const current = await resolve(payload.cwd, payload.session_id, { stateRoot });
     if (current.provider !== 'mem0') return ['claude-mem', 'not_mem0', 'unsupported_git'].includes(

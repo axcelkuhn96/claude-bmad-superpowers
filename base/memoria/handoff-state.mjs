@@ -134,73 +134,102 @@ async function readRow(dir, identity) {
   } catch { return null; }
 }
 
-async function cleanupExpired(dir, identity, now) {
-  let removed = 0;
-  const listing = await fs.opendir(dir);
-  for await (const entry of listing) {
-    if (removed >= 128) break;
-    const name = entry.name;
-    if (!name.startsWith(`${scopeFor(identity)}-`) || !/^[a-f0-9]{64}-[a-f0-9]{64}\.json$/.test(name)) continue;
+async function cleanupExpired(dir, identity, now, hasTime = () => true) {
+  const scope = scopeFor(identity);
+  const limit = 384;
+  const names = (await fs.readdir(dir)).sort();
+  if (!hasTime()) return;
+  const metadata = names.filter(name => name.startsWith(`${scope}-`) &&
+    /^[a-f0-9]{64}-[a-f0-9]{64}\.json$/.test(name));
+  const cursor = path.join(dir, `.${scope}.gc-metadata-cursor`);
+  let after = '';
+  try {
+    after = (await privateRead(cursor, 128)).trim();
+    if (after && !metadata.includes(after)) after = '';
+  } catch (error) { if (error.code !== 'ENOENT') return; }
+  if (!hasTime()) return;
+  const first = metadata.findIndex(name => name > after);
+  const ordered = first < 0 ? metadata : [...metadata.slice(first), ...metadata.slice(0, first)];
+  const referenced = new Set();
+  let examined = 0;
+  let last = after;
+  for (const name of ordered) {
+    if (examined >= limit || !hasTime()) break;
+    examined++;
     let row;
     try {
       const raw = JSON.parse(await privateRead(path.join(dir, name), 64 * 1024));
       const source = raw?.identity;
       if (!validIdentity(source) || name !== `${nameFor(source)}.json` ||
-          scopeFor(source) !== scopeFor(identity) ||
-          source.sourceSessionId === identity.sourceSessionId) continue;
+          scopeFor(source) !== scope) return;
       row = await readRow(dir, source);
-    } catch { continue; }
-    if (!row || now - Date.parse(row.at) <= TTL) continue;
-    try {
-      await fs.unlink(metadataFile(dir, row.identity));
-      removed++;
-    } catch { /* A concurrent change is left for a later write. */ }
+    } catch { return; }
+    if (!row || !hasTime()) return;
+    if (row.identity.sourceSessionId !== identity.sourceSessionId &&
+        now - Date.parse(row.at) > TTL) {
+      try { await fs.unlink(path.join(dir, name)); }
+      catch { /* A concurrent change is left for a later write. */ }
+    } else if (row.handoff) referenced.add(row.handoff.contentHash);
+    last = name;
   }
-  // Delivered paths remain valid until their own seven-day retention expires.
-  // Sweep only private files in this checkout scope and never the current row.
-  const referenced = new Set();
-  const metadata = await fs.opendir(dir);
-  for await (const entry of metadata) {
-    if (!entry.name.startsWith(`${scopeFor(identity)}-`) ||
-        !/^[a-f0-9]{64}-[a-f0-9]{64}\.json$/.test(entry.name)) continue;
-    let source;
-    try { source = JSON.parse(await privateRead(path.join(dir, entry.name), 64 * 1024))?.identity; }
-    catch { return; }
-    if (!validIdentity(source) || entry.name !== `${nameFor(source)}.json` ||
-        scopeFor(source) !== scopeFor(identity)) return;
-    const row = await readRow(dir, source);
-    if (!row) return;
-    if (row.handoff) referenced.add(row.handoff.contentHash);
+  if (!hasTime()) return;
+  if (metadata.length > limit && last !== after) {
+    await atomicWrite(cursor, `${last}\n`);
+    return;
   }
-  const markdowns = await fs.opendir(dir);
-  for await (const entry of markdowns) {
-    if (removed >= 128) break;
-    const match = /^([a-f0-9]{64})-([a-f0-9]{64})\.md$/.exec(entry.name);
-    if (!match || match[1] !== scopeFor(identity)) continue;
-    const file = path.join(dir, entry.name);
+  // A Markdown link remains valid while any metadata row refers to it.
+  const markdowns = names.filter(name => name.startsWith(`${scope}-`) &&
+    /^[a-f0-9]{64}-[a-f0-9]{64}\.md$/.test(name));
+  const markdownCursor = path.join(dir, `.${scope}.gc-markdown-cursor`);
+  let lastMarkdown = '';
+  try {
+    lastMarkdown = (await privateRead(markdownCursor, 128)).trim();
+    if (lastMarkdown && !markdowns.includes(lastMarkdown)) lastMarkdown = '';
+  } catch (error) { if (error.code !== 'ENOENT') return; }
+  if (!hasTime()) return;
+  const markdownFirst = markdowns.findIndex(name => name > lastMarkdown);
+  const orderedMarkdowns = markdownFirst < 0 ? markdowns :
+    [...markdowns.slice(markdownFirst), ...markdowns.slice(0, markdownFirst)];
+  let checked = 0;
+  for (const name of orderedMarkdowns) {
+    if (checked++ >= limit || !hasTime()) break;
+    const file = path.join(dir, name);
     let stat;
     try { stat = await fs.lstat(file); } catch { continue; }
+    if (!hasTime()) break;
+    lastMarkdown = name;
     if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) ||
-        Date.now() - stat.mtimeMs <= TTL || referenced.has(match[2])) continue;
-    try { await fs.unlink(file); removed++; }
+        Date.now() - stat.mtimeMs <= TTL || referenced.has(name.slice(65, -3))) continue;
+    try { await fs.unlink(file); }
     catch { /* A concurrent change is left for a later write. */ }
+  }
+  if (hasTime() && markdowns.length > limit && lastMarkdown) {
+    await atomicWrite(markdownCursor, `${lastMarkdown}\n`);
   }
 }
 
 // Activity is recorded even without safe text, so concurrent work blocks an
 // older handoff. The `handoff` value must come from authenticated capture.
-export async function saveHandoff(stateDir, { identity, handoff, event, at = new Date().toISOString() } = {}) {
-  if (!validIdentity(identity) || !events.has(event) || !Number.isFinite(Date.parse(at)) ||
-      !(await currentCheckout(identity))) return blocked('stale_identity');
+export async function saveHandoff(stateDir, { identity, handoff, event,
+  at = new Date().toISOString(), hasTime = () => true } = {}) {
+  if (!validIdentity(identity) || !events.has(event) || !Number.isFinite(Date.parse(at))) {
+    return blocked('stale_identity');
+  }
+  if (!hasTime()) return blocked('deadline');
+  if (!(await currentCheckout(identity))) return blocked('stale_identity');
+  if (!hasTime()) return blocked('deadline');
   let dir;
   try { dir = await privateRoot(stateDir, true); }
   catch { return blocked('unsafe_state'); }
+  if (!hasTime()) return blocked('deadline');
   const prior = await readRow(dir, identity);
+  if (!hasTime()) return blocked('deadline');
   if (!prior) {
     for (const file of [metadataFile(dir, identity)]) {
       const exists = await fs.lstat(file).then(() => true, error =>
         error.code === 'ENOENT' ? false : Promise.reject(error)).catch(() => true);
       if (exists) return blocked('unsafe_existing_state');
+      if (!hasTime()) return blocked('deadline');
     }
   }
   if (prior && !sameCheckout(prior.identity, identity)) return blocked('identity_changed');
@@ -223,11 +252,14 @@ export async function saveHandoff(stateDir, { identity, handoff, event, at = new
         if (sha(await privateRead(file)) !== row.handoff.contentHash) return blocked('unsafe_existing_state');
       } catch (error) {
         if (error.code !== 'ENOENT') return blocked('unsafe_existing_state');
+        if (!hasTime()) return blocked('deadline');
         await atomicWrite(file, handoff.markdown);
+        if (!hasTime()) return blocked('deadline');
       }
     }
+    if (!hasTime()) return blocked('deadline');
     await atomicWrite(metadataFile(dir, identity), JSON.stringify(row) + '\n');
-    await cleanupExpired(dir, identity, Date.parse(at));
+    if (hasTime()) await cleanupExpired(dir, identity, Date.parse(at), hasTime).catch(() => {});
     return { kind: 'saved', file: row.handoff ? markdownFile(dir, identity, row.handoff.contentHash) : null };
   } catch { return blocked('write_failed'); }
 }

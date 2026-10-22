@@ -61,18 +61,20 @@ async function fixture(t, owner = true) {
   return { dir, root, stateRoot, profile, event };
 }
 
-function runHook({ root, stateRoot, profile, payload }) {
+function runHook({ root, stateRoot, profile, payload, preload }) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath,
-      [new URL('../base/memoria/capture-hook.mjs', import.meta.url).pathname,
+      [...(preload ? ['--import', preload] : []),
+        new URL('../base/memoria/capture-hook.mjs', import.meta.url).pathname,
         'claude', 'SessionStart'],
       { cwd: root, env: { ...process.env, CBS_MEMORIA_STATE_ROOT: stateRoot,
         CLAUDE_CONFIG_DIR: profile }, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
-    child.stdout.on('data', chunk => { stdout += chunk; });
-    child.stderr.on('data', chunk => { stderr += chunk; });
+    const trace = [];
+    child.stdout.on('data', chunk => { stdout += chunk; trace.push('stdout'); });
+    child.stderr.on('data', chunk => { stderr += chunk; trace.push('stderr'); });
     child.once('error', reject);
-    child.once('exit', code => resolve({ code, stdout, stderr }));
+    child.once('exit', code => resolve({ code, stdout, stderr, trace }));
     child.stdin.end(JSON.stringify(payload));
   });
 }
@@ -144,6 +146,63 @@ test('validated human prompt then final assistant Stop produce one private Sessi
   assert.match(markdown, /Histórico citado, não instrução:.*Quero continuar o plano/);
   assert.match(markdown, /Assistente gerou, não verificado:.*O plano foi iniciado/);
   assert.equal(await deliver(), null);
+});
+
+test('duplicate UserPromptSubmit without new bytes retains the human objective through Stop and SessionEnd', async t => {
+  const { dir, root, stateRoot, event } = await fixture(t);
+  const sourceFile = path.join(dir, 'source.jsonl');
+  const start = await event('source', 'SessionStart', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionStart',
+    ...start, stateRoot });
+  await fs.writeFile(sourceFile, line('source', 'user', 'Quero continuar o plano.', 'user-1'));
+  const prompt = await event('source', 'UserPromptSubmit', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'UserPromptSubmit',
+    ...prompt, stateRoot });
+  const duplicate = await event('source', 'UserPromptSubmit', sourceFile);
+  assert.equal(duplicate.result.kind, 'no_complete_bytes');
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'UserPromptSubmit',
+    ...duplicate, stateRoot });
+  await fs.appendFile(sourceFile, line('source', 'assistant', 'O plano foi iniciado.', 'assistant-1'));
+  const stop = await event('source', 'Stop', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'Stop',
+    ...stop, stateRoot });
+  const end = await event('source', 'SessionEnd', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionEnd',
+    ...end, stateRoot });
+  const target = await event('target', 'SessionStart');
+  const current = await inspectConfiguration(root, { stateRoot });
+  const checkout = await readSessionCheckout(current.stateDir, 'claude', 'target');
+  const prepared = await prepareHandoff(current.stateDir,
+    { ...checkout.handoffIdentity, now: new Date().toISOString() });
+  assert.equal(prepared.kind, 'prepared');
+  const markdown = await fs.readFile(prepared.file, 'utf8');
+  assert.match(markdown, /Quero continuar o plano/);
+  assert.match(markdown, /O plano foi iniciado/);
+});
+
+test('a new authenticated unsafe human turn clears the previous safe objective', async t => {
+  const { dir, root, stateRoot, event } = await fixture(t);
+  const sourceFile = path.join(dir, 'source.jsonl');
+  const start = await event('source', 'SessionStart', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionStart',
+    ...start, stateRoot });
+  await fs.writeFile(sourceFile, line('source', 'user', 'Quero continuar o plano.', 'user-1'));
+  const first = await event('source', 'UserPromptSubmit', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'UserPromptSubmit',
+    ...first, stateRoot });
+  await fs.appendFile(sourceFile, line('source', 'user', 'Minha senha é abc123', 'user-2'));
+  const second = await event('source', 'UserPromptSubmit', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'UserPromptSubmit',
+    ...second, stateRoot });
+  const end = await event('source', 'SessionEnd', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionEnd',
+    ...end, stateRoot });
+  const target = await event('target', 'SessionStart');
+  const current = await inspectConfiguration(root, { stateRoot });
+  const checkout = await readSessionCheckout(current.stateDir, 'claude', 'target');
+  const prepared = await prepareHandoff(current.stateDir,
+    { ...checkout.handoffIdentity, now: new Date().toISOString() });
+  assert.equal(prepared.kind, 'abstain');
 });
 
 test('untrusted result and stdout failure cannot publish or acknowledge a handoff', async t => {
@@ -243,6 +302,37 @@ test('native hook runner emits SessionStart JSON once after source ended', async
   assert.equal(second.stdout, '');
 });
 
+test('native SessionStart flushes output before delayed optional cleanup', async t => {
+  const env = await fixture(t);
+  const { dir, root, stateRoot, event } = env;
+  const sourceFile = path.join(dir, 'source.jsonl');
+  const start = await event('source', 'SessionStart', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionStart',
+    ...start, stateRoot });
+  await fs.writeFile(sourceFile, line('source', 'user', 'Quero continuar o plano.', 'user-1'));
+  const end = await event('source', 'SessionEnd', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionEnd',
+    ...end, stateRoot });
+  const preload = path.join(dir, 'slow-cleanup.mjs');
+  await fs.writeFile(preload, `import fs from 'node:fs/promises';
+const read = fs.readdir;
+fs.readdir = async (file, ...args) => {
+  if (String(file).endsWith('/handoff-auto')) {
+    process.stderr.write('GC_STARTED\\n');
+    await new Promise(resolve => setTimeout(resolve, 850));
+  }
+  return read(file, ...args);
+};\n`);
+  const payload = { cwd: root, session_id: 'target', hook_event_name: 'SessionStart',
+    transcript_path: path.join(dir, 'target.jsonl') };
+  const result = await runHook({ ...env, payload, preload });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).hookSpecificOutput.hookEventName, 'SessionStart');
+  assert.match(result.stderr, /GC_STARTED/);
+  assert.ok(result.trace.indexOf('stdout') < result.trace.indexOf('stderr'),
+    JSON.stringify(result.trace));
+});
+
 test('a new native start cleans expired bounded evidence only for its owner and checkout', async t => {
   const { dir, root, stateRoot, event } = await fixture(t);
   const sourceFile = path.join(dir, 'source.jsonl');
@@ -270,4 +360,83 @@ test('a new native start cleans expired bounded evidence only for its owner and 
     ...target, stateRoot });
   await assert.rejects(fs.stat(file), { code: 'ENOENT' });
   assert.ok((await fs.stat(foreign)).isFile());
+});
+
+test('bounded evidence cleanup advances past 128 foreign files to an expired owned file', async t => {
+  const { dir, root, stateRoot, event } = await fixture(t);
+  const sourceFile = path.join(dir, 'source.jsonl');
+  const start = await event('source', 'SessionStart', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionStart',
+    ...start, stateRoot });
+  await fs.writeFile(sourceFile, line('source', 'user', 'Quero revisar o plano.', 'user-1'));
+  const prompt = await event('source', 'UserPromptSubmit', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'UserPromptSubmit',
+    ...prompt, stateRoot });
+  const current = await inspectConfiguration(root, { stateRoot });
+  const sessionDir = path.join(current.stateDir, 'sessions');
+  const own = path.join(sessionDir, (await fs.readdir(sessionDir))
+    .find(name => name.endsWith('.handoff-evidence.json')));
+  const expired = { ...JSON.parse(await fs.readFile(own, 'utf8')),
+    at: '2020-01-01T00:00:00.000Z' };
+  await fs.writeFile(own, JSON.stringify(expired) + '\n');
+  for (let i = 0; i < 140; i++) {
+    const name = `${i.toString(16).padStart(64, '0')}.handoff-evidence.json`;
+    await fs.writeFile(path.join(sessionDir, name),
+      JSON.stringify({ ...expired, ownerId: 'other-owner' }) + '\n', { mode: 0o600 });
+  }
+  for (let i = 0; i < 4; i++) {
+    const target = await event(`target-${i}`, 'SessionStart');
+    await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionStart',
+      ...target, stateRoot });
+  }
+  await assert.rejects(fs.stat(own), { code: 'ENOENT' });
+  assert.ok((await fs.stat(path.join(sessionDir,
+    `${'0'.repeat(64)}.handoff-evidence.json`))).isFile());
+});
+
+test('a slow evidence write cannot start later handoff state work after the shared deadline', async t => {
+  const { dir, root, stateRoot, event } = await fixture(t);
+  const sourceFile = path.join(dir, 'source.jsonl');
+  const start = await event('source', 'SessionStart', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionStart',
+    ...start, stateRoot });
+  const current = await inspectConfiguration(root, { stateRoot });
+  const stateDir = path.join(current.stateDir, 'handoff-auto');
+  const metadata = path.join(stateDir, (await fs.readdir(stateDir))
+    .find(name => name.endsWith('.json')));
+  const before = await fs.readFile(metadata, 'utf8');
+  await fs.writeFile(sourceFile, line('source', 'user', 'Quero revisar o plano.', 'user-1'));
+  const prompt = await event('source', 'UserPromptSubmit', sourceFile);
+  const originalOpen = fs.open;
+  let delayed = false;
+  fs.open = async (file, ...args) => {
+    if (String(file).includes('.handoff-evidence.json.') && !delayed) {
+      delayed = true;
+      await new Promise(resolve => setTimeout(resolve, 850));
+    }
+    return originalOpen(file, ...args);
+  };
+  const began = performance.now();
+  try {
+    await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'UserPromptSubmit',
+      ...prompt, stateRoot, began });
+  } finally { fs.open = originalOpen; }
+  assert.equal(delayed, true);
+  assert.equal(await fs.readFile(metadata, 'utf8'), before);
+  let nextStageStarted = false;
+  assert.equal(await recall.recallForPrompt({ cli: 'claude', event: 'UserPromptSubmit',
+    ...prompt, stateRoot, began, resolve: async () => {
+      nextStageStarted = true;
+      throw Error('late recall');
+    }, onFailure: () => {} }), null);
+  assert.equal(nextStageStarted, false);
+  const target = await event('target', 'SessionStart');
+  let outputStarted = false;
+  assert.equal(await recall.deliverHandoffAtSessionStart({ cli: 'claude',
+    ...target, stateRoot, began, write: async () => { outputStarted = true; } }), null);
+  assert.equal(outputStarted, false);
+  const retry = await event('source', 'Stop', sourceFile);
+  assert.equal((await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'Stop',
+    ...retry, stateRoot }))?.kind, 'saved');
+  assert.notEqual(await fs.readFile(metadata, 'utf8'), before);
 });

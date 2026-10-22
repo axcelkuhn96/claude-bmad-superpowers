@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { formatHandoff } from '../base/memoria/handoff-format.mjs';
 import { captureHandoffIdentity, saveHandoff, loadHandoff, prepareHandoff,
   acknowledgeHandoff } from '../base/memoria/handoff-state.mjs';
@@ -254,6 +255,42 @@ test('65 sessions stay selectable and cleanup progresses beyond 128 metadata rec
   const names = await fs.readdir(path.join(state, 'handoff-auto'));
   assert.ok(names.filter(name => name.endsWith('.json')).length <= 2);
   assert.equal((await loadHandoff(state, { ...target, now: '2026-10-30T12:00:00.000Z' })).kind, 'selected');
+});
+
+test('state cleanup bounds metadata reads and reaches an expired row behind 400 live rows', async t => {
+  const { state, identity } = await fixture(t);
+  const old = await identity('expired');
+  assert.equal((await record(state, old, [], 'SessionEnd', '2026-10-20T12:00:00.000Z')).kind,
+    'saved');
+  const dir = path.join(state, 'handoff-auto');
+  const sha = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const scope = sha([old.projectId, old.ownerId, old.nativeRoot, old.projectRoot,
+    old.commonGitDir, old.worktreeGitDir, old.branch, old.checkoutFingerprint]);
+  const filename = source => `${scope}-${sha([source.cli, source.sourceSessionId])}.json`;
+  for (let i = 0; i < 400; i++) {
+    const source = { ...old, sourceSessionId: `live-${i}` };
+    await fs.writeFile(path.join(dir, filename(source)), JSON.stringify({
+      version: 2, identity: source, event: 'SessionEnd',
+      at: '2026-10-30T12:00:00.000Z', handoff: null }) + '\n', { mode: 0o600 });
+  }
+  const originalOpen = fs.open;
+  let reads = new Set();
+  fs.open = async (file, ...args) => {
+    if (String(file).startsWith(dir) && String(file).endsWith('.json')) reads.add(String(file));
+    return originalOpen(file, ...args);
+  };
+  try {
+    for (let i = 0; i < 3; i++) {
+      reads = new Set();
+      const writer = await identity(`writer-${i}`);
+      assert.equal((await record(state, writer, [], 'SessionEnd',
+        '2026-10-30T12:00:00.000Z')).kind, 'saved');
+      assert.ok(reads.size <= 390, `cleanup read ${reads.size} metadata files`);
+    }
+  } finally { fs.open = originalOpen; }
+  await assert.rejects(fs.stat(path.join(dir, filename(old))), { code: 'ENOENT' });
+  assert.ok((await fs.stat(path.join(dir, filename({ ...old,
+    sourceSessionId: 'live-0' })))).isFile());
 });
 
 test('failed metadata replacement keeps prior Markdown readable and permits retry', async t => {
