@@ -59,11 +59,20 @@ for (const definition of readonlyDefinitions) definition.annotations = {
 readonlyDefinitions.at(-1).annotations = { readOnlyHint: false, destructiveHint: false,
   idempotentHint: true, openWorldHint: true };
 
+export function localWorkerEnvironment(sourceEnv = process.env) {
+  const device = sourceEnv.CBS_MEMORIA_EMBEDDING_DEVICE;
+  if (device !== undefined && !['auto', 'cpu', 'cuda', 'directml'].includes(device)) {
+    throw new Error('embedding_device_invalid');
+  }
+  return Object.fromEntries(['PATH', 'HOME', 'SYSTEMROOT', 'WINDIR', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL',
+    'CBS_MEMORIA_CA_FILE', 'CBS_MEMORIA_EMBEDDING_DEVICE']
+    .filter(key => sourceEnv[key] !== undefined).map(key => [key, sourceEnv[key]]));
+}
+
 function createLocalSearchWorker(resolution) {
   const model = path.join(resolution.stateDir, 'artifacts', 'model.onnx');
   const tokenizer = path.join(resolution.stateDir, 'artifacts', 'tokenizer.json');
-  const env = Object.fromEntries(['PATH', 'HOME', 'SYSTEMROOT', 'WINDIR', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'CBS_MEMORIA_CA_FILE']
-    .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
+  const env = localWorkerEnvironment();
   const worker = createBrokerWorker(() => spawn(runtimePython(resolution.stateDir), [script], {
     stdio: ['pipe', 'pipe', 'ignore'], env: { ...env, CBS_MEMORIA_MODEL: model,
       CBS_MEMORIA_TOKENIZER: tokenizer, OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1',

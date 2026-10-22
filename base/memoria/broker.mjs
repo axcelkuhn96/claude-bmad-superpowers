@@ -585,6 +585,8 @@ export async function requestBroker(request, secret, { stateRoot, deadlineMs = 1
 
 export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId, idleMs = 300000 } = {}) {
   if (process.platform !== 'win32' && !process.getuid) return blocked('native_windows_unproved');
+  const requestedDevice = process.env.CBS_MEMORIA_EMBEDDING_DEVICE ?? 'auto';
+  if (!['auto', 'cpu', 'cuda', 'directml'].includes(requestedDevice)) return blocked('embedding_device_invalid');
   const resolution = await inspectConfiguration(bootstrapCwd, { stateRoot });
   if (resolution.provider !== 'mem0') return blocked(resolution.reason ?? 'unbound');
   const trust = await readLocalTrust(resolution.stateDir);
@@ -679,6 +681,15 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
       if (!active) idle = setTimeout(() => server.close(), idleMs);
     });
     const accept = frame => {
+      if (frame.value?.kind === 'device_status') {
+        const valid = Object.keys(frame.value).sort().join(',') === 'deadlineAt,kind' &&
+          frame.secret.length === 0 && Number.isFinite(frame.value.deadlineAt) &&
+          frame.value.deadlineAt > Date.now();
+        frame.secret.fill(0);
+        connection.respond(valid ? { kind: 'device_status', requested: requestedDevice } :
+          blocked('invalid_request'));
+        return;
+      }
       if (frame.value?.kind === 'launch_lease') {
         if (leases >= 16) {
           frame.secret.fill(0);

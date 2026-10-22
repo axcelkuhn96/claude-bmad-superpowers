@@ -11,6 +11,7 @@ import { ensureBrokerReady } from '../base/memoria/broker-start.mjs';
 import { inspectConfiguration, initializeSession } from '../base/memoria/provider.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
+import { FrameReader, encodeFrame } from '../base/memoria/frame.mjs';
 
 const brokerEntrypoint = fileURLToPath(new URL('../base/memoria/broker.mjs', import.meta.url));
 const brokerLoaderSupported = typeof moduleApi.registerHooks === 'function';
@@ -71,8 +72,16 @@ async function fixture(t) {
   return { cwd, stateRoot, current };
 }
 
-async function endpoint(t, root) {
-  const server = net.createServer(socket => socket.end());
+async function endpoint(t, root, device = 'auto') {
+  const server = net.createServer(socket => {
+    const reader = new FrameReader();
+    socket.on('data', chunk => {
+      for (const frame of reader.push(chunk)) {
+        socket.end(encodeFrame({ kind: 'device_status', requested: device }, undefined, true));
+        frame.secret.fill(0);
+      }
+    });
+  });
   const file = path.join(root, 'encoder.sock');
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
   await new Promise((resolve, reject) => server.listen(file, error => error ? reject(error) : resolve()));
@@ -123,11 +132,26 @@ test('broker launch carries embedding device from the native process allowlist',
   await ensureBrokerReady(cwd, { stateRoot, deadlineMs: 1000,
     spawnBroker: (_command, _args, options) => {
       captured = options.env;
-      setTimeout(() => { endpoint(t, stateRoot).catch(() => {}); }, 10);
+      setTimeout(() => { endpoint(t, stateRoot, 'cpu').catch(() => {}); }, 10);
       return { unref() {} };
     } });
   assert.equal(captured.CBS_MEMORIA_EMBEDDING_DEVICE, 'cpu');
   assert.equal(captured.OPENAI_API_KEY, undefined);
+});
+
+test('a live broker rejects a conflicting explicit device without replacement', async t => {
+  const { cwd, stateRoot } = await fixture(t);
+  await endpoint(t, stateRoot, 'auto');
+  const previous = process.env.CBS_MEMORIA_EMBEDDING_DEVICE;
+  process.env.CBS_MEMORIA_EMBEDDING_DEVICE = 'cpu';
+  t.after(() => {
+    if (previous === undefined) delete process.env.CBS_MEMORIA_EMBEDDING_DEVICE;
+    else process.env.CBS_MEMORIA_EMBEDDING_DEVICE = previous;
+  });
+  let starts = 0;
+  assert.deepEqual(await ensureBrokerReady(cwd, { stateRoot,
+    spawnBroker: () => { starts++; } }), { kind: 'blocked', reason: 'device_conflict' });
+  assert.equal(starts, 0);
 });
 
 test('changed trust and unsafe endpoint fail closed without spawning', async t => {

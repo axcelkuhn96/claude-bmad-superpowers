@@ -1,6 +1,7 @@
 """Optional, project-local Mem0 runtime setup. No Mem0 import precedes isolation."""
 
 import argparse
+import ctypes
 import hashlib
 import importlib.metadata
 import json
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import venv
+import uuid
 
 
 def protect_windows_tree(root: Path) -> None:
@@ -113,21 +115,65 @@ def ort_pin(variant: str) -> str:
     return ORT_PINS[variant]
 
 
-def select_variant(device: str) -> str:
+def windows_dx12_gpu_available() -> bool:
+    try:
+        probe = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+                                'Get-CimInstance Win32_VideoController | ForEach-Object { $_.PNPDeviceID }'],
+                               capture_output=True, text=True, timeout=3, check=False)
+        if probe.returncode or not any('VEN_' + vendor in probe.stdout.upper()
+                                        for vendor in ('1002', '10DE', '8086')):
+            return False
+        d3d12 = ctypes.WinDLL('d3d12.dll')
+        create = d3d12.D3D12CreateDevice
+        create.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                           ctypes.POINTER(ctypes.c_void_p)]
+        create.restype = ctypes.c_long
+        interface = uuid.UUID('189819f1-1db6-4b57-be54-1821339b85f7')
+        guid = ctypes.create_string_buffer(interface.bytes_le)
+        device = ctypes.c_void_p()
+        if create(None, 0xb000, guid, ctypes.byref(device)) < 0 or not device.value:
+            return False
+        vtable = ctypes.cast(device, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])(device)
+        return True
+    except Exception:
+        return False
+
+
+def select_variant_with_reason(device: str) -> tuple[str, str | None]:
     if device not in ("auto", *ORT_PINS):
         raise RuntimeError("invalid embedding device")
     if device == "cpu":
-        return "cpu"
+        return "cpu", None
     if device == "cuda" or (device == "auto" and sys.platform == "linux"):
         try:
-            probe = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+            probe = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], capture_output=True,
                                    text=True, timeout=2, check=False)
-            return "cuda" if probe.returncode == 0 and probe.stdout.strip() else "cpu"
-        except (OSError, subprocess.TimeoutExpired):
-            return "cpu"
-    if sys.platform == "win32" and platform.machine().lower() in ("amd64", "x86_64") and (3, 11) <= sys.version_info[:2] <= (3, 14):
-        return "directml"
-    return "cpu"
+            drivers = [int(version.split('.')[0]) for version in probe.stdout.splitlines()
+                       if version.strip()]
+            if probe.returncode == 0 and drivers and all(version >= 580 for version in drivers):
+                return "cuda", None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+        return "cpu", "cuda_driver_unavailable"
+    if device == "directml" or (device == "auto" and sys.platform == "win32"):
+        if sys.platform != "win32" or platform.machine().lower() not in ("amd64", "x86_64") or \
+                not (3, 11) <= sys.version_info[:2] <= (3, 14):
+            return "cpu", "directml_platform_unsupported"
+        try:
+            build = int(platform.win32_ver()[1].split('.')[-1])
+        except (ValueError, IndexError, OSError):
+            build = 0
+        if build < 18362:
+            return "cpu", "directml_os_unsupported"
+        if not windows_dx12_gpu_available():
+            return "cpu", "directml_gpu_unavailable"
+        return "directml", None
+    return "cpu", "device_unsupported"
+
+
+def select_variant(device: str) -> str:
+    return select_variant_with_reason(device)[0]
 
 
 def check_versions(variant: str) -> None:
@@ -219,10 +265,9 @@ def main() -> int:
     python = runtime / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     env = os.environ.copy()
     requested = os.environ.get("CBS_MEMORIA_EMBEDDING_DEVICE", "auto")
-    variant = select_variant(requested)
+    variant, preflight_reason = select_variant_with_reason(requested)
     selected, reason = install_packages(python, variant, env)
-    if requested not in ("auto", variant):
-        reason = f"{requested}_unavailable"
+    reason = preflight_reason or reason
     try:
         subprocess.run([str(python), __file__, "--state", str(state), "--check", "--variant", selected],
                        check=True, env=env)

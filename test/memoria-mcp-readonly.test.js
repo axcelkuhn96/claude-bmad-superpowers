@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { createReadonlyMcp, installReadonlyShutdown, readonlyDefinitions } from '../base/memoria/mcp-readonly.mjs';
+import { createReadonlyMcp, installReadonlyShutdown, readonlyDefinitions, localWorkerEnvironment } from '../base/memoria/mcp-readonly.mjs';
 import { inspectConfiguration } from '../base/memoria/provider.mjs';
 import { writeLocalTrust, trustTuple } from '../base/memoria/trust.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
@@ -33,6 +33,15 @@ async function fixture(t) {
 const item = { sdkId: 'mem-1', projectId: 'project-one', status: 'active', text: 'Use Postgres.',
   score: .97, scoreSource: 'mem0_sdk_search', metadata: { scope: 'project', source: 'message-1',
     actor: 'user', origin: 'user_direct', speaker_role: 'user', evidence_at: '2026-10-01T00:00:00Z' } };
+
+test('local worker forwards an explicit CPU device without unrelated process secrets', () => {
+  const env = localWorkerEnvironment({ PATH: '/bin', CBS_MEMORIA_EMBEDDING_DEVICE: 'cpu',
+    OPENAI_API_KEY: 'secret' });
+  assert.equal(env.CBS_MEMORIA_EMBEDDING_DEVICE, 'cpu');
+  assert.equal(env.OPENAI_API_KEY, undefined);
+  assert.throws(() => localWorkerEnvironment({ CBS_MEMORIA_EMBEDDING_DEVICE: 'unknown' }),
+    /embedding_device_invalid/);
+});
 
 test('standalone tools describe read and explicit write behavior', () => {
   assert.deepEqual(readonlyDefinitions.map(tool => tool.name), ['search', 'get', 'status', 'remember']);
