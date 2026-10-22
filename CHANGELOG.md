@@ -2,6 +2,18 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [Unreleased]
+
+### Adicionado
+- **Busca híbrida com índice textual nativo:** `cbs memoria indexar-texto --project /raiz/git` prepara a coleção Qdrant existente em uma operação administrativa. Identificadores técnicos ASCII encontrados literalmente podem acrescentar resultados distintos após o prefixo vetorial elegível, até 20 resultados; o recall automático permanece em 500 bytes. O E5 local, a dimensão 384, o fingerprint e o fallback GPU/CPU permanecem os mesmos.
+- **Contexto gerado com proveniência:** a chamada Haiku já usada na extração pode produzir até quatro resumos de 256 bytes (`problem`, `reason`, `attempt`, `pending`), ligados às referências da fonte e marcados `generated_unverified`. É opcional, não cria chamada LLM por prompt e pode aumentar os tokens dessa extração; políticas v4, fatos e ACKs existentes continuam preservados.
+- **Avaliação de recuperação offline:** replay de candidatos congelados, com corpus real privado separado da fixture sintética e sidecars independentes de rótulos, identidades e observações ligados por hashes. Mede ranking condicional, sem alegar transação pareada ao vivo no Qdrant ou qualidade factual atual não observada.
+- **Exportação local em Markdown:** `cbs memoria exportar` cria snapshots derivados OKF v0.2 por projeto e owner quando este é identificável, com ponteiro atômico `current.json`; `cbs memoria historico` lê o bundle privado e distingue vínculos incompletos, atualidade remota não verificada e snapshot obsoleto. Paginação incompleta preserva o bundle anterior; não há envio ao Git nem reimportação automática.
+- **Handoff automático curto:** entrega no `SessionStart` de até 300 bytes e link para Markdown privado da sessão anterior elegível, no mesmo projeto, owner e checkout, com TTL de sete dias e abstenção em identidade ou concorrência incerta. Mantém `/handoff` manual; receipt após a saída nativa permite repetição antes do recibo. A prova física de Windows permanece pendente.
+
+### Limitações conhecidas
+- O gate de resgate de identificadores mediu 2 casos contra o mínimo de 3; o benefício de contexto real segue não medido e o p95 estrito de componente anterior excedeu 1 s. A aceitação, a publicação e o deploy geral ainda dependem de revisão e evidências finais; não há promessa de ganho universal de qualidade ou custo zero.
+
 ## [0.15.10] - 2026-10-22
 
 ### Adicionado
