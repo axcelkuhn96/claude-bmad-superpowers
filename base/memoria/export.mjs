@@ -1,11 +1,9 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { containsSecret, redactSource } from './candidates.mjs';
-import { verifiedGeneratedContext } from './generated-context.mjs';
+import { redactSource } from './candidates.mjs';
 import { inspectConfiguration } from './provider.mjs';
 import { readLocalTrust, sameTrustTuple, trustTuple, authorizeDestination } from './trust.mjs';
 import { identifyProject } from './project-id.mjs';
@@ -13,6 +11,7 @@ import { pinDestination } from './activation.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
 import { readOwner } from './policy.mjs';
 import { runtimePython, runtimeEnvironment } from './runtime.mjs';
+import { nativeProfile } from './native-profile.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const uuid = value => typeof value === 'string' &&
@@ -21,6 +20,30 @@ const fail = code => Object.assign(new Error(code), { code });
 const privateMode = stat => stat.isDirectory() && !(stat.mode & 0o077) &&
   (process.getuid === undefined || stat.uid === process.getuid());
 const pii = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|\+\d{1,3}[ .()-]*\d{2}[ .()-]*\d{4,5}[ .()-]*\d{4}\b|\(\d{2}\)\s*\d{4,5}-\d{4}\b/gi;
+const metadataFields = ['type', 'scope', 'owner_id', 'source', 'actor', 'origin',
+  'speaker_role', 'evidence_at', 'condition', 'valid_from', 'valid_to',
+  'supersedes_id', 'superseded_by', 'source_record_id', 'source_message_id',
+  'source_text_sha256', 'claim_sha256', 'dedup_key', 'policy_version',
+  'review_mode', 'auto_consent_hash', 'format_version'];
+const refFields = ['message_id', 'source_text_sha256', 'role', 'origin'];
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === 'object') return Object.fromEntries(
+    Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([key, item]) => [key, canonical(item)]));
+  return value;
+}
+function projectMetadata(metadata) {
+  const projected = { source_type: 'derived_export' };
+  for (const key of metadataFields) {
+    if (typeof metadata[key] === 'string' || key === 'format_version' &&
+        Number.isSafeInteger(metadata[key])) projected[key] = metadata[key];
+  }
+  if (Array.isArray(metadata.source_refs)) projected.source_refs = metadata.source_refs.map(ref =>
+    Object.fromEntries(refFields.filter(key => typeof ref?.[key] === 'string')
+      .map(key => [key, ref[key]])));
+  return projected;
+}
 
 function scrub(value) {
   if (typeof value === 'string') {
@@ -77,8 +100,6 @@ function concept(row) {
   const type = typeof metadata.type === 'string' && metadata.type.trim() ? metadata.type : 'memory';
   const fields = { ...metadata, id: row.qdrantId, type, status,
     history_state: state, project_id: row.projectId };
-  // These source fields are annotations in this derived bundle, never import authority.
-  delete fields.context_generated;
   const head = Object.entries(fields).sort(([a], [b]) => a.localeCompare(b))
     .map(([key, value]) => `${/^[A-Za-z_][A-Za-z0-9_-]*$/.test(key) ? key : yaml(key)}: ${yaml(value)}`).join('\n');
   const refs = ['supersedes_id', 'superseded_by'].filter(key => uuid(metadata[key]))
@@ -92,19 +113,14 @@ function normalize(row, projectId, ownerId) {
       row.status === 'superseded' && row.historyState !== 'superseded' ||
       typeof row.text !== 'string' || !row.text.trim() ||
       !['project', 'personal', 'episode'].includes(row.metadata?.scope) ||
-      row.metadata?.source_type === 'imported_legacy' ||
+      (!ownerId && row.metadata?.scope !== 'project') ||
+      ['imported_legacy', 'derived_export'].includes(row.metadata?.source_type) ||
       !['source', 'actor', 'origin', 'speaker_role', 'evidence_at']
         .every(key => typeof row.metadata[key] === 'string' && row.metadata[key]) ||
       row.metadata?.scope === 'personal' && (!ownerId || row.metadata.owner_id !== ownerId)) return null;
-  if (row.metadata?.context_generated && (!verifiedGeneratedContext(
-    row.metadata.context_generated, row.metadata.source_refs,
-    value => redactSource(value) === value && !new RegExp(pii.source, 'i').test(value)) ||
-      containsSecret(row.metadata.context_generated) ||
-      JSON.stringify(scrub(row.metadata.source_refs)) !== JSON.stringify(row.metadata.source_refs))) {
-    row = { ...row, metadata: { ...row.metadata } };
-    delete row.metadata.context_generated;
-  }
-  return scrub(row);
+  return canonical(scrub({ qdrantId: row.qdrantId, projectId: row.projectId,
+    status: row.status, historyState: row.historyState, text: row.text,
+    metadata: projectMetadata(row.metadata) }));
 }
 function hashFiles(files) {
   const hash = createHash('sha256');
@@ -156,7 +172,8 @@ export async function exportSnapshot({ output, projectId, ownerId = null,
   files.push(['history.json', JSON.stringify(ordered) + '\n']);
   const sha256 = hashFiles(files);
   const manifest = { version: '0.2', projectId, ownerId, collectionFingerprint,
-    createdAt: now(), cursorComplete: true, count: ordered.length, sha256 };
+    createdAt: now(), cursorComplete: true, count: ordered.length, sha256,
+    exportScope: ownerId ? 'bound_owner' : 'project_only' };
   const versions = path.join(root, 'versions');
   try { await fs.mkdir(versions, { mode: 0o700 }); }
   catch (error) { if (error.code !== 'EEXIST') throw error; }
@@ -303,24 +320,29 @@ async function runHistoryPython(request, secret, stateDir) {
 
 async function currentOwner(resolution, cli, profile, options) {
   const read = options.readOwner ?? readOwner;
-  const profiles = cli ? [[cli, profile ?? (cli === 'codex'
-    ? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex')
-    : process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'))]] : [
-    ['codex', process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex')],
-    ['claude', process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude')]];
+  if (profile && (!cli || path.resolve(profile) !== path.resolve(nativeProfile(cli))))
+    throw fail('owner_profile_mismatch');
+  const codexActive = !!process.env.CODEX_THREAD_ID;
+  const claudeActive = !!process.env.CLAUDECODE;
+  const activeCli = codexActive !== claudeActive ? codexActive ? 'codex' : 'claude' : null;
+  if (activeCli && cli && cli !== activeCli) throw fail('owner_profile_mismatch');
+  const profiles = (activeCli ? [activeCli] : ['codex', 'claude']).map(nativeCli =>
+    [nativeCli, nativeProfile(nativeCli)]);
   const owners = new Set();
+  let boundProfiles = 0;
   for (const [nativeCli, nativeProfile] of profiles) {
     try { await fs.stat(nativeProfile); }
     catch (error) { if (error.code === 'ENOENT') continue; throw error; }
     const owner = await read(resolution, nativeCli, nativeProfile);
     if (owner?.kind === 'blocked') throw fail(owner.reason ?? 'owner_binding_changed');
-    if (owner?.ownerId) owners.add(owner.ownerId);
+    if (owner?.ownerId) { owners.add(owner.ownerId); boundProfiles += 1; }
   }
-  if (owners.size > 1) throw fail('owner_ambiguous');
+  if (owners.size > 1) return null;
+  if (!activeCli && boundProfiles !== profiles.length) return null;
   return [...owners][0] ?? null;
 }
 
-async function authorizedProject(cwd, options = {}) {
+async function localProject(cwd, options = {}) {
   if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) throw fail('invalid_project');
   cwd = path.resolve(cwd);
   const inspect = options.inspect ?? inspectConfiguration;
@@ -332,22 +354,12 @@ async function authorizedProject(cwd, options = {}) {
   const expected = trustTuple(resolution);
   const trust = options.trust ?? readLocalTrust;
   if (!sameTrustTuple(expected, await trust(resolution.stateDir))) throw fail('trust_changed');
-  const destination = resolution.destination;
-  const pin = await (options.pin ?? pinDestination)(destination.url, {
-    address: destination.address, allowPublic: destination.allowPublic });
-  if (pin.kind !== 'pinned') throw fail(pin.reason ?? 'destination_unavailable');
   const current = await inspect(cwd, options);
   if (current.provider !== 'mem0' || current.projectId !== resolution.projectId ||
       current.embeddingFingerprint !== resolution.embeddingFingerprint ||
       !sameTrustTuple(expected, trustTuple(current))) throw fail('config_changed');
-  const auth = authorizeDestination(current, await trust(current.stateDir),
-    options.readSecret ?? readQdrantSecret);
-  if (auth.kind !== 'authorized') throw fail(auth.reason ?? 'unauthorized');
   const ownerId = await currentOwner(current, options.cli, options.profile, options);
-  const request = { projectId: current.projectId, collection: current.destination.collection,
-    connection: pin.connection, ownerId };
-  const run = options.run ?? ((value, key) => runHistoryPython(value, key, current.stateDir));
-  return { current, ownerId, request, run: value => run(value, auth.key),
+  return { current, ownerId,
     verifyCurrent: async () => {
       const live = await inspect(cwd, options);
       return live.provider === 'mem0' && live.projectId === current.projectId &&
@@ -357,8 +369,25 @@ async function authorizedProject(cwd, options = {}) {
     } };
 }
 
+async function remoteProject(local, options) {
+  const destination = local.current.destination;
+  const pin = await (options.pin ?? pinDestination)(destination.url, {
+    address: destination.address, allowPublic: destination.allowPublic });
+  if (pin.kind !== 'pinned') throw fail(pin.reason ?? 'destination_unavailable');
+  if (!await local.verifyCurrent()) throw fail('config_changed');
+  const auth = authorizeDestination(local.current,
+    await (options.trust ?? readLocalTrust)(local.current.stateDir),
+    options.readSecret ?? readQdrantSecret);
+  if (auth.kind !== 'authorized') throw fail(auth.reason ?? 'unauthorized');
+  const request = { projectId: local.current.projectId,
+    collection: destination.collection, connection: pin.connection,
+    ownerId: local.ownerId };
+  const run = options.run ?? ((value, key) => runHistoryPython(value, key, local.current.stateDir));
+  return { ...local, request, run: value => run(value, auth.key) };
+}
+
 export async function exportProject(cwd, output, options = {}) {
-  const auth = await authorizedProject(cwd, options);
+  const auth = await remoteProject(await localProject(cwd, options), options);
   const collectionFingerprint = digest(JSON.stringify([
     auth.current.destination.url, auth.current.destination.collection,
     auth.current.embeddingFingerprint]));
@@ -368,9 +397,15 @@ export async function exportProject(cwd, output, options = {}) {
 }
 
 export async function historyProject(cwd, snapshot, id, options = {}) {
-  const auth = await authorizedProject(cwd, options);
-  return historySnapshot({ snapshot, id, projectId: auth.current.projectId,
-    ownerId: auth.ownerId, fetchCurrent: async memoryId => {
+  const local = await localProject(cwd, options);
+  const stored = await historySnapshot({ snapshot, id, projectId: local.current.projectId,
+    ownerId: local.ownerId });
+  if (stored.integrity !== 'complete') return stored;
+  let auth;
+  try { auth = await remoteProject(local, options); }
+  catch { return stored; }
+  return historySnapshot({ snapshot, id, projectId: local.current.projectId,
+    ownerId: local.ownerId, fetchCurrent: async memoryId => {
       const result = await auth.run({ ...auth.request, op: 'history_get', memoryId });
       if (result.kind === 'blocked' && result.reason === 'source_unavailable') return null;
       if (result.kind !== 'item') throw fail(result.reason ?? 'read_failed');

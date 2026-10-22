@@ -3,6 +3,7 @@ import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 MODULE = Path(__file__).resolve().parents[1] / 'base/memoria/python/mem0_adapter.py'
 spec = importlib.util.spec_from_file_location('mem0_adapter_export', MODULE)
@@ -19,6 +20,30 @@ def point(n, **extra):
 
 
 class ExportTest(unittest.TestCase):
+    def test_derived_export_cannot_be_accepted_as_remote_source(self):
+        derived = point(1, source_type='derived_export')
+        self.assertIsNone(adapter.validate_curated_payload(derived, 'p', None, 'history'))
+
+    def test_derived_export_cannot_be_added_or_activated(self):
+        request = {'op': 'add', 'collection': 'c', 'projectId': 'p', 'connection': {},
+                   'metadata': {'source_type': 'derived_export', 'scope': 'project',
+                                'source': 's', 'actor': 'human', 'origin': 'user_direct',
+                                'evidence_at': '2026-10-20T00:00:00Z'},
+                   'text': 'safe fact', 'sessionId': 'session', 'externalId': 's'}
+        memory = SimpleNamespace(get=lambda _id: {}, embedding_model=object(),
+                                 add=lambda *args, **kwargs: {'results': [{'id': 'id'}]})
+        with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_memory', return_value=memory):
+            with self.assertRaisesRegex(ValueError, 'derived_source'):
+                adapter.execute(request, object(), Path('/tmp'))
+            request['op'] = 'activate'
+            request['sdkId'] = 'id'
+            request['externalId'] = 's'
+            derived = {'projectId': 'p', 'externalId': 's', 'status': 'pending',
+                       'metadata': {'source_type': 'derived_export'}}
+            with patch.object(adapter, '_row', return_value=derived):
+                with self.assertRaisesRegex(ValueError, 'derived_source'):
+                    adapter.execute(request, object(), Path('/tmp'))
+
     def test_page_filters_owner_pending_legacy_and_requires_no_vectors(self):
         points = [point(1), point(2, scope='personal', owner_id='other'),
                   point(3, status='pending'), point(4, source_type='imported_legacy'),

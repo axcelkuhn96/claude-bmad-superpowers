@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { exportSnapshot, historySnapshot, encodeRelativeLink, exportProject } from '../base/memoria/export.mjs';
+import { exportSnapshot, historySnapshot, encodeRelativeLink, exportProject, historyProject } from '../base/memoria/export.mjs';
 import { execFileSync } from 'node:child_process';
 import { trustTuple } from '../base/memoria/trust.mjs';
 
@@ -36,14 +36,14 @@ test('exports OKF bundle with stable bytes, encoded links and private modes', as
   assert.match(index, new RegExp(`${id(1)}\\.md`));
   assert.match(concept, /type: "work rule"/);
   assert.match(concept, /status: "stable"/);
-  assert.match(concept, /extension:/);
+  assert.doesNotMatch(concept, /extension:|odd:key/);
   const parsed = JSON.parse(execFileSync('python3', ['-c',
     'import json,sys,yaml; print(json.dumps(yaml.safe_load(sys.stdin.read())))'],
     { input: concept.slice(4, concept.indexOf('\n---', 4)), encoding: 'utf8' }));
   assert.equal(parsed.type, 'work rule');
   assert.equal(parsed.status, 'stable');
-  assert.deepEqual(parsed.extension, { x: 1 });
-  assert.equal(parsed['odd:key'], 'safe');
+  assert.equal(parsed.extension, undefined);
+  assert.equal(parsed['odd:key'], undefined);
   assert.equal(encodeRelativeLink('folder 1/100%.md'), 'folder%201/100%25.md');
   assert.throws(() => encodeRelativeLink('../index.md'), { code: 'invalid_link' });
   assert.equal((await fs.stat(path.join(first.bundleDir, 'index.md'))).mode & 0o777, 0o600);
@@ -116,12 +116,17 @@ test('history exposes corrections and detects stale, missing and cycles', async 
 test('trusted project binds owner, collection and destination without starting an encoder', async t => {
   const output = await fixture(t);
   const project = path.dirname(output);
+  const profile = path.join(project, 'profile');
+  await fs.mkdir(profile, { mode: 0o700 });
+  const oldProfile = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = profile;
+  t.after(() => oldProfile === undefined ? delete process.env.CODEX_HOME : process.env.CODEX_HOME = oldProfile);
   const resolution = { provider: 'mem0', projectRoot: project, projectId: 'p',
     stateDir: output, embeddingFingerprint: 'fp', destination: {
       url: 'https://example.org/', address: '1.2.3.4', allowPublic: true,
       collection: 'cbs-p', apiKeyEnv: 'TEST_KEY' } };
   const calls = [];
-  const deps = { cli: 'codex', profile: project, inspect: async () => resolution,
+  const deps = { cli: 'codex', profile, inspect: async () => resolution,
     trust: async () => trustTuple(resolution),
     identify: async () => ({ kind: 'git', activeRoot: project, projectRoot: project }),
     pin: async () => ({ kind: 'pinned', connection: { url: 'https://example.org/' } }),
@@ -140,6 +145,157 @@ test('trusted project binds owner, collection and destination without starting a
     [`${id(1)}.md`, 'index.md']);
   await assert.rejects(exportProject(project, output, { ...deps, trust: async () => null }),
     { code: 'trust_changed' });
+});
+
+test('requested profile B cannot select personal owner B from native profile A', async t => {
+  const output = await fixture(t);
+  const project = path.dirname(output);
+  const profileA = path.join(project, 'profile-a');
+  const profileB = path.join(project, 'profile-b');
+  await fs.mkdir(profileA, { mode: 0o700 });
+  await fs.mkdir(profileB, { mode: 0o700 });
+  const oldProfile = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = profileA;
+  t.after(() => oldProfile === undefined ? delete process.env.CODEX_HOME : process.env.CODEX_HOME = oldProfile);
+  const resolution = { provider: 'mem0', projectRoot: project, projectId: 'p',
+    stateDir: output, embeddingFingerprint: 'fp', destination: {
+      url: 'https://example.org/', address: '1.2.3.4', allowPublic: true,
+      collection: 'cbs-p', apiKeyEnv: 'TEST_KEY' } };
+  const deps = { cli: 'codex', profile: profileB, inspect: async () => resolution,
+    trust: async () => trustTuple(resolution),
+    identify: async () => ({ kind: 'git', activeRoot: project, projectRoot: project }),
+    pin: async () => ({ kind: 'pinned', connection: {} }), readSecret: () => 'secret',
+    readOwner: async (_resolution, _cli, profile) => ({ ownerId: profile === profileA ? 'owner-A' : 'owner-B' }),
+    run: async () => ({ kind: 'page', scanned: 1, nextOffset: null,
+      items: [item(1, { scope: 'personal', owner_id: 'owner-B' })] }) };
+  await assert.rejects(exportProject(project, output, deps), { code: 'owner_profile_mismatch' });
+});
+
+test('CLI selector cannot switch from active Codex owner to Claude owner', async t => {
+  const output = await fixture(t);
+  const project = path.dirname(output);
+  const codex = path.join(project, 'codex');
+  const claude = path.join(project, 'claude');
+  await fs.mkdir(codex, { mode: 0o700 });
+  await fs.mkdir(claude, { mode: 0o700 });
+  const old = [process.env.CODEX_HOME, process.env.CLAUDE_CONFIG_DIR,
+    process.env.CODEX_THREAD_ID, process.env.CLAUDECODE];
+  process.env.CODEX_HOME = codex;
+  process.env.CLAUDE_CONFIG_DIR = claude;
+  process.env.CODEX_THREAD_ID = 'native-session';
+  t.after(() => {
+    for (const [key, value] of [['CODEX_HOME', old[0]], ['CLAUDE_CONFIG_DIR', old[1]],
+      ['CODEX_THREAD_ID', old[2]], ['CLAUDECODE', old[3]]])
+      value === undefined ? delete process.env[key] : process.env[key] = value;
+  });
+  const resolution = { provider: 'mem0', projectRoot: project, projectId: 'p',
+    stateDir: output, embeddingFingerprint: 'fp', destination: {
+      url: 'https://example.org/', address: '1.2.3.4', allowPublic: true,
+      collection: 'cbs-p', apiKeyEnv: 'TEST_KEY' } };
+  const deps = { cli: 'claude', profile: claude, inspect: async () => resolution,
+    trust: async () => trustTuple(resolution),
+    identify: async () => ({ kind: 'git', activeRoot: project, projectRoot: project }),
+    pin: async () => ({ kind: 'pinned', connection: {} }), readSecret: () => 'secret',
+    readOwner: async (_resolution, selected) => ({ ownerId: selected === 'codex' ? 'owner-A' : 'owner-B' }),
+    run: async () => ({ kind: 'page', scanned: 1, nextOffset: null,
+      items: [item(1, { scope: 'personal', owner_id: 'owner-B' })] }) };
+  await assert.rejects(exportProject(project, output, deps), { code: 'owner_profile_mismatch' });
+  delete process.env.CODEX_THREAD_ID;
+  delete process.env.CLAUDECODE;
+  const unbound = await exportProject(project, output, { ...deps,
+    readOwner: async (_resolution, selected) => selected === 'claude' ? { ownerId: 'owner-B' } : null,
+    run: async () => ({ kind: 'page', scanned: 2, nextOffset: null,
+      items: [item(1), item(2, { scope: 'personal', owner_id: 'owner-B' })] }) });
+  assert.equal(unbound.count, 1);
+  const manifest = JSON.parse(await fs.readFile(path.join(unbound.bundleDir, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.exportScope, 'project_only');
+});
+
+test('derived bundle omits raw excerpts and unrelated metadata while retaining provenance ids and hashes', async t => {
+  const output = await fixture(t);
+  const sha = 'a'.repeat(64);
+  const row = item(1, { source_refs: [{ message_id: 'message-1', source_text_sha256: sha,
+    role: 'user', origin: 'human', actor: 'Mariana Cedar Lane',
+    excerpt: 'Mariana lives at 42 Cedar Lane, password=private123' }],
+    transcript_path: '/private/transcripts/mariana.jsonl', tool_args: { password: 'private123' },
+    claim_sha256: 'b'.repeat(64) });
+  const made = await exportSnapshot({ ...base(output), page: pageOf(row) });
+  const markdown = await fs.readFile(path.join(made.bundleDir, `${id(1)}.md`), 'utf8');
+  const history = await fs.readFile(path.join(made.bundleDir, 'history.json'), 'utf8');
+  for (const data of [markdown, history]) {
+    assert.doesNotMatch(data, /Mariana|Cedar Lane|private123|transcript_path|tool_args|excerpt/);
+    assert.match(data, /message-1/);
+    assert.match(data, new RegExp(sha));
+  }
+});
+
+test('unbound owner exports explicitly project-only scope', async t => {
+  const output = await fixture(t);
+  const made = await exportSnapshot({ ...base(output), page: pageOf(
+    item(1), item(2, { scope: 'episode', valid_to: '2026-10-25T00:00:00Z' }),
+    item(3, { scope: 'personal', owner_id: 'owner-B' })) });
+  const manifest = JSON.parse(await fs.readFile(path.join(made.bundleDir, 'manifest.json'), 'utf8'));
+  const rows = JSON.parse(await fs.readFile(path.join(made.bundleDir, 'history.json'), 'utf8'));
+  assert.equal(manifest.exportScope, 'project_only');
+  assert.deepEqual(rows.map(row => row.qdrantId), [id(1)]);
+});
+
+test('nested metadata key order keeps bytes, hash and remote freshness stable', async t => {
+  const output = await fixture(t);
+  const ref = { message_id: 'm1', source_text_sha256: 'a'.repeat(64), role: 'user',
+    origin: 'human', actor: 'conversation', excerpt: 'raw source' };
+  const first = item(1, { source_refs: [ref], claim_sha256: 'b'.repeat(64) });
+  const second = { ...first, metadata: { claim_sha256: 'b'.repeat(64), source_refs: [{
+    excerpt: 'raw source', actor: 'conversation', origin: 'human', role: 'user',
+    source_text_sha256: 'a'.repeat(64), message_id: 'm1' }],
+    scope: 'project', evidence_at: first.metadata.evidence_at, speaker_role: 'user',
+    origin: 'user_direct', actor: 'human', source: 's', type: 'decision' } };
+  const a = await exportSnapshot({ ...base(output), page: pageOf(first) });
+  const b = await exportSnapshot({ ...base(output), page: pageOf(second) });
+  assert.equal(a.sha256, b.sha256);
+  for (const name of [`${id(1)}.md`, 'history.json'])
+    assert.equal(await fs.readFile(path.join(a.bundleDir, name), 'utf8'),
+      await fs.readFile(path.join(b.bundleDir, name), 'utf8'));
+  const result = await historySnapshot({ snapshot: a.bundleDir, id: id(1), projectId: 'p',
+    fetchCurrent: async () => second });
+  assert.equal(result.freshness, 'fresh');
+});
+
+test('local history remains readable without key or DNS while wrong project remains denied', async t => {
+  const output = await fixture(t);
+  const project = path.dirname(output);
+  await exportSnapshot({ ...base(output), page: pageOf(item(1)) });
+  const resolution = { provider: 'mem0', projectRoot: project, projectId: 'p',
+    stateDir: output, embeddingFingerprint: 'fp', destination: {
+      url: 'https://example.org/', address: '1.2.3.4', allowPublic: true,
+      collection: 'cbs-p', apiKeyEnv: 'TEST_KEY' } };
+  const deps = { inspect: async () => resolution, trust: async () => trustTuple(resolution),
+    identify: async () => ({ kind: 'git', activeRoot: project, projectRoot: project }),
+    readOwner: async () => null, readSecret: () => undefined,
+    pin: async () => ({ kind: 'blocked', reason: 'destination_unavailable' }) };
+  const local = await historyProject(project, output, id(1), deps);
+  assert.equal(local.freshness, 'freshness_unverified');
+  assert.deepEqual(local.chain.map(row => row.qdrantId), [id(1)]);
+  const missingKey = await historyProject(project, output, id(1), { ...deps,
+    pin: async () => ({ kind: 'pinned', connection: {} }) });
+  assert.equal(missingKey.freshness, 'freshness_unverified');
+  assert.deepEqual(missingKey.chain.map(row => row.qdrantId), [id(1)]);
+  const wrong = { ...resolution, projectId: 'other' };
+  await assert.rejects(historyProject(project, output, id(1), { ...deps,
+    inspect: async () => wrong, trust: async () => trustTuple(wrong) }), { code: 'snapshot_identity' });
+  await exportSnapshot({ ...base(output), ownerId: 'owner-A',
+    page: pageOf(item(2, { scope: 'personal', owner_id: 'owner-A' })) });
+  const profile = path.join(project, 'profile-owner');
+  await fs.mkdir(profile, { mode: 0o700 });
+  const old = [process.env.CODEX_HOME, process.env.CODEX_THREAD_ID];
+  process.env.CODEX_HOME = profile;
+  process.env.CODEX_THREAD_ID = 'native-session';
+  t.after(() => {
+    for (const [key, value] of [['CODEX_HOME', old[0]], ['CODEX_THREAD_ID', old[1]]])
+      value === undefined ? delete process.env[key] : process.env[key] = value;
+  });
+  await assert.rejects(historyProject(project, output, id(2), { ...deps,
+    readOwner: async () => ({ ownerId: 'owner-B' }) }), { code: 'snapshot_identity' });
 });
 
 test('redacts known secrets and PII from facts and unknown extension fields', async t => {

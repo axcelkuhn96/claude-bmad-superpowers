@@ -553,7 +553,7 @@ def validate_curated_payload(point, project: str, owner: str | None,
     payload = getattr(point, 'payload', None)
     if not isinstance(payload, dict) or payload.get('project_id') != project or \
             payload.get('user_id') != project or 'expiration_date' in payload or \
-            payload.get('source_type') == 'imported_legacy':
+            payload.get('source_type') in ('imported_legacy', 'derived_export'):
         return None
     text = payload.get('data')
     external = payload.get('source_record_id')
@@ -864,6 +864,8 @@ def execute(request: dict, client, state: Path) -> dict:
         return _find_duplicate(client, collection, request)
     if op == 'add':
         metadata = request['metadata']
+        if metadata.get('source_type') == 'derived_export':
+            raise ValueError('derived_source')
         if 'context_generated' in metadata and not _valid_generated_context(
                 metadata['context_generated'], metadata.get('source_refs')):
             raise ValueError('context_generated_invalid')
@@ -896,6 +898,8 @@ def execute(request: dict, client, state: Path) -> dict:
         row = _row(memory.get(identifier), client, collection, memory.embedding_model)
         if row is None or row['projectId'] != project or row['externalId'] != external:
             raise ValueError('canonical_mismatch')
+        if row['metadata'].get('source_type') == 'derived_export':
+            raise ValueError('derived_source')
         if row['status'] == 'pending':
             supersedes = row['metadata'].get('supersedes_id')
             if supersedes:
