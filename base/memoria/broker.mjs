@@ -311,7 +311,7 @@ export async function claimBrokerWorker(root) {
   } };
 }
 const script = fileURLToPath(new URL('./python/worker.py', import.meta.url));
-const envAllow = () => Object.fromEntries(['PATH', 'HOME', 'SYSTEMROOT', 'WINDIR', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'CBS_MEMORIA_CA_FILE']
+const envAllow = () => Object.fromEntries(['PATH', 'HOME', 'SYSTEMROOT', 'WINDIR', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'CBS_MEMORIA_CA_FILE', 'CBS_MEMORIA_EMBEDDING_DEVICE']
   .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
 
 const launchDigest = token => createHash('sha256').update(token).digest('hex');

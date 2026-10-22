@@ -3,8 +3,10 @@
 import argparse
 import hashlib
 import importlib.metadata
+import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import sys
@@ -71,12 +73,17 @@ def protect_windows_tree(root: Path) -> None:
 PINS = (
     "mem0ai==2.2.1",
     "qdrant-client==1.19.1",
-    "onnxruntime==1.30.0",
     "tokenizers==0.23.2",
     "numpy==2.5.3",
     "httpx==0.28.1",
     "httpcore==1.0.9",
 )
+ORT_PINS = {
+    "cpu": "onnxruntime==1.30.0",
+    "cuda": "onnxruntime-gpu[cuda,cudnn]==1.30.0",
+    "directml": "onnxruntime-directml==1.24.4",
+}
+ORT_DISTRIBUTIONS = ("onnxruntime", "onnxruntime-gpu", "onnxruntime-directml")
 MODEL_SHA256 = (
     "ca456c06b3a9505ddfd9131408916d"
     "d79290368331e7d76bb621f1cba6bc8665"
@@ -102,16 +109,83 @@ def isolation(state: Path) -> None:
         os.environ.pop(name, None)
 
 
-def check_installed() -> None:
-    for pin in PINS:
+def ort_pin(variant: str) -> str:
+    return ORT_PINS[variant]
+
+
+def select_variant(device: str) -> str:
+    if device not in ("auto", *ORT_PINS):
+        raise RuntimeError("invalid embedding device")
+    if device == "cpu":
+        return "cpu"
+    if device == "cuda" or (device == "auto" and sys.platform == "linux"):
+        try:
+            probe = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+                                   text=True, timeout=2, check=False)
+            return "cuda" if probe.returncode == 0 and probe.stdout.strip() else "cpu"
+        except (OSError, subprocess.TimeoutExpired):
+            return "cpu"
+    if sys.platform == "win32" and platform.machine().lower() in ("amd64", "x86_64") and (3, 11) <= sys.version_info[:2] <= (3, 14):
+        return "directml"
+    return "cpu"
+
+
+def check_versions(variant: str) -> None:
+    for pin in (*PINS, ort_pin(variant)):
         package, version = pin.split("==")
+        package = package.split("[")[0]
         if importlib.metadata.version(package) != version:
             raise RuntimeError(f"version mismatch: {package}")
+    for package in ORT_DISTRIBUTIONS:
+        if package == ort_pin(variant).split("[")[0].split("==")[0]:
+            continue
+        try:
+            importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        raise RuntimeError(f"conflicting ONNX Runtime distribution: {package}")
+
+
+def check_installed(variant: str) -> None:
+    check_versions(variant)
     from mem0.configs.base import MemoryConfig
     from mem0.memory.telemetry import MEM0_TELEMETRY
 
     if MEM0_TELEMETRY or not str(MemoryConfig().history_db_path).startswith(os.environ["MEM0_DIR"] + os.sep):
         raise RuntimeError("Mem0 state isolation failed")
+
+
+def install_packages(python: Path, variant: str, env: dict) -> tuple[str, str | None]:
+    command = [str(python), "-m", "pip"]
+    subprocess.run([*command, "install", "--disable-pip-version-check", *PINS],
+                   check=True, env=env)
+    for candidate in (variant, "cpu") if variant != "cpu" else ("cpu",):
+        subprocess.run([*command, "uninstall", "-y", *ORT_DISTRIBUTIONS],
+                       check=True, env=env)
+        try:
+            subprocess.run([*command, "install", "--disable-pip-version-check", ort_pin(candidate)],
+                           check=True, env=env)
+            return candidate, None if candidate == variant else f"{variant}_install_failed"
+        except subprocess.CalledProcessError:
+            if candidate == "cpu":
+                raise
+    raise RuntimeError("runtime installation failed")
+
+
+def write_receipt(state: Path, requested: str, selected: str, fallback_reason: str | None) -> None:
+    target = state / "runtime-selection.json"
+    temporary = state / f".runtime-selection-{os.getpid()}.tmp"
+    try:
+        fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump({"requested": requested, "selected": selected,
+                       "fallback_reason": fallback_reason}, output)
+            output.write("\n")
+        os.replace(temporary, target)
+        if os.name != "nt":
+            os.chmod(target, 0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -120,13 +194,19 @@ def main() -> int:
     parser.add_argument("--model", type=Path)
     parser.add_argument("--tokenizer", type=Path)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--variant", choices=ORT_PINS)
     options = parser.parse_args()
     if sys.version_info < (3, 11):
         raise RuntimeError("Python 3.11 or newer required")
     state = options.state.resolve()
     isolation(state)
     if options.check:
-        check_installed()
+        if options.variant:
+            variant = options.variant
+        else:
+            with (state / "runtime-selection.json").open(encoding="utf-8") as source:
+                variant = json.load(source)["selected"]
+        check_installed(variant)
         return 0
     if options.model is None or options.tokenizer is None:
         parser.error("--model and --tokenizer are required for install")
@@ -138,8 +218,21 @@ def main() -> int:
     protect_windows_tree(runtime)
     python = runtime / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     env = os.environ.copy()
-    subprocess.run([str(python), "-m", "pip", "install", "--disable-pip-version-check", *PINS],
-                   check=True, env=env)
+    requested = os.environ.get("CBS_MEMORIA_EMBEDDING_DEVICE", "auto")
+    variant = select_variant(requested)
+    selected, reason = install_packages(python, variant, env)
+    if requested not in ("auto", variant):
+        reason = f"{requested}_unavailable"
+    try:
+        subprocess.run([str(python), __file__, "--state", str(state), "--check", "--variant", selected],
+                       check=True, env=env)
+    except subprocess.CalledProcessError:
+        if selected == "cpu":
+            raise
+        selected, _ = install_packages(python, "cpu", env)
+        reason = f"{variant}_check_failed"
+        subprocess.run([str(python), __file__, "--state", str(state), "--check", "--variant", selected],
+                       check=True, env=env)
     protect_windows_tree(runtime)
     artifacts = state / "artifacts"
     artifacts.mkdir(mode=0o700, exist_ok=True)
@@ -148,7 +241,7 @@ def main() -> int:
     protect_windows_tree(artifacts)
     if digest(artifacts / "model.onnx") != MODEL_SHA256 or digest(artifacts / "tokenizer.json") != TOKENIZER_SHA256:
         raise RuntimeError("artifact changed during copy")
-    subprocess.run([str(python), __file__, "--state", str(state), "--check"], check=True, env=env)
+    write_receipt(state, requested, selected, reason)
     return 0
 
 

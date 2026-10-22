@@ -45,7 +45,9 @@ export async function ensureBrokerReady(cwd, { stateRoot, bootstrapSessionId,
         const script = fileURLToPath(new URL('./broker.mjs', import.meta.url));
         const child = spawnBroker(process.execPath, [script, root, cwd],
           { detached: true, stdio: 'ignore', env: { PATH: process.env.PATH, HOME: process.env.HOME,
-            ...(process.env.CBS_MEMORIA_CA_FILE ? {
+            ...(process.env.CBS_MEMORIA_EMBEDDING_DEVICE !== undefined ? {
+              CBS_MEMORIA_EMBEDDING_DEVICE: process.env.CBS_MEMORIA_EMBEDDING_DEVICE,
+            } : {}), ...(process.env.CBS_MEMORIA_CA_FILE ? {
               CBS_MEMORIA_CA_FILE: process.env.CBS_MEMORIA_CA_FILE,
             } : {}) } });
         child.once?.('error', () => { spawnFailed = true; });

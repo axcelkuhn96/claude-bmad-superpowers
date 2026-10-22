@@ -11,7 +11,7 @@ import { pinDestination, validateDestination } from '../base/memoria/activation.
 import { activateProject, authorizeCurrentDestination } from '../base/memoria/setup.mjs';
 import { runBridgeOperation } from '../base/memoria/bridge.mjs';
 import { applyNativeExclusion, restoreNativeExclusion } from '../base/memoria/native.mjs';
-import { runtimeEnvironment, verifyRuntimeArtifacts } from '../base/memoria/runtime.mjs';
+import { RUNTIME_PINS, runtimeEnvironment, verifyRuntimeArtifacts } from '../base/memoria/runtime.mjs';
 import { provisionRuntime } from '../base/memoria/provision.mjs';
 
 const config = (id = 'project-one', collection = 'cbs-project-one') => ({
@@ -552,6 +552,17 @@ test('runtime opt-in valida hashes e prepara ambiente antes de import Python', a
   const env = runtimeEnvironment(path.join(dir, 'state'), { HOME: path.join(dir, 'home'), OPENAI_API_KEY: 'fixture-openai' });
   assert.equal(env.MEM0_TELEMETRY, '0');
   assert.equal(env.MEM0_DIR, path.join(dir, 'state', 'mem0'));
+  assert.equal(env.OPENAI_API_KEY, undefined);
+});
+
+test('runtime exposes exclusive ONNX Runtime variants and preserves device request', () => {
+  assert.equal(RUNTIME_PINS.onnx, 'onnxruntime==1.30.0');
+  assert.equal(RUNTIME_PINS.onnxCuda, 'onnxruntime-gpu[cuda,cudnn]==1.30.0');
+  assert.equal(RUNTIME_PINS.onnxDirectml, 'onnxruntime-directml==1.24.4');
+  const env = runtimeEnvironment('/tmp/cbs-fixture', {
+    CBS_MEMORIA_EMBEDDING_DEVICE: 'cuda', OPENAI_API_KEY: 'secret', HOME: '/tmp/home',
+  });
+  assert.equal(env.CBS_MEMORIA_EMBEDDING_DEVICE, 'cuda');
   assert.equal(env.OPENAI_API_KEY, undefined);
 });
 

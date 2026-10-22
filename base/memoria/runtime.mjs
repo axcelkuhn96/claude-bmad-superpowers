@@ -6,7 +6,9 @@ import { hashWindowsFile, holdWindowsHash, readWindowsBinary } from './windows-s
 
 export const RUNTIME_PINS = Object.freeze({
   python: '>=3.11', sdk: 'mem0ai==2.2.1', qdrant: 'qdrant-client==1.19.1',
-  onnx: 'onnxruntime==1.30.0', tokenizers: 'tokenizers==0.23.2', numpy: 'numpy==2.5.3',
+  onnx: 'onnxruntime==1.30.0', onnxCuda: 'onnxruntime-gpu[cuda,cudnn]==1.30.0',
+  onnxDirectml: 'onnxruntime-directml==1.24.4',
+  tokenizers: 'tokenizers==0.23.2', numpy: 'numpy==2.5.3',
   httpx: 'httpx==0.28.1', httpcore: 'httpcore==1.0.9',
   modelSha256: [
     'ca456c06b3a9505ddfd9131408916d',
@@ -93,7 +95,8 @@ export async function verifyRuntimeArtifacts(model, tokenizer) {
 
 export function runtimeEnvironment(stateDir, sourceEnv = process.env) {
   const env = { ...sourceEnv, MEM0_TELEMETRY: '0', MEM0_DIR: path.join(stateDir, 'mem0'),
-    CBS_MEMORIA_HISTORY: path.join(stateDir, 'mem0', 'history.db') };
+    CBS_MEMORIA_HISTORY: path.join(stateDir, 'mem0', 'history.db'),
+    CBS_MEMORIA_EMBEDDING_DEVICE: sourceEnv.CBS_MEMORIA_EMBEDDING_DEVICE ?? 'auto' };
   for (const key of Object.keys(env)) if (/^OPENAI_(API_KEY|BASE_URL|ORGANIZATION|PROJECT)$/.test(key)) delete env[key];
   return env;
 }

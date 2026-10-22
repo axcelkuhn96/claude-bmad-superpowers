@@ -111,6 +111,25 @@ test('a fresh native session cannot start a broker', async t => {
   assert.equal(starts, 0);
 });
 
+test('broker launch carries embedding device from the native process allowlist', async t => {
+  const { cwd, stateRoot } = await fixture(t);
+  const previous = process.env.CBS_MEMORIA_EMBEDDING_DEVICE;
+  process.env.CBS_MEMORIA_EMBEDDING_DEVICE = 'cpu';
+  t.after(() => {
+    if (previous === undefined) delete process.env.CBS_MEMORIA_EMBEDDING_DEVICE;
+    else process.env.CBS_MEMORIA_EMBEDDING_DEVICE = previous;
+  });
+  let captured;
+  await ensureBrokerReady(cwd, { stateRoot, deadlineMs: 1000,
+    spawnBroker: (_command, _args, options) => {
+      captured = options.env;
+      setTimeout(() => { endpoint(t, stateRoot).catch(() => {}); }, 10);
+      return { unref() {} };
+    } });
+  assert.equal(captured.CBS_MEMORIA_EMBEDDING_DEVICE, 'cpu');
+  assert.equal(captured.OPENAI_API_KEY, undefined);
+});
+
 test('changed trust and unsafe endpoint fail closed without spawning', async t => {
   const { cwd, stateRoot, current } = await fixture(t);
   let starts = 0;
