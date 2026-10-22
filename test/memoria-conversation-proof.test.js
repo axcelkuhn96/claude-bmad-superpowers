@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { validateConversationProof } from '../base/memoria/conversation-proof.mjs';
 import { containsSecret, redactSource, buildConversationPrompt } from '../base/memoria/candidates.mjs';
 import { dedupKeyFor } from '../base/memoria/dedup-key.mjs';
+import { contextFromCandidate } from '../base/memoria/generated-context.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const messages = [
@@ -77,6 +78,17 @@ test('conversation summary rejects forged speaker, missing owner support, and se
   const secret = payload();
   secret.source_refs[0].excerpt = 'api_key=very-secret-value-123';
   assert.equal(validateConversationProof(secret, row).eligible, false);
+});
+
+test('optional generated context must remain bound to the sealed conversation refs', () => {
+  const withContext = payload();
+  withContext.context_generated = contextFromCandidate([{
+    kind: 'reason', summary: 'Tenant isolation was required.',
+    source_message_ids: ['u1', 'a1'],
+  }], withContext.source_refs, () => true);
+  assert.equal(validateConversationProof(withContext, row).eligible, true);
+  withContext.context_generated.items[0].source_message_ids = ['foreign'];
+  assert.equal(validateConversationProof(withContext, row).eligible, false);
 });
 
 test('quoted JSON secret labels are removed before any conversation prompt or candidate proof', () => {

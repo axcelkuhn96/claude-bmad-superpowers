@@ -1123,6 +1123,9 @@ export function createOutbox(stateDir, options = {}) {
             metadata.format_version !== 4 || metadata.origin !== payload.origin ||
             metadata.speaker_role !== payload.speaker_role || metadata.actor !== payload.actor ||
             !isDeepStrictEqual(metadata.source_refs, payload.source_refs) ||
+            Object.hasOwn(metadata, 'context_generated') !==
+              Object.hasOwn(payload, 'context_generated') ||
+            !isDeepStrictEqual(metadata.context_generated, payload.context_generated) ||
             metadata.dedup_key !== payload.dedup_key || dedupKey !== payload.dedup_key ||
             metadata.review_mode !== 'automatic' ||
             !/^[a-f0-9]{64}$/.test(metadata.auto_consent_hash ?? '') ||
@@ -1579,7 +1582,8 @@ export function createOutbox(stateDir, options = {}) {
         ? { kind: 'duplicate', operationId: candidate.externalId }
         : blocked('candidate_already_terminal');
       candidate.status = 'duplicate';
-      candidate.reason = 'exact_remote_duplicate';
+      candidate.reason = payload.context_generated && proof.duplicateOf.hasContext === false
+        ? 'duplicate_without_context' : 'exact_remote_duplicate';
       candidate.duplicateProof = duplicateProof;
       if (!await fits(manifest)) return { kind: 'full', operationId: candidate.externalId };
       await durable(manifestFile(operationId), manifest);

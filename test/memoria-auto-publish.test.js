@@ -263,7 +263,8 @@ test('real v4 outbox publishes a paraphrased conversation with local multi-sourc
       candidates: [{ text: summarized, type: 'decision', scope: 'project', evidence: [
         { source_message_id: 'm1', excerpt: source.text },
         { source_message_id: 'm2', excerpt: 'PostgreSQL was configured' },
-      ] }] }) });
+      ], context: [{ kind: 'reason', summary: 'Persistence was needed.',
+        source_message_ids: ['m1', 'm2'] }] }] }) });
   assert.equal(extracted.kind, 'manifested', JSON.stringify(extracted));
   const revoked = await publish(row, resolution(root), { outbox,
     readAutoPublish: async () => null,
@@ -285,6 +286,8 @@ test('real v4 outbox publishes a paraphrased conversation with local multi-sourc
   assert.equal(stored.text, summarized);
   assert.equal(stored.metadata.origin, 'conversation_summary');
   assert.equal(stored.metadata.source_refs.length, 2);
+  assert.equal(stored.metadata.context_generated.trust, 'generated_unverified');
+  assert.equal(stored.metadata.context_generated.items[0].summary, 'Persistence was needed.');
   assert.equal((await outbox.sourceForRemote({ ...stored, status: 'active' })).kind, 'local_source');
   assert.equal((await outbox.ensureFutureBaseline({ cli: 'claude', sessionId: 'later',
     projectId: 'p', ownerId: consent.ownerId, consentHash: consent.consentHash,
@@ -301,7 +304,8 @@ test('real v4 outbox publishes a paraphrased conversation with local multi-sourc
       candidates: [{ text: summarized, type: 'decision', scope: 'project', evidence: [
         { source_message_id: 'm1', excerpt: source.text },
         { source_message_id: 'm2', excerpt: 'PostgreSQL was configured' },
-      ] }] }) })).kind, 'manifested');
+      ], context: [{ kind: 'reason', summary: 'Persistence was needed.',
+        source_message_ids: ['m1', 'm2'] }] }] }) })).kind, 'manifested');
   let duplicateStores = 0;
   const repeated = await publish(later, resolution(root), { outbox,
     readAutoPublish: async () => consent,
@@ -309,14 +313,16 @@ test('real v4 outbox publishes a paraphrased conversation with local multi-sourc
       duplicateStores++;
       assert.equal(operation.metadata.dedup_key, stored.metadata.dedup_key);
       return { kind: 'duplicate', dedupKey: operation.metadata.dedup_key,
-        duplicateOf: { externalId: stored.externalId, sdkId: 'sdk-conversation',
-          qdrantId: 'q-conversation', status: 'active' }, evidenceDigest: 'b'.repeat(64) };
+        duplicateOf: { externalId: `src-${'e'.repeat(64)}`, sdkId: 'sdk-old',
+          qdrantId: 'q-old', status: 'active', hasContext: false },
+        evidenceDigest: 'b'.repeat(64) };
     } });
   assert.equal(repeated.kind, 'published', JSON.stringify(repeated));
   assert.equal(repeated.published, 0);
   assert.equal(duplicateStores, 1);
   const disposition = await outbox.readDisposition(later.operationId);
   assert.equal(disposition.candidates[0].status, 'duplicate');
+  assert.equal(disposition.candidates[0].reason, 'duplicate_without_context');
   assert.equal(disposition.candidates[0].sdkId, undefined);
   assert.equal((await publish(later, resolution(root), { outbox,
     readAutoPublish: async () => consent,

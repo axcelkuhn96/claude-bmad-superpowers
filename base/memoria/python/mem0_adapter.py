@@ -273,6 +273,11 @@ def _row(raw: dict | None, client, collection: str, embedder) -> dict | None:
             payload.get('project_id') != raw.get('user_id') or payload.get('status') != metadata.get('status') or \
             payload.get('source_record_id') != metadata.get('source_record_id'):
         raise ValueError('remote_payload_unverified')
+    if payload.get('context_generated') != metadata.get('context_generated'):
+        raise ValueError('remote_context_unverified')
+    if 'context_generated' in metadata and not _valid_generated_context(
+            metadata['context_generated'], metadata.get('source_refs')):
+        metadata = {key: value for key, value in metadata.items() if key != 'context_generated'}
     return {'sdkId': identifier, 'qdrantId': str(points[0].id), 'externalId': metadata.get('source_record_id'),
             'projectId': raw.get('user_id'), 'status': metadata.get('status'), 'text': raw.get('memory'),
             'metadata': metadata, 'sessionId': raw.get('run_id'),
@@ -357,7 +362,9 @@ def _find_duplicate(client, collection: str, request: dict) -> dict:
         separators=(',', ':')).encode('utf-8')).hexdigest()
     return {'kind': 'duplicate', 'dedupKey': key, 'evidenceDigest': evidence_digest,
             'duplicateOf': {'externalId': payload['source_record_id'],
-                            'sdkId': identifier, 'qdrantId': identifier, 'status': 'active'}}
+                            'sdkId': identifier, 'qdrantId': identifier, 'status': 'active',
+                            'hasContext': _valid_generated_context(
+                                payload.get('context_generated'), payload.get('source_refs'))}}
 
 
 def _page(value: str, offset: int) -> dict:
@@ -408,6 +415,40 @@ def _raw_payload(payload: dict, collection: str, identifier) -> bool:
         isinstance(payload.get('source_project'), str) and \
         isinstance(payload.get('source_id'), int) and \
         isinstance(payload.get('evidence_at'), str)
+
+
+def _valid_generated_context(value, refs) -> bool:
+    if not isinstance(value, dict) or set(value) != {'version', 'items', 'trust',
+            'source_refs_sha256'} or type(value['version']) is not int or value['version'] != 1 or \
+            value['trust'] != 'generated_unverified' or not isinstance(refs, list):
+        return False
+    digest = hashlib.sha256(json.dumps(refs, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+    ids = [ref.get('message_id') if isinstance(ref, dict) else None for ref in refs]
+    if value['source_refs_sha256'] != digest or \
+            any(not isinstance(identifier, str) or not identifier for identifier in ids) or \
+            len(set(ids)) != len(ids):
+        return False
+    items = value['items']
+    if not isinstance(items, list) or not 1 <= len(items) <= 4:
+        return False
+    secret = re.compile(r'(?i)(?:api[_ -]?key|private[_ -]?key|token|password|secret|bearer)' \
+        r'["\']?\s*[:= ]\s*\S+|\bsk-[a-z0-9-]{16,}|\bgh[opusr]_[A-Za-z0-9_]{16,}|' \
+        r'-----BEGIN [A-Z ]*PRIVATE KEY-----')
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {'kind', 'summary', 'source_message_ids'} or \
+                item['kind'] not in ('problem', 'reason', 'attempt', 'pending') or \
+                not isinstance(item['summary'], str) or not item['summary'].strip() or \
+                len(item['summary'].encode('utf-8')) > 256 or \
+                any(ord(char) < 32 or ord(char) == 127 for char in item['summary']) or \
+                secret.search(item['summary']):
+            return False
+        cited = item['source_message_ids']
+        if not isinstance(cited, list) or not 1 <= len(cited) <= len(ids) or \
+                any(not isinstance(identifier, str) or identifier not in ids for identifier in cited) or \
+                len(set(cited)) != len(cited):
+            return False
+    return True
 
 
 def _conversation_summary(metadata: dict, text: str, project: str) -> bool:
@@ -556,6 +597,9 @@ def validate_curated_payload(point, project: str, owner: str | None,
         return None
     metadata = {key: value for key, value in payload.items() if key not in
                 ('data', 'user_id', 'run_id')}
+    if 'context_generated' in metadata and not _valid_generated_context(
+            metadata['context_generated'], metadata.get('source_refs')):
+        metadata.pop('context_generated')
     return {'sdkId': identifier, 'qdrantId': identifier, 'externalId': external,
             'projectId': project, 'status': status, 'text': text, 'metadata': metadata,
             **({'historyState': 'superseded' if status == 'superseded' else 'expired' if expired else 'active'}
@@ -744,6 +788,8 @@ def execute_readonly(request: dict, client, state: Path) -> dict:
     if _conversation_summary(metadata, row['text'], project):
         provenance.update({'generated': True, 'source_ref_count': len(metadata['source_refs']),
                            'source_refs': metadata['source_refs']})
+        if _valid_generated_context(metadata.get('context_generated'), metadata['source_refs']):
+            provenance['context_generated'] = metadata['context_generated']
     elif _explicit_mcp_record(metadata, row['text'], project):
         provenance.update({'review_mode': 'explicit_mcp',
                            'source_text_sha256': metadata['source_text_sha256'],
@@ -775,6 +821,9 @@ def execute(request: dict, client, state: Path) -> dict:
         return _find_duplicate(client, collection, request)
     if op == 'add':
         metadata = request['metadata']
+        if 'context_generated' in metadata and not _valid_generated_context(
+                metadata['context_generated'], metadata.get('source_refs')):
+            raise ValueError('context_generated_invalid')
         if any(key in metadata for key in ('status', 'source_record_id', 'project_id', 'expiration_date')):
             raise ValueError('reserved_metadata')
         if metadata.get('scope') not in ('project', 'personal', 'episode') or \

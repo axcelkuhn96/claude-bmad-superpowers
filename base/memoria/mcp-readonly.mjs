@@ -13,6 +13,7 @@ import { assertWriter } from './authority.mjs';
 import { pinDestination } from './activation.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
 import { selectSearchRecall, renderRecall } from './context.mjs';
+import { verifiedGeneratedContext } from './generated-context.mjs';
 import { ensureBrokerReady } from './broker-start.mjs';
 import { requestBroker } from './broker.mjs';
 import { runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
@@ -317,7 +318,13 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
         if (answer?.kind !== 'item' || answer.item?.projectId !== ready.projectId ||
             answer.item?.source !== args.source || typeof answer.item?.text !== 'string' ||
             Buffer.byteLength(answer.item.text, 'utf8') > 16 * 1024) return blocked('source_unavailable');
-        return answer;
+        const provenance = answer.item.provenance;
+        const generated = args.source === 'curated' && provenance?.generated === true
+          ? verifiedGeneratedContext(provenance.context_generated, provenance.source_refs,
+            () => true) : undefined;
+        return generated ? { ...answer, item: { ...answer.item,
+          context: generated.items.map(entry => ({ ...entry,
+            label: 'síntese gerada, não verificada' })) } } : answer;
       }
       const source = args.source ?? 'all';
       let curated = { kind: 'items', items: [] };

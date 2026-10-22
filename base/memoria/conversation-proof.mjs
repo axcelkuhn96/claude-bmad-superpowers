@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { containsSecret, redactSource } from './candidates.mjs';
 import { dedupKeyFor } from './dedup-key.mjs';
 import { completedConversationPairs } from './conversation-batches.mjs';
+import { verifiedGeneratedContext } from './generated-context.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const safe = value => typeof value === 'string' && !containsSecret(value) &&
@@ -86,6 +87,12 @@ export function validateConversationProof(payload, row, { requireFinal = true } 
     priorEnd = message?.end ?? priorEnd;
   }
   if (!hasHuman || !hasAssistant) add('missing_conversation_roles');
+  const firstHumanOwner = row?.messages?.find(message => message.origin === 'human' &&
+    payload.source_refs.some(ref => ref.message_id === message.messageId))?.ownerId;
+  const contextIds = row?.messages?.filter(message => message.origin !== 'human' ||
+    message.ownerId === firstHumanOwner).map(message => message.messageId);
+  if (payload.context_generated && !verifiedGeneratedContext(payload.context_generated,
+    payload.source_refs, safe, contextIds)) add('invalid_generated_context');
   if (payload.scope === 'personal' && (!personalOwner || !payload.owner_id) ||
       payload.scope === 'project' && payload.owner_id != null) add('missing_scope');
   const first = payload.source_refs[0];

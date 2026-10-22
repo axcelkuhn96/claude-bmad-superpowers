@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { dedupKeyFor } from './dedup-key.mjs';
 import { rankHybrid, verifiedLiteralSpans } from './hybrid-rank.mjs';
+import { verifiedGeneratedContext } from './generated-context.mjs';
 
 // Conservative interim floor; Task7 must calibrate it against frozen negative queries.
 export const MIN_RECALL_SCORE = 0.85;
@@ -156,6 +157,17 @@ function renderWithItems(items, maxTokens) {
       if (!explicit || !append(`[${item.id}; pedido via MCP/agente; texto longo; use get source=curated memory_id=${item.id}]`)) continue;
     }
     used.push(row);
+  }
+  for (const row of used) {
+    const item = fields(row);
+    if (!generatedConversation({ ...item.metadata, projectId: item.projectId }, item.text)) continue;
+    const generated = verifiedGeneratedContext(item.metadata.context_generated,
+      item.metadata.source_refs, () => true);
+    if (!generated) continue;
+    for (const entry of generated.items) {
+      const line = `[${item.id}; contexto gerado, não verificado; ${entry.kind}] ${entry.summary}`;
+      if (!append(line)) break;
+    }
   }
   return { text: lines.join('\n'), used };
 }

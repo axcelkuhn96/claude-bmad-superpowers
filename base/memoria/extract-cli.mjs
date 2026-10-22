@@ -84,6 +84,7 @@ async function runClaudeExtraction(prompt, policy, route) {
         USERPROFILE: cwd, CLAUDE_CONFIG_DIR: profile } :
         { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: cwd,
           CLAUDE_CONFIG_DIR: profile, LANG: 'C.UTF-8' };
+      if (conversation) env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = '8192';
       const child = spawn(tool?.executable ?? selectedExecutable ?? policy.executable, args,
         { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
       let output = '';

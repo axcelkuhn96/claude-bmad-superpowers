@@ -79,6 +79,25 @@ test('explicit Haiku policy is frozen and CLI enforces isolated model and schema
   }
 });
 
+test('conversation Haiku uses one bounded output call with optional context schema', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-context-cli-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const profile = path.join(root, 'profile');
+  await fs.mkdir(profile, { mode: 0o700 });
+  const executable = path.join(root, 'claude');
+  await fs.writeFile(executable, `#!${process.execPath}\n` +
+    `const a=process.argv.slice(2); const s=JSON.parse(a[a.indexOf('--json-schema')+1]);\n` +
+    `if(process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS!=='8192'||!s.properties.candidates.items.properties.context)process.exit(9);\n` +
+    `process.stdin.resume();process.stdin.on('end',()=>process.stdout.write(JSON.stringify({` +
+    `subtype:'success',structured_output:{no_facts:true,candidates:[]},` +
+    `modelUsage:{haiku:{canonicalModel:'claude-haiku-5-5'}},usage:{input_tokens:7,output_tokens:11}})));`,
+  { mode: 0o700 });
+  const result = await runHaikuExtraction('{}', { route: 'haiku', mode: 'conversation',
+    profile, executable });
+  assert.equal(result.kind, 'success');
+  assert.equal(result.usage.outputTokens, 11);
+});
+
 test('frozen Haiku selection uses the trusted updated Claude version after the old version disappears', async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-haiku-update-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));

@@ -15,6 +15,12 @@ export const conversationExtractionSchema = { type: 'object', additionalProperti
           required: ['source_message_id', 'excerpt'], properties: {
             source_message_id: { type: 'string' }, excerpt: { type: 'string' },
           } } },
+        context: { type: 'array', items: { type: 'object', additionalProperties: false,
+          required: ['kind', 'summary', 'source_message_ids'], properties: {
+            kind: { type: 'string', enum: ['problem', 'reason', 'attempt', 'pending'] },
+            summary: { type: 'string' },
+            source_message_ids: { type: 'array', items: { type: 'string' } },
+          } } },
       },
     } },
   },
@@ -27,7 +33,7 @@ export function validateConversationOutput(output) {
       output.candidates.length > 5 || output.no_facts !== (output.candidates.length === 0)) return false;
   for (const item of output.candidates) {
     if (!item || typeof item !== 'object' || Array.isArray(item) ||
-        Object.keys(item).some(key => !['text', 'type', 'scope', 'evidence'].includes(key)) ||
+        Object.keys(item).some(key => !['text', 'type', 'scope', 'evidence', 'context'].includes(key)) ||
         typeof item.text !== 'string' || !item.text.trim() ||
         Buffer.byteLength(item.text, 'utf8') > 2048 ||
         !['rule', 'fact', 'preference', 'decision'].includes(item.type) ||

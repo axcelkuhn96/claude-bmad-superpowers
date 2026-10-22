@@ -19,6 +19,26 @@ spec.loader.exec_module(adapter)
 
 
 class AdapterTest(unittest.TestCase):
+    def test_generated_context_requires_qualified_ref_hash_and_is_optional(self):
+        refs = [{'message_id': 'u1', 'origin': 'human', 'source_text_sha256': 'a' * 64,
+                 'excerpt': 'Use tenant filters.'},
+                {'message_id': 'a1', 'origin': 'assistant', 'source_text_sha256': 'b' * 64,
+                 'excerpt': 'Filters applied.'}]
+        context = {'version': 1, 'items': [{'kind': 'reason',
+                   'summary': 'Tenant isolation was required.',
+                   'source_message_ids': ['u1', 'a1']}],
+                   'trust': 'generated_unverified',
+                   'source_refs_sha256': adapter.hashlib.sha256(adapter.json.dumps(
+                       refs, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+        self.assertTrue(adapter._valid_generated_context(context, refs))
+        self.assertFalse(adapter._valid_generated_context(context, list(reversed(refs))))
+        bad = {**context, 'items': [{**context['items'][0],
+               'source_message_ids': ['invented']}]}
+        self.assertFalse(adapter._valid_generated_context(bad, refs))
+        self.assertFalse(adapter._valid_generated_context({**context, 'trust': 'verified'}, refs))
+        self.assertFalse(adapter._valid_generated_context({**context, 'items': [
+            {**context['items'][0], 'summary': 'é' * 129}]}, refs))
+
     def test_lexical_requires_literal_identifier_and_curated_identity(self):
         token = 'HML_TRIPEX_COMP'
         base = {'data': f'Usar {token} no teste', 'user_id': 'p', 'project_id': 'p',
@@ -233,6 +253,7 @@ class AdapterTest(unittest.TestCase):
             result = adapter.execute(request, Client(), Path('/tmp'))
         self.assertEqual(result['kind'], 'duplicate')
         self.assertEqual(result['duplicateOf']['externalId'], 'first')
+        self.assertIs(result['duplicateOf']['hasContext'], False)
         invalid = {**request, 'metadata': {**common, 'review_mode': 'automatic'}}
         with patch.object(adapter, 'verify_collection'), \
              patch.object(adapter, '_memory', return_value=memory):
@@ -307,6 +328,11 @@ class AdapterTest(unittest.TestCase):
                     'source_text_sha256': refs[0]['source_text_sha256'],
                     'evidence_at': '2026-10-01T00:00:00Z'}
         metadata['dedup_key'] = adapter._dedup_key('project', metadata, 'Conversation summary')
+        metadata['context_generated'] = {'version': 1, 'trust': 'generated_unverified',
+            'source_refs_sha256': adapter.hashlib.sha256(adapter.json.dumps(refs,
+                ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
+            'items': [{'kind': 'reason', 'summary': 'Durable storage was needed.',
+                       'source_message_ids': ['user-1', 'assistant-1']}]}
         row = {'projectId': 'project', 'status': 'active', 'text': 'Conversation summary',
                'metadata': metadata}
         memory = SimpleNamespace(embedding_model=object(), get=lambda _: {'id': identifier})
@@ -318,6 +344,13 @@ class AdapterTest(unittest.TestCase):
             result = adapter.execute_readonly(request, None, Path('/tmp'))
             self.assertEqual(result['item']['provenance']['origin'], 'conversation_summary')
             self.assertEqual(result['item']['provenance']['source_ref_count'], 2)
+            self.assertEqual(result['item']['provenance']['context_generated']['trust'],
+                             'generated_unverified')
+            row['metadata'] = {**metadata, 'context_generated': {**metadata['context_generated'],
+                'trust': 'verified'}}
+            self.assertEqual(adapter.execute_readonly(request, None, Path('/tmp'))['kind'], 'item')
+            self.assertNotIn('context_generated', adapter.execute_readonly(
+                request, None, Path('/tmp'))['item']['provenance'])
             row['metadata'] = {**metadata, 'speaker_role': 'user'}
             self.assertEqual(adapter.execute_readonly(request, None, Path('/tmp'))['reason'],
                              'source_unavailable')
@@ -609,6 +642,12 @@ class AdapterTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'remote_vector'):
                 adapter._row(raw, client, 'collection', Embedder())
         client.vector = expected
+        raw['metadata']['context_generated'] = {'version': 1}
+        payload['context_generated'] = {'version': 1}
+        self.assertNotIn('context_generated', adapter._row(raw, client, 'collection', Embedder())['metadata'])
+        payload['context_generated'] = {'version': 2}
+        with self.assertRaisesRegex(ValueError, 'remote_context_unverified'):
+            adapter._row(raw, client, 'collection', Embedder())
         with self.assertRaisesRegex(ValueError, 'remote_expiration_unsupported'):
             adapter._row({**raw, 'expiration_date': '2025-01-01T00:00:00Z'}, client, 'collection', Embedder())
 
