@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { resolveProject } from './provider.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
 import { searchProject } from './bridge.mjs';
-import { renderRecall, selectRecall } from './context.mjs';
+import { renderRecall, selectSearchRecall } from './context.mjs';
 import { withProjectLock } from './ledger.mjs';
 import { createWindowsState } from './windows-state.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsBinary,
@@ -161,8 +161,8 @@ export async function recallForPrompt({ cli, event = 'UserPromptSubmit', payload
     if (answer?.kind !== 'items') return fail(failureCategory(answer?.reason));
     if (remaining() <= 0) return fail('deadline');
     if (!Array.isArray(answer.items)) return fail('error');
-    const eligible = selectRecall(answer.items, { projectId: current.projectId,
-      ownerId: current.ownerId, now: now() });
+    const eligible = selectSearchRecall(answer, { projectId: current.projectId,
+      ownerId: current.ownerId, now: now(), query: payload.prompt });
     if (!eligible.length) return null;
     const selected = await recordWindow({ stateDir: current.stateDir, cli,
       sessionId: payload.session_id, eligible, remaining });

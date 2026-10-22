@@ -10,12 +10,13 @@ import { registerOwner, configureExtractor, localDevice, readOwner, readExtracto
   readAutoPublish, enableAutoPublish, disableAutoPublish,
   configureExtractionSchedule } from './policy.mjs';
 import { authorizeCurrentDestination } from './setup.mjs';
+import { indexTextProject } from './provision.mjs';
 import { administrativeSession, assertWriter, bootstrapWriter, beginWriterTransfer,
   completeWriterTransfer } from './authority.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const help = `Uso: cbs memoria <ação> [opções]
-Ações: avaliar, status, check, provision, activate, launch, review-correct, deactivate,
+Ações: avaliar, status, check, indexar-texto, provision, activate, launch, review-correct, deactivate,
        owner-register, extractor-select, extractor-schedule,
        auto-publish-enable, auto-publish-disable,
        writer-device, writer-bootstrap,
@@ -64,6 +65,12 @@ export async function main(args = []) {
   }
   const project = value(rest, '--project');
   if (!project || project.startsWith('--')) { process.stderr.write(help); return 2; }
+  if (action === 'indexar-texto') {
+    if (rest.length !== 2 || rest[0] !== '--project' || !path.isAbsolute(project)) return 2;
+    const result = await indexTextProject(project);
+    process.stdout.write(`${result.kind}: ${result.reason ?? result.field ?? 'data'}\n`);
+    return ['indexed', 'existing'].includes(result.kind) ? 0 : 1;
+  }
   if (['provision', 'activate', 'launch', 'review-correct', 'deactivate'].includes(action)) {
     if (['activate', 'launch'].includes(action) && /[/\\]_npx[/\\]/.test(here)) {
       process.stderr.write('blocked: durable_package_install_required\n'); return 1;

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { dedupKeyFor } from './dedup-key.mjs';
+import { rankHybrid, verifiedLiteralSpans } from './hybrid-rank.mjs';
 
 // Conservative interim floor; Task7 must calibrate it against frozen negative queries.
 export const MIN_RECALL_SCORE = 0.85;
@@ -61,7 +62,8 @@ function explicitMcpRequest(metadata, text, projectId) {
     metadata.dedup_key === expectedKey;
 }
 
-export function selectRecall(results, { projectId, now, ownerId } = {}) {
+export function selectRecall(results, { projectId, now, ownerId, query,
+  preserveHybridOrder = false } = {}) {
   const instant = date(now);
   if (!projectId || !Number.isFinite(instant) || !Array.isArray(results)) return [];
   return results.filter(row => {
@@ -69,9 +71,19 @@ export function selectRecall(results, { projectId, now, ownerId } = {}) {
     const m = item.metadata;
     const from = date(m.valid_from ?? row.valid_from);
     const to = date(m.valid_to ?? row.valid_to);
+    const vectorScore = row.scoreSource === 'mem0_sdk_search' ? row.score :
+      row.scoreSource === 'hybrid_verified' ? row.retrievalEvidence?.vectorScore : undefined;
+    const vectorProof = typeof vectorScore === 'number' && Number.isFinite(vectorScore) &&
+      vectorScore >= MIN_RECALL_SCORE && vectorScore <= 1;
+    const spans = verifiedLiteralSpans(query, item.text);
+    const lexicalProof = (row.scoreSource === 'lexical_verified' ||
+      row.scoreSource === 'hybrid_verified') &&
+      Number.isSafeInteger(row.retrievalEvidence?.lexicalRank) &&
+      row.retrievalEvidence.lexicalRank > 0 && spans.length > 0;
     return item.projectId === projectId && item.status === 'active' &&
-      row.scoreSource === 'mem0_sdk_search' && typeof row.score === 'number' &&
-      Number.isFinite(row.score) && row.score >= MIN_RECALL_SCORE && row.score <= 1 &&
+      (row.scoreSource === 'mem0_sdk_search' && vectorProof ||
+        row.scoreSource === 'lexical_verified' && lexicalProof ||
+        row.scoreSource === 'hybrid_verified' && (vectorProof || lexicalProof)) &&
       typeof item.text === 'string' && item.text.length > 0 && item.id &&
       typeof m.source === 'string' && m.source && typeof m.actor === 'string' && m.actor &&
       ((m.origin === 'user_direct' && m.speaker_role === 'user') ||
@@ -86,7 +98,32 @@ export function selectRecall(results, { projectId, now, ownerId } = {}) {
         m.scope === 'episode' && Number.isFinite(to)) &&
       (from === null || Number.isFinite(from) && from <= instant) &&
       (to === null || Number.isFinite(to) && instant < to);
-  }).sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  }).sort(preserveHybridOrder ? () => 0 : (a, b) => (b.score ?? 0) - (a.score ?? 0));
+}
+
+export function selectSearchRecall(answer, options = {}) {
+  if (answer?.kind !== 'items' || !Array.isArray(answer.items)) return [];
+  const unique = rows => {
+    const seen = new Set();
+    return rows.filter(row => {
+      const id = fields(row).id;
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+  };
+  const vectors = unique(selectRecall(answer.items, options).filter(row =>
+    row.scoreSource === 'mem0_sdk_search'));
+  if (!Array.isArray(answer.lexical_items) || !answer.lexical_items.length) return vectors.slice(0, 20);
+  const lexical = unique(selectRecall(answer.lexical_items, { ...options, preserveHybridOrder: true })
+    .filter(row => row.scoreSource === 'lexical_verified')
+    .map(row => ({ ...row, retrievalEvidence: {
+      lexicalRank: row.retrievalEvidence.lexicalRank,
+      literalSpans: verifiedLiteralSpans(options.query, row.text ?? row.memory),
+    } })));
+  if (!lexical.length) return vectors.slice(0, 20);
+  const ranked = rankHybrid(vectors, lexical, { query: options.query });
+  return selectRecall(ranked, { ...options, preserveHybridOrder: true }).slice(0, 20);
 }
 
 function renderWithItems(items, maxTokens) {
@@ -143,7 +180,8 @@ export function createRecall({ search, now = () => new Date().toISOString() }) {
       const sessionKey = session.nativeSessionId ?? session.sessionId ?? '';
       const seen = seenBySession.get(sessionKey) ?? new Set();
       seenBySession.set(sessionKey, seen);
-      const eligible = selectRecall(raced.items, { projectId: session.projectId, ownerId: session.ownerId, now: now() });
+      const eligible = selectSearchRecall(raced, { projectId: session.projectId,
+        ownerId: session.ownerId, now: now(), query });
       const unseen = eligible.filter(row => {
         const item = fields(row);
         const key = `${item.id}:${createHash('sha256').update(item.text).digest('hex')}`;

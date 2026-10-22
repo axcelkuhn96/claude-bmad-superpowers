@@ -12,7 +12,7 @@ import { readOwner, readAutoPublish } from './policy.mjs';
 import { assertWriter } from './authority.mjs';
 import { pinDestination } from './activation.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
-import { selectRecall, renderRecall } from './context.mjs';
+import { selectSearchRecall, renderRecall } from './context.mjs';
 import { ensureBrokerReady } from './broker-start.mjs';
 import { requestBroker } from './broker.mjs';
 import { runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
@@ -325,15 +325,18 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
         ? await search({ query: args.query, projectId: ready.projectId, ownerId: ready.ownerId }, auth)
         : await request({ op: 'search', query: args.query, ownerId: ready.ownerId });
       if (curated?.kind !== 'items') return blocked(curated?.reason ?? 'search_failed');
-      const selected = renderRecall(selectRecall(curated.items, { projectId: ready.projectId,
-        ownerId: ready.ownerId, now: new Date().toISOString() }), 500);
+      const retrieval = curated.vector_degradation ? { retrievalStatus: 'lexical_only',
+        retrievalReason: curated.vector_degradation } : curated.lexical_degradation
+        ? { retrievalStatus: 'vector_only', retrievalReason: curated.lexical_degradation } : {};
+      const selected = renderRecall(selectSearchRecall(curated, { projectId: ready.projectId,
+        ownerId: ready.ownerId, now: new Date().toISOString(), query: args.query }), 500);
       let legacy = { kind: 'items', items: [] };
       if (source !== 'curated') legacy = legacySearch
         ? await legacySearch({ query: args.query, projectId: ready.projectId }, auth)
         : await request({ op: 'raw_search', query: args.query });
       if (legacy?.kind !== 'items') return selected.used.length
         ? { kind: 'items', context: selected.text, count: selected.used.length,
-          legacyStatus: legacy?.reason ?? 'search_failed' }
+          legacyStatus: legacy?.reason ?? 'search_failed', ...retrieval }
         : blocked(legacy?.reason ?? 'search_failed');
       const lines = [];
       let remaining = 1200;
@@ -346,9 +349,9 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
         if (size > remaining) continue;
         lines.push(line); remaining -= size;
       }
-      if (!selected.used.length && !lines.length) return { kind: 'abstain' };
+      if (!selected.used.length && !lines.length) return { kind: 'abstain', ...retrieval };
       return { kind: 'items', context: [selected.used.length ? selected.text : '', ...lines].filter(Boolean).join('\n'),
-        count: selected.used.length + lines.length };
+        count: selected.used.length + lines.length, ...retrieval };
     } catch { return blocked('search_failed'); }
   }
   return { definitions, ready: initial, call, close: async () => {

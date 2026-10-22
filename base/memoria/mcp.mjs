@@ -3,7 +3,7 @@ import readline from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { resolveBoundLaunch } from './launch.mjs';
 import { searchProject, runBridgeOperation } from './bridge.mjs';
-import { selectRecall } from './context.mjs';
+import { selectSearchRecall } from './context.mjs';
 import { recordRecallWindow } from './hook-recall.mjs';
 import { createOutbox } from './outbox.mjs';
 import { POLICY_VERSION } from './transcript.mjs';
@@ -60,16 +60,19 @@ export function createMcp({ launchId = process.env.CBS_MEMORIA_LAUNCH_ID,
       finally { clearTimeout(searchTimer); }
       if (answer?.kind !== 'items') return answer?.kind === 'unavailable' || answer?.kind === 'blocked'
         ? blocked(answer.reason) : blocked('search_failed');
-      const eligible = selectRecall(answer.items, { projectId: bound.projectId,
-        ownerId: bound.ownerId, now: new Date().toISOString() });
-      if (!eligible.length) return { kind: 'abstain' };
+      const retrieval = answer.vector_degradation ? { retrievalStatus: 'lexical_only',
+        retrievalReason: answer.vector_degradation } : answer.lexical_degradation
+        ? { retrievalStatus: 'vector_only', retrievalReason: answer.lexical_degradation } : {};
+      const eligible = selectSearchRecall(answer, { projectId: bound.projectId,
+        ownerId: bound.ownerId, now: new Date().toISOString(), query: args.query });
+      if (!eligible.length) return { kind: 'abstain', ...retrieval };
       let selected;
       try { selected = await recordWindow({ stateDir: bound.stateDir, cli,
         sessionId: bound.nativeSessionId, eligible, remaining }); }
       catch { return blocked(remaining() <= 0 ? 'deadline' : 'window_unavailable'); }
       if (selected.kind !== 'items') return selected;
       if (remaining() <= 0) { await selected.rollback(); return blocked('deadline'); }
-      return { kind: 'items', context: selected.text, count: selected.items.length };
+      return { kind: 'items', context: selected.text, count: selected.items.length, ...retrieval };
     }
     if (name === 'source') {
       if (typeof args.memory_id !== 'string' || args.memory_id.length > 256) return blocked('invalid_memory_id');

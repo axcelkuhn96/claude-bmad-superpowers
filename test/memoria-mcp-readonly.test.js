@@ -71,6 +71,23 @@ test('standalone MCP searches approved project memory without session or launche
   await mcp.close();
 });
 
+test('standalone MCP accepts verified lexical identifier and labels partial retrieval', async t => {
+  const f = await fixture(t);
+  const lexical = { ...item, text: 'HML_TRIPEX_COMP is the code.', score: undefined,
+    scoreSource: 'lexical_verified', retrievalEvidence: { lexicalRank: 1,
+      literalSpans: ['HML_TRIPEX_COMP'] } };
+  const mcp = createReadonlyMcp({ cwd: f.root, cli: 'claude', stateRoot: f.stateRoot,
+    verifyNative: async () => ({ kind: 'verified' }),
+    authorize: async () => ({ kind: 'authorized', key: 'private', connection: {} }),
+    search: async () => ({ kind: 'items', items: [], lexical_items: [lexical],
+      vector_degradation: 'vector_unavailable' }) });
+  const found = await mcp.call('search', { query: 'HML_TRIPEX_COMP', source: 'curated' });
+  assert.equal(found.kind, 'items');
+  assert.equal(found.retrievalStatus, 'lexical_only');
+  assert.match(found.context, /HML_TRIPEX_COMP/);
+  await mcp.close();
+});
+
 test('read-only MCP status reports locally configured automatic writing without contacting Qdrant', async t => {
   const f = await fixture(t);
   let remoteCalls = 0;

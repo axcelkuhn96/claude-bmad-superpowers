@@ -2,15 +2,75 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { inspectConfiguration } from './provider.mjs';
-import { readLocalTrust, sameTrustTuple, trustTuple } from './trust.mjs';
-import { runtimeEnvironment, verifyRuntimeArtifacts } from './runtime.mjs';
+import { readLocalTrust, sameTrustTuple, trustTuple, authorizeDestination } from './trust.mjs';
+import { runtimeEnvironment, runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
+import { identifyProject } from './project-id.mjs';
+import { pinDestination } from './activation.mjs';
+import { readQdrantSecret } from './qdrant-key.mjs';
 import { resolveEnrolledWindowsTool } from './windows-enrollment.mjs';
 import { ensureWindowsPrivateDirectory } from './windows-security.mjs';
 
 const runFile = promisify(execFile);
 const blocked = (reason) => ({ kind: 'blocked', reason });
+
+async function runIndexPython(request, secret, stateDir) {
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'python', 'mem0_adapter.py');
+  const child = spawn(runtimePython(stateDir), [script], { stdio: ['pipe', 'pipe', 'ignore'],
+    env: { ...runtimeEnvironment(stateDir), CBS_MEMORIA_STATE: stateDir,
+      CBS_MEMORIA_API_KEY: secret } });
+  return new Promise(resolve => {
+    let output = '';
+    let settled = false;
+    const finish = value => { if (!settled) { settled = true; clearTimeout(timer); resolve(value); } };
+    const timer = setTimeout(() => { child.kill(); finish(blocked('deadline')); }, 120000);
+    child.stdout.on('data', chunk => {
+      output += chunk.toString('utf8');
+      if (output.length > 65536) { child.kill(); finish(blocked('response_oversized')); }
+    });
+    child.once('error', () => finish(blocked('worker_unavailable')));
+    child.stdin.on('error', () => {});
+    child.once('close', code => {
+      if (code !== 0) return finish(blocked('worker_failed'));
+      try { finish(JSON.parse(output.trim())); }
+      catch { finish(blocked('worker_protocol')); }
+    });
+    child.stdin.end(JSON.stringify(request) + '\n');
+  });
+}
+
+export async function indexTextProject(cwd, options = {}) {
+  if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) return blocked('invalid_project');
+  cwd = path.resolve(cwd);
+  const inspect = options.inspect ?? inspectConfiguration;
+  const resolution = await inspect(cwd, options);
+  if (resolution.provider !== 'mem0') return blocked(resolution.reason ?? 'not_mem0');
+  const scope = await (options.identify ?? identifyProject)(cwd);
+  if (scope.kind !== 'git' || scope.activeRoot !== cwd ||
+      scope.projectRoot !== resolution.projectRoot) return blocked('unsupported_git');
+  const expected = trustTuple(resolution);
+  if (!sameTrustTuple(expected, await (options.trust ?? readLocalTrust)(resolution.stateDir))) {
+    return blocked('trust_changed');
+  }
+  const destination = resolution.destination;
+  const pin = await (options.pin ?? pinDestination)(destination.url, { address: destination.address,
+    allowPublic: destination.allowPublic });
+  if (pin.kind !== 'pinned') return blocked(pin.reason ?? 'destination_unavailable');
+  const current = await inspect(cwd, options);
+  if (current.provider !== 'mem0' || current.projectId !== resolution.projectId ||
+      current.embeddingFingerprint !== resolution.embeddingFingerprint ||
+      !sameTrustTuple(expected, trustTuple(current))) return blocked('config_changed');
+  const auth = authorizeDestination(current,
+    await (options.trust ?? readLocalTrust)(current.stateDir), options.readSecret ?? readQdrantSecret);
+  if (auth.kind !== 'authorized') return auth;
+  const request = { op: 'index_text', projectId: current.projectId,
+    collection: current.destination.collection, connection: pin.connection };
+  try { return await (options.run ?? ((value, key) =>
+    runIndexPython(value, key, current.stateDir)))(request, auth.key); }
+  catch { return blocked('worker_failed'); }
+}
 
 export async function provisionRuntime(cwd, model, tokenizer, options = {}) {
   if (process.platform !== 'win32' && !process.getuid) return blocked('native_windows_unproved');
