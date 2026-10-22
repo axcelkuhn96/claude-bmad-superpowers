@@ -639,6 +639,24 @@ def lexical_candidates(client, collection: str, project: str, query: str,
         return {'kind': 'vector_only', 'reason': 'lexical_unavailable', 'items': []}
 
 
+class _OneQueryEmbedder:
+    """Reuse the SDK query embedding only within one search operation."""
+    def __init__(self, delegate):
+        self.delegate = delegate
+        self.query = None
+        self.vector = None
+
+    def embed(self, text: str, memory_action: str = 'add') -> list[float]:
+        if memory_action != 'search':
+            return self.delegate.embed(text, memory_action)
+        if self.vector is None:
+            self.query = text
+            self.vector = self.delegate.embed(text, memory_action)
+        elif text != self.query:
+            raise ValueError('query_embedding_changed')
+        return self.vector
+
+
 def execute_readonly(request: dict, client, state: Path) -> dict:
     """Read-only MCP operations; collection is always derived from the bound native one."""
     native = request['collection']
@@ -811,40 +829,46 @@ def execute(request: dict, client, state: Path) -> dict:
         now = datetime.now(timezone.utc)
         lexical = lexical_candidates(client, collection, project, request['query'],
             owner=request.get('ownerId'), now=now)
-        limit = 20
-        while limit <= 2048:
-            try:
-                result = memory.search(request['query'], filters={'user_id': project, 'status': 'active'},
-                                       top_k=limit, threshold=MIN_RECALL_SCORE)
-                items = [{**_row(row, client, collection, memory.embedding_model),
-                          'scoreSource': 'mem0_sdk_search'} for row in result['results']]
-            except Exception:
-                if lexical['items']:
-                    return {'kind': 'items', 'items': [], 'lexical_items': lexical['items'],
-                            'vector_degradation': 'vector_unavailable'}
-                return {'kind': 'unavailable', 'reason': 'vector_unavailable',
-                        'lexical_degradation': lexical.get('reason')}
-            eligible = [row for row in items if row['projectId'] == project and
-                isinstance(row.get('score'), (int, float)) and math.isfinite(row['score']) and
-                MIN_RECALL_SCORE <= row['score'] <= 1 and
-                row['status'] == 'active' and row['metadata'].get('source') and row['metadata'].get('actor') and
-                (row['metadata'].get('format_version') != 5 or
-                    _explicit_mcp_record(row['metadata'], row['text'], project)) and
-                row['metadata'].get('scope') in ('project', 'personal', 'episode') and
-                (row['metadata'].get('scope') != 'episode' or row['metadata'].get('valid_to')) and
-                (row['metadata']['scope'] in ('project', 'episode') or (request.get('ownerId') and
-                    row['metadata'].get('owner_id') == request['ownerId'])) and
-                (not row['metadata'].get('valid_from') or _time(row['metadata']['valid_from']) <= now) and
-                (not row['metadata'].get('valid_to') or now < _time(row['metadata']['valid_to']))]
-            if len(eligible) >= 20 or len(result['results']) < limit:
-                ranked_vector = [{**row, 'retrievalEvidence': {'vectorScore': row['score'],
-                                   'vectorRank': index}}
-                                 for index, row in enumerate(eligible[:20], 1)]
-                return {'kind': 'items', 'items': ranked_vector,
-                        'lexical_items': lexical['items'],
-                        'lexical_degradation': lexical.get('reason')}
-            limit *= 2
-        raise ValueError('remote_search_saturated')
+        original_embedder = memory.embedding_model
+        memory.embedding_model = (_OneQueryEmbedder(original_embedder)
+                                  if hasattr(original_embedder, 'embed') else original_embedder)
+        try:
+            limit = 20
+            while limit <= 2048:
+                try:
+                    result = memory.search(request['query'], filters={'user_id': project, 'status': 'active'},
+                                           top_k=limit, threshold=MIN_RECALL_SCORE)
+                    items = [{**_row(row, client, collection, memory.embedding_model),
+                              'scoreSource': 'mem0_sdk_search'} for row in result['results']]
+                except Exception:
+                    if lexical['items']:
+                        return {'kind': 'items', 'items': [], 'lexical_items': lexical['items'],
+                                'vector_degradation': 'vector_unavailable'}
+                    return {'kind': 'unavailable', 'reason': 'vector_unavailable',
+                            'lexical_degradation': lexical.get('reason')}
+                eligible = [row for row in items if row['projectId'] == project and
+                    isinstance(row.get('score'), (int, float)) and math.isfinite(row['score']) and
+                    MIN_RECALL_SCORE <= row['score'] <= 1 and
+                    row['status'] == 'active' and row['metadata'].get('source') and row['metadata'].get('actor') and
+                    (row['metadata'].get('format_version') != 5 or
+                        _explicit_mcp_record(row['metadata'], row['text'], project)) and
+                    row['metadata'].get('scope') in ('project', 'personal', 'episode') and
+                    (row['metadata'].get('scope') != 'episode' or row['metadata'].get('valid_to')) and
+                    (row['metadata']['scope'] in ('project', 'episode') or (request.get('ownerId') and
+                        row['metadata'].get('owner_id') == request['ownerId'])) and
+                    (not row['metadata'].get('valid_from') or _time(row['metadata']['valid_from']) <= now) and
+                    (not row['metadata'].get('valid_to') or now < _time(row['metadata']['valid_to']))]
+                if len(eligible) >= 20 or len(result['results']) < limit:
+                    ranked_vector = [{**row, 'retrievalEvidence': {'vectorScore': row['score'],
+                                       'vectorRank': index}}
+                                     for index, row in enumerate(eligible[:20], 1)]
+                    return {'kind': 'items', 'items': ranked_vector,
+                            'lexical_items': lexical['items'],
+                            'lexical_degradation': lexical.get('reason')}
+                limit *= 2
+            raise ValueError('remote_search_saturated')
+        finally:
+            memory.embedding_model = original_embedder
     raise ValueError('unknown_operation')
 
 

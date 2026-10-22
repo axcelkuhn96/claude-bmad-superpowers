@@ -96,6 +96,7 @@ class AdapterTest(unittest.TestCase):
 
     def test_vector_failure_admits_only_verified_lexical_or_unavailable(self):
         class Memory:
+            embedding_model = object()
             def search(self, *args, **kwargs):
                 raise OSError('vector unavailable')
         request = {'op': 'search', 'collection': 'c', 'projectId': 'p',
@@ -630,6 +631,35 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual([row['sdkId'] for row in result['items']], ['good'])
         self.assertEqual(result['items'][0]['scoreSource'], 'mem0_sdk_search')
         self.assertEqual(result['items'][0]['retrievalEvidence'], {'vectorScore': .9, 'vectorRank': 1})
+
+    def test_search_reuses_one_embedding_across_sdk_pages(self):
+        calls = []
+        bad = {'projectId': 'p', 'status': 'active', 'score': .9, 'sdkId': 'bad', 'metadata':
+               {'source': 's', 'actor': 'a', 'scope': 'personal', 'owner_id': 'other'}}
+        good = {'projectId': 'p', 'status': 'active', 'score': .9, 'sdkId': 'good', 'metadata':
+                {'source': 's', 'actor': 'a', 'scope': 'project'}}
+        class Embedder:
+            def embed(self, text, action):
+                calls.append((text, action))
+                return [1.0] + [0.0] * 383
+        class Memory:
+            embedding_model = Embedder()
+            def search(self, query, *, filters, top_k, threshold):
+                self.embedding_model.embed(query, 'search')
+                return {'results': ([bad] * 20 + [good])[:top_k]}
+        memory = Memory()
+        with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_memory', return_value=memory), \
+             patch.object(adapter, '_row', side_effect=lambda row, *args: row), \
+             patch.object(adapter, 'lexical_candidates', return_value={'kind': 'vector_only',
+                                                                       'reason': 'index_missing', 'items': []}):
+            result = adapter.execute({'op': 'search', 'collection': 'c', 'projectId': 'p',
+                                      'connection': {}, 'query': 'fact'}, None, Path('/tmp'))
+            self.assertEqual(calls, [('fact', 'search')])
+            self.assertIsInstance(memory.embedding_model, Embedder)
+            adapter.execute({'op': 'search', 'collection': 'c', 'projectId': 'p',
+                             'connection': {}, 'query': 'fact'}, None, Path('/tmp'))
+        self.assertEqual([item['sdkId'] for item in result['items']], ['good'])
+        self.assertEqual(calls, [('fact', 'search'), ('fact', 'search')])
 
     def test_reconciliation_includes_expired_sdk_rows_and_rejects_expiration_on_add(self):
         class Memory:
