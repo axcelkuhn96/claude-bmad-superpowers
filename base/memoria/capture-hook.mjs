@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { captureEvent } from './checkpoint.mjs';
+import { captureEvent, updateHandoffFromCapture } from './checkpoint.mjs';
 import { scheduleExtraction } from './extract-worker.mjs';
 
 const [cli, event] = process.argv.slice(2);
@@ -12,6 +12,13 @@ for await (const chunk of process.stdin) {
 try {
   const payload = JSON.parse(input);
   const result = await captureEvent({ cli, event, payload, stateRoot: process.env.CBS_MEMORIA_STATE_ROOT });
+  await updateHandoffFromCapture({ cli, event, payload, result,
+    stateRoot: process.env.CBS_MEMORIA_STATE_ROOT, began });
+  if (event === 'SessionStart') {
+    const { deliverHandoffAtSessionStart } = await import('./hook-recall.mjs');
+    await deliverHandoffAtSessionStart({ cli, payload, result,
+      stateRoot: process.env.CBS_MEMORIA_STATE_ROOT, began });
+  }
   scheduleExtraction({ cli, event, payload, result, stateRoot: process.env.CBS_MEMORIA_STATE_ROOT });
   if (event === 'UserPromptSubmit' || event === 'PreCompact') {
     const { recallForPrompt } = await import('./hook-recall.mjs');

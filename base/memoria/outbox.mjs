@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { constants } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -1737,8 +1738,63 @@ export function createOutbox(stateDir, options = {}) {
       return receipt;
     });
   }
+  // Read only the exact durable source just accepted by captureEvent. This is
+  // deliberately narrower than a transcript or outbox history API.
+  async function handoffSource({ cli, sessionId, projectId, ownerId, operationId } = {}) {
+    if (process.platform === 'win32' || !['claude', 'codex'].includes(cli) ||
+        !sessionId || !projectId || !ownerId ||
+        operationId != null && !validId(operationId)) return blocked('invalid_handoff_source');
+    const files = operationId ? [itemFile(operationId), ackFile(operationId),
+      processedFile(operationId)] : [conversationFile(cli, sessionId)];
+    let row;
+    for (const file of files) {
+      try {
+        const before = await fs.lstat(file);
+        if (!before.isFile() || before.isSymbolicLink() || before.uid !== process.getuid() ||
+            (before.mode & 0o077) || before.size > 16 * 1024 * 1024) return blocked('unsafe_handoff_source');
+        const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          const opened = await handle.stat();
+          if (opened.dev !== before.dev || opened.ino !== before.ino ||
+              opened.size !== before.size) return blocked('unsafe_handoff_source');
+          row = JSON.parse(await handle.readFile('utf8'));
+        } finally { await handle.close(); }
+        break;
+      } catch (error) {
+        if (error.code !== 'ENOENT') return blocked('unsafe_handoff_source');
+      }
+    }
+    if (!row || row.cli !== cli || row.sessionId !== sessionId ||
+        row.projectId !== projectId || row.policyVersion !== POLICY_VERSION ||
+        !Array.isArray(row.messages) || !Number.isSafeInteger(row.start) ||
+        !Number.isSafeInteger(row.end) || row.end <= row.start) return blocked('missing_handoff_source');
+    const slices = operationId ? row.sourceSlices : row.parts;
+    if (operationId ? row.operationId !== operationId ||
+        !/^[a-f0-9]{64}$/.test(row.sliceHash ?? '') ||
+        Array.isArray(slices) && hash(JSON.stringify(slices)) !== row.sliceHash
+      : !Array.isArray(slices) || !slices.length ||
+        !slices.every(part => /^[a-f0-9]{64}$/.test(part.sliceHash ?? ''))) {
+      return blocked('invalid_handoff_proof');
+    }
+    const latest = [];
+    for (const message of row.messages) {
+      if (message?.sessionId !== sessionId || !Number.isSafeInteger(message.start) ||
+          !Number.isSafeInteger(message.end) || message.start < row.start ||
+          message.end > row.end || message.end <= message.start) return blocked('invalid_handoff_message');
+      if (message.origin === 'human' && message.ownerId === ownerId ||
+          message.origin === 'assistant' && message.finalVisible === true) {
+        latest.push({ origin: message.origin, text: message.text,
+          messageId: message.messageId, finalVisible: message.finalVisible === true,
+          start: message.start, end: message.end,
+          proofHash: hash(JSON.stringify([row.sliceHash ?? slices, message.messageId,
+            message.start, message.end, message.text])) });
+      }
+    }
+    return { kind: 'source', operationId: operationId ?? `stage-${hash(JSON.stringify(slices))}`,
+      messages: latest.slice(-8) };
+  }
   return { enqueueCheckpoint, enqueueConversationSlice, flushConversationStage,
-    listConversationStages,
+    listConversationStages, handoffSource,
     ensureFutureBaseline, readFutureBaseline, futureSourceAllowed,
     ackVerified, recordManifest, persistCandidatePayload, sourceForRemote,
     claimExtraction, extractionBudget, recordExtractionUsage, extractionUsage, readCandidatePayload, readReview, sealReview,

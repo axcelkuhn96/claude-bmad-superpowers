@@ -15,7 +15,7 @@ const scopeFor = identity => sha(JSON.stringify([identity.projectId, identity.ow
 const nameFor = identity => `${scopeFor(identity)}-${sha(JSON.stringify([identity.cli, identity.sourceSessionId]))}`;
 const metadataFile = (dir, identity) => path.join(dir, `${nameFor(identity)}.json`);
 const markdownFile = (dir, identity, contentHash) => path.join(dir,
-  `${nameFor(identity)}-${contentHash}.md`);
+  `${scopeFor(identity)}-${contentHash}.md`);
 const receiptDir = dir => path.join(dir, 'receipts');
 const receiptFile = (dir, key) => path.join(receiptDir(dir), `${key}.json`);
 const TTL = 7 * 24 * 60 * 60 * 1000;
@@ -158,22 +158,30 @@ async function cleanupExpired(dir, identity, now) {
   }
   // Delivered paths remain valid until their own seven-day retention expires.
   // Sweep only private files in this checkout scope and never the current row.
+  const referenced = new Set();
+  const metadata = await fs.opendir(dir);
+  for await (const entry of metadata) {
+    if (!entry.name.startsWith(`${scopeFor(identity)}-`) ||
+        !/^[a-f0-9]{64}-[a-f0-9]{64}\.json$/.test(entry.name)) continue;
+    let source;
+    try { source = JSON.parse(await privateRead(path.join(dir, entry.name), 64 * 1024))?.identity; }
+    catch { return; }
+    if (!validIdentity(source) || entry.name !== `${nameFor(source)}.json` ||
+        scopeFor(source) !== scopeFor(identity)) return;
+    const row = await readRow(dir, source);
+    if (!row) return;
+    if (row.handoff) referenced.add(row.handoff.contentHash);
+  }
   const markdowns = await fs.opendir(dir);
   for await (const entry of markdowns) {
     if (removed >= 128) break;
-    const match = /^([a-f0-9]{64}-[a-f0-9]{64})-([a-f0-9]{64})\.md$/.exec(entry.name);
-    if (!match || !entry.name.startsWith(`${scopeFor(identity)}-`)) continue;
+    const match = /^([a-f0-9]{64})-([a-f0-9]{64})\.md$/.exec(entry.name);
+    if (!match || match[1] !== scopeFor(identity)) continue;
     const file = path.join(dir, entry.name);
     let stat;
     try { stat = await fs.lstat(file); } catch { continue; }
     if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) ||
-        Date.now() - stat.mtimeMs <= TTL) continue;
-    try {
-      const row = JSON.parse(await privateRead(path.join(dir, `${match[1]}.json`), 64 * 1024));
-      if (row?.handoff?.contentHash === match[2]) continue;
-    } catch (error) {
-      if (error.code !== 'ENOENT') continue;
-    }
+        Date.now() - stat.mtimeMs <= TTL || referenced.has(match[2])) continue;
     try { await fs.unlink(file); removed++; }
     catch { /* A concurrent change is left for a later write. */ }
   }

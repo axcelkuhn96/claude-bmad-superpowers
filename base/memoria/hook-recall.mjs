@@ -9,6 +9,8 @@ import { withProjectLock } from './ledger.mjs';
 import { createWindowsState } from './windows-state.mjs';
 import { ensureWindowsPrivateDirectory, readWindowsBinary,
   deleteWindowsBinary } from './windows-security.mjs';
+import { authenticatedHandoffCapture } from './checkpoint.mjs';
+import { prepareHandoff, acknowledgeHandoff } from './handoff-state.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const validCapture = result => result && !['blocked', 'pass_through', 'full'].includes(result.kind);
@@ -24,6 +26,42 @@ const failureCategory = reason => {
 };
 const stateFile = (stateDir, cli, sessionId) => path.join(stateDir, 'sessions',
   `${digest(JSON.stringify([cli, sessionId]))}.recall.json`);
+
+const nativeWrite = bytes => new Promise((resolve, reject) => {
+  try { process.stdout.write(bytes, error => error ? reject(error) : resolve()); }
+  catch (error) { reject(error); }
+});
+
+export async function deliverHandoffAtSessionStart({ cli, payload, result,
+  stateRoot: _stateRoot, began = performance.now(), write = nativeWrite,
+  now = () => new Date().toISOString() } = {}) {
+  const proof = authenticatedHandoffCapture({ cli, event: 'SessionStart', payload, result });
+  if (!proof || process.platform === 'win32' ||
+      typeof payload?.prompt === 'string' && payload.prompt.trim()) return null;
+  const remaining = () => Math.floor(900 - (performance.now() - began));
+  if (remaining() <= 0) return null;
+  let timer;
+  try {
+    const prepared = await Promise.race([
+      prepareHandoff(proof.stateDir, { ...proof.identity, now: now() }),
+      new Promise(resolve => { timer = setTimeout(() => resolve(null), remaining()); }),
+    ]);
+    if (prepared?.kind !== 'prepared' || remaining() < 75) return null;
+    const output = { hookSpecificOutput: { hookEventName: 'SessionStart',
+      additionalContext: prepared.summary } };
+    const bytes = JSON.stringify(output) + '\n';
+    if (Buffer.byteLength(prepared.summary) > 300) return null;
+    let writeTimer;
+    const flushed = await Promise.race([
+      Promise.resolve().then(() => write(bytes)).then(() => true),
+      new Promise(resolve => { writeTimer = setTimeout(() => resolve(false), remaining()); }),
+    ]).finally(() => clearTimeout(writeTimer));
+    if (!flushed) return null;
+    await acknowledgeHandoff(proof.stateDir, prepared.receipt);
+    return output;
+  } catch { return null; }
+  finally { clearTimeout(timer); }
+}
 
 async function readSeen(file) {
   if (process.platform === 'win32') {

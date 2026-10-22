@@ -33,6 +33,19 @@ const format = (identity, messages) => formatHandoff({ ...identity,
 const record = async (state, identity, messages, event = 'SessionEnd', time = at) =>
   saveHandoff(state, { identity, handoff: format(identity, messages), event, at: time });
 
+test('private handoff path fits 300-byte context at a realistic state directory depth', async t => {
+  const { root, identity } = await fixture(t);
+  const state = path.join(root, 'x'.repeat(70));
+  const source = await identity('source');
+  const target = await identity('target');
+  assert.equal((await record(state, source, [msg('human', 'Quero continuar o plano.')])).kind,
+    'saved');
+  const prepared = await prepareHandoff(state, { ...target, now: at });
+  assert.equal(prepared.kind, 'prepared', JSON.stringify(prepared));
+  assert.ok(Buffer.byteLength(prepared.summary) <= 300);
+  assert.ok((await fs.readFile(prepared.file, 'utf8')).includes('Quero continuar o plano.'));
+});
+
 // Removing the privacy filter or untrusted labels must fail this test.
 test('format retains eight headings and only safe, labeled bounded excerpts', async t => {
   const { identity } = await fixture(t);

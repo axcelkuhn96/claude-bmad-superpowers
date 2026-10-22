@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { ensureWindowsPrivateDirectory, publishWindowsBinary, readWindowsBinary } from './windows-security.mjs';
 import { nativeProfile } from './native-profile.mjs';
 import { withProjectLock } from './ledger.mjs';
+import { captureHandoffIdentity } from './handoff-state.mjs';
 
 const fileFor = (stateDir, cli, sessionId) => path.join(stateDir, 'sessions',
   `${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.checkout.json`);
@@ -112,6 +113,17 @@ export async function recordSessionCheckout(resolution, cli, sessionId, nativeRo
       : blocked('session_checkout_changed');
   }
   if (prior.reason !== 'missing_session_checkout') return prior;
+  // This identity belongs to the native session, not the current branch at a
+  // later Stop. Older bindings and unknown owners remain ineligible.
+  if (resolution.ownerId && process.platform !== 'win32') {
+    try {
+      expected.handoffIdentity = await captureHandoffIdentity({
+        projectId: resolution.projectId, ownerId: resolution.ownerId,
+        nativeRoot, projectRoot: resolution.projectRoot, cli,
+        sourceSessionId: sessionId,
+      });
+    } catch { /* Git identity unavailable: keep ordinary capture working. */ }
+  }
   try {
     const handle = await fs.open(file, 'wx', 0o600);
     try { await handle.writeFile(JSON.stringify(expected) + '\n'); await handle.sync(); }
@@ -122,6 +134,7 @@ export async function recordSessionCheckout(resolution, cli, sessionId, nativeRo
     if (error.code !== 'EEXIST') return blocked('session_checkout_write_failed');
   }
   const saved = await readSessionCheckout(resolution.stateDir, cli, sessionId);
-  return saved.kind === 'bound' && Object.entries(expected).every(([key, value]) => saved[key] === value)
+  return saved.kind === 'bound' && Object.entries(expected).every(([key, value]) =>
+    key === 'handoffIdentity' ? JSON.stringify(saved[key]) === JSON.stringify(value) : saved[key] === value)
     ? saved : blocked('session_checkout_changed');
 }

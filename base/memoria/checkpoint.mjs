@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { inspectConfiguration, initializeSession, resolveProject,
   refreshSessionPolicyForCapture } from './provider.mjs';
 import { verifyNativeCapture } from './native.mjs';
@@ -15,11 +15,15 @@ import { bindSessionCheckoutProfile, recordSessionCheckout,
 import { readWindowsBinary } from './windows-security.mjs';
 import { nativeProfile } from './native-profile.mjs';
 import { currentExtractionSchedule } from './policy.mjs';
+import { withProjectLock } from './ledger.mjs';
+import { formatHandoff } from './handoff-format.mjs';
+import { saveHandoff } from './handoff-state.mjs';
 
 const events = { claude: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'SessionEnd']),
   codex: new Set(['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'Interrupt', 'SessionEnd']) };
 const blocked = reason => ({ kind: 'blocked', reason });
 const flushEvents = new Set(['PreCompact', 'SessionEnd', 'Interrupt']);
+const handoffProofs = new WeakMap();
 
 async function completeTranscriptEnd(transcriptPath, stat) {
   if (!stat) return 0;
@@ -59,6 +63,7 @@ async function completeTranscriptEnd(transcriptPath, stat) {
 }
 
 export async function captureEvent({ cli, event, payload, stateRoot, installedPlugin } = {}) {
+  const capturedAt = new Date().toISOString();
   const noTranscriptFlush = cli === 'codex' && flushEvents.has(event) &&
     payload?.transcript_path === null;
   if (!events[cli]?.has(event) || payload?.hook_event_name !== event ||
@@ -96,6 +101,10 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
   if (!noTranscriptFlush && (!path.isAbsolute(transcriptPath) || !(cli === 'claude'
     ? basename === `${payload.session_id}.jsonl` : basename.endsWith(`${payload.session_id}.jsonl`)))) {
     return blocked('transcript_session_mismatch');
+  }
+  if (!noTranscriptFlush && !path.relative(session.stateDir, transcriptPath).startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(path.relative(session.stateDir, transcriptPath))) {
+    return blocked('unsafe_transcript');
   }
   let stat;
   if (!noTranscriptFlush) {
@@ -141,6 +150,20 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
       extractor: await currentExtractionSchedule(session, session.extractor) };
   }
   const outbox = createOutbox(session.stateDir);
+  const identity = checkout.handoffIdentity;
+  const handoffBound = identity && identity.ownerId === session.ownerId &&
+    identity.projectId === session.projectId && identity.projectRoot === session.projectRoot &&
+    identity.nativeRoot === scope.activeRoot && identity.sourceSessionId === payload.session_id &&
+    identity.cli === cli;
+  const sourceRefs = [];
+  const finish = result => {
+    if (handoffBound && result && !['blocked', 'pass_through', 'full'].includes(result.kind)) {
+      handoffProofs.set(result, { cli, event, sessionId: payload.session_id,
+        cwd: payload.cwd, transcriptPath, stateDir: session.stateDir,
+        identity, sourceRefs: [...sourceRefs], capturedAt });
+    }
+    return result;
+  };
   const conversation = session.extractor?.autoPublish === true &&
     session.extractor.mode === 'conversation';
   const flushStage = () => outbox.flushConversationStage({ cli, sessionId: payload.session_id,
@@ -153,10 +176,10 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
         consentHash: session.extractor.autoPublishConsent?.consentHash,
         policyVersion: POLICY_VERSION });
       if (proof.kind !== 'baselined') return proof;
-      return flushStage();
+      return finish(await flushStage());
     }
     const { queuedEnd } = await outbox.cursor(cli, payload.session_id);
-    return { kind: 'no_complete_bytes', queuedEnd };
+    return finish({ kind: 'no_complete_bytes', queuedEnd });
   }
   let baseline;
   if (session.extractor?.autoPublish === true) {
@@ -198,16 +221,144 @@ export async function captureEvent({ cli, event, payload, stateRoot, installedPl
       : await outbox.enqueueCheckpoint(slice,
         { projectId: session.projectId, policyVersion: POLICY_VERSION });
     if (!['queued', 'acked', 'processed', 'staged'].includes(queued.kind)) return queued;
+    sourceRefs.push(queued.operationId ?? null);
     if (last.kind !== 'queued' || queued.kind === 'queued') last = queued;
     queuedEnd = parsed.lastCompleteByte;
   }
   if (conversation && flushEvents.has(event)) {
     const flushed = await flushStage();
-    if (['queued', 'acked', 'processed'].includes(flushed.kind)) return flushed;
+    if (['queued', 'acked', 'processed'].includes(flushed.kind)) {
+      sourceRefs.push(flushed.operationId);
+      return finish(flushed);
+    }
     if (!['no_complete_pairs', 'staged'].includes(flushed.kind)) return flushed;
   }
   if (conversation && event === 'Stop' && last.kind === 'no_complete_bytes') {
-    return { kind: 'staged', queuedEnd };
+    return finish({ kind: 'staged', queuedEnd });
   }
-  return last;
+  return finish(last);
+}
+
+// A result object gets authority only from the completed native capture path.
+// Copying it or adding request-side flags cannot manufacture this proof.
+export function authenticatedHandoffCapture({ cli, event, payload, result } = {}) {
+  const proof = handoffProofs.get(result);
+  return proof && proof.cli === cli && proof.event === event &&
+    proof.sessionId === payload?.session_id && proof.cwd === payload.cwd &&
+    proof.transcriptPath === payload.transcript_path ? proof : null;
+}
+
+const evidenceFile = (stateDir, cli, sessionId) => path.join(stateDir, 'sessions',
+  `${createHash('sha256').update(JSON.stringify([cli, sessionId])).digest('hex')}.handoff-evidence.json`);
+
+async function readHandoffEvidence(file, identity, allowExpired = false) {
+  try {
+    const before = await fs.lstat(file);
+    if (!before.isFile() || before.isSymbolicLink() || before.uid !== process.getuid() ||
+        (before.mode & 0o077) || before.size > 8192) return null;
+    const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const opened = await handle.stat();
+      if (opened.dev !== before.dev || opened.ino !== before.ino ||
+          opened.size !== before.size) return null;
+      const value = JSON.parse(await handle.readFile('utf8'));
+      return value.checkoutFingerprint === identity.checkoutFingerprint &&
+        value.ownerId === identity.ownerId &&
+        value.cli === identity.cli && typeof value.sessionId === 'string' &&
+        file === evidenceFile(path.dirname(path.dirname(file)), value.cli, value.sessionId) &&
+        Number.isFinite(Date.parse(value.at)) &&
+        (allowExpired || Date.now() - Date.parse(value.at) <= 7 * 24 * 60 * 60 * 1000) &&
+        Array.isArray(value.messages) && value.messages.length <= 2 &&
+        value.messages.every(item => ['human', 'assistant'].includes(item.origin) &&
+          typeof item.text === 'string' && Buffer.byteLength(item.text) <= 160 &&
+          /^[a-f0-9]{64}$/.test(item.proofHash ?? '')) ? value : null;
+    } finally { await handle.close(); }
+  } catch { return null; }
+}
+
+async function cleanupHandoffEvidence(stateDir, identity, began) {
+  const dir = path.join(stateDir, 'sessions');
+  const names = await fs.readdir(dir);
+  let examined = 0;
+  for (const name of names) {
+    if (!/^[a-f0-9]{64}\.handoff-evidence\.json$/.test(name)) continue;
+    if (++examined > 128 || performance.now() - began > 750) break;
+    const file = path.join(dir, name);
+    const value = await readHandoffEvidence(file, identity, true);
+    if (value && Date.now() - Date.parse(value.at) > 7 * 24 * 60 * 60 * 1000) {
+      await fs.rm(file, { force: true });
+    }
+  }
+}
+
+async function writeHandoffEvidence(file, value) {
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  const handle = await fs.open(temporary, 'wx', 0o600);
+  try { await handle.writeFile(JSON.stringify(value) + '\n'); await handle.sync(); }
+  catch (error) { await handle.close(); await fs.rm(temporary, { force: true }); throw error; }
+  await handle.close();
+  try { await fs.rename(temporary, file); }
+  catch (error) { await fs.rm(temporary, { force: true }); throw error; }
+  const directory = await fs.open(path.dirname(file), 'r');
+  try { await directory.sync(); } finally { await directory.close(); }
+}
+
+export async function updateHandoffFromCapture({ cli, event, payload, result,
+  stateRoot: _stateRoot, began = performance.now() } = {}) {
+  const proof = authenticatedHandoffCapture({ cli, event, payload, result });
+  if (!proof || process.platform === 'win32' || performance.now() - began > 800) return null;
+  const lockName = `handoff-${createHash('sha256').update(JSON.stringify([cli, proof.sessionId]))
+    .digest('hex').slice(0, 32)}.lock`;
+  try {
+    return await withProjectLock(proof.stateDir, async () => {
+      const file = evidenceFile(proof.stateDir, cli, proof.sessionId);
+      const prior = await readHandoffEvidence(file, proof.identity);
+      if (!prior && await fs.lstat(file).then(() => true, error =>
+        error.code === 'ENOENT' ? false : Promise.reject(error))) return null;
+      if (prior && Date.parse(proof.capturedAt) < Date.parse(prior.at)) return null;
+      let messages = ['SessionStart', 'UserPromptSubmit'].includes(event)
+        ? [] : [...(prior?.messages ?? [])];
+      let operationId = prior?.operationId;
+      const outbox = createOutbox(proof.stateDir);
+      for (const ref of [...new Set(proof.sourceRefs)]) {
+        if (performance.now() - began > 800) return null;
+        const source = await outbox.handoffSource({ cli, sessionId: proof.sessionId,
+          projectId: proof.identity.projectId, ownerId: proof.identity.ownerId,
+          operationId: ref });
+        if (source.kind !== 'source') continue;
+        operationId = source.operationId;
+        for (const item of source.messages) {
+          if (typeof item.text !== 'string' || Buffer.byteLength(item.text) > 160) continue;
+          // Persist only excerpts the formatter itself permits. Rejected source
+          // text already lives in the authenticated outbox and is not copied.
+          const screened = formatHandoff({ ...proof.identity,
+            checkpoint: { operationId, messages: [item] }, now: proof.capturedAt });
+          if (!screened.markdown.includes(`“${item.text.trim()}”`)) continue;
+          if (item.origin === 'human') messages = [item];
+          else if (item.origin === 'assistant' && item.finalVisible === true) {
+            messages = [...messages.filter(message => message.origin === 'human'), item];
+          }
+        }
+      }
+      const value = { checkoutFingerprint: proof.identity.checkoutFingerprint,
+        ownerId: proof.identity.ownerId, cli, sessionId: proof.sessionId,
+        at: proof.capturedAt, operationId,
+        messages: messages.slice(-2) };
+      if (performance.now() - began > 800) return null;
+      await writeHandoffEvidence(file, value);
+      let handoff;
+      if (operationId && messages.length) {
+        handoff = formatHandoff({ ...proof.identity,
+          checkpoint: { operationId, messages }, now: proof.capturedAt });
+      }
+      const saved = await saveHandoff(proof.stateDir, { identity: proof.identity,
+        handoff, event, at: proof.capturedAt });
+      if (saved.kind === 'saved' && ['SessionEnd', 'Interrupt'].includes(event)) {
+        await fs.rm(file, { force: true }).catch(() => {});
+      } else if (saved.kind === 'saved' && event === 'SessionStart') {
+        await cleanupHandoffEvidence(proof.stateDir, proof.identity, began).catch(() => {});
+      }
+      return saved;
+    }, lockName, 25);
+  } catch { return null; }
 }
