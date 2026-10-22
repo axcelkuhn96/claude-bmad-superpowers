@@ -16,6 +16,7 @@
     "!**/*.pyo",
     "overrides/",
     "README.md",
+    "CHANGELOG.md",
     "INSTALL.md",
     "LICENSE"
   ],
