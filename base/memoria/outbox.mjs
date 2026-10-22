@@ -1790,8 +1790,11 @@ export function createOutbox(stateDir, options = {}) {
             message.start, message.end, message.text])) });
       }
     }
+    const selected = latest.slice(-8);
+    const newestHuman = latest.findLast(message => message.origin === 'human');
+    if (newestHuman && !selected.includes(newestHuman)) selected[0] = newestHuman;
     return { kind: 'source', operationId: operationId ?? `stage-${hash(JSON.stringify(slices))}`,
-      messages: latest.slice(-8) };
+      messages: selected };
   }
   return { enqueueCheckpoint, enqueueConversationSlice, flushConversationStage,
     listConversationStages, handoffSource,

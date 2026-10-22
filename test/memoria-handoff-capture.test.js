@@ -13,6 +13,7 @@ import { trustTuple, writeLocalTrust } from '../base/memoria/trust.mjs';
 import { RUNTIME_PINS } from '../base/memoria/runtime.mjs';
 import { readSessionCheckout } from '../base/memoria/session-checkout.mjs';
 import { prepareHandoff } from '../base/memoria/handoff-state.mjs';
+import { createOutbox } from '../base/memoria/outbox.mjs';
 
 const git = (cwd, ...args) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null',
   '-c', 'commit.gpgsign=false', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
@@ -203,6 +204,84 @@ test('a new authenticated unsafe human turn clears the previous safe objective',
   const prepared = await prepareHandoff(current.stateDir,
     { ...checkout.handoffIdentity, now: new Date().toISOString() });
   assert.equal(prepared.kind, 'abstain');
+});
+
+test('unsafe human before nine final assistants clears old objective across duplicate hooks', async t => {
+  const { dir, root, stateRoot, event } = await fixture(t);
+  const sourceFile = path.join(dir, 'source.jsonl');
+  const start = await event('source', 'SessionStart', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionStart',
+    ...start, stateRoot });
+  await fs.writeFile(sourceFile, line('source', 'user', 'Quero continuar o plano.', 'user-1'));
+  const first = await event('source', 'UserPromptSubmit', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'UserPromptSubmit',
+    ...first, stateRoot });
+  const batch = line('source', 'user', 'Minha senha é abc123', 'user-2') +
+    Array.from({ length: 9 }, (_, index) => line('source', 'assistant',
+      `Resposta final ${index + 1}.`, `assistant-${index + 1}`)).join('');
+  await fs.appendFile(sourceFile, batch);
+  const stop = await event('source', 'Stop', sourceFile);
+  assert.equal(stop.result.kind, 'queued');
+  const sourceState = await inspectConfiguration(root, { stateRoot });
+  const sourceCheckout = await readSessionCheckout(sourceState.stateDir, 'claude', 'source');
+  const captured = await createOutbox(sourceState.stateDir).handoffSource({
+    cli: 'claude', sessionId: 'source', projectId: 'project-one',
+    ownerId: sourceCheckout.handoffIdentity.ownerId, operationId: stop.result.operationId });
+  assert.equal(captured.kind, 'source');
+  assert.ok(captured.messages.some(message => message.origin === 'human'), JSON.stringify(captured));
+  assert.equal((await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'Stop',
+    ...stop, stateRoot }))?.kind, 'saved');
+  const duplicate = await event('source', 'Stop', sourceFile);
+  assert.equal(duplicate.result.kind, 'no_complete_bytes');
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'Stop',
+    ...duplicate, stateRoot });
+  const end = await event('source', 'SessionEnd', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionEnd',
+    ...end, stateRoot });
+  await event('target', 'SessionStart');
+  const current = await inspectConfiguration(root, { stateRoot });
+  const checkout = await readSessionCheckout(current.stateDir, 'claude', 'target');
+  const prepared = await prepareHandoff(current.stateDir,
+    { ...checkout.handoffIdentity, now: new Date().toISOString() });
+  assert.equal(prepared.kind, 'abstain');
+});
+
+test('safe human before nine final assistants remains the current objective', async t => {
+  const { dir, root, stateRoot, event } = await fixture(t);
+  const sourceFile = path.join(dir, 'source.jsonl');
+  const start = await event('source', 'SessionStart', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionStart',
+    ...start, stateRoot });
+  await fs.writeFile(sourceFile, line('source', 'user', 'Quero continuar o plano.', 'user-1'));
+  const first = await event('source', 'UserPromptSubmit', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'UserPromptSubmit',
+    ...first, stateRoot });
+  const batch = line('source', 'user', 'Quero revisar o plano.', 'user-2') +
+    Array.from({ length: 9 }, (_, index) => line('source', 'assistant',
+      index === 8 ? 'O projeto foi concluido.' : 'O plano foi iniciado.',
+      `assistant-${index + 1}`)).join('');
+  await fs.appendFile(sourceFile, batch);
+  const stop = await event('source', 'Stop', sourceFile);
+  assert.equal(stop.result.kind, 'queued');
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'Stop',
+    ...stop, stateRoot });
+  const duplicate = await event('source', 'Stop', sourceFile);
+  assert.equal(duplicate.result.kind, 'no_complete_bytes');
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'Stop',
+    ...duplicate, stateRoot });
+  const end = await event('source', 'SessionEnd', sourceFile);
+  await checkpoint.updateHandoffFromCapture({ cli: 'claude', event: 'SessionEnd',
+    ...end, stateRoot });
+  await event('target', 'SessionStart');
+  const current = await inspectConfiguration(root, { stateRoot });
+  const checkout = await readSessionCheckout(current.stateDir, 'claude', 'target');
+  const prepared = await prepareHandoff(current.stateDir,
+    { ...checkout.handoffIdentity, now: new Date().toISOString() });
+  assert.equal(prepared.kind, 'prepared', JSON.stringify(prepared));
+  const markdown = await fs.readFile(prepared.file, 'utf8');
+  assert.match(markdown, /Quero revisar o plano/);
+  assert.match(markdown, /O projeto foi concluido/);
+  assert.doesNotMatch(markdown, /Quero continuar o plano/);
 });
 
 test('untrusted result and stdout failure cannot publish or acknowledge a handoff', async t => {

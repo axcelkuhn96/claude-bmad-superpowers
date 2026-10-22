@@ -345,6 +345,7 @@ export async function updateHandoffFromCapture({ cli, event, payload, result,
       if (prior && Date.parse(proof.capturedAt) < Date.parse(prior.at)) return null;
       let messages = event === 'SessionStart' ? [] : [...(prior?.messages ?? [])];
       let operationId = prior?.operationId;
+      let hadHuman = false;
       const outbox = createOutbox(proof.stateDir);
       for (const ref of [...new Set(proof.sourceRefs)]) {
         if (!hasTime()) return null;
@@ -354,8 +355,11 @@ export async function updateHandoffFromCapture({ cli, event, payload, result,
         if (!hasTime()) return null;
         if (source.kind !== 'source') continue;
         operationId = source.operationId;
-        if (source.messages.some(item => item.origin === 'human')) messages = [];
         for (const item of source.messages) {
+          if (item.origin === 'human') {
+            hadHuman = true;
+            messages = [];
+          }
           if (typeof item.text !== 'string' || Buffer.byteLength(item.text) > 160) continue;
           // Persist only excerpts the formatter itself permits. Rejected source
           // text already lives in the authenticated outbox and is not copied.
@@ -368,6 +372,7 @@ export async function updateHandoffFromCapture({ cli, event, payload, result,
           }
         }
       }
+      if (hadHuman && !messages.some(message => message.origin === 'human')) messages = [];
       const value = { checkoutFingerprint: proof.identity.checkoutFingerprint,
         ownerId: proof.identity.ownerId, cli, sessionId: proof.sessionId,
         at: proof.capturedAt, operationId,
@@ -379,6 +384,12 @@ export async function updateHandoffFromCapture({ cli, event, payload, result,
       if (operationId && messages.length) {
         handoff = formatHandoff({ ...proof.identity,
           checkpoint: { operationId, messages }, now: proof.capturedAt });
+      }
+      if (hadHuman && !handoff && !['SessionStart', 'UserPromptSubmit'].includes(event)) {
+        // Stop/terminal saves preserve an absent handoff; clear it as an active turn first.
+        const cleared = await saveHandoff(proof.stateDir, { identity: proof.identity,
+          event: 'UserPromptSubmit', at: proof.capturedAt, hasTime });
+        if (cleared.kind !== 'saved') return cleared;
       }
       const saved = await saveHandoff(proof.stateDir, { identity: proof.identity,
         handoff, event, at: proof.capturedAt, hasTime });
