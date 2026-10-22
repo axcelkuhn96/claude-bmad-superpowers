@@ -8,7 +8,7 @@ export const conversationExtractionSchema = { type: 'object', additionalProperti
   required: ['candidates', 'no_facts'], properties: {
     no_facts: { type: 'boolean' }, candidates: { type: 'array', items: {
       type: 'object', additionalProperties: false,
-      required: ['text', 'type', 'scope', 'evidence'], properties: {
+      required: ['text', 'type', 'scope', 'evidence', 'context'], properties: {
         text: { type: 'string' }, type: { type: 'string', enum: ['rule', 'fact', 'preference', 'decision'] },
         scope: { type: 'string', enum: ['project', 'personal'] },
         evidence: { type: 'array', items: { type: 'object', additionalProperties: false,
