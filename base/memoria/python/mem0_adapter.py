@@ -467,6 +467,178 @@ def _explicit_mcp_record(metadata: dict, text: str, project: str) -> bool:
         metadata.get('dedup_key') == expected_key
 
 
+_IDENTIFIER = re.compile(r'(?<![A-Za-z0-9])(?:[A-Za-z0-9]+(?:[_.:/-][A-Za-z0-9]+)+|[A-Z]{2,}[0-9]+)(?![A-Za-z0-9])')
+
+
+def distinctive_tokens(query: str) -> list[str]:
+    """Only bounded technical identifiers can grant literal lexical evidence."""
+    if not isinstance(query, str):
+        return []
+    tokens = []
+    for match in _IDENTIFIER.finditer(unicodedata.normalize('NFKC', query)):
+        value = match.group()
+        if 4 <= len(value) <= 80 and any(char.isalpha() for char in value) and \
+                value.casefold() not in [item.casefold() for item in tokens]:
+            tokens.append(value)
+    return tokens[:9]
+
+
+def literal_spans(text: str, token: str) -> list[str]:
+    if not isinstance(text, str) or not isinstance(token, str):
+        return []
+    normalized = unicodedata.normalize('NFKC', text).casefold()
+    needle = unicodedata.normalize('NFKC', token).casefold()
+    found = []
+    start = 0
+    while needle:
+        index = normalized.find(needle, start)
+        if index < 0:
+            break
+        end = index + len(needle)
+        if (index == 0 or not normalized[index - 1].isalnum()) and \
+                (end == len(normalized) or not normalized[end].isalnum()):
+            found.append(normalized[index:end])
+        start = index + 1
+    return found
+
+
+def validate_curated_payload(point, project: str, owner: str | None,
+                             purpose: str = 'recall', now: datetime | None = None) -> dict | None:
+    """Validate a Qdrant point without claiming an SDK row or checking a vector."""
+    if purpose not in ('recall', 'history') or not isinstance(project, str) or not project:
+        raise ValueError('invalid_curated_validation')
+    payload = getattr(point, 'payload', None)
+    if not isinstance(payload, dict) or payload.get('project_id') != project or \
+            payload.get('user_id') != project or 'expiration_date' in payload or \
+            payload.get('source_type') == 'imported_legacy':
+        return None
+    text = payload.get('data')
+    external = payload.get('source_record_id')
+    if not isinstance(text, str) or not text.strip() or not isinstance(external, str) or not external:
+        return None
+    try:
+        identifier = str(uuid.UUID(str(point.id)))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    status = payload.get('status')
+    if status != 'active' and not (purpose == 'history' and status == 'superseded'):
+        return None
+    scope = payload.get('scope')
+    if scope not in ('project', 'personal', 'episode') or \
+            (scope == 'personal' and (not owner or payload.get('owner_id') != owner)):
+        return None
+    if not all(isinstance(payload.get(key), str) and payload[key] for key in
+               ('source', 'actor', 'origin', 'speaker_role', 'evidence_at')):
+        return None
+    origin, role = payload['origin'], payload['speaker_role']
+    if not ((origin, role) in (('user_direct', 'user'), ('assistant_report', 'assistant'),
+                                  ('tool_observation', 'tool'), ('external_reference', 'external')) or
+            origin == 'conversation_summary' and role == 'mixed'):
+        return None
+    version = payload.get('format_version')
+    if version == 4 and not _conversation_summary(payload, text, project) or \
+            version == 5 and not _explicit_mcp_record(payload, text, project) or \
+            version not in (None, 4, 5) or \
+            origin == 'conversation_summary' and version != 4:
+        return None
+    try:
+        instant = now or datetime.now(timezone.utc)
+        if instant.tzinfo is None or _time(payload['evidence_at']) > instant:
+            return None
+        start = _time(payload['valid_from']) if payload.get('valid_from') else None
+        end = _time(payload['valid_to']) if payload.get('valid_to') else None
+        if scope == 'episode' and end is None:
+            return None
+        expired = end is not None and instant >= end
+        if purpose == 'recall' and (expired or start is not None and instant < start):
+            return None
+    except (ValueError, TypeError):
+        return None
+    metadata = {key: value for key, value in payload.items() if key not in
+                ('data', 'user_id', 'run_id')}
+    return {'sdkId': identifier, 'qdrantId': identifier, 'externalId': external,
+            'projectId': project, 'status': status, 'text': text, 'metadata': metadata,
+            **({'historyState': 'superseded' if status == 'superseded' else 'expired' if expired else 'active'}
+               if purpose == 'history' else {})}
+
+
+def _text_index_present(client, collection: str) -> bool:
+    schema = (client.get_collection(collection).payload_schema or {}).get('data')
+    if schema is None:
+        return False
+    kind = getattr(schema, 'data_type', None)
+    return str(kind).lower() in ('text', 'payloadschematype.text')
+
+
+def ensure_text_index(client, collection: str) -> dict:
+    """Administrative operation; collection trust is verified by execute first."""
+    from qdrant_client.models import TextIndexParams, TextIndexType, TokenizerType
+    if _text_index_present(client, collection):
+        return {'kind': 'indexed', 'created': False}
+    schema = (client.get_collection(collection).payload_schema or {}).get('data')
+    if schema is not None:
+        raise ValueError('text_index_schema_mismatch')
+    client.create_payload_index(collection_name=collection, field_name='data',
+        field_schema=TextIndexParams(type=TextIndexType.TEXT, tokenizer=TokenizerType.WORD,
+                                     min_token_len=2, max_token_len=80, lowercase=True), wait=True)
+    if not _text_index_present(client, collection):
+        raise ValueError('text_index_unverified')
+    return {'kind': 'indexed', 'created': True}
+
+
+def lexical_candidates(client, collection: str, project: str, query: str,
+                       limit: int = 32, owner: str | None = None,
+                       now: datetime | None = None) -> dict:
+    from qdrant_client.models import FieldCondition, Filter, MatchText, MatchTextAny, MatchValue
+    tokens = distinctive_tokens(query)
+    if not tokens:
+        return {'kind': 'vector_only', 'reason': 'no_distinctive_token', 'items': []}
+    if len(tokens) > 8:
+        return {'kind': 'vector_only', 'reason': 'token_budget', 'items': []}
+    if type(limit) is not int or limit < 1 or limit > 32:
+        raise ValueError('lexical_limit_invalid')
+    try:
+        if not _text_index_present(client, collection):
+            return {'kind': 'vector_only', 'reason': 'index_missing', 'items': []}
+        terms = [FieldCondition(key='project_id', match=MatchValue(value=project)),
+                 FieldCondition(key='user_id', match=MatchValue(value=project)),
+                 FieldCondition(key='status', match=MatchValue(value='active'))]
+        matches = [MatchText(text=tokens[0])]
+        if len(tokens) > 1:
+            matches.append(MatchTextAny(text_any=' '.join(tokens)))
+        found = {}
+        for match in matches:
+            points, offset = client.scroll(collection_name=collection,
+                scroll_filter=Filter(must=terms + [FieldCondition(key='data', match=match)]),
+                limit=limit - len(found), with_payload=True, with_vectors=False)
+            if offset is not None or len(points) + len(found) > limit:
+                return {'kind': 'vector_only', 'reason': 'saturated', 'items': []}
+            for point in points:
+                found[str(point.id)] = point
+            if len(found) == limit and match is not matches[-1]:
+                return {'kind': 'vector_only', 'reason': 'saturated', 'items': []}
+        ranked = []
+        terms_in_query = set(re.findall(r'[a-z0-9]+', unicodedata.normalize('NFKC', query).casefold()))
+        for point in found.values():
+            row = validate_curated_payload(point, project, owner, 'recall', now)
+            if row is None:
+                continue
+            spans = [matches[0] for token in tokens if (matches := literal_spans(row['text'], token))]
+            if not spans:
+                continue
+            exact = len(set(spans))
+            coverage = len(terms_in_query.intersection(re.findall(r'[a-z0-9]+',
+                unicodedata.normalize('NFKC', row['text']).casefold())))
+            ranked.append((-exact, -coverage, row['qdrantId'], row, spans))
+        ranked.sort(key=lambda item: item[:3])
+        items = [{**row, 'scoreSource': 'lexical_verified',
+                  'retrievalEvidence': {'lexicalRank': index, 'literalSpans': spans}}
+                 for index, (_, _, _, row, spans) in enumerate(ranked, 1)]
+        return {'kind': 'items', 'items': items}
+    except Exception:
+        return {'kind': 'vector_only', 'reason': 'lexical_unavailable', 'items': []}
+
+
 def execute_readonly(request: dict, client, state: Path) -> dict:
     """Read-only MCP operations; collection is always derived from the bound native one."""
     native = request['collection']
@@ -570,6 +742,8 @@ def execute(request: dict, client, state: Path) -> dict:
         raise ValueError('invalid_identity')
     verify_collection(client, collection, FINGERPRINT)
     op = request['op']
+    if op == 'index_text':
+        return ensure_text_index(client, collection)
     memory = _memory(client, collection, state, request['connection'], history_db_path=':memory:') \
         if op == 'search' else _memory(client, collection, state, request['connection'])
     if op == 'find':
@@ -635,12 +809,21 @@ def execute(request: dict, client, state: Path) -> dict:
         return {'kind': 'item', 'item': _row(memory.get(identifier), client, collection, memory.embedding_model)}
     if op == 'search':
         now = datetime.now(timezone.utc)
+        lexical = lexical_candidates(client, collection, project, request['query'],
+            owner=request.get('ownerId'), now=now)
         limit = 20
         while limit <= 2048:
-            result = memory.search(request['query'], filters={'user_id': project, 'status': 'active'},
-                                   top_k=limit, threshold=MIN_RECALL_SCORE)
-            items = [{**_row(row, client, collection, memory.embedding_model),
-                      'scoreSource': 'mem0_sdk_search'} for row in result['results']]
+            try:
+                result = memory.search(request['query'], filters={'user_id': project, 'status': 'active'},
+                                       top_k=limit, threshold=MIN_RECALL_SCORE)
+                items = [{**_row(row, client, collection, memory.embedding_model),
+                          'scoreSource': 'mem0_sdk_search'} for row in result['results']]
+            except Exception:
+                if lexical['items']:
+                    return {'kind': 'items', 'items': [], 'lexical_items': lexical['items'],
+                            'vector_degradation': 'vector_unavailable'}
+                return {'kind': 'unavailable', 'reason': 'vector_unavailable',
+                        'lexical_degradation': lexical.get('reason')}
             eligible = [row for row in items if row['projectId'] == project and
                 isinstance(row.get('score'), (int, float)) and math.isfinite(row['score']) and
                 MIN_RECALL_SCORE <= row['score'] <= 1 and
@@ -654,7 +837,12 @@ def execute(request: dict, client, state: Path) -> dict:
                 (not row['metadata'].get('valid_from') or _time(row['metadata']['valid_from']) <= now) and
                 (not row['metadata'].get('valid_to') or now < _time(row['metadata']['valid_to']))]
             if len(eligible) >= 20 or len(result['results']) < limit:
-                return {'kind': 'items', 'items': eligible[:20]}
+                ranked_vector = [{**row, 'retrievalEvidence': {'vectorScore': row['score'],
+                                   'vectorRank': index}}
+                                 for index, row in enumerate(eligible[:20], 1)]
+                return {'kind': 'items', 'items': ranked_vector,
+                        'lexical_items': lexical['items'],
+                        'lexical_degradation': lexical.get('reason')}
             limit *= 2
         raise ValueError('remote_search_saturated')
     raise ValueError('unknown_operation')

@@ -19,6 +19,118 @@ spec.loader.exec_module(adapter)
 
 
 class AdapterTest(unittest.TestCase):
+    def test_lexical_requires_literal_identifier_and_curated_identity(self):
+        token = 'HML_TRIPEX_COMP'
+        base = {'data': f'Usar {token} no teste', 'user_id': 'p', 'project_id': 'p',
+                'status': 'active', 'source_record_id': 'source-1', 'scope': 'project',
+                'source': 'message', 'actor': 'human', 'origin': 'user_direct',
+                'speaker_role': 'user', 'evidence_at': '2026-10-21T12:00:00Z'}
+        point = SimpleNamespace(id='00000000-0000-0000-0000-000000000001', payload=base)
+        now = datetime(2026, 10, 22, tzinfo=timezone.utc)
+        self.assertIsNotNone(adapter.validate_curated_payload(point, 'p', None, 'recall', now))
+        for bad in ({'project_id': 'other'}, {'user_id': 'other'}, {'status': 'pending'},
+                    {'scope': 'personal', 'owner_id': 'other'}, {'origin': 'imported_legacy'},
+                    {'source_type': 'imported_legacy'},
+                    {'format_version': 5, 'source': 'mcp_request:' + 'a' * 64,
+                     'origin': 'assistant_report', 'speaker_role': 'assistant'},
+                    {'data': 'Use HMLXTRIPEX_COMP'}):
+            candidate = SimpleNamespace(id=point.id, payload={**base, **bad})
+            if 'data' not in bad:
+                self.assertIsNone(adapter.validate_curated_payload(candidate, 'p', None, 'recall', now))
+        self.assertEqual(adapter.distinctive_tokens('servidor comum'), [])
+        self.assertEqual(adapter.distinctive_tokens('HML_TRIPEX_COMP e ERR42'), [token, 'ERR42'])
+        self.assertEqual(adapter.literal_spans('prefixHML_TRIPEX_COMP HML_TRIPEX_COMP2 HML_TRIPEX_COMP', token),
+                         ['hml_tripex_comp'])
+
+    def test_history_labels_expired_superseded_and_never_pending(self):
+        base = {'data': 'ERR42', 'user_id': 'p', 'project_id': 'p',
+                'source_record_id': 's', 'scope': 'episode', 'source': 'm', 'actor': 'human',
+                'origin': 'user_direct', 'speaker_role': 'user', 'evidence_at': '2026-10-20T00:00:00Z',
+                'valid_to': '2026-10-21T00:00:00Z'}
+        point = SimpleNamespace(id='00000000-0000-0000-0000-000000000001', payload={**base, 'status': 'active'})
+        now = datetime(2026, 10, 22, tzinfo=timezone.utc)
+        self.assertIsNone(adapter.validate_curated_payload(point, 'p', None, 'recall', now))
+        self.assertEqual(adapter.validate_curated_payload(point, 'p', None, 'history', now)['historyState'], 'expired')
+        point.payload['status'] = 'superseded'
+        self.assertEqual(adapter.validate_curated_payload(point, 'p', None, 'history', now)['historyState'], 'superseded')
+        point.payload['status'] = 'pending'
+        self.assertIsNone(adapter.validate_curated_payload(point, 'p', None, 'history', now))
+
+    def test_lexical_ranks_verified_payload_not_scroll_order(self):
+        base = {'user_id': 'p', 'project_id': 'p', 'status': 'active', 'source_record_id': 's',
+                'scope': 'project', 'source': 'm', 'actor': 'human', 'origin': 'user_direct',
+                'speaker_role': 'user', 'evidence_at': '2026-10-21T12:00:00Z'}
+        points = [SimpleNamespace(id=f'00000000-0000-0000-0000-{i:012d}', payload={**base, 'data': text})
+                  for i, text in ((1, 'HML_TRIPEX_COMP'), (2, 'HML_TRIPEX_COMP ERR42'),
+                                  (3, 'HML_TRIPEX_COMP2'), (4, 'HML_TRIPEX_COMP'))]
+        points[3].payload['project_id'] = 'other'
+        class Client:
+            def get_collection(self, collection):
+                return SimpleNamespace(payload_schema={'data': SimpleNamespace(data_type='text')})
+            def scroll(self, **kwargs):
+                self_test.assertFalse(kwargs['with_vectors'])
+                return points, None
+        self_test = self
+        result = adapter.lexical_candidates(Client(), 'c', 'p', 'HML_TRIPEX_COMP ERR42')
+        self.assertEqual(result['kind'], 'items')
+        self.assertEqual([row['sdkId'] for row in result['items']], [str(points[1].id), str(points[0].id)])
+        self.assertEqual(result['items'][0]['retrievalEvidence']['literalSpans'], ['hml_tripex_comp', 'err42'])
+
+    def test_index_text_admin_does_not_initialize_mem0(self):
+        class Client:
+            indexed = False
+            def get_collection(self, collection):
+                return SimpleNamespace(payload_schema={'data': SimpleNamespace(data_type='text')} if self.indexed else {},
+                    config=SimpleNamespace(params=SimpleNamespace(vectors=SimpleNamespace(size=384, distance='Cosine')),
+                                           metadata={'cbs_embedding_fingerprint': adapter.FINGERPRINT}))
+            def create_payload_index(self, **kwargs):
+                self_test.assertEqual((kwargs['collection_name'], kwargs['field_name']), ('c', 'data'))
+                self.indexed = True
+        self_test = self
+        client = Client()
+        with patch.object(adapter, '_memory', side_effect=AssertionError('mem0 loaded')):
+            self.assertEqual(adapter.execute({'op': 'index_text', 'collection': 'c',
+                'projectId': 'p', 'connection': {}}, client, Path('/tmp'))['created'], True)
+            self.assertEqual(adapter.execute({'op': 'index_text', 'collection': 'c',
+                'projectId': 'p', 'connection': {}}, client, Path('/tmp'))['created'], False)
+
+    def test_vector_failure_admits_only_verified_lexical_or_unavailable(self):
+        class Memory:
+            def search(self, *args, **kwargs):
+                raise OSError('vector unavailable')
+        request = {'op': 'search', 'collection': 'c', 'projectId': 'p',
+                   'connection': {}, 'query': 'ERR42'}
+        with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_memory', return_value=Memory()), \
+             patch.object(adapter, 'lexical_candidates', return_value={'kind': 'items', 'items':
+                 [{'sdkId': 'one', 'scoreSource': 'lexical_verified',
+                   'retrievalEvidence': {'literalSpans': ['err42']}}]}):
+            result = adapter.execute(request, object(), Path('/tmp'))
+            self.assertEqual(result['kind'], 'items')
+            self.assertEqual(result['items'], [])
+            self.assertEqual(result['vector_degradation'], 'vector_unavailable')
+        with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_memory', return_value=Memory()), \
+             patch.object(adapter, 'lexical_candidates', return_value={'kind': 'vector_only',
+                                                                       'items': [], 'reason': 'index_missing'}):
+            result = adapter.execute(request, object(), Path('/tmp'))
+            self.assertEqual(result['kind'], 'unavailable')
+
+    def test_lexical_index_absence_saturation_and_network_are_typed(self):
+        class Client:
+            def __init__(self, schema=True, points=None, offset=None, error=False):
+                self.schema, self.points, self.offset, self.error = schema, points or [], offset, error
+            def get_collection(self, collection):
+                return SimpleNamespace(payload_schema={'data': SimpleNamespace(data_type='text')} if self.schema else {})
+            def scroll(self, **kwargs):
+                if self.error:
+                    raise OSError('offline')
+                return self.points, self.offset
+        for client, reason in ((Client(schema=False), 'index_missing'),
+                               (Client(points=[SimpleNamespace(id=i, payload={}) for i in range(32)], offset=33), 'saturated'),
+                               (Client(error=True), 'lexical_unavailable')):
+            result = adapter.lexical_candidates(client, 'c', 'p', 'HML_TRIPEX_COMP')
+            self.assertEqual(result['kind'], 'vector_only')
+            self.assertEqual(result['reason'], reason)
+
     def _fake_e5(self, device, available, *, platform='linux', fail_create=(), fail_run=(),
                  effective=None):
         sessions = []
@@ -517,6 +629,7 @@ class AdapterTest(unittest.TestCase):
                                       'connection': {}, 'query': 'fact'}, None, Path('/tmp'))
         self.assertEqual([row['sdkId'] for row in result['items']], ['good'])
         self.assertEqual(result['items'][0]['scoreSource'], 'mem0_sdk_search')
+        self.assertEqual(result['items'][0]['retrievalEvidence'], {'vectorScore': .9, 'vectorRank': 1})
 
     def test_reconciliation_includes_expired_sdk_rows_and_rejects_expiration_on_add(self):
         class Memory:
@@ -564,7 +677,8 @@ class AdapterTest(unittest.TestCase):
                                              None, Path('/tmp'))['kind'], 'pending')
             result = adapter.execute({'op': 'search', 'collection': 'c', 'projectId': 'p',
                                       'connection': {}, 'query': 'fact'}, None, Path('/tmp'))
-            self.assertEqual(result['items'], [{**rows[2], 'scoreSource': 'mem0_sdk_search'}])
+            self.assertEqual(result['items'], [{**rows[2], 'scoreSource': 'mem0_sdk_search',
+                                                'retrievalEvidence': {'vectorScore': .9, 'vectorRank': 1}}])
 
     def test_readonly_raw_search_uses_only_derived_marked_collection(self):
         from uuid import uuid4
