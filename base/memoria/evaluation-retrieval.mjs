@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
+import { isDeepStrictEqual } from 'node:util';
 import { selectRecall } from './context.mjs';
 import { rankHybrid, verifiedLiteralSpans } from './hybrid-rank.mjs';
 import { validateMemoryCorpusV2 } from './evaluation.mjs';
@@ -42,6 +43,34 @@ export function validateRetrievalAdjudication(corpus, adjudication, { corpusSha2
     ['approved', 'rejected', 'unmeasured'].includes(item.status));
 }
 
+// Caller-supplied, locally trusted authority. The hash binds its declared
+// observation; it does not authenticate the file's author or prove identity.
+export function validateRetrievalIdentities(corpus, identities, { corpusSha256 } = {}) {
+  if (!validateMemoryCorpusV2(corpus) || !identities ||
+      identities.version !== 1 || identities.kind !== 'retrieval_identity_authority' ||
+      identities.source !== 'validated_local_config' ||
+      !validSha(identities.authority_observation_sha256) ||
+      identities.corpus_sha256 !== (corpusSha256 ?? hash(corpus)) ||
+      identities.split_sha256 !== hashCorpusSplits(corpus) ||
+      !Array.isArray(identities.cases) || identities.cases.length !== corpus.cases.length ||
+      new Set(identities.cases.map(item => item?.case_id)).size !== corpus.cases.length)
+    return false;
+  const byId = new Map(corpus.cases.map(entry => [entry.id, entry]));
+  return identities.cases.every(item => byId.has(item.case_id) &&
+    item.project_id === byId.get(item.case_id).projectId && nonEmpty(item.owner_id));
+}
+
+export async function loadRetrievalIdentities(file) {
+  const stat = await fs.stat(file);
+  if (stat.size > ADJUDICATION_LIMIT) fail('identities_too_large');
+  const bytes = await fs.readFile(file);
+  if (bytes.length > ADJUDICATION_LIMIT) fail('identities_too_large');
+  let identities;
+  try { identities = JSON.parse(bytes.toString('utf8')); }
+  catch { fail('invalid_identities'); }
+  return { identities, sha256: sha256(bytes) };
+}
+
 export async function loadRetrievalAdjudication(file) {
   const stat = await fs.stat(file);
   if (stat.size > ADJUDICATION_LIMIT) fail('adjudication_too_large');
@@ -75,7 +104,12 @@ export function hashCandidateSet(item) {
     payload_hashes: item.payload_hashes, eligibility_metadata: item.eligibility_metadata });
 }
 
-function caseErrors(entry, item) {
+function canonicalCandidate(row) {
+  const { score, scoreSource, retrievalEvidence, ...payload } = row;
+  return payload;
+}
+
+function caseErrors(entry, item, expectedOwner) {
   const errors = [];
   const add = reason => { if (!errors.includes(reason)) errors.push(reason); };
   if (!item || item.case_id !== entry.id || item.query !== entry.query) add('case_or_query_mismatch');
@@ -90,11 +124,17 @@ function caseErrors(entry, item) {
       hashCandidateSet(item) !== item.candidate_set_sha256) add('candidate_set_hash_mismatch');
   const all = [...item.vector_candidates, ...item.lexical_candidates];
   const ids = new Set();
+  const byId = new Map();
+  if (expectedOwner !== undefined && item.owner_id !== expectedOwner)
+    add('owner_authority_mismatch');
   for (const row of all) {
     const id = idFor(row);
     if (!nonEmpty(id) || !nonEmpty(row?.text) || !row?.metadata ||
         typeof row.metadata !== 'object') { add('invalid_candidate'); continue; }
     ids.add(id);
+    if (byId.has(id) && !isDeepStrictEqual(canonicalCandidate(byId.get(id)),
+        canonicalCandidate(row))) add('candidate_payload_mismatch');
+    else byId.set(id, row);
     if (item.payload_hashes[id] !== sha256(row.text)) add('payload_hash_mismatch');
     if (row.metadata.project_id != null && row.metadata.project_id !== row.projectId)
       add('eligibility_metadata_mismatch');
@@ -120,7 +160,8 @@ function caseErrors(entry, item) {
       if (row.projectId !== entry.projectId ||
           row.metadata?.project_id != null && row.metadata.project_id !== entry.projectId ||
           row.metadata?.scope === 'personal' &&
-            (!nonEmpty(item.owner_id) || row.metadata.owner_id !== item.owner_id))
+            (!nonEmpty(expectedOwner ?? item.owner_id) ||
+              row.metadata.owner_id !== (expectedOwner ?? item.owner_id)))
         add('ineligible_returned_id');
       if (row.status !== 'active') add('ineligible_returned_id');
       const at = Date.parse(item.observed_at ?? '');
@@ -181,7 +222,7 @@ function emptyMetrics() {
     project_leak: null, stale: null, superseded: null, context_error: null };
 }
 
-function scoreArm(cases, records, arm, truthEligible) {
+function scoreArm(cases, records, arm, truthEligible, owners) {
   const counts = { hit1: 0, hit3: 0, hit5: 0, precision: 0, recall: 0,
     relevant: 0, positives: 0, reciprocal: 0, negative: 0, abstain: 0,
     falsePositive: 0, returned: 0, owner: 0, project: 0, stale: 0, superseded: 0 };
@@ -192,14 +233,14 @@ function scoreArm(cases, records, arm, truthEligible) {
     const rows = new Map([...item.vector_candidates, ...item.lexical_candidates]
       .map(row => [idFor(row), row]));
     const now = Date.parse(item.observed_at ?? '');
-    const ownerId = item.owner_id;
+    const ownerId = owners?.get(entry.id);
     for (const id of ids) {
       counts.returned++;
       const row = rows.get(id);
       if (!row) continue;
       if (row.projectId !== entry.projectId || row.metadata?.project_id != null &&
           row.metadata.project_id !== entry.projectId) counts.project++;
-      if (row.metadata?.scope === 'personal' &&
+      if (owners && row.metadata?.scope === 'personal' &&
           (!nonEmpty(ownerId) || row.metadata.owner_id !== ownerId)) counts.owner++;
       if (row.status === 'superseded') counts.superseded++;
       if (Number.isFinite(now) && (row.metadata?.valid_to &&
@@ -236,7 +277,7 @@ function scoreArm(cases, records, arm, truthEligible) {
     mrr: counts.positives ? { sum: counts.reciprocal, denominator: counts.positives } : null,
     abstention_accuracy: ratio(counts.abstain, counts.negative),
     false_positive: ratio(counts.falsePositive, counts.negative),
-    owner_leak: ratio(counts.owner, counts.returned),
+    owner_leak: owners ? ratio(counts.owner, counts.returned) : null,
     project_leak: ratio(counts.project, counts.returned),
     stale: ratio(counts.stale, counts.returned),
     superseded: ratio(counts.superseded, counts.returned) };
@@ -257,7 +298,7 @@ function observedUsage(cases) {
 }
 
 export function evaluateRetrieval(corpus, runs, { split = 'all', corpusSha256,
-  adjudication, adjudicationSha256 } = {}) {
+  adjudication, adjudicationSha256, identities, identitiesSha256 } = {}) {
   if (!validateMemoryCorpusV2(corpus)) fail('invalid_corpus');
   if (!['all', 'dev', 'holdout'].includes(split)) fail('invalid_split');
   if (!runs || runs.version !== 1 || runs.kind !== 'frozen_retrieval' ||
@@ -272,7 +313,11 @@ export function evaluateRetrieval(corpus, runs, { split = 'all', corpusSha256,
   if (adjudication !== undefined &&
       !validateRetrievalAdjudication(corpus, adjudication, { corpusSha256: expectedCorpusSha }))
     fail('invalid_adjudication');
+  if (identities !== undefined &&
+      !validateRetrievalIdentities(corpus, identities, { corpusSha256: expectedCorpusSha }))
+    fail('invalid_identities');
   const reviews = adjudication ? new Map(adjudication.cases.map(item => [item.case_id, item.status])) : null;
+  const owners = identities ? new Map(identities.cases.map(item => [item.case_id, item.owner_id])) : null;
   const corpusMatched = runs.corpus_sha256 === expectedCorpusSha;
   const expectedSplitSha = hashCorpusSplits(corpus);
   const splitMatched = runs.split_sha256 === expectedSplitSha;
@@ -282,7 +327,8 @@ export function evaluateRetrieval(corpus, runs, { split = 'all', corpusSha256,
       'agent_proposed_provisional' : 'agent_reviewed_provisional';
   const caseReports = selected.map(entry => {
     const item = records.get(entry.id);
-    const errors = item ? caseErrors(entry, item) : ['missing_case'];
+    const errors = item ? caseErrors(entry, item, owners?.get(entry.id)) : ['missing_case'];
+    if (!owners) errors.push('missing_owner_authority');
     if (item && !Number.isFinite(Date.parse(item.observed_at ?? '')))
       errors.push('missing_observation_time');
     if (!corpusMatched) errors.push('corpus_hash_mismatch');
@@ -290,14 +336,15 @@ export function evaluateRetrieval(corpus, runs, { split = 'all', corpusSha256,
     if (item && errors.length === 0) {
       try {
         const replay = replayRetrievalCase(entry, item, { now: item.observed_at,
-          ownerId: item.owner_id });
+          ownerId: owners.get(entry.id) });
         if (['baseline', 'candidate'].some(arm => JSON.stringify(item[arm].returned_ids) !==
             JSON.stringify(replay[arm].returned_ids))) errors.push('algorithm_output_mismatch');
       } catch { errors.push('algorithm_replay_unavailable'); }
     }
     return { case_id: entry.id, split: entry.split, paired_replay: errors.length === 0,
-      ground_truth: reviews ? reviews.get(entry.id) :
-        entry.expected.unmeasured === true ? 'unmeasured' :
+      conditional_relevance_review: reviews?.get(entry.id) ?? null,
+      ground_truth: entry.expected.unmeasured === true ? 'unmeasured' :
+        reviews ? reviews.get(entry.id) :
         entry.adjudication.source === 'agent_proposed' ?
           'agent_proposed_provisional' : 'agent_reviewed_provisional', errors };
   });
@@ -305,12 +352,12 @@ export function evaluateRetrieval(corpus, runs, { split = 'all', corpusSha256,
   const submitted = selected.filter(entry => records.has(entry.id));
   const valid = submitted.filter(entry => !caseReports.find(item => item.case_id === entry.id).errors
     .some(error => ['invalid_candidate_set', 'invalid_candidate', 'unknown_returned_id',
-      'invalid_returned_ids'].includes(error)));
-  const truthEligible = new Set(selected.filter(entry => reviews ?
-    reviews.get(entry.id) === 'approved' : entry.expected.unmeasured !== true).map(entry => entry.id));
-  const baseline = scoreArm(valid, records, 'baseline', truthEligible);
-  const candidate = scoreArm(valid, records, 'candidate', truthEligible);
-  const comparisonEligible = paired && reviews && selected.some(entry => reviews.get(entry.id) === 'approved') &&
+      'invalid_returned_ids', 'candidate_payload_mismatch'].includes(error)));
+  const truthEligible = new Set(selected.filter(entry => entry.expected.unmeasured !== true &&
+    (!reviews || reviews.get(entry.id) === 'approved')).map(entry => entry.id));
+  const baseline = scoreArm(valid, records, 'baseline', truthEligible, owners);
+  const candidate = scoreArm(valid, records, 'candidate', truthEligible, owners);
+  const comparisonEligible = paired && reviews && truthEligible.size > 0 &&
     selected.every(entry => reviews.get(entry.id) === 'approved' ||
       reviews.get(entry.id) === 'unmeasured' && entry.expected.unmeasured === true);
   const comparison = comparisonEligible ? Object.fromEntries(['hit_at_1', 'hit_at_3', 'hit_at_5',
@@ -321,17 +368,29 @@ export function evaluateRetrieval(corpus, runs, { split = 'all', corpusSha256,
   return { version: 1, split, corpus_sha256: expectedCorpusSha,
     split_sha256: expectedSplitSha,
     adjudication_sha256: adjudication ? adjudicationSha256 ?? hash(adjudication) : null,
+    identities_sha256: identities ? identitiesSha256 ?? hash(identities) : null,
     retrieval_sha256: hash(runs), label_status: labelStatus,
+    quality_truth_status: selected.some(entry => entry.expected.unmeasured === true) ?
+      'partially_unmeasured_frozen_truth' : 'frozen_truth_without_factual_verification',
     assessment_scope: 'offline_ranking_conditional_on_frozen_candidates',
     live_qdrant_paired: false, historical_baseline_paired: false, paired_replay: paired,
-    metric_definitions: { context_error: 'unmeasured_without_rendered_context_and_source_review' },
+    operational_revision_verified: false,
+    trust_assumptions: { identities: identities ?
+      'caller_supplied_trusted_local_sidecar_not_cryptographically_authenticated' :
+      'unmeasured_without_independent_owner_authority',
+    collection_observation: 'artifact_declared_hash_is_not_operational_revision_proof' },
+    metric_definitions: { context_error: 'unmeasured_without_rendered_context_and_source_review',
+      owner_leak: 'unmeasured_without_independent_owner_authority',
+      quality_truth: 'frozen_expected_unmeasured_cases_excluded_even_if_conditional_relevance_approved' },
     algorithm_sources: retrievalAlgorithmSources,
     coverage: { selected: selected.length, submitted: submitted.length,
       paired: caseReports.filter(item => item.paired_replay).length,
+      owner_authority_bound: owners ? selected.length : 0,
       approved: reviews ? selected.filter(entry => reviews.get(entry.id) === 'approved').length : 0,
+      quality_truth_eligible: truthEligible.size,
       rejected: reviews ? selected.filter(entry => reviews.get(entry.id) === 'rejected').length : 0,
-      truth_unmeasured: selected.filter(entry => reviews ?
-        reviews.get(entry.id) === 'unmeasured' : entry.expected.unmeasured === true).length },
+      truth_unmeasured: selected.filter(entry => entry.expected.unmeasured === true ||
+        reviews?.get(entry.id) === 'unmeasured').length },
     cases: caseReports, baseline, candidate, comparison,
     usage: observedUsage(submitted.map(entry => records.get(entry.id))) };
 }
