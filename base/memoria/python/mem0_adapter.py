@@ -917,7 +917,11 @@ def execute(request: dict, client, state: Path) -> dict:
                             'lexical_items': lexical['items'],
                             'lexical_degradation': lexical.get('reason')}
                 limit *= 2
-            raise ValueError('remote_search_saturated')
+            if lexical['items']:
+                return {'kind': 'items', 'items': [], 'lexical_items': lexical['items'],
+                        'vector_degradation': 'vector_saturated'}
+            return {'kind': 'unavailable', 'reason': 'vector_saturated',
+                    'lexical_degradation': lexical.get('reason')}
         finally:
             memory.embedding_model = original_embedder
     raise ValueError('unknown_operation')

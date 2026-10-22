@@ -123,7 +123,8 @@ export async function recallForPrompt({ cli, event = 'UserPromptSubmit', payload
       typeof payload?.cwd !== 'string' || typeof payload.session_id !== 'string') return null;
   if (event !== 'UserPromptSubmit' && event !== 'PreCompact') return null;
   try {
-    const remaining = () => Math.floor(1000 - (performance.now() - began));
+    // Leave room for native transport and final rendering after this component returns.
+    const remaining = () => Math.floor(900 - (performance.now() - began));
     if (remaining() <= 0) return fail('deadline');
     const current = await resolve(payload.cwd, payload.session_id, { stateRoot });
     if (current.provider !== 'mem0') return ['claude-mem', 'not_mem0', 'unsupported_git'].includes(

@@ -154,19 +154,20 @@ test('prompt hook injects approved context once per session and resets at compac
   t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
   const session = { provider: 'mem0', projectId: 'p', stateDir };
   const input = { cli: 'claude', payload: { session_id: 's', cwd: '/checkout', prompt: 'What rule?' },
-    result: { kind: 'queued' }, began: performance.now(),
+    result: { kind: 'queued' },
     resolve: async () => session,
     search: async () => ({ kind: 'items', items: [{ ...base, sdkId: 'one' }] }),
     now: () => now };
-  const first = await recallForPrompt(input);
+  const invoke = overrides => recallForPrompt({ ...input, began: performance.now(), ...overrides });
+  const first = await invoke();
   assert.equal(first.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
   assert.match(first.hookSpecificOutput.additionalContext, /message-1/);
-  assert.equal(await recallForPrompt(input), null);
-  assert.equal(await recallForPrompt({ ...input, payload: { ...input.payload, session_id: 's2' } }) !== null, true);
-  await recallForPrompt({ ...input, event: 'PreCompact' });
-  assert.equal(await recallForPrompt(input) !== null, true);
-  assert.equal(await recallForPrompt({ ...input, result: { kind: 'pass_through' } }), null);
-  assert.equal(await recallForPrompt({ ...input, began: performance.now() - 1001 }), null);
+  assert.equal(await invoke(), null);
+  assert.equal(await invoke({ payload: { ...input.payload, session_id: 's2' } }) !== null, true);
+  await invoke({ event: 'PreCompact' });
+  assert.equal(await invoke() !== null, true);
+  assert.equal(await invoke({ result: { kind: 'pass_through' } }), null);
+  assert.equal(await invoke({ began: performance.now() - 1001 }), null);
 });
 
 test('native PreCompact opens a new window for a live MCP process', async t => {
@@ -273,6 +274,22 @@ test('expired initial hook budget reports deadline before resolve or search', as
   assert.deepEqual(observed, ['deadline']);
   assert.equal(resolved, 0);
   assert.equal(searched, 0);
+});
+
+test('native hook reserves transport budget before dispatching search', async () => {
+  const deadlines = [];
+  const input = { cli: 'claude', payload: { cwd: '/checkout', session_id: 's', prompt: 'rule' },
+    result: { kind: 'queued' }, resolve: async () => ({ provider: 'mem0', projectId: 'p',
+      stateDir: '/tmp' }), search: async (_request, _secret, opts) => {
+      deadlines.push(opts.deadlineMs);
+      return { kind: 'abstain' };
+    } };
+  assert.equal(await recallForPrompt(input), null);
+  assert.equal(deadlines.length, 1);
+  assert.ok(deadlines[0] > 0 && deadlines[0] <= 900);
+  assert.equal(await recallForPrompt({ ...input, began: performance.now() - 950,
+    resolve: async () => { throw new Error('deadline should precede resolution'); } }), null);
+  assert.equal(deadlines.length, 1);
 });
 
 test('empty query and no eligible recall remain diagnostically silent', async () => {

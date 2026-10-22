@@ -710,6 +710,25 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual([item['sdkId'] for item in result['items']], ['good'])
         self.assertEqual(calls, [('fact', 'search'), ('fact', 'search')])
 
+    def test_search_saturation_returns_verified_lexical_fallback(self):
+        bad = {'projectId': 'p', 'status': 'active', 'score': .9, 'sdkId': 'bad', 'metadata':
+               {'source': 's', 'actor': 'a', 'scope': 'personal', 'owner_id': 'other'}}
+        class Memory:
+            embedding_model = object()
+            def search(self, query, *, filters, top_k, threshold):
+                return {'results': [bad] * top_k}
+        lexical = {'kind': 'items', 'items': [{'sdkId': 'lex', 'scoreSource': 'lexical_verified',
+                   'retrievalEvidence': {'literalSpans': ['err42']}}]}
+        with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_memory', return_value=Memory()), \
+             patch.object(adapter, '_row', side_effect=lambda row, *args: row), \
+             patch.object(adapter, 'lexical_candidates', return_value=lexical):
+            result = adapter.execute({'op': 'search', 'collection': 'c', 'projectId': 'p',
+                'connection': {}, 'query': 'ERR42'}, None, Path('/tmp'))
+        self.assertEqual(result['kind'], 'items')
+        self.assertEqual(result['items'], [])
+        self.assertEqual(result['lexical_items'], lexical['items'])
+        self.assertEqual(result['vector_degradation'], 'vector_saturated')
+
     def test_reconciliation_includes_expired_sdk_rows_and_rejects_expiration_on_add(self):
         class Memory:
             def get_all(self, **kwargs):

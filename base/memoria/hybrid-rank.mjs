@@ -49,14 +49,13 @@ function coverage(query, text) {
 export function rankHybrid(vectorRows, lexicalRows, { limit = 20, rrfK = 60,
   query = '' } = {}) {
   if (!Array.isArray(vectorRows) || !Array.isArray(lexicalRows)) return [];
-  const vectors = [...vectorRows].sort((a, b) => b.score - a.score ||
-    String(idFor(a)).localeCompare(String(idFor(b))));
   const lexical = [...lexicalRows].sort((a, b) =>
     (b.retrievalEvidence?.literalSpans?.length ?? 0) -
       (a.retrievalEvidence?.literalSpans?.length ?? 0) ||
     coverage(query, b.text ?? b.memory) - coverage(query, a.text ?? a.memory) ||
     String(idFor(a)).localeCompare(String(idFor(b))));
   const rows = new Map();
+  const vectorOrder = [];
   const add = (row, channel, rank) => {
     const id = idFor(row);
     if (typeof id !== 'string' || !id) return;
@@ -69,11 +68,15 @@ export function rankHybrid(vectorRows, lexicalRows, { limit = 20, rrfK = 60,
     if (channel === 'vector') entry.evidence.vectorScore = row.score;
     else entry.evidence.literalSpans = row.retrievalEvidence.literalSpans;
     rows.set(id, entry);
+    if (channel === 'vector' && !existing) vectorOrder.push(id);
   };
-  vectors.forEach((row, index) => add(row, 'vector', index + 1));
+  vectorRows.forEach((row, index) => add(row, 'vector', index + 1));
   lexical.forEach((row, index) => add(row, 'lexical', index + 1));
-  return [...rows.entries()].sort((a, b) => b[1].rank - a[1].rank ||
-    a[0].localeCompare(b[0])).slice(0, Math.min(20, limit)).map(([, value]) => ({
-    ...value.row, scoreSource: 'hybrid_verified', retrievalEvidence: value.evidence,
-  }));
+  const tail = [...rows.keys()].filter(id => !vectorOrder.includes(id)).sort((a, b) =>
+    rows.get(b).rank - rows.get(a).rank || a.localeCompare(b));
+  return [...vectorOrder, ...tail].slice(0, Math.min(20, limit)).map(id => {
+    const value = rows.get(id);
+    if (value.evidence.vectorRank && !value.evidence.lexicalRank) return value.row;
+    return { ...value.row, scoreSource: 'hybrid_verified', retrievalEvidence: value.evidence };
+  });
 }

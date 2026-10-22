@@ -28,15 +28,34 @@ test('technical literals use whole boundaries and ignore claimed metadata eviden
   assert.deepEqual(verifiedLiteralSpans(`HML_${'X'.repeat(80)}`, `HML_${'X'.repeat(80)}`), []);
 });
 
-test('RRF joins validated IDs and preserves hybrid order through context rendering', () => {
+test('verified vector order is an immutable prefix through context rendering', () => {
   const answer = { kind: 'items', items: [vector('a', .99), vector('b', .86)],
     lexical_items: [lexical('b'), lexical('c')] };
   const selected = selectSearchRecall(answer, options);
-  assert.deepEqual(selected.map(row => row.sdkId), ['b', 'a', 'c']);
-  assert.equal(selected[0].scoreSource, 'hybrid_verified');
-  assert.ok(selected[0].retrievalEvidence.vectorScore >= .85);
-  assert.deepEqual(renderRecall(selected).used.map(row => row.sdkId), ['b', 'a', 'c']);
+  assert.deepEqual(selected.map(row => row.sdkId), ['a', 'b', 'c']);
+  assert.equal(selected[0].scoreSource, 'mem0_sdk_search');
+  assert.equal(selected[1].scoreSource, 'hybrid_verified');
+  assert.ok(selected[1].retrievalEvidence.vectorScore >= .85);
+  assert.deepEqual(renderRecall(selected).used.map(row => row.sdkId), ['a', 'b', 'c']);
   assert.ok(rankHybrid([vector('a', .99)], [lexical('a')])[0].retrievalEvidence.lexicalRank);
+});
+
+test('twenty vetted vectors keep every slot despite lexical intersections and stronger RRF', () => {
+  const vectors = Array.from({ length: 20 }, (_, i) => vector(`v${i}`, .99 - i * .001,
+    { text: `HML_TRIPEX_COMP vector ${i}` }));
+  const lexicalRows = [lexical('v19', { text: vectors[19].text }),
+    ...Array.from({ length: 20 }, (_, i) => lexical(`l${i}`))];
+  const selected = selectSearchRecall({ kind: 'items', items: vectors,
+    lexical_items: lexicalRows }, options);
+  assert.deepEqual(selected.map(row => row.sdkId), vectors.map(row => row.sdkId));
+  assert.ok(selected[19].retrievalEvidence.lexicalRank > 0);
+});
+
+test('vector ties remain stable and lexical-only IDs fill remaining slots by evidence order', () => {
+  const selected = selectSearchRecall({ kind: 'items', items: [vector('b', .9),
+    vector('a', .9)], lexical_items: [lexical('z', { text: 'HML_TRIPEX_COMP only' }),
+    lexical('c', { text: 'HML_TRIPEX_COMP Where is' })] }, options);
+  assert.deepEqual(selected.map(row => row.sdkId), ['b', 'a', 'c', 'z']);
 });
 
 test('lexical path rejects mismatched scope, stale, superseded, forged source and loose match', () => {
