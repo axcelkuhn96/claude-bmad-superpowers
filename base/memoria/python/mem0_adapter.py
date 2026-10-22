@@ -916,7 +916,9 @@ def execute(request: dict, client, state: Path) -> dict:
                     return {'kind': 'items', 'items': ranked_vector,
                             'lexical_items': lexical['items'],
                             'lexical_degradation': lexical.get('reason')}
-                limit *= 2
+                if limit == 2048:
+                    break
+                limit = min(limit * 2, 2048)
             if lexical['items']:
                 return {'kind': 'items', 'items': [], 'lexical_items': lexical['items'],
                         'vector_degradation': 'vector_saturated'}
