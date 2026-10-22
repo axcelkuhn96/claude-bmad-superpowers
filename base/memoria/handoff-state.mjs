@@ -153,9 +153,29 @@ async function cleanupExpired(dir, identity, now) {
     if (!row || now - Date.parse(row.at) <= TTL) continue;
     try {
       await fs.unlink(metadataFile(dir, row.identity));
-      if (row.file) await fs.unlink(row.file);
       removed++;
     } catch { /* A concurrent change is left for a later write. */ }
+  }
+  // Delivered paths remain valid until their own seven-day retention expires.
+  // Sweep only private files in this checkout scope and never the current row.
+  const markdowns = await fs.opendir(dir);
+  for await (const entry of markdowns) {
+    if (removed >= 128) break;
+    const match = /^([a-f0-9]{64}-[a-f0-9]{64})-([a-f0-9]{64})\.md$/.exec(entry.name);
+    if (!match || !entry.name.startsWith(`${scopeFor(identity)}-`)) continue;
+    const file = path.join(dir, entry.name);
+    let stat;
+    try { stat = await fs.lstat(file); } catch { continue; }
+    if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) ||
+        Date.now() - stat.mtimeMs <= TTL) continue;
+    try {
+      const row = JSON.parse(await privateRead(path.join(dir, `${match[1]}.json`), 64 * 1024));
+      if (row?.handoff?.contentHash === match[2]) continue;
+    } catch (error) {
+      if (error.code !== 'ENOENT') continue;
+    }
+    try { await fs.unlink(file); removed++; }
+    catch { /* A concurrent change is left for a later write. */ }
   }
 }
 
@@ -183,11 +203,13 @@ export async function saveHandoff(stateDir, { identity, handoff, event, at = new
       Buffer.byteLength(handoff.markdown) > 64 * 1024 || Buffer.byteLength(handoff.summary) > 300)) {
     return blocked('invalid_handoff');
   }
+  const reuse = handoff && prior?.handoff?.sourceHash === handoff.sourceHash;
   const row = { version: 2, identity, event, at,
-    handoff: handoff ? { summary: handoff.summary, sourceHash: handoff.sourceHash,
-      contentHash: sha(handoff.markdown) } : active.has(event) ? null : prior?.handoff ?? null };
+    handoff: reuse ? prior.handoff : handoff ? { summary: handoff.summary,
+      sourceHash: handoff.sourceHash, contentHash: sha(handoff.markdown) } :
+      active.has(event) ? null : prior?.handoff ?? null };
   try {
-    if (handoff) {
+    if (handoff && !reuse) {
       const file = markdownFile(dir, identity, row.handoff.contentHash);
       try {
         if (sha(await privateRead(file)) !== row.handoff.contentHash) return blocked('unsafe_existing_state');
@@ -197,9 +219,6 @@ export async function saveHandoff(stateDir, { identity, handoff, event, at = new
       }
     }
     await atomicWrite(metadataFile(dir, identity), JSON.stringify(row) + '\n');
-    if (prior?.file && prior.file !== markdownFile(dir, identity, row.handoff?.contentHash)) {
-      await fs.unlink(prior.file).catch(() => {});
-    }
     await cleanupExpired(dir, identity, Date.parse(at));
     return { kind: 'saved', file: row.handoff ? markdownFile(dir, identity, row.handoff.contentHash) : null };
   } catch { return blocked('write_failed'); }
