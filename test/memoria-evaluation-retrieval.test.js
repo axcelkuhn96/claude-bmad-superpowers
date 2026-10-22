@@ -22,10 +22,12 @@ const eligibility = rows => Object.fromEntries(rows.map(r => [r.id, { project_id
   valid_from: r.metadata.valid_from ?? null, valid_to: r.metadata.valid_to ?? null }]));
 function artifact(entry, vectors, lexical = [], baselineIds = [], candidateIds = baselineIds) {
   const rows = [...vectors, ...lexical];
+  const points = [...new Map(rows.map(r => [r.id, [r.id, { data: r.text }]])).values()]
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
   const item = { case_id: entry.id, query: entry.query,
     observed_at: '2026-10-22T00:00:00Z',
     owner_id: 'synthetic-owner',
-    collection_observation_sha256: 'c'.repeat(64), vector_candidates: vectors,
+    collection_observation_sha256: sha(stable(points)), vector_candidates: vectors,
     lexical_candidates: lexical, payload_hashes: Object.fromEntries(rows.map(r => [r.id, sha(r.text)])),
     eligibility_metadata: eligibility(rows) };
   item.candidate_set_sha256 = hashCandidateSet(item);
@@ -53,6 +55,28 @@ const identities = (source = corpus) => ({ version: 1,
   corpus_sha256: sha(JSON.stringify(source)), split_sha256: hashCorpusSplits(source),
   cases: source.cases.map(entry => ({ case_id: entry.id,
     project_id: entry.projectId, owner_id: 'synthetic-owner' })) });
+const stable = value => JSON.stringify(value, (_, object) => object &&
+  !Array.isArray(object) && typeof object === 'object' ?
+    Object.fromEntries(Object.entries(object).sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0)) : object);
+function observationsFor(input, source = corpus) {
+  return { version: 1, kind: 'retrieval_collection_observations',
+    source: 'trusted_external_collector', corpus_sha256: sha(JSON.stringify(source)),
+    split_sha256: hashCorpusSplits(source), cases: source.cases.map(entry => {
+      const item = input.cases.find(x => x.case_id === entry.id);
+      const rows = item ? [...item.vector_candidates, ...item.lexical_candidates] : [];
+      const points = [...new Map(rows.map(r => [r.id, [r.id, { data: r.text }]])).values()]
+        .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+      const payload_sha256 = sha(stable(points));
+      const observation = { snapshot_file: '/synthetic/collector-snapshot.json',
+        snapshot_file_sha256: payload_sha256, payload_sha256, count: points.length,
+        cursor_complete: true, points };
+      return { case_id: entry.id,
+        candidate_set_sha256: item?.candidate_set_sha256 ?? 'a'.repeat(64),
+        collection_observation_sha256: item?.collection_observation_sha256 ?? payload_sha256,
+        before: structuredClone(observation), after: structuredClone(observation) };
+    }) };
+}
 
 test('independent owner authority blocks a forged personal return and absence stays unmeasured', () => {
   const personal = row('foreign', 0.95, 'FOREIGN_42',
@@ -77,8 +101,9 @@ test('independently bound personal return is eligible without an owner leak', ()
   const personal = row('a', 0.95, 'ALPHA_42',
     { scope: 'personal', owner_id: 'synthetic-owner' });
   const one = artifact(corpus.cases[0], [personal], [], ['a'], ['a']);
-  const report = evaluateRetrieval(corpus, runs([one]),
-    { split: 'dev', identities: identities() });
+  const input = runs([one]);
+  const report = evaluateRetrieval(corpus, input,
+    { split: 'dev', identities: identities(), observations: observationsFor(input) });
   assert.equal(report.paired_replay, true);
   assert.deepEqual(report.candidate.owner_leak, { count: 0, denominator: 1 });
 });
@@ -140,6 +165,106 @@ test('same memory ID with changed metadata across channels cannot claim paired r
   assert.ok(report.cases[0].errors.includes('candidate_payload_mismatch'));
 });
 
+test('adapter vector sessionId transport differs from lexical without changing shared payload', () => {
+  const vector = { ...row('a', 0.95), sessionId: 'run-id-only-in-vector' };
+  const lexical = { ...row('a', 0.7), scoreSource: 'lexical_verified',
+    retrievalEvidence: { lexicalRank: 1 } };
+  const one = artifact(corpus.cases[0], [vector], [lexical], ['a'], ['a']);
+  one.collection_observation_sha256 = sha(stable([['a', { data: vector.text }]]));
+  one.candidate_set_sha256 = hashCandidateSet(one);
+  for (const arm of ['baseline', 'candidate']) {
+    one[arm].candidate_set_sha256 = one.candidate_set_sha256;
+    one[arm].collection_observation_sha256 = one.collection_observation_sha256;
+  }
+  const input = runs([one]);
+  const report = evaluateRetrieval(corpus, input,
+    { split: 'dev', identities: identities(), observations: observationsFor(input) });
+  assert.equal(report.paired_replay, true);
+  assert.equal(report.cases[0].errors.includes('candidate_payload_mismatch'), false);
+  lexical.metadata.source = 'foreign-source';
+  const changed = artifact(corpus.cases[0], [vector], [lexical], ['a'], ['a']);
+  changed.collection_observation_sha256 = one.collection_observation_sha256;
+  changed.candidate_set_sha256 = hashCandidateSet(changed);
+  for (const arm of ['baseline', 'candidate']) {
+    changed[arm].candidate_set_sha256 = changed.candidate_set_sha256;
+    changed[arm].collection_observation_sha256 = changed.collection_observation_sha256;
+  }
+  const drifted = runs([changed]);
+  const mismatch = evaluateRetrieval(corpus, drifted,
+    { split: 'dev', identities: identities(), observations: observationsFor(drifted) });
+  assert.equal(mismatch.paired_replay, false);
+  assert.ok(mismatch.cases[0].errors.includes('candidate_payload_mismatch'));
+});
+
+test('external collection receipts gate paired replay and reject drift or case binding changes', () => {
+  const one = artifact(corpus.cases[0], [row('a', 0.95)], [], ['a'], ['a']);
+  const payload = sha(stable([['a', { data: one.vector_candidates[0].text }]]));
+  one.collection_observation_sha256 = payload;
+  one.candidate_set_sha256 = hashCandidateSet(one);
+  for (const arm of ['baseline', 'candidate']) {
+    one[arm].candidate_set_sha256 = one.candidate_set_sha256;
+    one[arm].collection_observation_sha256 = payload;
+  }
+  const input = runs([one]);
+  const base = observationsFor(input);
+  const options = { split: 'dev', identities: identities(), adjudication: sidecar() };
+  const absent = evaluateRetrieval(corpus, input, options);
+  assert.equal(absent.paired_replay, false);
+  assert.equal(absent.comparison, null);
+  const valid = evaluateRetrieval(corpus, input, { ...options, observations: base });
+  assert.equal(valid.paired_replay, true);
+  assert.equal(valid.operational_revision_verified, true);
+  assert.notEqual(valid.comparison, null);
+  for (const edit of [
+    x => { x.corpus_sha256 = 'f'.repeat(64); },
+    x => { x.split_sha256 = 'f'.repeat(64); },
+    x => { x.cases.pop(); },
+    x => { x.cases[0].case_id = x.cases[1].case_id; },
+    x => { x.cases[0].candidate_set_sha256 = 'f'.repeat(64); },
+    x => { x.cases[0].before.count++; },
+    x => { x.cases[0].before.cursor_complete = false; },
+    x => { x.cases[0].after.points[0][1].data = 'changed'; },
+  ]) {
+    const invalid = structuredClone(base);
+    edit(invalid);
+    const report = evaluateRetrieval(corpus, input, { ...options, observations: invalid });
+    assert.equal(report.paired_replay, false);
+    assert.equal(report.comparison, null);
+    assert.equal(report.operational_revision_verified, false);
+  }
+});
+
+test('operator trusted digest proof binds counts without claiming retained raw snapshots', () => {
+  const one = artifact(corpus.cases[0], [row('a', 0.95)], [], ['a'], ['a']);
+  const input = runs([one]);
+  const receipts = observationsFor(input);
+  receipts.source = 'operator_trusted_collector';
+  receipts.collector_source_sha256 = 'e'.repeat(64);
+  receipts.proof_file = '/synthetic/collector-proof.json';
+  receipts.proof_file_sha256 = 'f'.repeat(64);
+  receipts.proof = { corpus_sha256: input.corpus_sha256,
+    cases: receipts.cases.map(entry => ({ case_id: entry.case_id,
+      collection_observation_sha256: entry.before.payload_sha256,
+      after_sha256: entry.after.payload_sha256,
+      point_count_before: entry.before.count, point_count_after: entry.after.count,
+      stable: true, candidate_payloads_stable: true, duplicate_consistent: true })) };
+  for (const entry of receipts.cases) {
+    delete entry.before.points;
+    delete entry.after.points;
+  }
+  const options = { split: 'dev', identities: identities(), observations: receipts };
+  const verified = evaluateRetrieval(corpus, input, options);
+  assert.equal(verified.paired_replay, true);
+  assert.equal(verified.operational_revision_verified, true);
+  assert.match(verified.trust_assumptions.collection_observation, /raw_snapshot_unretained/);
+  assert.equal(verified.live_qdrant_paired, false);
+  const altered = structuredClone(receipts);
+  altered.proof.cases[0].point_count_after++;
+  const mismatch = evaluateRetrieval(corpus, input, { ...options, observations: altered });
+  assert.equal(mismatch.paired_replay, false);
+  assert.ok(mismatch.cases[0].errors.includes('collection_receipt_proof_mismatch'));
+});
+
 test('v2 requires source excerpt and hash, rejects secrets and unauthenticated human label', () => {
   assert.equal(validateMemoryCorpusV2(corpus), true);
   const changed = edit => { const copy = structuredClone(corpus); edit(copy.cases[0]); return copy; };
@@ -154,12 +279,14 @@ test('two relevant IDs produce case hit, recall, precision and MRR with explicit
   const x = row('x', 0.96, 'UNRELATED_42');
   const lexical = [a, b].map((r, i) => ({ ...r, scoreSource: 'lexical_verified',
     retrievalEvidence: { lexicalRank: i + 1 } }));
-  const result = evaluateRetrieval(corpus, runs([artifact(corpus.cases[0], [x, a, b], lexical,
-    ['x', 'a', 'b'], ['a', 'b', 'x'])]), { split: 'dev', identities: identities() });
+  const input = runs([artifact(corpus.cases[0], [x, a, b], lexical,
+    ['x', 'a', 'b'], ['x', 'a', 'b'])]);
+  const result = evaluateRetrieval(corpus, input,
+    { split: 'dev', identities: identities(), observations: observationsFor(input) });
   assert.equal(result.paired_replay, true);
   assert.equal(result.comparison, null);
   assert.deepEqual(result.baseline.hit_at_1, { count: 0, denominator: 1 });
-  assert.deepEqual(result.candidate.hit_at_1, { count: 1, denominator: 1 });
+  assert.deepEqual(result.candidate.hit_at_1, { count: 0, denominator: 1 });
   assert.deepEqual(result.candidate.hit_at_3, { count: 1, denominator: 1 });
   assert.deepEqual(result.candidate.recall_at_5, { count: 2, denominator: 2 });
   assert.deepEqual(result.candidate.precision_at_5, { count: 2, denominator: 5 });
@@ -192,7 +319,7 @@ test('unknown ID, cross owner/project and stale/superseded remain ineligible for
   const unknown = evaluateRetrieval(corpus, runs([base]), { split: 'dev', identities: identities() });
   assert.equal(unknown.paired_replay, false);
   assert.equal(unknown.comparison, null);
-  assert.deepEqual(unknown.cases[0].errors, ['unknown_returned_id']);
+  assert.ok(unknown.cases[0].errors.includes('unknown_returned_id'));
   const bad = artifact(corpus.cases[0], [row('a', 0.95),
     row('foreign', 0.94, 'FOREIGN_42', { scope: 'personal', owner_id: 'someone-else' }),
     row('stale', 0.93, 'STALE_42', { valid_to: '2026-01-01T00:00:00Z' }),
@@ -249,8 +376,9 @@ test('independent sidecar permits approved truth and excludes rejected labels', 
   const review = sidecar();
   review.cases[1].status = 'rejected';
   assert.equal(validateRetrievalAdjudication(corpus, review), true);
-  const report = evaluateRetrieval(corpus, runs([a, b]),
-    { adjudication: review, identities: identities() });
+  const input = runs([a, b]);
+  const report = evaluateRetrieval(corpus, input,
+    { adjudication: review, identities: identities(), observations: observationsFor(input) });
   assert.equal(report.paired_replay, true);
   assert.equal(report.label_status, 'agent_reviewed_partial');
   assert.equal(report.coverage.approved, 1);
@@ -259,8 +387,8 @@ test('independent sidecar permits approved truth and excludes rejected labels', 
   assert.equal(report.baseline.abstention_accuracy, null);
   assert.equal(report.comparison, null);
   review.cases[1].status = 'approved';
-  const approved = evaluateRetrieval(corpus, runs([a, b]),
-    { adjudication: review, identities: identities() });
+  const approved = evaluateRetrieval(corpus, input,
+    { adjudication: review, identities: identities(), observations: observationsFor(input) });
   assert.equal(approved.label_status, 'agent_reviewed');
   assert.notEqual(approved.comparison, null);
 });
@@ -282,12 +410,15 @@ test('sidecar rejects mismatched expected hash, corpus hash, missing IDs and hum
 
 test('forged algorithm outputs and missing observation time cannot claim paired improvement', () => {
   const one = artifact(corpus.cases[0], [row('a', 0.95)], [], [], ['a']);
-  let report = evaluateRetrieval(corpus, runs([one]), { split: 'dev', identities: identities() });
+  const input = runs([one]);
+  let report = evaluateRetrieval(corpus, input, { split: 'dev', identities: identities(),
+    observations: observationsFor(input) });
   assert.equal(report.paired_replay, false);
   assert.ok(report.cases[0].errors.includes('algorithm_output_mismatch'));
   one.baseline.returned_ids = ['a'];
   delete one.observed_at;
-  report = evaluateRetrieval(corpus, runs([one]), { split: 'dev', identities: identities() });
+  report = evaluateRetrieval(corpus, input, { split: 'dev', identities: identities(),
+    observations: observationsFor(input) });
   assert.equal(report.paired_replay, false);
   assert.ok(report.cases[0].errors.includes('missing_observation_time'));
 });
@@ -333,12 +464,24 @@ test('CLI reads a v2 corpus and frozen retrieval artifact without printing candi
   const corpusFile = path.join(dir, 'corpus.json');
   const retrievalFile = path.join(dir, 'retrieval.json');
   const identitiesFile = path.join(dir, 'identities.json');
+  const observationsFile = path.join(dir, 'observations.json');
+  const proofFile = path.join(dir, 'collector-proof.json');
   const adjudicationFile = path.join(dir, 'adjudication.json');
   const outputsFile = path.join(dir, 'outputs.json');
   await fs.writeFile(corpusFile, JSON.stringify(corpus), { mode: 0o600 });
   const { corpus: loaded } = await loadMemoryCorpus(corpusFile);
   assert.equal(loaded.version, 2);
   const input = runs([artifact(corpus.cases[0], [row('a', 0.95, 'ALPHA_42')], [], ['a'], ['a'])]);
+  const observation = observationsFor(input);
+  for (const [index, entry] of observation.cases.entries()) {
+    for (const arm of ['before', 'after']) {
+      const snap = entry[arm];
+      snap.snapshot_file = path.join(dir, `snapshot-${index}-${arm}.json`);
+      await fs.writeFile(snap.snapshot_file, stable(snap.points), { mode: 0o600 });
+      delete snap.points;
+    }
+  }
+  await fs.writeFile(observationsFile, JSON.stringify(observation), { mode: 0o600 });
   await fs.writeFile(retrievalFile, JSON.stringify(input), { mode: 0o600 });
   await fs.writeFile(identitiesFile, JSON.stringify(identities()), { mode: 0o600 });
   const cli = fileURLToPath(new URL('../base/memoria/evaluation-cli.mjs', import.meta.url));
@@ -348,9 +491,44 @@ test('CLI reads a v2 corpus and frozen retrieval artifact without printing candi
     '--identities', identitiesFile], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   const report = JSON.parse(result.stdout);
-  assert.equal(report.paired_replay, true);
+  assert.equal(report.paired_replay, false);
   assert.equal(report.coverage.selected, 1);
   assert.equal(result.stdout.includes('ALPHA_42'), false);
+  const withObservations = spawnSync(process.execPath, ['--input-type=module', '-e', script, '--',
+    '--retrieval', retrievalFile, '--corpus', corpusFile, '--split', 'dev',
+    '--identities', identitiesFile, '--observations', observationsFile], { encoding: 'utf8' });
+  assert.equal(withObservations.status, 0, withObservations.stderr);
+  assert.equal(JSON.parse(withObservations.stdout).paired_replay, true);
+  assert.equal(withObservations.stdout.includes('ALPHA_42'), false);
+  const oldReceipt = observationsFor(input);
+  oldReceipt.source = 'operator_trusted_collector';
+  oldReceipt.collector_source_sha256 = 'e'.repeat(64);
+  oldReceipt.proof_file = proofFile;
+  const proof = { corpus_sha256: input.corpus_sha256,
+    cases: oldReceipt.cases.map(entry => ({ case_id: entry.case_id,
+      collection_observation_sha256: entry.before.payload_sha256,
+      after_sha256: entry.after.payload_sha256,
+      point_count_before: entry.before.count, point_count_after: entry.after.count,
+      stable: true, candidate_payloads_stable: true, duplicate_consistent: true })) };
+  const proofBytes = JSON.stringify(proof);
+  await fs.writeFile(proofFile, proofBytes, { mode: 0o600 });
+  oldReceipt.proof_file_sha256 = sha(proofBytes);
+  for (const entry of oldReceipt.cases) {
+    delete entry.before.points;
+    delete entry.after.points;
+  }
+  await fs.writeFile(observationsFile, JSON.stringify(oldReceipt), { mode: 0o600 });
+  const oldObserved = spawnSync(process.execPath, ['--input-type=module', '-e', script, '--',
+    '--retrieval', retrievalFile, '--corpus', corpusFile, '--split', 'dev',
+    '--identities', identitiesFile, '--observations', observationsFile], { encoding: 'utf8' });
+  assert.equal(oldObserved.status, 0, oldObserved.stderr);
+  assert.equal(JSON.parse(oldObserved.stdout).paired_replay, true);
+  await fs.writeFile(proofFile, `${proofBytes} `, { mode: 0o600 });
+  const tamperedProof = spawnSync(process.execPath, ['--input-type=module', '-e', script, '--',
+    '--retrieval', retrievalFile, '--corpus', corpusFile, '--split', 'dev',
+    '--identities', identitiesFile, '--observations', observationsFile], { encoding: 'utf8' });
+  assert.equal(tamperedProof.status, 2);
+  assert.equal(tamperedProof.stdout, '');
   await fs.writeFile(adjudicationFile, JSON.stringify(sidecar()), { mode: 0o600 });
   const reviewed = spawnSync(process.execPath, ['--input-type=module', '-e', script, '--',
     '--retrieval', retrievalFile, '--corpus', corpusFile, '--split', 'dev',

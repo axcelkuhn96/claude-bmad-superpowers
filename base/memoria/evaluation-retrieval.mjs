@@ -23,6 +23,7 @@ export const retrievalAlgorithmSources = Object.freeze({
 });
 const RETRIEVAL_LIMIT = 8 * 1024 * 1024;
 const ADJUDICATION_LIMIT = 1024 * 1024;
+const SNAPSHOT_LIMIT = 16 * 1024 * 1024;
 
 export const hashCorpusSplits = corpus => hash(corpus.cases.map(entry => [entry.id, entry.split]));
 export const hashExpectedLabel = entry => hash(entry.expected);
@@ -96,6 +97,52 @@ export async function loadRetrievalArtifact(file) {
   return { retrieval, sha256: sha256(bytes) };
 }
 
+async function readBoundFile(file, limit, tooLarge) {
+  const stat = await fs.stat(file);
+  if (stat.size > limit) fail(tooLarge);
+  const bytes = await fs.readFile(file);
+  if (bytes.length > limit) fail(tooLarge);
+  return bytes;
+}
+
+// The sidecar comes from an operator-trusted collector, separately from the
+// candidate artifact. Old collector proofs retained aggregate full-scroll
+// hashes; new captures may also retain independently checkable raw snapshots.
+export async function loadRetrievalObservations(file) {
+  const bytes = await readBoundFile(file, ADJUDICATION_LIMIT, 'observations_too_large');
+  let observations;
+  try { observations = JSON.parse(bytes.toString('utf8')); }
+  catch { fail('invalid_observations'); }
+  if (!observations || !Array.isArray(observations.cases) || observations.cases.length > 100)
+    fail('invalid_observations');
+  if (observations.source === 'operator_trusted_collector') {
+    if (!nonEmpty(observations.proof_file) || !validSha(observations.proof_file_sha256))
+      fail('invalid_observations');
+    const proofBytes = await readBoundFile(observations.proof_file, SNAPSHOT_LIMIT,
+      'observations_too_large');
+    if (sha256(proofBytes) !== observations.proof_file_sha256) fail('invalid_observations');
+    try { observations.proof = JSON.parse(proofBytes.toString('utf8')); }
+    catch { fail('invalid_observations'); }
+  } else if (observations.source === 'trusted_external_collector') {
+    for (const item of observations.cases) {
+      for (const key of ['before', 'after']) {
+        const snapshot = item?.[key];
+        if (!nonEmpty(snapshot?.snapshot_file) || !validSha(snapshot?.snapshot_file_sha256))
+          fail('invalid_observations');
+        const snapshotBytes = await readBoundFile(snapshot.snapshot_file, SNAPSHOT_LIMIT,
+          'observations_too_large');
+        if (sha256(snapshotBytes) !== snapshot.snapshot_file_sha256)
+          fail('invalid_observations');
+        try { snapshot.points = JSON.parse(snapshotBytes.toString('utf8')); }
+        catch { fail('invalid_observations'); }
+        if (JSON.stringify(snapshot.points) !== snapshotBytes.toString('utf8'))
+          fail('invalid_observations');
+      }
+    }
+  }
+  return { observations, sha256: sha256(bytes) };
+}
+
 // Hash exactly the candidate material both arms receive. No raw payload enters reports.
 export function hashCandidateSet(item) {
   return hash({ query: item.query, collection_observation_sha256: item.collection_observation_sha256,
@@ -105,8 +152,77 @@ export function hashCandidateSet(item) {
 }
 
 function canonicalCandidate(row) {
-  const { score, scoreSource, retrievalEvidence, ...payload } = row;
-  return payload;
+  // Only channel transport fields differ. Preserve all metadata and any
+  // other selection/ranking inputs, including nested provenance/validity.
+  const { score, scoreSource, retrievalEvidence, sessionId, sdkId, memory_id,
+    memory, ...payload } = row;
+  return { ...payload, id: idFor(row), text: row.text ?? memory };
+}
+
+const stable = value => JSON.stringify(value, (_, object) => object &&
+  !Array.isArray(object) && typeof object === 'object' ?
+    Object.fromEntries(Object.entries(object).sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0)) : object);
+
+function receiptErrors(corpus, observations, item, entry, expectedCorpusSha, expectedSplitSha) {
+  if (!observations) return ['missing_collection_receipt'];
+  const cases = observations.cases;
+  if (observations.version !== 1 || observations.kind !== 'retrieval_collection_observations' ||
+      !['operator_trusted_collector', 'trusted_external_collector'].includes(observations.source) ||
+      observations.corpus_sha256 !== expectedCorpusSha ||
+      observations.split_sha256 !== expectedSplitSha || !Array.isArray(cases) ||
+      cases.length !== corpus.cases.length ||
+      new Set(cases.map(x => x?.case_id)).size !== corpus.cases.length ||
+      cases.some(x => !corpus.cases.some(c => c.id === x.case_id)))
+    return ['invalid_collection_receipt'];
+  const receipt = cases.find(x => x.case_id === entry.id);
+  if (!item || !receipt || receipt.candidate_set_sha256 !== item.candidate_set_sha256 ||
+      receipt.collection_observation_sha256 !== item.collection_observation_sha256)
+    return ['collection_receipt_binding_mismatch'];
+  const { before, after } = receipt;
+  const validSide = side => side && validSha(side.payload_sha256) &&
+    Number.isSafeInteger(side.count) && side.count >= 0 && side.cursor_complete === true;
+  if (!validSide(before) || !validSide(after) || before.payload_sha256 !== after.payload_sha256 ||
+      before.count !== after.count || before.payload_sha256 !== item.collection_observation_sha256)
+    return ['collection_receipt_drift'];
+  if (observations.source === 'operator_trusted_collector') {
+    const proof = observations.proof;
+    if (!validSha(observations.collector_source_sha256) ||
+        !validSha(observations.proof_file_sha256) || !proof ||
+        proof.corpus_sha256 !== expectedCorpusSha || !Array.isArray(proof.cases) ||
+        proof.cases.length !== corpus.cases.length ||
+        new Set(proof.cases.map(x => x?.case_id)).size !== corpus.cases.length ||
+        proof.cases.some(x => !corpus.cases.some(c => c.id === x.case_id)))
+      return ['invalid_collection_receipt'];
+    const original = proof.cases.find(x => x.case_id === entry.id);
+    if (!original || original.collection_observation_sha256 !== before.payload_sha256 ||
+        original.after_sha256 !== after.payload_sha256 ||
+        original.point_count_before !== before.count ||
+        original.point_count_after !== after.count ||
+        original.stable !== true || original.candidate_payloads_stable !== true ||
+        original.duplicate_consistent !== true)
+      return ['collection_receipt_proof_mismatch'];
+  } else {
+    for (const side of [before, after]) {
+      if (!Array.isArray(side.points) || side.points.length !== side.count ||
+          !validSha(side.snapshot_file_sha256) ||
+          stable(side.points) !== JSON.stringify(side.points) ||
+          sha256(stable(side.points)) !== side.payload_sha256 ||
+          side.snapshot_file_sha256 !== side.payload_sha256 ||
+          new Set(side.points.map(point => point?.[0])).size !== side.count ||
+          side.points.some(point => !Array.isArray(point) || point.length !== 2 ||
+            !nonEmpty(point[0]) || !point[1] || typeof point[1] !== 'object'))
+        return ['invalid_collection_snapshot'];
+      const ids = side.points.map(point => point[0]);
+      if (JSON.stringify(ids) !== JSON.stringify([...ids].sort()))
+        return ['invalid_collection_snapshot'];
+      const payloads = new Map(side.points);
+      if ([...item.vector_candidates, ...item.lexical_candidates].some(row =>
+        payloads.get(idFor(row))?.data !== row.text))
+        return ['collection_candidate_payload_mismatch'];
+    }
+  }
+  return [];
 }
 
 function caseErrors(entry, item, expectedOwner) {
@@ -298,7 +414,8 @@ function observedUsage(cases) {
 }
 
 export function evaluateRetrieval(corpus, runs, { split = 'all', corpusSha256,
-  adjudication, adjudicationSha256, identities, identitiesSha256 } = {}) {
+  adjudication, adjudicationSha256, identities, identitiesSha256,
+  observations, observationsSha256 } = {}) {
   if (!validateMemoryCorpusV2(corpus)) fail('invalid_corpus');
   if (!['all', 'dev', 'holdout'].includes(split)) fail('invalid_split');
   if (!runs || runs.version !== 1 || runs.kind !== 'frozen_retrieval' ||
@@ -328,6 +445,8 @@ export function evaluateRetrieval(corpus, runs, { split = 'all', corpusSha256,
   const caseReports = selected.map(entry => {
     const item = records.get(entry.id);
     const errors = item ? caseErrors(entry, item, owners?.get(entry.id)) : ['missing_case'];
+    errors.push(...receiptErrors(corpus, observations, item, entry,
+      expectedCorpusSha, expectedSplitSha));
     if (!owners) errors.push('missing_owner_authority');
     if (item && !Number.isFinite(Date.parse(item.observed_at ?? '')))
       errors.push('missing_observation_time');
@@ -369,16 +488,21 @@ export function evaluateRetrieval(corpus, runs, { split = 'all', corpusSha256,
     split_sha256: expectedSplitSha,
     adjudication_sha256: adjudication ? adjudicationSha256 ?? hash(adjudication) : null,
     identities_sha256: identities ? identitiesSha256 ?? hash(identities) : null,
+    observations_sha256: observations ? observationsSha256 ?? hash(observations) : null,
     retrieval_sha256: hash(runs), label_status: labelStatus,
     quality_truth_status: selected.some(entry => entry.expected.unmeasured === true) ?
       'partially_unmeasured_frozen_truth' : 'frozen_truth_without_factual_verification',
     assessment_scope: 'offline_ranking_conditional_on_frozen_candidates',
     live_qdrant_paired: false, historical_baseline_paired: false, paired_replay: paired,
-    operational_revision_verified: false,
+    operational_revision_verified: paired,
     trust_assumptions: { identities: identities ?
       'caller_supplied_trusted_local_sidecar_not_cryptographically_authenticated' :
       'unmeasured_without_independent_owner_authority',
-    collection_observation: 'artifact_declared_hash_is_not_operational_revision_proof' },
+    collection_observation: observations?.source === 'operator_trusted_collector' ?
+      'operator_trusted_collector_observation_raw_snapshot_unretained_not_independently_recomputable' :
+      observations?.source === 'trusted_external_collector' ?
+        'operator_trusted_collector_with_independently_recomputed_raw_snapshot_hashes_not_MVCC' :
+        'artifact_declared_hash_is_not_operational_revision_proof' },
     metric_definitions: { context_error: 'unmeasured_without_rendered_context_and_source_review',
       owner_leak: 'unmeasured_without_independent_owner_authority',
       quality_truth: 'frozen_expected_unmeasured_cases_excluded_even_if_conditional_relevance_approved' },

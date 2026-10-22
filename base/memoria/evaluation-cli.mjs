@@ -2,10 +2,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { evaluateMemoryOutputs, loadMemoryCorpus, loadMemoryOutputs } from './evaluation.mjs';
 import { evaluateRetrieval, loadRetrievalArtifact,
-  loadRetrievalAdjudication, loadRetrievalIdentities } from './evaluation-retrieval.mjs';
+  loadRetrievalAdjudication, loadRetrievalIdentities,
+  loadRetrievalObservations } from './evaluation-retrieval.mjs';
 
 const defaultCorpus = fileURLToPath(new URL('./evals/curation-v1.json', import.meta.url));
-const usage = `Uso: cbs memoria avaliar (--outputs|--retrieval) <arquivo.json> [--corpus <arquivo.json>] [--split dev|holdout|all] [--adjudication <arquivo.json>] [--identities <arquivo.json>]
+const usage = `Uso: cbs memoria avaliar (--outputs|--retrieval) <arquivo.json> [--corpus <arquivo.json>] [--split dev|holdout|all] [--adjudication <arquivo.json>] [--identities <arquivo.json>] [--observations <arquivo.json>]
 
 Avaliação offline de saídas de extração já gravadas. O corpus padrão é ${path.basename(defaultCorpus)}.
 Não chama modelo, embedding, broker ou Qdrant. Rótulos sem adjudicação declarada
@@ -14,6 +15,7 @@ O arquivo outputs usa {"version":1,"results":[{"case_id":"...","output":{"no_fac
 Retrieval v1 exige corpus v2 e artefatos de candidatos congelados; paired_replay compara apenas ranking offline.
 Adjudicação opcional é sidecar privado ligado ao hash do corpus, sem rótulo humano presumido.
 Identidades para segurança de owner exigem sidecar privado independente do artefato de retrieval.
+Comparação pareada exige receipt privado do coletor via --observations, ligado ao corpus, split e candidatos.
 `;
 
 function parse(args) {
@@ -21,14 +23,15 @@ function parse(args) {
   const seen = new Set();
   for (let i = 0; i < args.length; i++) {
     const flag = args[i];
-    if (!['--corpus', '--outputs', '--retrieval', '--split', '--adjudication', '--identities'].includes(flag) ||
+    if (!['--corpus', '--outputs', '--retrieval', '--split', '--adjudication', '--identities',
+      '--observations'].includes(flag) ||
         seen.has(flag) ||
         !args[i + 1] || args[i + 1].startsWith('--')) throw new Error('invalid_arguments');
     seen.add(flag);
     options[flag.slice(2)] = args[++i];
   }
   if (!!options.outputs === !!options.retrieval ||
-      (options.adjudication || options.identities) && !options.retrieval ||
+      (options.adjudication || options.identities || options.observations) && !options.retrieval ||
       !['all', 'dev', 'holdout'].includes(options.split)) {
     throw new Error('invalid_arguments');
   }
@@ -47,22 +50,26 @@ export async function evaluateCli(args = []) {
     return 2;
   }
   try {
-    const [{ corpus, sha256: corpusSha256 }, loaded, reviewed, identityAuthority] = await Promise.all([
+    const [{ corpus, sha256: corpusSha256 }, loaded, reviewed, identityAuthority,
+      collected] = await Promise.all([
       loadMemoryCorpus(options.corpus), options.retrieval ?
         loadRetrievalArtifact(options.retrieval) : loadMemoryOutputs(options.outputs),
       options.adjudication ? loadRetrievalAdjudication(options.adjudication) : null,
       options.identities ? loadRetrievalIdentities(options.identities) : null,
+      options.observations ? loadRetrievalObservations(options.observations) : null,
     ]);
     const report = options.retrieval ?
       evaluateRetrieval(corpus, loaded.retrieval, { split: options.split, corpusSha256,
         adjudication: reviewed?.adjudication, adjudicationSha256: reviewed?.sha256,
         identities: identityAuthority?.identities,
-        identitiesSha256: identityAuthority?.sha256 }) :
+        identitiesSha256: identityAuthority?.sha256,
+        observations: collected?.observations,
+        observationsSha256: collected?.sha256 }) :
       evaluateMemoryOutputs(corpus, loaded.outputs, { split: options.split });
     process.stdout.write(`${JSON.stringify(report)}\n`);
     return 0;
   } catch (error) {
     process.stderr.write(`CBS Mem0 avaliar: ${error.message}\n`);
-    return /^(?:invalid_|unknown_case|corpus_too_large|outputs_too_large|retrieval_too_large|adjudication_too_large|identities_too_large)/.test(error.message) ? 2 : 1;
+    return /^(?:invalid_|unknown_case|corpus_too_large|outputs_too_large|retrieval_too_large|adjudication_too_large|identities_too_large|observations_too_large)/.test(error.message) ? 2 : 1;
   }
 }
