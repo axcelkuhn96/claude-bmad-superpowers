@@ -19,6 +19,151 @@ spec.loader.exec_module(adapter)
 
 
 class AdapterTest(unittest.TestCase):
+    def test_delete_curated_removes_only_versioned_owned_target_and_confirms_absence(self):
+        from qdrant_client.models import FilterSelector
+        first = '64eef286-9f7e-4326-b137-5658f0286c46'
+        other = '64eef286-9f7e-4326-b137-5658f0286c47'
+        payload = {'data': 'old memory', 'user_id': 'p', 'project_id': 'p',
+                   'status': 'active', 'source_record_id': 'source-1', 'scope': 'personal',
+                   'owner_id': 'alice', 'source': 'message', 'actor': 'human',
+                   'origin': 'user_direct', 'speaker_role': 'user',
+                   'evidence_at': '2026-10-20T00:00:00Z'}
+        class Client:
+            def __init__(self):
+                self.points = {first: SimpleNamespace(id=first, payload=payload.copy()),
+                               other: SimpleNamespace(id=other, payload={**payload,
+                                   'source_record_id': 'source-2'})}
+                self.calls = []
+            def retrieve(self, collection_name, ids, **kwargs):
+                return [self.points[key] for key in ids if key in self.points]
+            def delete(self, collection_name, points_selector, wait):
+                self_test.assertIsInstance(points_selector, FilterSelector)
+                self_test.assertTrue(wait)
+                self.calls.append(points_selector)
+                self.points.pop(first, None)
+                return SimpleNamespace(status='completed')
+        self_test = self
+        client = Client()
+        row = adapter.validate_curated_payload(client.points[first], 'p', 'alice', 'history')
+        request = {'op': 'delete_curated', 'collection': 'c', 'projectId': 'p',
+                   'ownerId': 'alice', 'memoryId': first,
+                   'expectedVersion': adapter._target_version(row), 'connection': {}}
+        with patch.object(adapter, 'verify_collection'):
+            self.assertEqual(adapter.execute(request, client, Path('/tmp')),
+                             {'kind': 'deleted', 'memoryId': first})
+            self.assertEqual(set(client.points), {other})
+            self.assertEqual(adapter.execute(request, client, Path('/tmp')),
+                             {'kind': 'absent', 'memoryId': first})
+            self.assertEqual(len(client.calls), 1)
+
+    def test_delete_curated_refuses_foreign_owner_project_and_changed_version(self):
+        identifier = '64eef286-9f7e-4326-b137-5658f0286c46'
+        point = SimpleNamespace(id=identifier, payload={'data': 'old memory',
+            'user_id': 'p', 'project_id': 'p', 'status': 'active',
+            'source_record_id': 'source-1', 'scope': 'personal', 'owner_id': 'alice',
+            'source': 'message', 'actor': 'human', 'origin': 'user_direct',
+            'speaker_role': 'user', 'evidence_at': '2026-10-20T00:00:00Z'})
+        class Client:
+            def retrieve(self, collection_name, ids, **kwargs):
+                return [point]
+            def delete(self, **kwargs):
+                self_test.fail('foreign or changed target reached delete')
+        self_test = self
+        with patch.object(adapter, 'verify_collection'):
+            for project, owner, version in [('other', 'alice', 'a' * 64),
+                                             ('p', 'bob', 'a' * 64),
+                                             ('p', 'alice', 'a' * 64)]:
+                request = {'op': 'delete_curated', 'collection': 'c',
+                           'projectId': project, 'ownerId': owner,
+                           'memoryId': identifier, 'expectedVersion': version,
+                           'connection': {}}
+                self.assertNotEqual(adapter.execute(request, Client(), Path('/tmp'))['kind'], 'deleted')
+
+    def test_delete_curated_does_not_ack_when_conditional_delete_misses_or_errors(self):
+        identifier = '64eef286-9f7e-4326-b137-5658f0286c46'
+        point = SimpleNamespace(id=identifier, payload={'data': 'old memory',
+            'user_id': 'p', 'project_id': 'p', 'status': 'active',
+            'source_record_id': 'source-1', 'scope': 'project',
+            'source': 'message', 'actor': 'human', 'origin': 'user_direct',
+            'speaker_role': 'user', 'evidence_at': '2026-10-20T00:00:00Z'})
+        class Client:
+            def retrieve(self, collection_name, ids, **kwargs):
+                return [point]
+            def delete(self, **kwargs):
+                return SimpleNamespace(status='completed')
+        row = adapter.validate_curated_payload(point, 'p', None, 'history')
+        request = {'op': 'delete_curated', 'collection': 'c', 'projectId': 'p',
+                   'memoryId': identifier, 'expectedVersion': adapter._target_version(row),
+                   'connection': {}}
+        with patch.object(adapter, 'verify_collection'):
+            self.assertEqual(adapter.execute(request, Client(), Path('/tmp')),
+                             {'kind': 'conflict', 'reason': 'target_changed'})
+            class Failed(Client):
+                def delete(self, **kwargs):
+                    return SimpleNamespace(status='acknowledged')
+            self.assertEqual(adapter.execute(request, Failed(), Path('/tmp')),
+                             {'kind': 'unavailable', 'reason': 'remote_delete_unconfirmed'})
+
+    def test_mutation_target_distinguishes_absent_from_foreign_owner(self):
+        identifier = '64eef286-9f7e-4326-b137-5658f0286c46'
+        payload = {'data': 'old memory', 'user_id': 'p', 'project_id': 'p',
+                   'status': 'active', 'source_record_id': 'source-1',
+                   'scope': 'personal', 'owner_id': 'alice', 'source': 'message',
+                   'actor': 'human', 'origin': 'user_direct', 'speaker_role': 'user',
+                   'evidence_at': '2026-10-20T00:00:00Z'}
+        class Client:
+            point = SimpleNamespace(id=identifier, payload=payload)
+            def retrieve(self, collection_name, ids, **kwargs):
+                return [self.point] if self.point else []
+        client = Client()
+        request = {'op': 'mutation_target', 'collection': 'c', 'projectId': 'p',
+                   'ownerId': 'alice', 'memoryId': identifier, 'connection': {}}
+        with patch.object(adapter, 'verify_collection'):
+            self.assertEqual(adapter.execute(request, client, Path('/tmp'))['kind'], 'item')
+            self.assertEqual(adapter.execute({**request, 'ownerId': 'bob'},
+                            client, Path('/tmp'))['kind'], 'blocked')
+            client.point = None
+            self.assertEqual(adapter.execute(request, client, Path('/tmp')),
+                             {'kind': 'absent', 'memoryId': identifier})
+
+    def test_activate_correction_rechecks_target_version_before_supersede(self):
+        old_id = '64eef286-9f7e-4326-b137-5658f0286c46'
+        new_id = '64eef286-9f7e-4326-b137-5658f0286c48'
+        old = {'sdkId': old_id, 'qdrantId': old_id, 'externalId': 'source-1',
+               'projectId': 'p', 'status': 'active', 'text': 'old',
+               'metadata': {'scope': 'project', 'status': 'active'}}
+        new = {'sdkId': new_id, 'qdrantId': new_id, 'externalId': 'source-2',
+               'projectId': 'p', 'status': 'pending', 'text': 'new',
+               'metadata': {'scope': 'project', 'status': 'pending',
+                            'supersedes_id': old_id,
+                            'correction_target_external_id': 'source-1',
+                            'correction_target_version': adapter._target_version(old)}}
+        class Memory:
+            embedding_model = object()
+            def __init__(self):
+                self.rows = {old_id: old.copy(), new_id: new.copy()}
+                self.calls = []
+            def get(self, identifier):
+                return self.rows[identifier]
+            def update(self, identifier, metadata):
+                self.calls.append(identifier)
+                row = self.rows[identifier]
+                self.rows[identifier] = {**row, 'status': metadata['status'],
+                    'metadata': {**row['metadata'], **metadata}}
+        memory = Memory()
+        request = {'op': 'activate', 'projectId': 'p', 'collection': 'c',
+                   'connection': {}, 'sdkId': new_id, 'externalId': 'source-2'}
+        with patch.object(adapter, 'verify_collection'), \
+             patch.object(adapter, '_memory', return_value=memory), \
+             patch.object(adapter, '_row', side_effect=lambda raw, *args: raw):
+            memory.rows[old_id] = {**old, 'text': 'changed'}
+            with self.assertRaisesRegex(ValueError, 'target_changed'):
+                adapter.execute(request, object(), Path('/tmp'))
+            self.assertEqual(memory.calls, [])
+            memory.rows[old_id] = old
+            self.assertEqual(adapter.execute(request, object(), Path('/tmp'))['item']['status'], 'active')
+            self.assertEqual(memory.calls, [old_id, new_id])
+
     def test_generated_context_requires_qualified_ref_hash_and_is_optional(self):
         refs = [{'message_id': 'u1', 'origin': 'human', 'source_text_sha256': 'a' * 64,
                  'excerpt': 'Use tenant filters.'},

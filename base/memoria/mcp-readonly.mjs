@@ -20,8 +20,10 @@ import { runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { createBrokerWorker } from './broker-worker.mjs';
 import { serveMcp } from './mcp.mjs';
 import { containsSecret } from './candidates.mjs';
-import { createExplicitMcpRequest, ackExplicitMcpRequest } from './mcp-request-proof.mjs';
+import { createExplicitMcpRequest, createExplicitMcpDeleteRequest,
+  ackExplicitMcpRequest } from './mcp-request-proof.mjs';
 import { storeMemory } from './bridge.mjs';
+import { targetVersion } from './correction.mjs';
 
 const blocked = reason => ({ kind: 'unavailable', reason });
 const script = fileURLToPath(new URL('./python/worker.py', import.meta.url));
@@ -53,11 +55,24 @@ export const readonlyDefinitions = [
       scope: { type: 'string', enum: ['project', 'personal'] },
       condition: { type: 'string', maxLength: 512 },
     }, required: ['text'], additionalProperties: false } },
+  { name: 'update', description: 'Substitua uma memória curada ativa do projeto atual a pedido explícito. Preserva escopo, tipo e condição quando omitidos; confirme apenas após ACK remoto.',
+    inputSchema: { type: 'object', properties: {
+      memory_id: { type: 'string' }, text: { type: 'string', minLength: 1, maxLength: 8192 },
+      type: { type: 'string', enum: ['rule', 'fact', 'decision', 'preference'] },
+      condition: { type: 'string', maxLength: 512 },
+    }, required: ['memory_id', 'text'], additionalProperties: false } },
+  { name: 'delete', description: 'Exclua uma memória curada do Qdrant por ID no projeto atual a pedido explícito. Confirme apenas após ausência remota verificada.',
+    inputSchema: { type: 'object', properties: { memory_id: { type: 'string' } },
+      required: ['memory_id'], additionalProperties: false } },
 ];
 for (const definition of readonlyDefinitions) definition.annotations = {
   readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false,
 };
-readonlyDefinitions.at(-1).annotations = { readOnlyHint: false, destructiveHint: false,
+readonlyDefinitions.at(-3).annotations = { readOnlyHint: false, destructiveHint: false,
+  idempotentHint: true, openWorldHint: true };
+readonlyDefinitions.at(-2).annotations = { readOnlyHint: false, destructiveHint: false,
+  idempotentHint: true, openWorldHint: true };
+readonlyDefinitions.at(-1).annotations = { readOnlyHint: false, destructiveHint: true,
   idempotentHint: true, openWorldHint: true };
 
 export function localWorkerEnvironment(sourceEnv = process.env) {
@@ -229,6 +244,17 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
         args.condition !== undefined && (typeof args.condition !== 'string' ||
           Buffer.byteLength(args.condition, 'utf8') > 512) ||
         containsSecret(args))) return blocked('invalid_request');
+    if (['update', 'delete'].includes(name) &&
+        (typeof args.memory_id !== 'string' || !uuid.test(args.memory_id))) {
+      return blocked('invalid_memory_id');
+    }
+    if (name === 'update' && (typeof args.text !== 'string' || !args.text.trim() ||
+        Buffer.byteLength(args.text, 'utf8') > 8192 ||
+        args.type !== undefined && !['rule', 'fact', 'decision', 'preference'].includes(args.type) ||
+        args.condition !== undefined && (typeof args.condition !== 'string' ||
+          Buffer.byteLength(args.condition, 'utf8') > 512) || containsSecret(args))) {
+      return blocked('invalid_request');
+    }
     let ready;
     try { ready = await check(); } catch { return blocked('project_unavailable'); }
     if (ready.kind !== 'ready') return ready;
@@ -245,6 +271,92 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
       } catch { /* A local policy read must not make read-only search unavailable. */ }
       return { kind: 'ready', provider: 'mem0', mode: 'readonly', projectId: ready.projectId,
         automaticWriteConfigured, manualWriteConfigured: false };
+    }
+    if (name === 'update' || name === 'delete') {
+      try {
+        const current = await writeReady();
+        if (current.kind !== 'ready') return blocked(current.reason);
+        const auth = await authorizeReady(current);
+        if (auth.kind !== 'authorized') return blocked(auth.reason);
+        const designated = await writer(current.resolution, auth);
+        if (designated.kind !== 'writer') return blocked(designated.reason ?? 'writer_not_designated');
+        const beforeDispatch = async () => {
+          const live = await writeReady(current.consent);
+          if (live.kind !== 'ready') return blocked(live.reason);
+          const freshAuth = await authorizeReady(live);
+          if (freshAuth.kind !== 'authorized') return blocked(freshAuth.reason);
+          const freshWriter = await writer(live.resolution, freshAuth);
+          return freshWriter.kind === 'writer' ? { kind: 'allowed' } :
+            blocked(freshWriter.reason ?? 'writer_not_designated');
+        };
+        const found = await dispatch({ op: 'mutation_target', memoryId: args.memory_id,
+          ownerId: current.ownerId }, auth, beforeDispatch);
+        if (found.kind === 'absent' && found.memoryId === args.memory_id) {
+          return name === 'delete' ? { kind: 'absent', memoryId: args.memory_id }
+            : { kind: 'conflict', reason: 'target_absent' };
+        }
+        const target = found.item;
+        if (found.kind !== 'item' || target?.sdkId !== args.memory_id ||
+            target.projectId !== current.projectId || target.status !== 'active' ||
+            !targetVersion(target) ||
+            target.metadata?.scope === 'personal' && target.metadata.owner_id !== current.ownerId) {
+          return blocked(found.reason ?? 'target_unavailable');
+        }
+        if (name === 'delete') {
+          const source = await createExplicitMcpDeleteRequest({ resolution: current.resolution,
+            cli, profile, ownerId: current.ownerId, consent: current.consent,
+            memoryId: args.memory_id, expectedVersion: targetVersion(target) });
+          if (source.kind !== 'request') return blocked(source.reason);
+          const result = await dispatch(source.operation, auth, beforeDispatch, source.operation);
+          if (result.kind === 'deleted' && result.memoryId === args.memory_id) {
+            return { kind: 'deleted', memoryId: args.memory_id };
+          }
+          if (result.kind === 'absent' && result.memoryId === args.memory_id) {
+            return { kind: 'absent', memoryId: args.memory_id };
+          }
+          return result.kind === 'conflict' ? result : blocked(result.reason ?? 'remote_ack_unconfirmed');
+        }
+        const source = await createExplicitMcpRequest({ resolution: current.resolution,
+          cli, profile, ownerId: current.ownerId, consent: current.consent,
+          text: args.text, type: args.type ?? target.metadata.type,
+          scope: target.metadata.scope,
+          condition: args.condition ?? target.metadata.condition,
+          correctionTarget: target });
+        if (source.kind !== 'request') return blocked(source.reason);
+        const fresh = async () => {
+          const latest = await writeReady(current.consent);
+          return latest.kind === 'ready' ? latest : { provider: 'blocked', reason: latest.reason };
+        };
+        const result = await storeMemory(cwd, source.operation.sessionId, source.operation,
+          readQdrantSecret, { stateRoot,
+            resolve: async () => {
+              const latest = await fresh();
+              return latest.kind === 'ready' ? latest.resolution : latest;
+            },
+            authorize: async () => {
+              const latest = await fresh();
+              return latest.kind === 'ready' ? authorizeReady(latest) : latest;
+            },
+            readAutoPublish: autoPublish, autoPublishConsent: current.consent,
+            ...(writerControl ? { control: writerControl } : {}),
+            ackLocal: (externalId, remote) => ackExplicitMcpRequest(source.operation,
+              current.resolution, externalId, remote),
+            run: (_python, _script, request, _env, key) => dispatch(request,
+              { ...auth, key }, beforeDispatch, source.operation),
+          });
+        if (!['stored', 'acked'].includes(result?.kind) || !result.sdkId || !result.qdrantId) {
+          return result?.kind === 'conflict' ? result : blocked(result?.reason ?? 'remote_ack_unconfirmed');
+        }
+        const previous = await dispatch({ op: 'read', projectId: current.projectId,
+          sdkId: args.memory_id }, auth, beforeDispatch, source.operation);
+        if (previous.kind !== 'item' || previous.item?.status !== 'superseded' ||
+            previous.item?.metadata?.superseded_by !== result.sdkId ||
+            previous.item?.metadata?.superseded_by_external_id !== source.operation.externalId) {
+          return blocked('supersede_unconfirmed');
+        }
+        return { kind: 'updated', memoryId: result.sdkId,
+          previousMemoryId: args.memory_id };
+      } catch { return blocked('mutation_failed'); }
     }
     if (name === 'remember') {
       try {

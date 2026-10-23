@@ -2,6 +2,12 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.16.2] - 2026-10-23
+
+### Adicionado
+- **Edição e exclusão explícitas no MCP normal:** `cbs_memoria.update` cria nova versão curada, supersede a anterior e preserva escopo, tipo e condição omitidos; `cbs_memoria.delete` exclui somente o ID curado indicado e confirma sua ausência no Qdrant. Ambas exigem pedido explícito, vínculo nativo de projeto/owner, escritor e consentimento vigentes. A correção mantém proveniência `assistant_report`/`explicit_mcp`, sem revisão humana presumida. Resultado `absent` indica alvo previamente ausente; falhas e conflitos não declaram sucesso. Snapshots Markdown locais anteriores não são reescritos.
+- **Catálogo de seis ferramentas:** registros Codex CBS antigos de três ou quatro ferramentas migram para `search`, `get`, `status`, `remember`, `update` e `delete`, mantendo a política de aprovação de escrita e customizações alheias. Novas sessões Claude e Codex recebem o mesmo catálogo.
+
 ## [0.16.1] - 2026-10-23
 
 ### Publicação

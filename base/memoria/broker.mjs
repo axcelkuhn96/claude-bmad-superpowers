@@ -20,6 +20,7 @@ import { readLocalTrust, sameTrustTuple, trustTuple, authorizeDestination } from
 import { pinDestination } from './activation.mjs';
 import { verifyNativeCapture } from './native.mjs';
 import { sourceForExplicitMcp } from './mcp-request-proof.mjs';
+import { targetVersion } from './correction.mjs';
 import { openArtifactIdentity, runtimePython, verifyRuntimeArtifacts } from './runtime.mjs';
 import { withProjectLock } from './ledger.mjs';
 import { createBrokerWorker } from './broker-worker.mjs';
@@ -41,6 +42,7 @@ const sameAutoConsent = (frozen, live, current) => frozen?.version === 1 &&
   ['consentHash', 'destinationHash', 'ownerId', 'deviceId', 'enabledAt']
     .every(key => current.extractor.autoPublishConsent?.[key] === frozen[key]);
 export function mcpOperationMatches(operation, source, observed) {
+  if (operation.op === 'delete_curated') return isDeepStrictEqual(operation, source);
   const keys = {
     dedup_find: ['op', 'projectId', 'externalId', 'sessionId', 'text', 'metadata'],
     find: ['op', 'projectId', 'externalId'],
@@ -55,7 +57,8 @@ export function mcpOperationMatches(operation, source, observed) {
     isDeepStrictEqual(operation.metadata, source.metadata);
   if (operation.op === 'find') return operation.externalId === source.externalId;
   if (operation.op === 'read') return typeof operation.sdkId === 'string' &&
-    observed?.has(operation.sdkId) === true;
+    (observed?.has(operation.sdkId) === true ||
+      source.metadata?.supersedes_id === operation.sdkId);
   if (operation.op === 'activate') return operation.externalId === source.externalId &&
     typeof operation.sdkId === 'string' && observed?.get(operation.sdkId) === true;
   return false;
@@ -792,13 +795,16 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
         !path.isAbsolute(profile) || !binding || typeof binding !== 'object' ||
         !operation || typeof operation !== 'object' ||
         Array.isArray(operation)) return blocked('invalid_request');
-    const writes = ['find', 'dedup_find', 'read', 'add', 'activate'];
+    const writes = ['find', 'dedup_find', 'read', 'add', 'activate', 'delete_curated'];
     const isWriteFlow = writes.includes(operation.op);
-    if (!isWriteFlow && (!['search', 'raw_search', 'readonly_get'].includes(operation.op) ||
+    if (!isWriteFlow && (!['search', 'raw_search', 'readonly_get', 'history_get',
+        'mutation_target'].includes(operation.op) ||
         sourceOperation !== undefined)) return blocked('invalid_operation');
     const readonlyKeys = { search: ['op', 'query', 'ownerId'],
       raw_search: ['op', 'query'],
-      readonly_get: ['op', 'memoryId', 'source', 'offset', 'ownerId'] };
+      readonly_get: ['op', 'memoryId', 'source', 'offset', 'ownerId'],
+      history_get: ['op', 'memoryId', 'ownerId'],
+      mutation_target: ['op', 'memoryId', 'ownerId'] };
     if (!isWriteFlow && (!isDeepStrictEqual(Object.keys(operation).sort(),
       readonlyKeys[operation.op].sort()) || operation.op === 'search' &&
         (typeof operation.query !== 'string' || !operation.query.trim()) ||
@@ -886,6 +892,9 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
       return signal.aborted || deadlineAt <= Date.now() ? blocked('deadline') : { kind: 'allowed' };
     };
     const result = await bridge.request(request, secret, deadlineAt, beforeDispatch);
+    if (operation.op === 'delete_curated' &&
+        ['deleted', 'absent'].includes(result.kind) &&
+        result.memoryId !== operation.memoryId) return blocked('remote_ack_unconfirmed');
     if (operation.op === 'activate' && result.kind === 'item' &&
         (!mcpRowMatches(result.item, sourceOperation) ||
           result.item.sdkId !== operation.sdkId || result.item.status !== 'active')) {
@@ -902,9 +911,23 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
         }
       }
       if (operation.op === 'read' && result.kind === 'item') {
-        if (!mcpRowMatches(result.item, sourceOperation) ||
-            result.item.sdkId !== operation.sdkId) return blocked('explicit_mcp_unproved');
-        ids.set(operation.sdkId, true);
+        const target = sourceOperation.metadata?.supersedes_id === operation.sdkId;
+        if (target) {
+          if (result.item?.sdkId !== operation.sdkId ||
+              result.item?.projectId !== sourceOperation.projectId ||
+              result.item?.externalId !== sourceOperation.metadata.correction_target_external_id ||
+              !(result.item.status === 'active' &&
+                targetVersion(result.item) === sourceOperation.metadata.correction_target_version ||
+                result.item.status === 'superseded' &&
+                result.item.metadata?.superseded_by_external_id === sourceOperation.externalId &&
+                typeof result.item.metadata?.superseded_by === 'string')) {
+            return blocked('explicit_mcp_unproved');
+          }
+        } else {
+          if (!mcpRowMatches(result.item, sourceOperation) ||
+              result.item.sdkId !== operation.sdkId) return blocked('explicit_mcp_unproved');
+          ids.set(operation.sdkId, true);
+        }
       }
       mcpObserved.set(sourceOperation.externalId, ids);
       if (mcpObserved.size > 256) mcpObserved.delete(mcpObserved.keys().next().value);

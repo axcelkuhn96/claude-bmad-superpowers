@@ -45,11 +45,12 @@ test('local worker forwards an explicit CPU device without unrelated process sec
 });
 
 test('standalone tools describe read and explicit write behavior', () => {
-  assert.deepEqual(readonlyDefinitions.map(tool => tool.name), ['search', 'get', 'status', 'remember']);
+  assert.deepEqual(readonlyDefinitions.map(tool => tool.name),
+    ['search', 'get', 'status', 'remember', 'update', 'delete']);
   for (const tool of readonlyDefinitions.slice(0, 3)) assert.deepEqual(tool.annotations, {
     readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false,
   });
-  assert.deepEqual(readonlyDefinitions.at(-1).annotations, {
+  assert.deepEqual(readonlyDefinitions.find(tool => tool.name === 'remember').annotations, {
     readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true,
   });
 });

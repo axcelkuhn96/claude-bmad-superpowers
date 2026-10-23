@@ -53,11 +53,12 @@ async function matches(cli, output, command, args, env, cwd) {
 }
 
 const codexPolicy = [
-  ['enabled_tools', '["search", "get", "status", "remember"]'],
+  ['enabled_tools', '["search", "get", "status", "remember", "update", "delete"]'],
   ['default_tools_approval_mode', '"writes"'],
 ];
 const legacyCodexTools = '["search","get","status"]';
-const currentCodexTools = '["search","get","status","remember"]';
+const previousCodexTools = '["search","get","status","remember"]';
+const currentCodexTools = '["search","get","status","remember","update","delete"]';
 
 async function persistCodexPolicy(env) {
   const profile = env.CODEX_HOME ?? path.join(env.HOME ?? os.homedir(), '.codex');
@@ -90,7 +91,8 @@ async function persistCodexPolicy(env) {
         if (key === 'enabled_tools') {
           let parsed;
           try { parsed = JSON.stringify(JSON.parse(current)); } catch { return false; }
-          if (parsed !== legacyCodexTools && parsed !== currentCodexTools) return false;
+          if (parsed !== legacyCodexTools && parsed !== previousCodexTools &&
+              parsed !== currentCodexTools) return false;
         } else if (current !== value) return false;
         section = section.replace(pattern, `$1${value}$3`);
       } else {

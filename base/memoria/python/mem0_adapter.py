@@ -643,6 +643,61 @@ def history_get(client, collection: str, project: str, owner: str | None,
         {'kind': 'blocked', 'reason': 'source_unavailable'}
 
 
+def _target_version(row: dict) -> str:
+    fields = [row['sdkId'], row['externalId'], row['projectId'], row['text'], row['metadata']]
+    return hashlib.sha256(json.dumps(fields, ensure_ascii=False,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+def delete_curated(client, collection: str, project: str, owner: str | None,
+                   identifier: str, expected_version: str) -> dict:
+    """Delete one versioned curated point, then prove remote absence."""
+    from qdrant_client.models import FieldCondition, Filter, FilterSelector, HasIdCondition, MatchValue
+    identifier = str(uuid.UUID(identifier))
+    if not re.fullmatch(r'[a-f0-9]{64}', expected_version or ''):
+        raise ValueError('target_version_invalid')
+    points = client.retrieve(collection_name=collection, ids=[identifier],
+                             with_payload=True, with_vectors=False)
+    if not points:
+        return {'kind': 'absent', 'memoryId': identifier}
+    if len(points) != 1 or str(points[0].id) != identifier:
+        return {'kind': 'conflict', 'reason': 'target_changed'}
+    row = validate_curated_payload(points[0], project, owner, 'history')
+    if row is None or row['status'] != 'active':
+        return {'kind': 'blocked', 'reason': 'target_unavailable'}
+    if _target_version(row) != expected_version:
+        return {'kind': 'conflict', 'reason': 'target_changed'}
+    payload = points[0].payload
+    must = [HasIdCondition(has_id=[identifier])]
+    for key in ('project_id', 'user_id', 'status', 'source_record_id',
+                'scope', 'data', 'owner_id'):
+        if key in payload:
+            must.append(FieldCondition(key=key, match=MatchValue(value=payload[key])))
+    result = client.delete(collection_name=collection,
+        points_selector=FilterSelector(filter=Filter(must=must)), wait=True)
+    status = getattr(result, 'status', None)
+    if getattr(status, 'value', status) != 'completed':
+        return {'kind': 'unavailable', 'reason': 'remote_delete_unconfirmed'}
+    remaining = client.retrieve(collection_name=collection, ids=[identifier],
+                                with_payload=True, with_vectors=False)
+    if remaining:
+        return {'kind': 'conflict', 'reason': 'target_changed'}
+    return {'kind': 'deleted', 'memoryId': identifier}
+
+
+def mutation_target(client, collection: str, project: str, owner: str | None,
+                    identifier: str) -> dict:
+    identifier = str(uuid.UUID(identifier))
+    points = client.retrieve(collection_name=collection, ids=[identifier],
+                             with_payload=True, with_vectors=False)
+    if not points:
+        return {'kind': 'absent', 'memoryId': identifier}
+    row = validate_curated_payload(points[0], project, owner, 'history') if len(points) == 1 else None
+    if row is None or row['sdkId'] != identifier or row['status'] != 'active':
+        return {'kind': 'blocked', 'reason': 'target_unavailable'}
+    return {'kind': 'item', 'item': row}
+
+
 def _text_index_present(client, collection: str) -> bool:
     schema = (client.get_collection(collection).payload_schema or {}).get('data')
     if schema is None:
@@ -851,6 +906,12 @@ def execute(request: dict, client, state: Path) -> dict:
     if op == 'history_get':
         return history_get(client, collection, project, request.get('ownerId'),
                            request['memoryId'])
+    if op == 'mutation_target':
+        return mutation_target(client, collection, project, request.get('ownerId'),
+                               request['memoryId'])
+    if op == 'delete_curated':
+        return delete_curated(client, collection, project, request.get('ownerId'),
+                              request['memoryId'], request['expectedVersion'])
     memory = _memory(client, collection, state, request['connection'], history_db_path=':memory:') \
         if op == 'search' else _memory(client, collection, state, request['connection'])
     if op == 'find':
@@ -911,6 +972,8 @@ def execute(request: dict, client, state: Path) -> dict:
                          old['metadata'].get('owner_id') != row['metadata'].get('owner_id')):
                     raise ValueError('superseded_target_invalid')
                 if old['status'] == 'active':
+                    if _target_version(old) != row['metadata'].get('correction_target_version'):
+                        raise ValueError('target_changed')
                     memory.update(supersedes, metadata={'status': 'superseded',
                         'superseded_by': identifier, 'superseded_by_external_id': external})
                     old = _row(memory.get(supersedes), client, collection, memory.embedding_model)

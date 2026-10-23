@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { containsSecret } from './candidates.mjs';
 import { dedupKeyFor } from './dedup-key.mjs';
+import { targetVersion } from './correction.mjs';
 import { externalIdFor, withProjectLock } from './ledger.mjs';
 import { createWindowsState } from './windows-state.mjs';
 
@@ -12,6 +13,7 @@ const blocked = reason => ({ kind: 'blocked', reason });
 const directory = resolution => path.join(resolution.stateDir, 'mcp-requests');
 const fileFor = (resolution, requestId) => path.join(directory(resolution), `${requestId}.json`);
 const policyVersion = 'mcp-request-v1';
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const sameConsent = (a, b) => a?.version === 1 && a.enabled === true &&
   b?.version === 1 && b.enabled === true &&
   ['projectId', 'ownerId', 'consentHash', 'destinationHash', 'deviceId', 'enabledAt']
@@ -46,19 +48,29 @@ async function writePrivate(file, value) {
 }
 
 export async function createExplicitMcpRequest({ resolution, cli, profile, ownerId, consent,
-  text, type = 'fact', scope = 'project', condition } = {}) {
+  text, type = 'fact', scope = 'project', condition, correctionTarget } = {}) {
+  const correctionVersion = correctionTarget && targetVersion(correctionTarget);
+  if (correctionTarget && (!uuid.test(correctionTarget.sdkId ?? '') ||
+      correctionTarget.projectId !== resolution?.projectId ||
+      correctionTarget.status !== 'active' || !correctionVersion ||
+      correctionTarget.metadata?.scope !== scope ||
+      (scope === 'personal' && correctionTarget.metadata?.owner_id !== ownerId))) {
+    return blocked('target_unavailable');
+  }
   if (resolution?.provider !== 'mem0' || !['claude', 'codex'].includes(cli) ||
       typeof profile !== 'string' || !path.isAbsolute(profile) ||
       typeof ownerId !== 'string' || !ownerId || !sameConsent(consent, consent) ||
       consent.projectId !== resolution.projectId || consent.ownerId !== ownerId ||
       !['rule', 'fact', 'decision', 'preference'].includes(type) ||
-      !['project', 'personal'].includes(scope) ||
+      !(correctionTarget ? ['project', 'personal', 'episode'] : ['project', 'personal']).includes(scope) ||
       typeof text !== 'string' || !text.trim() || Buffer.byteLength(text, 'utf8') > 8192 ||
       condition !== undefined && (typeof condition !== 'string' ||
         Buffer.byteLength(condition, 'utf8') > 512) ||
       containsSecret({ text, condition })) return blocked('invalid_request');
-  // This is the actual parsed MCP argument object, serialized canonically; it is not a native transcript.
-  const args = { text, type, scope, ...(condition === undefined ? {} : { condition }) };
+  // Normalize the MCP text and options with the selected target; this is not a native transcript.
+  const args = { text, type, scope, ...(condition === undefined ? {} : { condition }),
+    ...(correctionTarget ? { memory_id: correctionTarget.sdkId,
+      target_version: correctionVersion } : {}) };
   const sourceBytes = JSON.stringify(args);
   const binding = [resolution.projectId, resolution.projectRoot, resolution.destination,
     ownerId, cli, profile, consent.consentHash, sourceBytes];
@@ -87,9 +99,20 @@ export async function createExplicitMcpRequest({ resolution, cli, profile, owner
             review_mode: 'explicit_mcp', auto_consent_hash: consent.consentHash, scope,
             ...(scope === 'personal' ? { owner_id: ownerId } : {}),
             type, ...(condition === undefined ? {} : { condition }),
+            ...(correctionTarget ? {
+              supersedes_id: correctionTarget.sdkId,
+              correction_target_external_id: correctionTarget.externalId,
+              correction_target_version: correctionVersion,
+              ...(correctionTarget.metadata?.valid_from
+                ? { valid_from: correctionTarget.metadata.valid_from } : {}),
+              ...(correctionTarget.metadata?.valid_to
+                ? { valid_to: correctionTarget.metadata.valid_to } : {}),
+            } : {}),
             evidence_at: createdAt, dedup_key: dedupKeyFor({ projectId: resolution.projectId,
               scope, ownerId: scope === 'personal' ? ownerId : undefined,
-              type, text, condition }) },
+              type, text, condition,
+              validFrom: correctionTarget?.metadata?.valid_from,
+              validTo: correctionTarget?.metadata?.valid_to }) },
           approval: { kind: 'approved', mode: 'explicit_mcp' } };
         record = { ...request, createdAt, operation };
         await writePrivate(file, record);
@@ -100,7 +123,62 @@ export async function createExplicitMcpRequest({ resolution, cli, profile, owner
   } catch { return blocked('request_unavailable'); }
 }
 
+export async function createExplicitMcpDeleteRequest({ resolution, cli, profile, ownerId,
+  consent, memoryId, expectedVersion } = {}) {
+  if (resolution?.provider !== 'mem0' || !['claude', 'codex'].includes(cli) ||
+      typeof profile !== 'string' || !path.isAbsolute(profile) ||
+      typeof ownerId !== 'string' || !ownerId || !sameConsent(consent, consent) ||
+      consent.projectId !== resolution.projectId || consent.ownerId !== ownerId ||
+      !uuid.test(memoryId ?? '') || !/^[a-f0-9]{64}$/.test(expectedVersion ?? '')) {
+    return blocked('invalid_request');
+  }
+  const sourceBytes = JSON.stringify({ operation: 'delete', memory_id: memoryId,
+    target_version: expectedVersion });
+  const requestId = hash(JSON.stringify([resolution.projectId, resolution.projectRoot,
+    resolution.destination, ownerId, cli, profile, consent.consentHash, sourceBytes]));
+  const operation = { op: 'delete_curated', projectId: resolution.projectId,
+    ownerId, memoryId, expectedVersion, requestId,
+    approval: { kind: 'approved', mode: 'explicit_mcp' } };
+  const request = { version: 1, requestId, sourceBytes, projectId: resolution.projectId,
+    projectRoot: resolution.projectRoot, destination: resolution.destination,
+    cli, profile, ownerId, consent, operation };
+  try {
+    return await withProjectLock(resolution.stateDir, async () => {
+      const file = fileFor(resolution, requestId);
+      const existing = await readPrivate(file);
+      if (existing && !isDeepStrictEqual({ ...existing, createdAt: undefined },
+        { ...request, createdAt: undefined })) return blocked('request_conflict');
+      if (!existing) await writePrivate(file, { ...request, createdAt: new Date().toISOString() });
+      return { kind: 'request', requestId, operation };
+    }, 'mcp-request.lock');
+  } catch { return blocked('request_unavailable'); }
+}
+
+async function sourceForExplicitMcpDelete(operation, resolution) {
+  if (operation?.op !== 'delete_curated' ||
+      operation.approval?.mode !== 'explicit_mcp' ||
+      !/^[a-f0-9]{64}$/.test(operation.requestId ?? '')) return blocked('mcp_source_unproved');
+  try {
+    const record = await readPrivate(fileFor(resolution, operation.requestId));
+    if (!record || !isDeepStrictEqual(record.operation, operation) ||
+        record.projectId !== resolution.projectId || record.ownerId !== resolution.ownerId ||
+        record.projectRoot !== resolution.projectRoot ||
+        !isDeepStrictEqual(record.destination, resolution.destination) ||
+        !sameConsent(record.consent, resolution.extractor?.autoPublishConsent) ||
+        resolution.extractor?.autoPublish !== true ||
+        hash(JSON.stringify([record.projectId, record.projectRoot, record.destination,
+          record.ownerId, record.cli, record.profile, record.consent?.consentHash,
+          record.sourceBytes])) !== operation.requestId ||
+        record.sourceBytes !== JSON.stringify({ operation: 'delete',
+          memory_id: operation.memoryId, target_version: operation.expectedVersion }) ||
+        !uuid.test(operation.memoryId ?? '') ||
+        !/^[a-f0-9]{64}$/.test(operation.expectedVersion ?? '')) return blocked('mcp_source_unproved');
+    return { kind: 'local_source', requestId: operation.requestId, record };
+  } catch { return blocked('mcp_source_unproved'); }
+}
+
 export async function sourceForExplicitMcp(operation, resolution) {
+  if (operation?.op === 'delete_curated') return sourceForExplicitMcpDelete(operation, resolution);
   if (operation?.metadata?.format_version !== 5 ||
       operation.metadata.review_mode !== 'explicit_mcp' ||
       operation.approval?.mode !== 'explicit_mcp' ||
@@ -136,7 +214,9 @@ export async function sourceForExplicitMcp(operation, resolution) {
     const args = JSON.parse(record.sourceBytes);
     if (args.text !== operation.text || args.type !== operation.metadata.type ||
         args.scope !== operation.metadata.scope ||
-        args.condition !== operation.metadata.condition) return blocked('mcp_source_unproved');
+        args.condition !== operation.metadata.condition ||
+        args.memory_id !== operation.metadata.supersedes_id ||
+        args.target_version !== operation.metadata.correction_target_version) return blocked('mcp_source_unproved');
     return { kind: 'local_source', requestId, record };
   } catch { return blocked('mcp_source_unproved'); }
 }

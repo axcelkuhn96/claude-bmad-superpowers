@@ -62,7 +62,7 @@ process.exit(2);
   return { dir, project, profile, env, state, calls };
 }
 
-test('Codex exposes remember and preserves unrelated TOML byte for byte', async t => {
+test('Codex exposes all six tools and preserves unrelated TOML byte for byte', async t => {
   const f = await fixture(t);
   const config = path.join(f.profile, 'config.toml');
   const other = '[other]\nvalue = "keep me"\n\n';
@@ -71,7 +71,7 @@ test('Codex exposes remember and preserves unrelated TOML byte for byte', async 
   const after = await fs.readFile(config, 'utf8');
   assert.ok(after.startsWith(other));
   assert.ok(after.endsWith('[tail]\nx = 1\n'));
-  assert.match(after, /\[mcp_servers\.cbs_memoria\][\s\S]*enabled_tools = \["search", "get", "status", "remember"\]/);
+  assert.match(after, /\[mcp_servers\.cbs_memoria\][\s\S]*enabled_tools = \["search", "get", "status", "remember", "update", "delete"\]/);
   assert.match(after, /\[mcp_servers\.cbs_memoria\][\s\S]*default_tools_approval_mode = "writes"/);
   assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).kind, 'existing');
   assert.equal(await fs.readFile(config, 'utf8'), after);
@@ -81,9 +81,9 @@ test('Codex exposes remember and preserves unrelated TOML byte for byte', async 
 test('Codex migrates the exact legacy allowlist and leaves conflicting servers unchanged', async t => {
   const f = await fixture(t);
   const config = path.join(f.profile, 'config.toml');
-  await fs.writeFile(config, '[mcp_servers.cbs_memoria]\nenabled_tools = ["search", "get", "status"]\ndefault_tools_approval_mode = "writes"\n');
+  await fs.writeFile(config, '[mcp_servers.cbs_memoria]\nenabled_tools = ["search", "get", "status", "remember"]\ndefault_tools_approval_mode = "writes"\n');
   assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).kind, 'registered');
-  assert.match(await fs.readFile(config, 'utf8'), /enabled_tools = \["search", "get", "status", "remember"\]/);
+  assert.match(await fs.readFile(config, 'utf8'), /enabled_tools = \["search", "get", "status", "remember", "update", "delete"\]/);
   assert.match(await fs.readFile(config, 'utf8'), /default_tools_approval_mode = "writes"/);
   const current = await fs.readFile(config, 'utf8');
   const state = await f.state();
@@ -164,7 +164,7 @@ test('Codex reconhece entrada legada node quando resolve ao mesmo runtime', asyn
   await fs.writeFile(path.join(f.profile, 'config.toml'), '[mcp_servers.cbs_memoria]\ncommand = "node"\n');
   assert.equal((await registerReadonlyMcp(f.project, 'codex', { env: f.env })).kind, 'existing');
   assert.match(await fs.readFile(path.join(f.profile, 'config.toml'), 'utf8'),
-    /enabled_tools = \["search", "get", "status", "remember"\]/);
+    /enabled_tools = \["search", "get", "status", "remember", "update", "delete"\]/);
   assert.equal((await f.calls()).filter(call => call.args[1] === 'add').length, 0);
 });
 

@@ -1,6 +1,6 @@
 ---
 name: memoria
-description: Use quando o usuário pedir para buscar, consultar ou guardar algo na memória do projeto, ou iniciar sob demanda o serviço Mem0 já selecionado.
+description: Use quando o usuário pedir para buscar, consultar, guardar, editar, corrigir, apagar ou excluir algo na memória do projeto, ou iniciar sob demanda o serviço Mem0 já selecionado.
 ---
 
 # Memória CBS
@@ -20,6 +20,14 @@ Quando o usuário pedir **explicitamente** “guarde”, “salve”, “lembre 
 Esse pedido explícito não espera cinco trocas nem chama Haiku. A ferramenta envia o texto fornecido pelo agente ao MCP, com proveniência `mcp_agent`/`assistant_report` e `explicit_mcp`; essa proveniência não comprova citação literal do usuário nem revisão humana. Só confirme “gravado no Qdrant” se a resposta for `kind: "stored"` com confirmação remota. `kind: "duplicate"` com ID remoto significa que o mesmo conteúdo já está guardado; não anuncie uma nova gravação. Se vier `blocked`, `pending` ou `unavailable`, relate o estado e o motivo sem afirmar que foi salvo.
 
 Se `remember` não aparecer no catálogo da sessão, diga que a ferramenta de escrita ainda não foi carregada e peça uma nova sessão após atualizar/ativar o CBS. Não use `status`, busca, CLI, arquivo de memória local ou `MEMORY.md` como substituto silencioso de gravação. Se o usuário mencionar conteúdo anterior da conversa ou um arquivo, confira o conteúdo necessário antes de montar `text`; não invente dados ausentes.
+
+## Editar ou apagar a pedido
+
+Quando o usuário pedir **explicitamente** para editar, corrigir, apagar ou excluir uma memória curada, identifique o alvo pelo ID UUID da curadoria. Se o alvo estiver ambíguo, use `search` com `source: "curated"` e `get` para conferir o texto antes de agir; não escolha uma memória por aproximação. Não chame `update` ou `delete` por iniciativa própria. Nunca aplique essas ferramentas ao histórico bruto Claude-mem.
+
+Para editar, chame `mcp__cbs_memoria__update` com `memory_id` e o novo `text` fiel ao pedido. `type` e `condition` são opcionais; omitidos, conservam os valores anteriores, assim como o escopo. `kind: "updated"` com `memoryId` e `previousMemoryId` confirma a nova versão ativa e a anterior supersedida somente após ACK remoto. O texto novo conserva proveniência `assistant_report`/`explicit_mcp`, sem atribuição de fala literal ou revisão humana.
+
+Para apagar, chame `mcp__cbs_memoria__delete` com `memory_id`. `kind: "deleted"` confirma ausência remota do ponto específico no Qdrant. `kind: "absent"` indica que o alvo já não estava presente; não anuncie nova exclusão. Conflito, bloqueio ou indisponibilidade não confirmam alteração. As duas operações exigem projeto confiável, proprietário, escritor e consentimento vigentes. Exportações Markdown antigas são snapshots locais e não são reescritas automaticamente.
 
 ## Guardar automaticamente
 
