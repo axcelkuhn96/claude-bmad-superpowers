@@ -12,7 +12,8 @@ import { identifyProject } from './project-id.mjs';
 import { bindLaunch, resolveBoundLaunch } from './launch.mjs';
 import { bindSessionCheckoutProfile, recordSessionCheckout,
   readSessionCheckout } from './session-checkout.mjs';
-import { readWindowsBinary } from './windows-security.mjs';
+import { readWindowsBinary, deleteWindowsBinary } from './windows-security.mjs';
+import { createWindowsState } from './windows-state.mjs';
 import { nativeProfile } from './native-profile.mjs';
 import { currentExtractionSchedule } from './policy.mjs';
 import { withProjectLock } from './ledger.mjs';
@@ -253,16 +254,23 @@ const evidenceFile = (stateDir, cli, sessionId) => path.join(stateDir, 'sessions
 
 async function readHandoffEvidence(file, identity, allowExpired = false) {
   try {
-    const before = await fs.lstat(file);
-    if (!before.isFile() || before.isSymbolicLink() || before.uid !== process.getuid() ||
-        (before.mode & 0o077) || before.size > 8192) return null;
-    const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
-    try {
-      const opened = await handle.stat();
-      if (opened.dev !== before.dev || opened.ino !== before.ino ||
-          opened.size !== before.size) return null;
-      const value = JSON.parse(await handle.readFile('utf8'));
-      return value.checkoutFingerprint === identity.checkoutFingerprint &&
+    let value;
+    if (process.platform === 'win32') {
+      value = await createWindowsState(file).read();
+      if (Buffer.byteLength(JSON.stringify(value ?? '')) > 8192) return null;
+    } else {
+      const before = await fs.lstat(file);
+      if (!before.isFile() || before.isSymbolicLink() || before.uid !== process.getuid() ||
+          (before.mode & 0o077) || before.size > 8192) return null;
+      const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const opened = await handle.stat();
+        if (opened.dev !== before.dev || opened.ino !== before.ino ||
+            opened.size !== before.size) return null;
+        value = JSON.parse(await handle.readFile('utf8'));
+      } finally { await handle.close(); }
+    }
+    return value && value.checkoutFingerprint === identity.checkoutFingerprint &&
         value.ownerId === identity.ownerId &&
         value.cli === identity.cli && typeof value.sessionId === 'string' &&
         file === evidenceFile(path.dirname(path.dirname(file)), value.cli, value.sessionId) &&
@@ -272,8 +280,15 @@ async function readHandoffEvidence(file, identity, allowExpired = false) {
         value.messages.every(item => ['human', 'assistant'].includes(item.origin) &&
           typeof item.text === 'string' && Buffer.byteLength(item.text) <= 160 &&
           /^[a-f0-9]{64}$/.test(item.proofHash ?? '')) ? value : null;
-    } finally { await handle.close(); }
   } catch { return null; }
+}
+
+async function deleteHandoffEvidence(file) {
+  if (process.platform === 'win32') {
+    const observed = await readWindowsBinary(file, { length: 8192 });
+    if (observed.size !== observed.bytes.length) throw new Error('unsafe_handoff_evidence');
+    await deleteWindowsBinary(file, observed.fileId, observed.bytes);
+  } else await fs.rm(file, { force: true });
 }
 
 async function cleanupHandoffEvidence(stateDir, identity, began) {
@@ -282,12 +297,18 @@ async function cleanupHandoffEvidence(stateDir, identity, began) {
     identity.ownerId, identity.checkoutFingerprint])).digest('hex')}.handoff-gc-cursor`);
   let after = '';
   try {
-    const before = await fs.lstat(cursor);
-    if (!before.isFile() || before.uid !== process.getuid() || (before.mode & 0o077) ||
-        before.size > 128) return;
-    const handle = await fs.open(cursor, constants.O_RDONLY | constants.O_NOFOLLOW);
-    try { after = (await handle.readFile('utf8')).trim(); }
-    finally { await handle.close(); }
+    if (process.platform === 'win32') {
+      const value = await createWindowsState(cursor).read();
+      if (value !== null && (typeof value !== 'string' || Buffer.byteLength(value) > 128)) return;
+      after = value?.trim() ?? '';
+    } else {
+      const before = await fs.lstat(cursor);
+      if (!before.isFile() || before.uid !== process.getuid() || (before.mode & 0o077) ||
+          before.size > 128) return;
+      const handle = await fs.open(cursor, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try { after = (await handle.readFile('utf8')).trim(); }
+      finally { await handle.close(); }
+    }
     if (after && !/^[a-f0-9]{64}\.handoff-evidence\.json$/.test(after)) return;
   } catch (error) { if (error.code !== 'ENOENT') return; }
   if (performance.now() - began > 750) return;
@@ -303,11 +324,15 @@ async function cleanupHandoffEvidence(stateDir, identity, began) {
     const value = await readHandoffEvidence(file, identity, true);
     if (performance.now() - began > 750) break;
     if (value && Date.now() - Date.parse(value.at) > 7 * 24 * 60 * 60 * 1000) {
-      await fs.rm(file, { force: true });
+      await deleteHandoffEvidence(file);
     }
     last = name;
   }
   if (last !== after && performance.now() - began <= 750) {
+    if (process.platform === 'win32') {
+      await createWindowsState(cursor).write(`${last}\n`);
+      return;
+    }
     const temporary = `${cursor}.${randomUUID()}.tmp`;
     await fs.writeFile(temporary, `${last}\n`, { mode: 0o600, flag: 'wx' });
     try { await fs.rename(temporary, cursor); }
@@ -316,6 +341,10 @@ async function cleanupHandoffEvidence(stateDir, identity, began) {
 }
 
 async function writeHandoffEvidence(file, value) {
+  if (process.platform === 'win32') {
+    await createWindowsState(file).write(value);
+    return;
+  }
   const temporary = `${file}.${randomUUID()}.tmp`;
   const handle = await fs.open(temporary, 'wx', 0o600);
   try { await handle.writeFile(JSON.stringify(value) + '\n'); await handle.sync(); }
@@ -331,7 +360,7 @@ export async function updateHandoffFromCapture({ cli, event, payload, result,
   stateRoot: _stateRoot, began = performance.now() } = {}) {
   const proof = authenticatedHandoffCapture({ cli, event, payload, result });
   const hasTime = () => performance.now() - began < 800;
-  if (!proof || process.platform === 'win32' || !hasTime()) return null;
+  if (!proof || !hasTime()) return null;
   const lockName = `handoff-${createHash('sha256').update(JSON.stringify([cli, proof.sessionId]))
     .digest('hex').slice(0, 32)}.lock`;
   try {
@@ -394,7 +423,7 @@ export async function updateHandoffFromCapture({ cli, event, payload, result,
       const saved = await saveHandoff(proof.stateDir, { identity: proof.identity,
         handoff, event, at: proof.capturedAt, hasTime });
       if (saved.kind === 'saved' && hasTime() && ['SessionEnd', 'Interrupt'].includes(event)) {
-        await fs.rm(file, { force: true }).catch(() => {});
+        await deleteHandoffEvidence(file).catch(() => {});
       } else if (saved.kind === 'saved' && hasTime() && event === 'SessionStart') {
         await cleanupHandoffEvidence(proof.stateDir, proof.identity, began).catch(() => {});
       }

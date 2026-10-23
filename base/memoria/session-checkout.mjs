@@ -92,13 +92,24 @@ export async function recordSessionCheckout(resolution, cli, sessionId, nativeRo
   if (process.platform === 'win32') {
     if (!(await ensureWindowsPrivateDirectory(path.dirname(file))).ok) return blocked('unsafe_session_checkout');
     const prior = await readSessionCheckout(resolution.stateDir, cli, sessionId);
-    if (prior.kind === 'bound') return Object.entries(expected).every(([key, value]) => prior[key] === value)
+    if (prior.kind === 'bound') return Object.entries(expected).every(([key, value]) =>
+      key === 'handoffIdentity' ? JSON.stringify(prior[key]) === JSON.stringify(value) : prior[key] === value)
       ? prior : blocked('session_checkout_changed');
     if (prior.reason !== 'missing_session_checkout') return prior;
+    if (resolution.ownerId) {
+      try {
+        expected.handoffIdentity = await captureHandoffIdentity({
+          projectId: resolution.projectId, ownerId: resolution.ownerId,
+          nativeRoot, projectRoot: resolution.projectRoot, cli,
+          sourceSessionId: sessionId,
+        });
+      } catch { /* Git identity unavailable: keep ordinary capture working. */ }
+    }
     try { await publishWindowsBinary(file, Buffer.from(JSON.stringify(expected) + '\n')); }
     catch (error) { if (error.message !== 'windows_publish_failed') return blocked('session_checkout_write_failed'); }
     const saved = await readSessionCheckout(resolution.stateDir, cli, sessionId);
-    return saved.kind === 'bound' && Object.entries(expected).every(([key, value]) => saved[key] === value)
+    return saved.kind === 'bound' && Object.entries(expected).every(([key, value]) =>
+      key === 'handoffIdentity' ? JSON.stringify(saved[key]) === JSON.stringify(value) : saved[key] === value)
       ? saved : blocked('session_checkout_changed');
   }
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -115,7 +126,7 @@ export async function recordSessionCheckout(resolution, cli, sessionId, nativeRo
   if (prior.reason !== 'missing_session_checkout') return prior;
   // This identity belongs to the native session, not the current branch at a
   // later Stop. Older bindings and unknown owners remain ineligible.
-  if (resolution.ownerId && process.platform !== 'win32') {
+  if (resolution.ownerId) {
     try {
       expected.handoffIdentity = await captureHandoffIdentity({
         projectId: resolution.projectId, ownerId: resolution.ownerId,

@@ -4,6 +4,9 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createWindowsState } from './windows-state.mjs';
+import { ensureWindowsPrivateDirectory, inspectWindowsPath, readWindowsBinary,
+  publishWindowsBinary, deleteWindowsBinary } from './windows-security.mjs';
 
 const runFile = promisify(execFile);
 const sha = text => createHash('sha256').update(text).digest('hex');
@@ -81,7 +84,18 @@ async function currentCheckout(identity) {
 }
 
 async function privateDir(dir, create = false) {
-  if (process.platform === 'win32' || !process.getuid || !path.isAbsolute(dir)) throw new Error('unsafe_handoff_dir');
+  if (!path.isAbsolute(dir)) throw new Error('unsafe_handoff_dir');
+  if (process.platform === 'win32') {
+    const result = create ? await ensureWindowsPrivateDirectory(dir) :
+      await inspectWindowsPath(dir, 'directory');
+    if (!result.ok) {
+      const error = new Error('unsafe_handoff_dir');
+      if (result.code === 'missing') error.code = 'ENOENT';
+      throw error;
+    }
+    return;
+  }
+  if (!process.getuid) throw new Error('unsafe_handoff_dir');
   if (create) await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const st = await fs.lstat(dir);
   if (!st.isDirectory() || st.uid !== process.getuid() || (st.mode & 0o077)) {
@@ -95,6 +109,21 @@ async function privateRoot(stateDir, create = false) {
   return dir;
 }
 async function privateRead(file, limit = 1024 * 1024) {
+  if (process.platform === 'win32') {
+    if (file.endsWith('.md')) {
+      const observed = await readWindowsBinary(file, { length: limit });
+      if (observed.size !== observed.bytes.length || observed.size > limit) throw new Error('unsafe_handoff_file');
+      return observed.bytes.toString('utf8');
+    }
+    const value = await createWindowsState(file).read();
+    if (value === null) {
+      const error = new Error('missing_handoff_file');
+      error.code = 'ENOENT';
+      throw error;
+    }
+    if (typeof value !== 'string' || Buffer.byteLength(value) > limit) throw new Error('unsafe_handoff_file');
+    return value;
+  }
   const before = await fs.lstat(file);
   if (!before.isFile() || before.uid !== process.getuid() || (before.mode & 0o077) ||
       before.size > limit) throw new Error('unsafe_handoff_file');
@@ -107,6 +136,11 @@ async function privateRead(file, limit = 1024 * 1024) {
   } finally { await handle.close(); }
 }
 async function atomicWrite(file, content) {
+  if (process.platform === 'win32') {
+    if (file.endsWith('.md')) await publishWindowsBinary(file, Buffer.from(content));
+    else await createWindowsState(file).write(content);
+    return;
+  }
   const tmp = `${file}.${randomUUID()}.tmp`;
   const handle = await fs.open(tmp, 'wx', 0o600);
   try { await handle.writeFile(content); await handle.sync(); }
@@ -116,6 +150,13 @@ async function atomicWrite(file, content) {
   catch (error) { await fs.rm(tmp, { force: true }); throw error; }
   const dir = await fs.open(path.dirname(file), 'r');
   try { await dir.sync(); } finally { await dir.close(); }
+}
+async function privateDelete(file) {
+  if (process.platform === 'win32') {
+    const observed = await readWindowsBinary(file, { length: 1024 * 1024 });
+    if (observed.size !== observed.bytes.length) throw new Error('unsafe_handoff_file');
+    await deleteWindowsBinary(file, observed.fileId, observed.bytes);
+  } else await fs.unlink(file);
 }
 async function readRow(dir, identity) {
   try {
@@ -167,7 +208,7 @@ async function cleanupExpired(dir, identity, now, hasTime = () => true) {
     if (!row || !hasTime()) return;
     if (row.identity.sourceSessionId !== identity.sourceSessionId &&
         now - Date.parse(row.at) > TTL) {
-      try { await fs.unlink(path.join(dir, name)); }
+      try { await privateDelete(path.join(dir, name)); }
       catch { /* A concurrent change is left for a later write. */ }
     } else if (row.handoff) referenced.add(row.handoff.contentHash);
     last = name;
@@ -198,9 +239,10 @@ async function cleanupExpired(dir, identity, now, hasTime = () => true) {
     try { stat = await fs.lstat(file); } catch { continue; }
     if (!hasTime()) break;
     lastMarkdown = name;
-    if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) ||
+    if (!stat.isFile() || process.platform !== 'win32' &&
+        (stat.uid !== process.getuid() || (stat.mode & 0o077)) ||
         Date.now() - stat.mtimeMs <= TTL || referenced.has(name.slice(65, -3))) continue;
-    try { await fs.unlink(file); }
+    try { await privateDelete(file); }
     catch { /* A concurrent change is left for a later write. */ }
   }
   if (hasTime() && markdowns.length > limit && lastMarkdown) {

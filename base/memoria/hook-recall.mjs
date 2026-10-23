@@ -36,8 +36,7 @@ export async function deliverHandoffAtSessionStart({ cli, payload, result,
   stateRoot: _stateRoot, began = performance.now(), write = nativeWrite,
   now = () => new Date().toISOString() } = {}) {
   const proof = authenticatedHandoffCapture({ cli, event: 'SessionStart', payload, result });
-  if (!proof || process.platform === 'win32' ||
-      typeof payload?.prompt === 'string' && payload.prompt.trim()) return null;
+  if (!proof || typeof payload?.prompt === 'string' && payload.prompt.trim()) return null;
   const remaining = () => Math.floor(900 - (performance.now() - began));
   if (remaining() < 75) return null;
   let timer;
