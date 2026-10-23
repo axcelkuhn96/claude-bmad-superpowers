@@ -2,6 +2,11 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [0.16.1] - 2026-10-23
+
+### Publicação
+- Publicação do código 0.16.0 com versão patch porque 0.16.0 permaneceu reservada no staging.
+
 ## [0.16.0] - 2026-10-22
 
 ### Adicionado
