@@ -28,6 +28,30 @@ def responses(data):
 
 
 class WorkerReadinessTest(unittest.TestCase):
+    def test_curated_mutations_pass_worker_dispatch_and_invalid_ops_stay_blocked(self):
+        adapter = ModuleType('mem0_adapter')
+        adapter.PinnedTransport = lambda connection: httpx.MockTransport(
+            lambda request: httpx.Response(200, json={}))
+        calls = []
+        def execute(request, client, state):
+            calls.append(request['op'])
+            return {'kind': 'item' if request['op'] == 'mutation_target' else 'deleted'}
+        adapter.execute = execute
+        script = Path(__file__).resolve().parents[1] / 'base/memoria/python/worker.py'
+        spec = importlib.util.spec_from_file_location('mem0_worker_mutation_test', script)
+        worker = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'mem0_adapter': adapter}):
+            spec.loader.exec_module(worker)
+            for op, expected in [('mutation_target', 'item'), ('delete_curated', 'deleted')]:
+                request = {'op': op, 'state': '/tmp',
+                           'connection': {'url': 'https://fixture.invalid/'}}
+                self.assertEqual(worker.execute_one(request, b'fixture-key')['kind'], expected)
+                self.assertEqual(worker.execute_one(request, b''),
+                                 {'kind': 'blocked', 'reason': 'invalid_operation'})
+            self.assertEqual(worker.execute_one({'op': 'not_allowed'}, b'fixture-key'),
+                             {'kind': 'blocked', 'reason': 'invalid_operation'})
+        self.assertEqual(calls, ['mutation_target', 'delete_curated'])
+
     def test_exact_duplicate_lookup_reaches_adapter_without_writing(self):
         adapter = ModuleType('mem0_adapter')
         adapter.PinnedTransport = lambda connection: httpx.MockTransport(

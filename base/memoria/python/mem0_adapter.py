@@ -251,6 +251,15 @@ def _memory(client, collection: str, state: Path, connection: dict, history_db_p
     return Memory(config)
 
 
+def _point_metadata(payload: dict) -> dict:
+    metadata = {key: value for key, value in payload.items() if key not in
+                ('data', 'user_id', 'run_id')}
+    if 'context_generated' in metadata and not _valid_generated_context(
+            metadata['context_generated'], metadata.get('source_refs')):
+        metadata.pop('context_generated')
+    return metadata
+
+
 def _row(raw: dict | None, client, collection: str, embedder) -> dict | None:
     if raw is None:
         return None
@@ -275,9 +284,7 @@ def _row(raw: dict | None, client, collection: str, embedder) -> dict | None:
         raise ValueError('remote_payload_unverified')
     if payload.get('context_generated') != metadata.get('context_generated'):
         raise ValueError('remote_context_unverified')
-    if 'context_generated' in metadata and not _valid_generated_context(
-            metadata['context_generated'], metadata.get('source_refs')):
-        metadata = {key: value for key, value in metadata.items() if key != 'context_generated'}
+    metadata = _point_metadata(payload)
     return {'sdkId': identifier, 'qdrantId': str(points[0].id), 'externalId': metadata.get('source_record_id'),
             'projectId': raw.get('user_id'), 'status': metadata.get('status'), 'text': raw.get('memory'),
             'metadata': metadata, 'sessionId': raw.get('run_id'),
@@ -597,11 +604,7 @@ def validate_curated_payload(point, project: str, owner: str | None,
             return None
     except (ValueError, TypeError):
         return None
-    metadata = {key: value for key, value in payload.items() if key not in
-                ('data', 'user_id', 'run_id')}
-    if 'context_generated' in metadata and not _valid_generated_context(
-            metadata['context_generated'], metadata.get('source_refs')):
-        metadata.pop('context_generated')
+    metadata = _point_metadata(payload)
     return {'sdkId': identifier, 'qdrantId': identifier, 'externalId': external,
             'projectId': project, 'status': status, 'text': text, 'metadata': metadata,
             **({'historyState': 'superseded' if status == 'superseded' else 'expired' if expired else 'active'}

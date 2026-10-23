@@ -273,6 +273,7 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
         automaticWriteConfigured, manualWriteConfigured: false };
     }
     if (name === 'update' || name === 'delete') {
+      const memoryId = args.memory_id.toLowerCase();
       try {
         const current = await writeReady();
         if (current.kind !== 'ready') return blocked(current.reason);
@@ -289,14 +290,14 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
           return freshWriter.kind === 'writer' ? { kind: 'allowed' } :
             blocked(freshWriter.reason ?? 'writer_not_designated');
         };
-        const found = await dispatch({ op: 'mutation_target', memoryId: args.memory_id,
+        const found = await dispatch({ op: 'mutation_target', memoryId,
           ownerId: current.ownerId }, auth, beforeDispatch);
-        if (found.kind === 'absent' && found.memoryId === args.memory_id) {
-          return name === 'delete' ? { kind: 'absent', memoryId: args.memory_id }
+        if (found.kind === 'absent' && found.memoryId === memoryId) {
+          return name === 'delete' ? { kind: 'absent', memoryId }
             : { kind: 'conflict', reason: 'target_absent' };
         }
         const target = found.item;
-        if (found.kind !== 'item' || target?.sdkId !== args.memory_id ||
+        if (found.kind !== 'item' || target?.sdkId !== memoryId ||
             target.projectId !== current.projectId || target.status !== 'active' ||
             !targetVersion(target) ||
             target.metadata?.scope === 'personal' && target.metadata.owner_id !== current.ownerId) {
@@ -305,14 +306,14 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
         if (name === 'delete') {
           const source = await createExplicitMcpDeleteRequest({ resolution: current.resolution,
             cli, profile, ownerId: current.ownerId, consent: current.consent,
-            memoryId: args.memory_id, expectedVersion: targetVersion(target) });
+            memoryId, expectedVersion: targetVersion(target) });
           if (source.kind !== 'request') return blocked(source.reason);
           const result = await dispatch(source.operation, auth, beforeDispatch, source.operation);
-          if (result.kind === 'deleted' && result.memoryId === args.memory_id) {
-            return { kind: 'deleted', memoryId: args.memory_id };
+          if (result.kind === 'deleted' && result.memoryId === memoryId) {
+            return { kind: 'deleted', memoryId };
           }
-          if (result.kind === 'absent' && result.memoryId === args.memory_id) {
-            return { kind: 'absent', memoryId: args.memory_id };
+          if (result.kind === 'absent' && result.memoryId === memoryId) {
+            return { kind: 'absent', memoryId };
           }
           return result.kind === 'conflict' ? result : blocked(result.reason ?? 'remote_ack_unconfirmed');
         }
@@ -348,14 +349,14 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
           return result?.kind === 'conflict' ? result : blocked(result?.reason ?? 'remote_ack_unconfirmed');
         }
         const previous = await dispatch({ op: 'read', projectId: current.projectId,
-          sdkId: args.memory_id }, auth, beforeDispatch, source.operation);
+          sdkId: memoryId }, auth, beforeDispatch, source.operation);
         if (previous.kind !== 'item' || previous.item?.status !== 'superseded' ||
             previous.item?.metadata?.superseded_by !== result.sdkId ||
             previous.item?.metadata?.superseded_by_external_id !== source.operation.externalId) {
           return blocked('supersede_unconfirmed');
         }
         return { kind: 'updated', memoryId: result.sdkId,
-          previousMemoryId: args.memory_id };
+          previousMemoryId: memoryId };
       } catch { return blocked('mutation_failed'); }
     }
     if (name === 'remember') {

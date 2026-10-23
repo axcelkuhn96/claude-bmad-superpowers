@@ -164,6 +164,68 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(adapter.execute(request, object(), Path('/tmp'))['item']['status'], 'active')
             self.assertEqual(memory.calls, [old_id, new_id])
 
+    def test_activate_correction_accepts_version_from_qdrant_with_sdk_get_shape(self):
+        old_id = '64eef286-9f7e-4326-b137-5658f0286c46'
+        new_id = '64eef286-9f7e-4326-b137-5658f0286c48'
+        common = {'user_id': 'p', 'project_id': 'p', 'scope': 'personal',
+                  'owner_id': 'alice', 'source': 'message', 'actor': 'human',
+                  'origin': 'user_direct', 'speaker_role': 'user',
+                  'evidence_at': '2026-10-20T00:00:00Z',
+                  'created_at': '2026-10-20T00:00:00Z',
+                  'updated_at': '2026-10-20T00:00:00Z',
+                  'hash': 'sdk-content-hash', 'text_lemmatized': 'content'}
+        payloads = {old_id: {**common, 'data': 'old memory', 'status': 'active',
+                             'source_record_id': 'source-1'},
+                    new_id: {**common, 'data': 'new memory', 'status': 'pending',
+                             'source_record_id': 'source-2', 'supersedes_id': old_id,
+                             'correction_target_external_id': 'source-1'}}
+
+        class Client:
+            def retrieve(self, collection_name, ids, **kwargs):
+                return [SimpleNamespace(id=identifier, payload=payloads[identifier],
+                                        vector=[0.1] * 384)
+                        for identifier in ids if identifier in payloads]
+
+        class Embedder:
+            def embed(self, text, action):
+                return [0.1] * 384
+
+        class Memory:
+            embedding_model = Embedder()
+            def get(self, identifier):
+                payload = payloads[identifier]
+                # Memory.get promotes these Qdrant payload fields out of metadata.
+                excluded = {'data', 'hash', 'created_at', 'updated_at', 'id',
+                            'text_lemmatized', 'user_id', 'run_id'}
+                return {'id': identifier, 'memory': payload['data'],
+                        'hash': payload['hash'], 'created_at': payload['created_at'],
+                        'updated_at': payload['updated_at'], 'user_id': payload['user_id'],
+                        'metadata': {k: v for k, v in payload.items() if k not in excluded}}
+            def update(self, identifier, metadata):
+                payloads[identifier].update(metadata)
+                payloads[identifier]['updated_at'] = '2026-10-21T00:00:00Z'
+
+        client = Client()
+        target_request = {'op': 'mutation_target', 'collection': 'c',
+                          'projectId': 'p', 'ownerId': 'alice', 'memoryId': old_id,
+                          'connection': {}}
+        activate_request = {'op': 'activate', 'collection': 'c', 'projectId': 'p',
+                            'sdkId': new_id, 'externalId': 'source-2', 'connection': {}}
+        with patch.object(adapter, 'verify_collection'), \
+             patch.object(adapter, '_memory', return_value=Memory()):
+            target = adapter.execute(target_request, client, Path('/tmp'))['item']
+            payloads[new_id]['correction_target_version'] = adapter._target_version(target)
+            payloads[old_id]['actor'] = 'changed'
+            with self.assertRaisesRegex(ValueError, 'target_changed'):
+                adapter.execute(activate_request, client, Path('/tmp'))
+            self.assertEqual(payloads[old_id]['status'], 'active')
+            self.assertEqual(payloads[new_id]['status'], 'pending')
+            payloads[old_id]['actor'] = 'human'
+            self.assertEqual(adapter.execute(activate_request, client, Path('/tmp'))['item']['status'],
+                             'active')
+            self.assertEqual(payloads[old_id]['status'], 'superseded')
+            self.assertEqual(payloads[old_id]['superseded_by'], new_id)
+
     def test_generated_context_requires_qualified_ref_hash_and_is_optional(self):
         refs = [{'message_id': 'u1', 'origin': 'human', 'source_text_sha256': 'a' * 64,
                  'excerpt': 'Use tenant filters.'},

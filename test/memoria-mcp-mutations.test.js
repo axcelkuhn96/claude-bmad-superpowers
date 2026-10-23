@@ -148,7 +148,7 @@ test('MCP update supersedes only the selected active memory after remote ACK', a
       }
       throw Error(`unexpected ${request.op}`);
     } })));
-  const result = await mcp.call('update', { memory_id: id, text: 'New text' });
+  const result = await mcp.call('update', { memory_id: id.toUpperCase(), text: 'New text' });
   assert.deepEqual(result, { kind: 'updated', memoryId: nextId, previousMemoryId: id });
   assert.equal(rows.get(id).status, 'superseded');
   assert.equal(rows.get(nextId).metadata.type, 'rule');
@@ -178,9 +178,9 @@ test('MCP delete confirms target absence and leaves other memories untouched', a
       }
       throw Error(`unexpected ${request.op}`);
     } })));
-  assert.deepEqual(await mcp.call('delete', { memory_id: id }),
+  assert.deepEqual(await mcp.call('delete', { memory_id: id.toUpperCase() }),
     { kind: 'deleted', memoryId: id });
-  assert.deepEqual(await mcp.call('delete', { memory_id: id }),
+  assert.deepEqual(await mcp.call('delete', { memory_id: id.toUpperCase() }),
     { kind: 'absent', memoryId: id });
   assert.equal(deletions, 1);
   assert.deepEqual([...rows.keys()], [other]);
