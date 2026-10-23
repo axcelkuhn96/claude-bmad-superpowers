@@ -1,11 +1,33 @@
-import test, { mock } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
+if (process.env.CBS_WINDOWS_HANDOFF_TEST_CHILD !== '1') {
+  test('Windows handoff simulation runs with module mocks when supported', t => {
+    const flag = '--experimental-test-module-mocks';
+    const probe = spawnSync(process.execPath, [flag, '-e',
+      "if (typeof require('node:test').mock?.module !== 'function') process.exit(2)"], { encoding: 'utf8' });
+    if (probe.status === 2 || /bad option: --experimental-test-module-mocks/.test(probe.stderr)) {
+      t.skip(`module mocks unavailable on ${process.version}: ${probe.stderr.trim() || `exit ${probe.status}`}`);
+      return;
+    }
+    assert.equal(probe.status, 0, `${probe.stdout}\n${probe.stderr}`);
+    const { NODE_TEST_CONTEXT, ...env } = process.env;
+    const run = spawnSync(process.execPath, [flag, '--test', fileURLToPath(import.meta.url)], {
+      encoding: 'utf8',
+      env: { ...env, CBS_WINDOWS_HANDOFF_TEST_CHILD: '1' },
+    });
+    assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
+    assert.match(run.stdout, /WINDOWS_HANDOFF_SIMULATION_EXECUTED/);
+  });
+} else {
+
+const { mock } = test;
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const privateDirectory = async dir => {
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -104,5 +126,7 @@ test('Windows handoff uses private transport and acknowledges only after deliver
     await fs.chmod(path.join(state, 'handoff-auto'), 0o755);
     assert.equal((await prepareHandoff(state,
       { ...target, now: '2026-10-22T12:01:00.000Z' })).reason, 'unsafe_state');
+    console.log('WINDOWS_HANDOFF_SIMULATION_EXECUTED');
   } finally { Object.defineProperty(process, 'platform', platform); }
 });
+}
