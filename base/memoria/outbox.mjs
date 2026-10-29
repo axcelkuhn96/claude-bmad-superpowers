@@ -742,6 +742,9 @@ export function createOutbox(stateDir, options = {}) {
           if (++count > 65536 || entry.isSymbolicLink()) throw new Error('unsafe_outbox_entry');
           const file = path.join(dir, entry.name);
           if (entry.isDirectory()) await visit(file);
+          // The held kernel lock is open for write, so a FILE_SHARE_READ-only open of it
+          // fails with a sharing violation; it is a fixed-size marker, counted as one block.
+          else if (entry.isFile() && file === kernelLock) total += blockSize;
           else if (entry.isFile()) {
             const observed = await readWindowsBinary(file, { length: 0 });
             total += Math.max(observed.allocatedBytes, allocated(observed.size));

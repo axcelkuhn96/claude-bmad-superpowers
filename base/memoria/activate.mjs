@@ -5,8 +5,8 @@ import { activateProject } from './setup.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
 
 export async function main(args = process.argv.slice(2)) {
-  if (process.platform !== 'linux') {
-    process.stdout.write(`blocked: ${process.platform === 'win32' ? 'windows_release_unproved' : 'platform_unproved'}\n`);
+  if (!['linux', 'win32'].includes(process.platform)) {
+    process.stdout.write('blocked: platform_unproved\n');
     return 1;
   }
   const cli = args.includes('--cli') ? args[args.indexOf('--cli') + 1] : undefined;

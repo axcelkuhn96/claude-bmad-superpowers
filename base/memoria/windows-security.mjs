@@ -11,7 +11,7 @@ import { createRequire } from 'node:module';
 const runFile = promisify(execFile);
 const nativeFile = new URL('./bin/windows-native-x64.node', import.meta.url);
 const requireNative = createRequire(import.meta.url);
-export const WINDOWS_NATIVE_SHA256 = '97933936be122f9b2cefc4c8b8aeb79f5e1b5a74548c44b645bc2db5a5a329d1';
+export const WINDOWS_NATIVE_SHA256 = '33b49cb893fdeba04a2a598595e40c9232bb38185962b18f70cd902073c69978';
 
 export function windowsGitPattern(root, target) {
   const relative = path.win32.relative(windowsPathKey(root), windowsPathKey(target));
@@ -72,17 +72,20 @@ public static class CbsFileHandle {
       throw new InvalidOperationException("delete");
   }
   public static int RenameNew(SafeFileHandle handle, string target) {
-    byte[] name = Encoding.Unicode.GetBytes(target);
+    // kernel32 reads FileName as a NUL-terminated string and FileRenameInfo ignores the
+    // long-path opt-in: without the terminator, heap bytes were appended to the target name.
+    byte[] name = Encoding.Unicode.GetBytes(@"\\?\" + target);
     int root = Marshal.OffsetOf(typeof(RenameInfo), "RootDirectory").ToInt32();
     int length = Marshal.OffsetOf(typeof(RenameInfo), "FileNameLength").ToInt32();
     int offset = Marshal.OffsetOf(typeof(RenameInfo), "FileName").ToInt32();
-    IntPtr value = Marshal.AllocHGlobal(offset + name.Length);
+    IntPtr value = Marshal.AllocHGlobal(offset + name.Length + 2);
     try {
       Marshal.WriteInt32(value, 0, 0);
       Marshal.WriteIntPtr(value, root, IntPtr.Zero);
       Marshal.WriteInt32(value, length, name.Length);
       Marshal.Copy(name, 0, IntPtr.Add(value, offset), name.Length);
-      return SetFileInformationByHandleRaw(handle, 3, value, (uint)(offset + name.Length))
+      Marshal.WriteInt16(value, offset + name.Length, 0);
+      return SetFileInformationByHandleRaw(handle, 3, value, (uint)(offset + name.Length + 2))
         ? 0 : Marshal.GetLastWin32Error();
     } finally { Marshal.FreeHGlobal(value); }
   }
@@ -177,10 +180,18 @@ function Audit([string]$value, [string]$kind, [bool]$privateState = $true,
   if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { throw 'owner' }
   if (($privateState -and !$acl.AreAccessRulesProtected) -or !$acl.AreAccessRulesCanonical) { throw 'dacl' }
   $allowed = @($sid.Value, 'S-1-5-18', 'S-1-5-32-544')
+  # Outside private state only integrity matters: a read/execute-only grant to another
+  # principal (e.g. CodexSandboxUsers inherited under the profile) cannot alter the object.
+  $mutating = [int64]([System.Security.AccessControl.FileSystemRights]'WriteData,AppendData,WriteExtendedAttributes,WriteAttributes,Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership') -bor
+    [int64]0x10000000 -bor [int64]0x40000000
   $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
   $ownerRead = $false
   $ownerWrite = $false
   foreach ($rule in $rules) {
+    if (!$privateState -and
+        $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+        $rule.IdentityReference.Value -notin $allowed -and
+        (([int64]$rule.FileSystemRights -band $mutating) -eq 0)) { continue }
     if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
         $rule.IdentityReference.Value -notin $allowed) { throw 'dacl' }
     if ($rule.IdentityReference.Value -eq $sid.Value) {
@@ -243,8 +254,9 @@ function AuditTool([string]$value, $roots) {
   }
   return @{ trustedTool = $true }
 }
+function Invoke-CbsRequest([string]$raw) {
 try {
-  $inputValue = [Console]::In.ReadToEnd() | ConvertFrom-Json
+  $inputValue = $raw | ConvertFrom-Json
   $target = SafePath ([string]$inputValue.path)
   switch ([string]$inputValue.action) {
     'inspect' { Result $true 'safe' (Audit $target ([string]$inputValue.kind) ([bool]$inputValue.privateState)); break }
@@ -335,6 +347,12 @@ try {
       'invalid_text','unsupported_windows_replace')) { $_.Exception.Message } else { 'security_error' }
   Result $false $code
 }
+}
+# One single-line JSON request per stdin line, one single-line JSON result per request.
+while ($null -ne ($cbsRequest = [Console]::In.ReadLine())) {
+  Invoke-CbsRequest $cbsRequest
+  [Console]::Out.Flush()
+}
 `;
 
 export function windowsPathKey(value) {
@@ -401,41 +419,98 @@ async function powershellExe() {
   return path.win32.join(windows, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 }
 
-function powershellArgs(program) {
+// The encoded program exceeds the 32,767-char Windows command line (ENAMETOOLONG),
+// so argv carries only a bootstrap that reads the program from the first stdin line.
+const POWERSHELL_BOOTSTRAP = '$cbsProgram = [Console]::In.ReadLine(); ' +
+  '. ([ScriptBlock]::Create([System.Text.Encoding]::UTF8.GetString(' +
+  '[System.Convert]::FromBase64String($cbsProgram))))';
+const HELPER_REQUEST_TIMEOUT_MS = 7000;
+const HELPER_OUTPUT_LIMIT = 2 * 1024 * 1024;
+
+function powershellArgs() {
   return ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
-    Buffer.from(program, 'utf16le').toString('base64')];
+    Buffer.from(POWERSHELL_BOOTSTRAP, 'utf16le').toString('base64')];
+}
+
+// One helper per Node process: PowerShell startup plus Add-Type cost ~0.65 s per spawn,
+// which made a single outbox enqueue take ~24 s. Requests are serialized over the same
+// private pipes; a timeout, oversized output or exit discards the helper for a fresh one.
+let helper = null;
+let helperTurn = Promise.resolve();
+
+async function startHelper() {
+  const command = await powershellExe();
+  const { windows } = await systemLocations();
+  const child = spawn(command, powershellArgs(), { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true,
+    env: { SystemRoot: windows, WINDIR: windows, TEMP: os.tmpdir(), PATH: '' } });
+  const state = { child, buffer: '', waiting: null, dead: false };
+  const fail = () => {
+    state.dead = true;
+    if (helper === state) helper = null;
+    state.waiting?.(null);
+    state.waiting = null;
+  };
+  child.once('error', fail);
+  child.once('close', fail);
+  child.stdin.on('error', fail);
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', chunk => {
+    state.buffer += chunk;
+    if (state.buffer.length > HELPER_OUTPUT_LIMIT) { child.kill(); return; }
+    const end = state.buffer.indexOf('\n');
+    if (end < 0 || !state.waiting) return;
+    const line = state.buffer.slice(0, end);
+    state.buffer = state.buffer.slice(end + 1);
+    const deliver = state.waiting;
+    state.waiting = null;
+    deliver(line);
+  });
+  child.stdin.write(Buffer.from(WINDOWS_SECURITY_PROGRAM, 'utf8').toString('base64') + '\n');
+  return state;
+}
+
+function setHelperRef(state, active) {
+  for (const handle of [state.child, state.child.stdin, state.child.stdout]) {
+    if (active) handle.ref?.(); else handle.unref?.();
+  }
+}
+
+async function helperRequest(request) {
+  if (!helper || helper.dead) helper = await startHelper();
+  const state = helper;
+  setHelperRef(state, true);
+  try {
+    return await new Promise(resolve => {
+      const timer = setTimeout(() => { state.child.kill(); }, HELPER_REQUEST_TIMEOUT_MS);
+      state.waiting = line => { clearTimeout(timer); resolve(line); };
+      if (state.dead) { state.waiting(null); return; }
+      state.child.stdin.write(request + '\n');
+    });
+  } finally { if (!state.dead) setHelperRef(state, false); }
 }
 
 async function invoke(action, file, extra = {}) {
   if (process.platform !== 'win32') return { ok: false, code: 'native_windows_unproved' };
   windowsPathKey(file);
-  const command = await powershellExe();
-  const { windows } = await systemLocations();
-  const args = powershellArgs(WINDOWS_SECURITY_PROGRAM);
-  return await new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true,
-      env: { SystemRoot: windows, WINDIR: windows, TEMP: os.tmpdir(), PATH: '' } });
-    const timer = setTimeout(() => child.kill(), 7000);
-    child.stdin.once('error', () => resolve({ ok: false, code: 'security_helper_failed' }));
-    let output = '';
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', chunk => { output += chunk; if (output.length > 2 * 1024 * 1024) child.kill(); });
-    child.once('error', () => resolve({ ok: false, code: 'security_helper_failed' }));
-    child.once('close', code => {
-      clearTimeout(timer);
-      if (code !== 0) return resolve({ ok: false, code: 'security_helper_failed' });
-      if (action === 'trusted-tool') {
-        try {
-          const result = JSON.parse(output.trim());
-          return resolve(result?.ok === true && result?.code === 'safe' && result?.trustedTool === true
-            ? result : { ok: false, code: result?.code ?? 'invalid_response' });
-        } catch { return resolve({ ok: false, code: 'invalid_response' }); }
-      }
-      resolve(parseWindowsSecurityResult(output.trim(), { version: action === 'read-file' || action === 'write-file',
-        text: action === 'read-file' }));
-    });
-    child.stdin.end(JSON.stringify({ action, path: file, ...extra }));
-  });
+  const request = JSON.stringify({ action, path: file, ...extra });
+  const previous = helperTurn;
+  let release;
+  helperTurn = new Promise(resolve => { release = resolve; });
+  await previous;
+  let output;
+  try { output = await helperRequest(request); }
+  catch { output = null; }
+  finally { release(); }
+  if (output === null) return { ok: false, code: 'security_helper_failed' };
+  if (action === 'trusted-tool') {
+    try {
+      const result = JSON.parse(output.trim());
+      return result?.ok === true && result?.code === 'safe' && result?.trustedTool === true
+        ? result : { ok: false, code: result?.code ?? 'invalid_response' };
+    } catch { return { ok: false, code: 'invalid_response' }; }
+  }
+  return parseWindowsSecurityResult(output.trim(), { version: action === 'read-file' || action === 'write-file',
+    text: action === 'read-file' });
 }
 
 export async function canonicalWindowsPath(value) {
@@ -583,12 +658,18 @@ export async function withWindowsLockQueue(file, callback, timeoutMs = 200) {
   }
 }
 
-export async function withWindowsFileLock(file, callback, { timeoutMs = 200 } = {}) {
+// Each operation under the lock spawns the PowerShell security helper (~0.65 s measured on
+// Windows 11), so the Linux-sized 200 ms budget expired before the first acquisition attempt.
+export const WINDOWS_FILE_LOCK_TIMEOUT_MS = 10000;
+
+export async function withWindowsFileLock(file, callback,
+  { timeoutMs = WINDOWS_FILE_LOCK_TIMEOUT_MS } = {}) {
   if (typeof callback !== 'function') throw new Error('windows_file_lock_args');
-  return withWindowsLockQueue(file, async deadline => {
-    if (Date.now() >= deadline) throw new Error('windows_file_lock_busy');
+  return withWindowsLockQueue(file, async () => {
+    // Parent validation is not contention: the acquisition budget starts after it.
     await checkedWindowsParent(file);
     const native = await nativeWindows();
+    const deadline = Date.now() + timeoutMs;
     for (;;) {
       if (Date.now() >= deadline) throw new Error('windows_file_lock_busy');
       let held;

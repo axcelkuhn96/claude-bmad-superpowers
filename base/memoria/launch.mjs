@@ -302,7 +302,6 @@ export async function buildLaunchCommand(cwd, cli, args = [], options = {}, made
 }
 
 export async function launchCli(cwd, cli, args = [], options = {}) {
-  if (process.platform === 'win32') return blocked('windows_release_unproved');
   if (cli === 'codex' && !safeCodexArgs(args)) return blocked('unsafe_cli_args');
   const made = await createLaunch(cwd, cli, options);
   if (made.kind !== 'created') return made;

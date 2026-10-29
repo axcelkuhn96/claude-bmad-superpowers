@@ -1327,8 +1327,9 @@ async function main() {
     ? 'passed' : 'failed', { provider: defaultSelection.provider });
   beginControl('public_windows_release_gate');
   const gates = [await activateProject(project, {}), await launchCli(project, 'claude', [], { stateRoot })];
+  // The blanket platform gate is gone; an unconfigured project must still be refused by real checks.
   record('public_windows_release_gate', gates.every(value => value.kind === 'blocked' &&
-    value.reason === 'windows_release_unproved') ? 'passed' : 'failed', { results: gates });
+    value.reason !== 'windows_release_unproved') ? 'passed' : 'failed', { results: gates });
   const enrolled = await enroll(stateRoot, project);
   if (settings.destination?.url) {
     beginControl('private_destination_proxy');
@@ -1481,7 +1482,8 @@ async function main() {
       try {
         const endpoint = path.join(stateRoot, 'encoder.discovery.json');
         const start = Date.now();
-        while (!served && Date.now() - start < 5000) {
+        // Windows cold start (Python, onnxruntime, mem0 and the 470 MB model) measured ~17 s.
+        while (!served && Date.now() - start < 30000) {
           if (await fs.lstat(endpoint).then(() => true, () => false)) break;
           await new Promise(resolve => setTimeout(resolve, 50));
         }

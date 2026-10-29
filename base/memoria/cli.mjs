@@ -137,7 +137,8 @@ export async function main(args = []) {
       extractionMode: extractor?.mode ?? (extractor?.route ? 'prompt' : null),
       conversationTurns: extractor?.conversationTurns ?? null,
       autoPublish: trusted && autoPublishConsent !== null,
-      release: process.platform === 'linux' ? 'linux_experimental' : 'blocked' }) + '\n');
+      release: process.platform === 'linux' ? 'linux_experimental'
+        : process.platform === 'win32' ? 'windows_experimental' : 'blocked' }) + '\n');
     return 0;
   }
   if (action === 'writer-device') {
