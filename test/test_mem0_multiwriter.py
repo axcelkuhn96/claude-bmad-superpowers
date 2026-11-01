@@ -2,12 +2,14 @@
 
 import importlib.util
 import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
-from threading import Lock
+from threading import Event, Lock
 from types import SimpleNamespace
 import unittest
+import uuid
 from unittest.mock import patch
 
 from qdrant_client.models import UpdateMode
@@ -56,6 +58,7 @@ class SharedQdrant:
         with self.lock:
             for point in self.points.values():
                 if all((point.id in condition.has_id if hasattr(condition, 'has_id') else
+                        point.payload.get(condition.is_null.key) is None if getattr(condition, 'is_null', None) else
                         point.payload.get(condition.key) == condition.match.value)
                        for condition in points.must):
                     point.payload.update(payload)
@@ -75,6 +78,20 @@ class SharedQdrant:
 class Memory:
     embedding_model = SimpleNamespace(embed=lambda text, action: [0.1] * 384)
 
+    def __init__(self, client=None):
+        self.client = client
+
+    def get(self, identifier):
+        point = self.client.points.get(identifier)
+        if point is None:
+            return None
+        payload = point.payload
+        return {'id': identifier, 'memory': payload['data'], 'user_id': payload['user_id'],
+                'run_id': payload['run_id'], 'metadata': adapter._point_metadata(payload)}
+
+    def update(self, identifier, metadata):
+        self.client.points[identifier].payload.update(metadata)
+
 
 class MultiwriterTest(unittest.TestCase):
     def request(self, external, source, text='Shared note'):
@@ -85,16 +102,17 @@ class MultiwriterTest(unittest.TestCase):
                     'auto_consent_hash': 'c' * 64, 'scope': 'project', 'type': 'decision',
                     'evidence_at': '2026-10-20T00:00:00Z'}
         metadata['dedup_key'] = adapter._dedup_key('p', metadata, text)
+        raw = hashlib.sha256(json.dumps(['cbs-writer-v1', 'p', 'https://qdrant.example/', 'c'],
+            ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()[:32]
+        marker_id = str(uuid.UUID(raw))
         return {'op': 'add', 'collection': 'c', 'projectId': 'p',
                 'externalId': external, 'sessionId': 's', 'text': text,
-                'metadata': metadata, 'connection': {'url': 'https://qdrant.example/'}}
+                'metadata': metadata, 'connection': {'url': 'https://qdrant.example/',
+                    'controlPointId': marker_id}}
 
     def marker(self, client):
         request = self.request('unused', '0' * 64)
-        raw = hashlib.sha256(adapter.json.dumps(['cbs-writer-v1', 'p',
-            request['connection']['url'], 'c'], ensure_ascii=False,
-            separators=(',', ':')).encode()).hexdigest()[:32]
-        identifier = f'{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}'
+        identifier = request['connection']['controlPointId']
         client.points[identifier] = SimpleNamespace(id=identifier,
             payload={'cbs_control': 'writer_v2', 'projectId': 'p', 'collection': 'c',
                      'mode': 'database', 'protocol': 2}, vector=[0.0] * 384)
@@ -210,6 +228,127 @@ class MultiwriterTest(unittest.TestCase):
             self.assertEqual(adapter.execute(request, client, Path('/tmp/one'))['kind'], 'absent')
             self.assertEqual(adapter.execute(self.request('source-b', 'b' * 64),
                                              client, Path('/tmp/two'))['kind'], 'pending')
+
+    def test_delete_retry_takeover_barrier_never_activates_two_equivalent_points(self):
+        client = SharedQdrant()
+        self.marker(client)
+        first = self.request('source-a', 'a' * 64)
+        second = self.request('source-b', 'b' * 64)
+        memory = Memory(client)
+        deleted = Event()
+        reacquired = Event()
+        release_delete = Event()
+        release_retry = Event()
+        real_retire = adapter._retire_dedup
+        real_acquire = adapter._acquire_dedup
+
+        def pause_retire(*args):
+            deleted.set()
+            self.assertTrue(release_delete.wait(5))
+            return real_retire(*args)
+
+        def pause_reacquire(*args):
+            result = real_acquire(*args)
+            if args[3] == 'source-a':
+                reacquired.set()
+                self.assertTrue(release_retry.wait(5))
+            return result
+
+        with patch.object(adapter, 'verify_collection'), \
+             patch.object(adapter, '_memory', return_value=memory):
+            added = adapter.execute(first, client, Path('/tmp/one'))
+            self.assertEqual(adapter.execute({**first, 'op': 'activate',
+                'sdkId': added['sdkId']}, client, Path('/tmp/one'))['kind'], 'item')
+            row = adapter.validate_curated_payload(client.points[added['sdkId']], 'p', None, 'history')
+            version = adapter._target_version(row)
+            deletion = {'op': 'delete_curated', 'collection': 'c', 'projectId': 'p',
+                        'connection': first['connection'], 'memoryId': added['sdkId'],
+                        'expectedVersion': version, 'requestId': 'd' * 64}
+            with patch.object(adapter, '_retire_dedup', side_effect=pause_retire), \
+                 patch.object(adapter, '_acquire_dedup', side_effect=pause_reacquire), \
+                 ThreadPoolExecutor(max_workers=2) as pool:
+                delete_future = pool.submit(adapter.execute, deletion, client, Path('/tmp/delete'))
+                self.assertTrue(deleted.wait(5))
+                retry_future = pool.submit(adapter.execute, first, client, Path('/tmp/retry'))
+                self.assertTrue(reacquired.wait(5))
+                release_delete.set()
+                self.assertEqual(delete_future.result(timeout=5)['kind'], 'deleted')
+                takeover = adapter.execute(second, client, Path('/tmp/takeover'))
+                release_retry.set()
+                retried = retry_future.result(timeout=5)
+            self.assertEqual(retried['kind'], 'pending')
+            self.assertIn('sdkId', retried)
+            self.assertEqual(takeover, {'kind': 'pending', 'reason': 'duplicate_pending'})
+            acknowledgements = []
+            for request, result, root in ((second, takeover, '/tmp/takeover'),
+                                          (first, retried, '/tmp/retry')):
+                if result.get('sdkId'):
+                    activated = adapter.execute({**request, 'op': 'activate',
+                        'sdkId': result['sdkId']}, client, Path(root))
+                    acknowledgements.append(activated)
+            active = [point for point in client.points.values()
+                      if point.payload.get('status') == 'active' and
+                      point.payload.get('dedup_key') == first['metadata']['dedup_key']]
+            self.assertLessEqual(len(active), 1)
+            self.assertEqual(len([ack for ack in acknowledgements if ack['kind'] == 'item']),
+                             len(active))
+
+    def test_stale_dedup_epoch_cannot_activate_after_owner_takeover(self):
+        client = SharedQdrant()
+        self.marker(client)
+        first = self.request('source-a', 'a' * 64)
+        second = self.request('source-b', 'b' * 64)
+        memory = Memory(client)
+        with patch.object(adapter, 'verify_collection'), \
+             patch.object(adapter, '_memory', return_value=memory):
+            old = adapter.execute(first, client, Path('/tmp/one'))
+            client.points[old['sdkId']].payload['status'] = 'superseded'
+            new = adapter.execute(second, client, Path('/tmp/two'))
+            stale = adapter.execute({**first, 'op': 'activate',
+                'sdkId': old['sdkId']}, client, Path('/tmp/one'))
+            current = adapter.execute({**second, 'op': 'activate',
+                'sdkId': new['sdkId']}, client, Path('/tmp/two'))
+        self.assertEqual(stale, {'kind': 'conflict', 'reason': 'dedup_claim_changed'})
+        self.assertEqual(current['kind'], 'item')
+        self.assertEqual(client.points[old['sdkId']].payload['status'], 'superseded')
+        self.assertEqual(client.points[new['sdkId']].payload['status'], 'active')
+
+    def test_legacy_claim_without_epoch_can_advance_after_point_absence(self):
+        client = SharedQdrant()
+        self.marker(client)
+        request = self.request('source-a', 'a' * 64)
+        with patch.object(adapter, 'verify_collection'), \
+             patch.object(adapter, '_memory', return_value=Memory(client)):
+            added = adapter.execute(request, client, Path('/tmp/one'))
+            claim = client.points[adapter._point_id('dedup', 'p', request['metadata']['dedup_key'])]
+            claim.payload.pop('epoch')
+            claim.payload.pop('phase')
+            client.points.pop(added['sdkId'])
+            readded = adapter.execute(request, client, Path('/tmp/two'))
+        self.assertEqual(readded['kind'], 'pending')
+        self.assertIn('sdkId', readded)
+        self.assertEqual(client.points[readded['sdkId']].payload['cbs_dedup_epoch'],
+                         claim.payload['epoch'])
+
+    def test_takeover_cas_rejects_claim_entering_activation(self):
+        client = SharedQdrant()
+        self.marker(client)
+        first = self.request('source-a', 'a' * 64)
+        second = self.request('source-b', 'b' * 64)
+        with patch.object(adapter, 'verify_collection'), \
+             patch.object(adapter, '_memory', return_value=Memory(client)):
+            old = adapter.execute(first, client, Path('/tmp/one'))
+            client.points[old['sdkId']].payload['status'] = 'superseded'
+            claim = client.points[adapter._point_id('dedup', 'p', first['metadata']['dedup_key'])]
+            real_set = client.set_payload
+            def race_activation(*args, **kwargs):
+                if kwargs['payload'].get('owner_external_id') == 'source-b':
+                    claim.payload['phase'] = 'activating'
+                return real_set(*args, **kwargs)
+            with patch.object(client, 'set_payload', side_effect=race_activation):
+                result = adapter.execute(second, client, Path('/tmp/two'))
+        self.assertEqual(result, {'kind': 'pending', 'reason': 'duplicate_pending'})
+        self.assertEqual(claim.payload['owner_external_id'], 'source-a')
 
     def test_unconfirmed_insert_never_acks(self):
         client = SharedQdrant()

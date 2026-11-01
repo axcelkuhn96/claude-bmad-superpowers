@@ -55,6 +55,7 @@ class RemoteSDKTest(unittest.TestCase):
             marker_raw = hashlib.sha256(json.dumps(['cbs-writer-v1', 'project-A',
                 connection['url'], collection], separators=(',', ':')).encode()).hexdigest()[:32]
             marker_id = f'{marker_raw[:8]}-{marker_raw[8:12]}-{marker_raw[12:16]}-{marker_raw[16:20]}-{marker_raw[20:]}'
+            connection['controlPointId'] = marker_id
             client.upsert(collection_name=collection, points=[models.PointStruct(
                 id=marker_id, vector=[0.0] * 384,
                 payload={'cbs_control': 'writer_v2', 'projectId': 'project-A',

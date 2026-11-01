@@ -266,6 +266,9 @@ def _row(raw: dict | None, client, collection: str, embedder) -> dict | None:
     metadata = raw.get('metadata') or {}
     identifier = raw['id']
     points = client.retrieve(collection, ids=[identifier], with_payload=True, with_vectors=True)
+    if len(points) == 1 and str(points[0].id) == str(identifier) and \
+            'cbs_control' in (points[0].payload or {}):
+        raise ValueError('control_point_denied')
     if 'expiration_date' in raw or 'expiration_date' in metadata or \
             (points and 'expiration_date' in (points[0].payload or {})):
         raise ValueError('remote_expiration_unsupported')
@@ -278,8 +281,6 @@ def _row(raw: dict | None, client, collection: str, embedder) -> dict | None:
                                       for actual, wanted in zip(points[0].vector, expected)):
         raise ValueError('remote_vector_unverified')
     payload = points[0].payload or {}
-    if 'cbs_control' in payload:
-        raise ValueError('control_point_denied')
     if payload.get('data') != raw.get('memory') or payload.get('user_id') != raw.get('user_id') or \
             payload.get('project_id') != raw.get('user_id') or payload.get('status') != metadata.get('status') or \
             payload.get('source_record_id') != metadata.get('source_record_id'):
@@ -359,51 +360,109 @@ def _claim(client, collection: str, identifier: str, payload: dict) -> dict:
     return winner
 
 
+def _epoch_condition(epoch: str | None):
+    from qdrant_client.models import FieldCondition, IsNullCondition, MatchValue, PayloadField
+    return (FieldCondition(key='epoch', match=MatchValue(value=epoch)) if epoch is not None
+            else IsNullCondition(is_null=PayloadField(key='epoch')))
+
+
+def _phase_condition(phase: str | None):
+    from qdrant_client.models import FieldCondition, IsNullCondition, MatchValue, PayloadField
+    return (FieldCondition(key='phase', match=MatchValue(value=phase)) if phase is not None
+            else IsNullCondition(is_null=PayloadField(key='phase')))
+
+
 def _acquire_dedup(client, collection: str, project: str, external: str,
-                   key: str, digest: str) -> bool:
+                   key: str, digest: str) -> str | None:
     from qdrant_client.models import FieldCondition, Filter, HasIdCondition, MatchValue
     identifier = _point_id('dedup', project, key)
+    epoch = str(uuid.uuid4())
     payload = {'cbs_control': 'dedup_v2', 'project_id': project,
-               'owner_external_id': external, 'owner_digest': digest, 'retired': False}
+               'owner_external_id': external, 'owner_digest': digest, 'retired': False,
+               'epoch': epoch, 'phase': 'pending'}
     winner = _claim(client, collection, identifier, payload)
     if winner == payload:
-        return True
+        return epoch
     if winner.get('owner_external_id') == external:
         if winner.get('owner_digest') != digest:
             raise ValueError('source_changed')
-        if winner.get('retired') is not True:
-            return True
-        selector = Filter(must=[HasIdCondition(has_id=[identifier]),
-            FieldCondition(key='cbs_control', match=MatchValue(value='dedup_v2')),
-            FieldCondition(key='project_id', match=MatchValue(value=project)),
-            FieldCondition(key='owner_external_id', match=MatchValue(value=external)),
-            FieldCondition(key='owner_digest', match=MatchValue(value=digest)),
-            FieldCondition(key='retired', match=MatchValue(value=True))])
-        _completed(client.set_payload(collection_name=collection, payload={'retired': False},
-            points=selector, wait=True, ordering='strong'), 'remote_claim_unconfirmed')
-        after = client.retrieve(collection_name=collection, ids=[identifier], with_payload=True)
-        return len(after) == 1 and after[0].payload == payload
+        if winner.get('retired') is not True and winner.get('phase') == 'pending' and \
+                isinstance(winner.get('epoch'), str):
+            return winner['epoch']
+        if winner.get('retired') is not True and winner.get('phase') == 'activating':
+            return None
+        if winner.get('retired') is not True and winner.get('phase') not in ('active', None):
+            raise ValueError('remote_claim_mismatch')
+    elif winner.get('phase') == 'activating' and winner.get('retired') is not True:
+        return None
     prior_id = _point_id('memory', project, winner.get('owner_external_id', ''))
-    if winner.get('retired') is not True:
+    if winner.get('owner_external_id') != external and winner.get('retired') is not True:
         previous = client.retrieve(collection_name=collection, ids=[prior_id], with_payload=True)
         if len(previous) != 1 or not isinstance(previous[0].payload, dict) or \
                 previous[0].payload.get('project_id') != project or \
                 previous[0].payload.get('source_record_id') != winner.get('owner_external_id') or \
                 previous[0].payload.get('status') != 'superseded':
-            return False
+            return None
     selector = Filter(must=[HasIdCondition(has_id=[identifier]),
         FieldCondition(key='cbs_control', match=MatchValue(value='dedup_v2')),
         FieldCondition(key='project_id', match=MatchValue(value=project)),
         FieldCondition(key='owner_external_id', match=MatchValue(value=winner['owner_external_id'])),
         FieldCondition(key='owner_digest', match=MatchValue(value=winner['owner_digest'])),
-        FieldCondition(key='retired', match=MatchValue(value=winner.get('retired', False)))])
+        FieldCondition(key='retired', match=MatchValue(value=winner.get('retired', False))),
+        _epoch_condition(winner.get('epoch')), _phase_condition(winner.get('phase'))])
     _completed(client.set_payload(collection_name=collection,
-        payload={'owner_external_id': external, 'owner_digest': digest, 'retired': False},
+        payload={'owner_external_id': external, 'owner_digest': digest, 'retired': False,
+                 'epoch': epoch, 'phase': 'pending'},
         points=selector, wait=True, ordering='strong'), 'remote_claim_unconfirmed')
     after = client.retrieve(collection_name=collection, ids=[identifier], with_payload=True)
     if len(after) != 1 or after[0].payload != payload:
+        return None
+    return epoch
+
+
+def _dedup_activation(client, collection: str, project: str, row: dict,
+                      phase: str) -> bool:
+    from qdrant_client.models import FieldCondition, Filter, HasIdCondition, MatchValue
+    metadata = row['metadata']
+    if metadata.get('format_version') not in (4, 5):
+        return True
+    identifier = _point_id('dedup', project, metadata['dedup_key'])
+    epoch = metadata.get('cbs_dedup_epoch')
+    points = client.retrieve(collection_name=collection, ids=[identifier], with_payload=True)
+    if len(points) != 1 or not isinstance(points[0].payload, dict):
         return False
-    return True
+    claim = points[0].payload
+    if (claim.get('cbs_control') != 'dedup_v2' or claim.get('project_id') != project or
+            claim.get('owner_external_id') != row['externalId'] or
+            claim.get('owner_digest') != metadata.get('cbs_request_digest') or
+            claim.get('epoch') != epoch or claim.get('retired') is not False):
+        return False
+    if phase == 'begin' and claim.get('phase') == 'active':
+        return row['status'] == 'active'
+    if phase == 'begin' and claim.get('phase') == 'activating':
+        return True
+    if phase == 'begin' and claim.get('phase') not in ('pending', None):
+        return False
+    if phase == 'complete' and claim.get('phase') == 'active':
+        return True
+    if phase == 'complete' and claim.get('phase') != 'activating':
+        return False
+    before = claim.get('phase')
+    selector = Filter(must=[HasIdCondition(has_id=[identifier]),
+        FieldCondition(key='cbs_control', match=MatchValue(value='dedup_v2')),
+        FieldCondition(key='project_id', match=MatchValue(value=project)),
+        FieldCondition(key='owner_external_id', match=MatchValue(value=row['externalId'])),
+        FieldCondition(key='owner_digest', match=MatchValue(value=metadata['cbs_request_digest'])),
+        FieldCondition(key='retired', match=MatchValue(value=False)), _epoch_condition(epoch),
+        _phase_condition(before)])
+    next_phase = 'activating' if phase == 'begin' else 'active'
+    _completed(client.set_payload(collection_name=collection, payload={'phase': next_phase},
+        points=selector, wait=True, ordering='strong'), 'remote_claim_unconfirmed')
+    after = client.retrieve(collection_name=collection, ids=[identifier], with_payload=True)
+    return (len(after) == 1 and isinstance(after[0].payload, dict) and
+            all(after[0].payload.get(key) == value for key, value in
+                (('owner_external_id', row['externalId']), ('owner_digest', metadata['cbs_request_digest']),
+                 ('epoch', epoch), ('retired', False), ('phase', next_phase))))
 
 
 def _write_pending(client, collection: str, memory, request: dict, metadata: dict) -> dict:
@@ -435,9 +494,11 @@ def _write_pending(client, collection: str, memory, request: dict, metadata: dic
                 points[0].payload.get('status') not in ('pending', 'active', 'superseded'):
             raise ValueError('remote_pending_unverified')
         return {'kind': 'pending', 'sdkId': identifier}
-    if metadata.get('format_version') in (4, 5) and not _acquire_dedup(
-            client, collection, project, external, metadata['dedup_key'], digest):
-        return {'kind': 'pending', 'reason': 'duplicate_pending'}
+    epoch = None
+    if metadata.get('format_version') in (4, 5):
+        epoch = _acquire_dedup(client, collection, project, external, metadata['dedup_key'], digest)
+        if epoch is None:
+            return {'kind': 'pending', 'reason': 'duplicate_pending'}
     vector = memory.embedding_model.embed(text, 'add')
     if len(vector) != 384 or not all(math.isfinite(value) for value in vector):
         raise ValueError('embedding_invalid')
@@ -446,7 +507,8 @@ def _write_pending(client, collection: str, memory, request: dict, metadata: dic
                'project_id': project, 'user_id': project, 'run_id': request['sessionId'],
                'role': 'user', 'data': text, 'hash': hashlib.md5(text.encode()).hexdigest(),
                'created_at': now, 'updated_at': now, 'text_lemmatized': lemmatize_for_bm25(text),
-               'cbs_request_digest': digest}
+               'cbs_request_digest': digest,
+               **({'cbs_dedup_epoch': epoch} if epoch is not None else {})}
     _insert_only(client, collection, identifier, vector, payload)
     points = client.retrieve(collection_name=collection, ids=[identifier],
                              with_payload=True, with_vectors=True)
@@ -807,7 +869,8 @@ def _target_version(row: dict) -> str:
 
 def _target_claim(client, collection: str, project: str, identifier: str,
                   version: str, operation_id: str, operation_type: str,
-                  source_external: str | None = None, dedup_key: str | None = None) -> bool:
+                  source_external: str | None = None, dedup_key: str | None = None,
+                  dedup_epoch: str | None = None) -> bool:
     if not isinstance(operation_id, str) or not operation_id or \
             (operation_type == 'delete' and re.fullmatch(r'[a-f0-9]{64}', operation_id) is None) or \
             operation_type not in ('update', 'delete') or \
@@ -824,12 +887,14 @@ def _target_claim(client, collection: str, project: str, identifier: str,
             if re.fullmatch(r'[a-f0-9]{64}', dedup_key) is None:
                 raise ValueError('mutation_identity_invalid')
             payload['dedup_key_hash'] = dedup_key
+            if dedup_epoch is not None:
+                payload['dedup_epoch'] = str(uuid.UUID(dedup_epoch))
     winner = _claim(client, collection, _point_id('target', project, identifier, version), payload)
     return winner == payload
 
 
 def _retire_dedup(client, collection: str, project: str,
-                  external: str, key: str | None) -> None:
+                  external: str, key: str | None, epoch: str | None = None) -> None:
     if key is None:
         return
     from qdrant_client.models import FieldCondition, Filter, HasIdCondition, MatchValue
@@ -842,8 +907,8 @@ def _retire_dedup(client, collection: str, project: str,
     claim = points[0].payload
     if claim.get('cbs_control') != 'dedup_v2' or claim.get('project_id') != project:
         raise ValueError('dedup_retirement_unverified')
-    if claim.get('owner_external_id') != external:
-        return  # A later source owns the dedup key.
+    if claim.get('owner_external_id') != external or claim.get('epoch') != epoch:
+        return  # A later generation or source owns the dedup key.
     if claim.get('retired') is True:
         return
     selector = Filter(must=[HasIdCondition(has_id=[identifier]),
@@ -851,12 +916,16 @@ def _retire_dedup(client, collection: str, project: str,
         FieldCondition(key='project_id', match=MatchValue(value=project)),
         FieldCondition(key='owner_external_id', match=MatchValue(value=external)),
         FieldCondition(key='owner_digest', match=MatchValue(value=claim.get('owner_digest'))),
-        FieldCondition(key='retired', match=MatchValue(value=False))])
+        FieldCondition(key='retired', match=MatchValue(value=False)),
+        _epoch_condition(epoch)])
     _completed(client.set_payload(collection_name=collection, payload={'retired': True},
         points=selector, wait=True, ordering='strong'), 'dedup_retirement_unverified')
     after = client.retrieve(collection_name=collection, ids=[identifier], with_payload=True)
-    if len(after) != 1 or after[0].payload.get('owner_external_id') != external or \
-            after[0].payload.get('retired') is not True:
+    if len(after) != 1 or not isinstance(after[0].payload, dict):
+        raise ValueError('dedup_retirement_unverified')
+    if after[0].payload.get('epoch') != epoch or after[0].payload.get('owner_external_id') != external:
+        return
+    if after[0].payload.get('retired') is not True:
         raise ValueError('dedup_retirement_unverified')
 
 
@@ -866,10 +935,7 @@ def _require_writer_v2(client, request: dict) -> None:
     if not match or tuple(map(int, match.groups())) < (1, 16, 0):
         raise ValueError('qdrant_insert_only_unavailable')
     project, collection = request['projectId'], request['collection']
-    destination = request['connection']['url']
-    raw = hashlib.sha256(json.dumps(['cbs-writer-v1', project, destination, collection],
-        ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()[:32]
-    identifier = f'{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}'
+    identifier = str(uuid.UUID(request['connection']['controlPointId']))
     points = client.retrieve(collection_name=collection, ids=[identifier], with_payload=True)
     expected = {'cbs_control': 'writer_v2', 'projectId': project, 'collection': collection,
                 'mode': 'database', 'protocol': 2}
@@ -895,7 +961,8 @@ def delete_curated(client, collection: str, project: str, owner: str | None,
                     claim.get('target_id') == identifier and claim.get('target_version') == expected_version and \
                     claim.get('operation_type') == 'delete' and claim.get('operation_id') == operation_id:
                 _retire_dedup(client, collection, project,
-                              claim.get('source_external_id'), claim.get('dedup_key_hash'))
+                              claim.get('source_external_id'), claim.get('dedup_key_hash'),
+                              claim.get('dedup_epoch'))
         return {'kind': 'absent', 'memoryId': identifier}
     if len(points) != 1 or str(points[0].id) != identifier:
         return {'kind': 'conflict', 'reason': 'target_changed'}
@@ -905,8 +972,9 @@ def delete_curated(client, collection: str, project: str, owner: str | None,
     if _target_version(row) != expected_version:
         return {'kind': 'conflict', 'reason': 'target_changed'}
     dedup_key = row['metadata'].get('dedup_key') if row['metadata'].get('format_version') in (4, 5) else None
+    dedup_epoch = row['metadata'].get('cbs_dedup_epoch')
     if not _target_claim(client, collection, project, identifier, expected_version,
-                         operation_id, 'delete', row['externalId'], dedup_key):
+                         operation_id, 'delete', row['externalId'], dedup_key, dedup_epoch):
         return {'kind': 'conflict', 'reason': 'concurrent_mutation'}
     payload = points[0].payload
     must = [HasIdCondition(has_id=[identifier])]
@@ -923,7 +991,7 @@ def delete_curated(client, collection: str, project: str, owner: str | None,
                                 with_payload=True, with_vectors=False)
     if remaining:
         return {'kind': 'conflict', 'reason': 'target_changed'}
-    _retire_dedup(client, collection, project, row['externalId'], dedup_key)
+    _retire_dedup(client, collection, project, row['externalId'], dedup_key, dedup_epoch)
     return {'kind': 'deleted', 'memoryId': identifier}
 
 
@@ -1177,7 +1245,7 @@ def execute(request: dict, client, state: Path) -> dict:
                 metadata['context_generated'], metadata.get('source_refs')):
             raise ValueError('context_generated_invalid')
         if any(key in metadata for key in ('status', 'source_record_id', 'project_id',
-                'expiration_date', 'cbs_control', 'cbs_request_digest', 'user_id',
+                'expiration_date', 'cbs_control', 'cbs_request_digest', 'cbs_dedup_epoch', 'user_id',
                 'run_id', 'data', 'hash', 'created_at', 'updated_at', 'text_lemmatized', 'role')):
             raise ValueError('reserved_metadata')
         if metadata.get('scope') not in ('project', 'personal', 'episode') or \
@@ -1224,6 +1292,8 @@ def execute(request: dict, client, state: Path) -> dict:
             if not _target_claim(client, collection, project, supersedes, version,
                                  external, 'update'):
                 raise ValueError('concurrent_mutation')
+        if not _dedup_activation(client, collection, project, row, 'begin'):
+            return {'kind': 'conflict', 'reason': 'dedup_claim_changed'}
         if row['status'] == 'pending':
             if supersedes:
                 if old['status'] == 'active':
@@ -1236,6 +1306,8 @@ def execute(request: dict, client, state: Path) -> dict:
                         old['metadata'].get('superseded_by_external_id') != external:
                     raise ValueError('superseded_target_invalid')
             memory.update(identifier, metadata={'status': 'active'})
+        if not _dedup_activation(client, collection, project, row, 'complete'):
+            return {'kind': 'conflict', 'reason': 'dedup_claim_changed'}
         return {'kind': 'item', 'item': _row(memory.get(identifier), client, collection, memory.embedding_model)}
     if op == 'search':
         now = datetime.now(timezone.utc)
@@ -1250,8 +1322,15 @@ def execute(request: dict, client, state: Path) -> dict:
                 try:
                     result = memory.search(request['query'], filters={'user_id': project, 'status': 'active'},
                                            top_k=limit, threshold=MIN_RECALL_SCORE)
-                    items = [{**_row(row, client, collection, memory.embedding_model),
-                              'scoreSource': 'mem0_sdk_search'} for row in result['results']]
+                    items = []
+                    for raw in result['results']:
+                        try:
+                            item = _row(raw, client, collection, memory.embedding_model)
+                        except ValueError as error:
+                            if str(error) == 'control_point_denied':
+                                continue
+                            raise
+                        items.append({**item, 'scoreSource': 'mem0_sdk_search'})
                 except Exception:
                     if lexical['items']:
                         return {'kind': 'items', 'items': [], 'lexical_items': lexical['items'],

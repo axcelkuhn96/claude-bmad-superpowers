@@ -884,6 +884,18 @@ class AdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'remote_expiration_unsupported'):
             adapter._row({**raw, 'expiration_date': '2025-01-01T00:00:00Z'}, client, 'collection', Embedder())
 
+    def test_remote_vector_allows_float32_roundtrip_of_normalized_embedding(self):
+        expected = [math.sqrt(.5), math.sqrt(.5)] + [0.0] * 382
+        actual = [float(np.float32(value)) for value in expected]
+        payload = {'data': 'fact', 'user_id': 'p', 'project_id': 'p',
+                   'status': 'active', 'source_record_id': 'source-1'}
+        point = SimpleNamespace(id='uuid-1', vector=actual, payload=payload)
+        client = SimpleNamespace(retrieve=lambda *args, **kwargs: [point])
+        embedder = SimpleNamespace(embed=lambda text, action: expected)
+        self.assertEqual(adapter._row({'id': 'uuid-1', 'memory': 'fact', 'user_id': 'p',
+            'metadata': {'status': 'active', 'source_record_id': 'source-1'}},
+            client, 'collection', embedder)['sdkId'], 'uuid-1')
+
     def test_search_fetches_past_ineligible_items_before_limiting(self):
         bad = {'projectId': 'p', 'status': 'active', 'score': .9, 'sdkId': 'bad', 'metadata':
                {'source': 's', 'actor': 'a', 'scope': 'personal', 'owner_id': 'other'}}
@@ -903,6 +915,40 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual([row['sdkId'] for row in result['items']], ['good'])
         self.assertEqual(result['items'][0]['scoreSource'], 'mem0_sdk_search')
         self.assertEqual(result['items'][0]['retrievalEvidence'], {'vectorScore': .9, 'vectorRank': 1})
+
+    def test_search_skips_control_hit_and_keeps_valid_vector_hit(self):
+        vector = [1.0] + [0.0] * 383
+        metadata = {'status': 'active', 'scope': 'project', 'source': 'message',
+                    'actor': 'human', 'source_record_id': 'source-1'}
+        control = {'id': 'control', 'memory': 'fact', 'user_id': 'p',
+                   'metadata': metadata, 'score': .99}
+        valid = {**control, 'id': 'valid', 'score': .9}
+        points = {
+            'control': SimpleNamespace(id='control', vector=vector,
+                payload={'data': 'fact', 'user_id': 'p', 'project_id': 'p',
+                         'status': 'active', 'source_record_id': 'source-1',
+                         'cbs_control': 'target_v2'}),
+            'valid': SimpleNamespace(id='valid', vector=vector,
+                payload={'data': 'fact', 'user_id': 'p', 'project_id': 'p',
+                         'status': 'active', 'source_record_id': 'source-1',
+                         'scope': 'project', 'source': 'message', 'actor': 'human'})}
+        class Client:
+            def retrieve(self, collection, ids, **kwargs):
+                return [points[key] for key in ids]
+        class Memory:
+            embedding_model = SimpleNamespace(embed=lambda text, action: vector)
+            def search(self, query, **kwargs):
+                return {'results': [control, valid]}
+        for marker in ('target_v2', None):
+            points['control'].payload['cbs_control'] = marker
+            with patch.object(adapter, 'verify_collection'), \
+                 patch.object(adapter, '_memory', return_value=Memory()), \
+                 patch.object(adapter, 'lexical_candidates', return_value={'kind': 'items', 'items': []}):
+                result = adapter.execute({'op': 'search', 'collection': 'c', 'projectId': 'p',
+                    'connection': {}, 'query': 'fact'}, Client(), Path('/tmp'))
+            self.assertEqual(result['kind'], 'items')
+            self.assertEqual([row['sdkId'] for row in result['items']], ['valid'])
+            self.assertNotIn('vector_degradation', result)
 
     def test_search_reuses_one_embedding_across_sdk_pages(self):
         calls = []
