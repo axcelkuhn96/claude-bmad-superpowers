@@ -11,7 +11,7 @@ import { identifyProject } from './project-id.mjs';
 import { pinDestination } from './activation.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
 import { resolveEnrolledWindowsTool } from './windows-enrollment.mjs';
-import { ensureWindowsPrivateDirectory } from './windows-security.mjs';
+import { ensureWindowsPrivateDirectory, windowsPathKey } from './windows-security.mjs';
 
 const runFile = promisify(execFile);
 const blocked = (reason) => ({ kind: 'blocked', reason });
@@ -48,7 +48,9 @@ export async function indexTextProject(cwd, options = {}) {
   const resolution = await inspect(cwd, options);
   if (resolution.provider !== 'mem0') return blocked(resolution.reason ?? 'not_mem0');
   const scope = await (options.identify ?? identifyProject)(cwd);
-  if (scope.kind !== 'git' || scope.activeRoot !== cwd ||
+  const sameRoot = process.platform === 'win32' ? scope.activeRoot === windowsPathKey(cwd)
+    : scope.activeRoot === cwd;
+  if (scope.kind !== 'git' || !sameRoot ||
       scope.projectRoot !== resolution.projectRoot) return blocked('unsupported_git');
   const expected = trustTuple(resolution);
   if (!sameTrustTuple(expected, await (options.trust ?? readLocalTrust)(resolution.stateDir))) {

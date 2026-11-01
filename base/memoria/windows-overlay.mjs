@@ -41,7 +41,9 @@ export async function inspectWindowsCaptureSources({ cli, root, projectRoot, pro
       profileKey === activeKey || profileKey.startsWith(activeKey + '\\')) {
     throw new Error('windows_capture_profile_unsafe');
   }
-  if (!(await inspectWindowsPath(profile, 'directory')).ok) {
+  // Same integrity bar as POSIX (owned, no foreign writers): a real profile inherits the user
+  // ACL and the CLI rewrites settings.json, so an exclusive DACL could never hold here.
+  if (!(await inspectWindowsPath(profile, 'directory', { privateState: false })).ok) {
     throw new Error('windows_capture_profile_unsafe');
   }
   if (cli === 'claude') {
@@ -64,7 +66,7 @@ export async function inspectWindowsCaptureSources({ cli, root, projectRoot, pro
       [profile, 'hooks.json']];
   for (const parts of sources) {
     const file = path.win32.join(...parts);
-    const value = await optionalJson(file, parts[0] === profile);
+    const value = await optionalJson(file, false);
     if (value === null) continue;
     if (!value || typeof value !== 'object' || Array.isArray(value) ||
         JSON.stringify(value).includes('capture-hook.mjs')) {
@@ -78,12 +80,12 @@ export async function inspectWindowsCaptureSources({ cli, root, projectRoot, pro
       const parent = path.win32.dirname(file);
       try { await fs.lstat(parent); }
       catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-      if (!(await inspectWindowsPath(parent, 'directory', { privateState: parts[0] === profile })).ok) {
+      if (!(await inspectWindowsPath(parent, 'directory', { privateState: false })).ok) {
         throw new Error('windows_capture_source_unsafe');
       }
       try {
         const observed = await readWindowsBinary(file,
-          { length: 2 * 1024 * 1024, privateState: parts[0] === profile });
+          { length: 2 * 1024 * 1024, privateState: false });
         if (observed.size !== observed.bytes.length ||
             observed.bytes.includes(Buffer.from('capture-hook.mjs'))) {
           throw new Error('windows_capture_source_ambiguous');

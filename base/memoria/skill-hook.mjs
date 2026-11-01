@@ -31,7 +31,7 @@ export function parseSkillTrigger(command) {
 }
 
 export async function authenticateSkillHook({ cli, payload, stateRoot } = {}) {
-  if (process.platform === 'win32' || !process.getuid) return unavailable('native_windows_unproved');
+  if (process.platform !== 'win32' && !process.getuid) return unavailable('native_windows_unproved');
   if (!['claude', 'codex'].includes(cli) || payload?.hook_event_name !== 'PreToolUse' ||
       payload.tool_name !== 'Bash' || typeof payload.cwd !== 'string' ||
       typeof payload.session_id !== 'string' || !payload.session_id || payload.session_id.length > 256 ||

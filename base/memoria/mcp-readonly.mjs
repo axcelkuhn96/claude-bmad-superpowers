@@ -94,8 +94,13 @@ function createLocalSearchWorker(resolution) {
       CBS_MEMORIA_TOKENIZER: tokenizer, OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1',
       MKL_NUM_THREADS: '1' },
   }), { coldMs: 30000 });
+  // Hashing the 470 MB model cost ~8 s per search; the worker digests it again on every load.
+  let verified = false;
   return { async request(request, auth, beforeDispatch) {
-    if ((await verifyRuntimeArtifacts(model, tokenizer)).kind !== 'verified') return blocked('missing_artifact');
+    if (!verified) {
+      if ((await verifyRuntimeArtifacts(model, tokenizer)).kind !== 'verified') return blocked('missing_artifact');
+      verified = true;
+    }
     const ready = await worker.start();
     if (ready?.kind !== 'ready' || ready.fingerprint !== resolution.embeddingFingerprint) {
       return blocked(ready?.reason ?? 'worker_unavailable');

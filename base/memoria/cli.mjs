@@ -17,7 +17,7 @@ import { administrativeSession, assertWriter, bootstrapWriter, beginWriterTransf
 const here = path.dirname(fileURLToPath(import.meta.url));
 const help = `Uso: cbs memoria <ação> [opções]
 Ações: avaliar, status, check, indexar-texto, exportar, historico, provision, activate, launch, review-correct, deactivate,
-       owner-register, extractor-select, extractor-schedule,
+       enroll, owner-register, extractor-select, extractor-schedule,
        auto-publish-enable, auto-publish-disable,
        writer-device, writer-bootstrap,
        writer-transfer-start, writer-transfer-complete, help
@@ -25,6 +25,7 @@ Use --project /caminho/git nas ações de projeto. O cadastro pessoal e a seleç
 do extrator exigem declaração local explícita; publicação automática exige opt-in local
 por projeto, owner e writer designado.
 Activate aceita --allow-tracked-native para configuração nativa versionada autorizada.
+No Windows: cbs memoria enroll --tool claude|codex|python --executable caminho.exe --sha256 hash.
 Avaliar é offline: cbs memoria avaliar --outputs arquivo.json [--corpus arquivo.json] [--split dev|holdout|all].
 No automático por conversa, --max-calls vale por sessão/dia UTC; o histórico de chamadas é preservado.
 `;
@@ -62,6 +63,21 @@ export async function main(args = []) {
       return 0;
     }
     return 2;
+  }
+  if (action === 'enroll') {
+    const [tool, executable, sha256] = ['--tool', '--executable', '--sha256'].map(flag => value(rest, flag));
+    if (rest.length !== 6 || !tool || !executable || !sha256) { process.stderr.write(help); return 2; }
+    if (process.platform !== 'win32') { process.stdout.write('blocked: windows_only\n'); return 1; }
+    try {
+      const { enrollWindowsTool } = await import('./windows-enrollment.mjs');
+      const record = await enrollWindowsTool({ name: tool, executable, sha256,
+        productRoot: path.resolve(here, '..', '..') });
+      process.stdout.write(`enrolled: ${record.name} ${record.sha256}\n`);
+      return 0;
+    } catch (error) {
+      process.stdout.write(`blocked: ${error.message}\n`);
+      return 1;
+    }
   }
   const project = value(rest, '--project');
   if (!project || project.startsWith('--')) { process.stderr.write(help); return 2; }
@@ -137,7 +153,8 @@ export async function main(args = []) {
       extractionMode: extractor?.mode ?? (extractor?.route ? 'prompt' : null),
       conversationTurns: extractor?.conversationTurns ?? null,
       autoPublish: trusted && autoPublishConsent !== null,
-      release: process.platform === 'linux' ? 'linux_experimental' : 'blocked' }) + '\n');
+      release: process.platform === 'linux' ? 'linux_experimental'
+        : process.platform === 'win32' ? 'windows_experimental' : 'blocked' }) + '\n');
     return 0;
   }
   if (action === 'writer-device') {

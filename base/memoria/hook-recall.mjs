@@ -14,6 +14,10 @@ import { prepareHandoff, acknowledgeHandoff } from './handoff-state.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const validCapture = result => result && !['blocked', 'pass_through', 'full'].includes(result.kind);
+// A remote Qdrant (one TLS round trip ~0.45 s measured) cannot meet 825 ms; the opt-in raise
+// stays well under the 10 s native hook timeout. Invalid values keep the default.
+export const recallBudgetMs = (value = process.env.CBS_MEMORIA_RECALL_BUDGET_MS) =>
+  /^\d{3,4}$/.test(value ?? '') && Number(value) >= 825 && Number(value) <= 5000 ? Number(value) : 825;
 const failureCategory = reason => {
   if (reason === 'deadline' || reason === 'queue_timeout') return 'deadline';
   if (reason === 'missing_key') return 'auth';
@@ -161,7 +165,7 @@ export async function recallForPrompt({ cli, event = 'UserPromptSubmit', payload
   if (event !== 'UserPromptSubmit' && event !== 'PreCompact') return null;
   try {
     // Leave room for native transport and final rendering after this component returns.
-    const remaining = () => Math.floor(825 - (performance.now() - began));
+    const remaining = () => Math.floor(recallBudgetMs() - (performance.now() - began));
     if (remaining() <= 0) return fail('deadline');
     const current = await resolve(payload.cwd, payload.session_id, { stateRoot });
     if (current.provider !== 'mem0') return ['claude-mem', 'not_mem0', 'unsupported_git'].includes(

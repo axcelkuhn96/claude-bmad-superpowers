@@ -2,6 +2,25 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [Não publicado]
+
+### Corrigido
+- **Windows nativo — helper de segurança:** o programa PowerShell codificado (45.788 caracteres) excedia o limite de 32.767 da linha de comando (`spawn ENAMETOOLONG`) e derrubava toda operação de estado privado. O argv passa a levar só um bootstrap; o programa segue pelo stdin num helper persistente por processo, com requisições serializadas e prazo por requisição. A latência por operação caiu de ~650 ms para ~4 ms.
+- **Windows nativo — rename de publicação:** `FILE_RENAME_INFO` era alocado sem o terminador NUL, no addon e no P/Invoke C#; o kernel32 lia bytes do heap e acrescentava lixo ao nome publicado. Os nomes também passam a usar a forma `\\?\`, porque o addon não herda o opt-in de caminhos longos e recibos do journal chegam a ~277 caracteres. O addon foi recompilado e o hash fixado, atualizado.
+- **Windows nativo — trava de arquivo e outbox:** o prazo de aquisição conta a partir da validação da pasta pai, com padrão de 10 s; a contagem de uso do outbox não abre mais o `.kernel-lock` mantido aberto (violação de compartilhamento).
+- **Windows nativo — auditoria de ferramentas:** fora de estado privado, concessões somente leitura/execução a outros principais (por exemplo, `CodexSandboxUsers` herdado no perfil) não bloqueiam mais o enrollment de `claude.exe` e `python.exe`; o estado privado continua exigindo ACL exclusiva.
+- **Identificação do projeto:** o `git.exe` é resolvido uma vez por identificação (~535 ms → ~325 ms no Windows).
+- **Windows nativo — repositórios e perfis reais:** auditorias de integridade ignoram regras Deny, que só restringem acesso, e o perfil da CLI usa o mesmo critério do POSIX (dono e sem terceiros com escrita); a ACL exclusiva não pode valer num perfil que a CLI regrava. Estado privado continua exigindo ACL exclusiva.
+- **Windows nativo — ativação repetível:** a confiança é idempotente com o mesmo destino e substituída quando ele muda; uma queda entre os passos deixa o projeto sem confiança (falha fechada). O MCP local é registrado nas grafias reais do caminho, `C:/` e `c:/` (VS Code); antes ficava numa chave em minúsculas que nenhuma sessão lia.
+- **Windows nativo — MCP:** o SHA-256 do modelo de 470 MB é verificado uma vez por worker, não a cada busca (~9,5 s → ~3,5 s por busca com servidor remoto).
+- **`indexar-texto` no Windows:** compara a raiz pela forma canônica e não recusa mais repositórios válidos.
+
+### Adicionado
+- **Ativação experimental no Windows:** `activate` e `launch` deixam de retornar `windows_release_unproved` incondicionalmente; os checks reais de configuração, confiança, ACL e destino continuam valendo. `status` informa `windows_experimental`.
+- **`cbs memoria enroll`:** comando público para registrar `claude`, `codex` e `python` com caminho e SHA-256 explícitos, repetível após atualizar a CLI. Antes só a fixture de validação fazia isso.
+- **Broker e lease no Windows:** `launch`, `ensureBrokerReady` e o skill hook funcionam no Windows, com lease de uso único em arquivo privado sobre o transporte autenticado existente, no lugar do socket Unix.
+- **`CBS_MEMORIA_RECALL_BUDGET_MS`:** prazo opcional do recall automático (825–5000 ms; padrão 825) para Qdrant remoto, onde uma ida TLS custa ~0,45 s.
+
 ## [0.16.2] - 2026-10-23
 
 ### Adicionado

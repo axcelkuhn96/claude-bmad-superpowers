@@ -134,6 +134,8 @@ static napi_value release(napi_env env, napi_callback_info info) {
   return result;
 }
 
+#define EXTENDED_PREFIX_CHARS 4
+
 static int path_arg(napi_env env, napi_value value, wchar_t **out) {
   size_t length = 0;
   if (napi_get_value_string_utf16(env, value, NULL, 0, &length) != napi_ok ||
@@ -151,7 +153,17 @@ static int path_arg(napi_env env, napi_value value, wchar_t **out) {
     free(path);
     return 0;
   }
-  *out = path;
+  /* The addon does not inherit the long-path opt-in: CreateFileW and FileRenameInfo failed
+     at MAX_PATH (journal receipts reach ~277 chars). Win32 calls get the \\?\ form of the
+     validated drive-absolute path; it disables normalization, so separators are fixed here. */
+  wchar_t *extended = (wchar_t *)calloc(EXTENDED_PREFIX_CHARS + length + 1, sizeof(wchar_t));
+  if (!extended) { free(path); return 0; }
+  wcscpy(extended, L"\\\\?\\");
+  for (size_t i = 0; i < length; i++) {
+    extended[EXTENDED_PREFIX_CHARS + i] = path[i] == L'/' ? L'\\' : path[i];
+  }
+  free(path);
+  *out = extended;
   return 1;
 }
 
@@ -197,6 +209,8 @@ static int audit_file(HANDLE handle, int private_state, BY_HANDLE_FILE_INFORMATI
     void *entry = NULL;
     if (!GetAce(dacl, i, &entry)) goto cleanup;
     ACE_HEADER *header = (ACE_HEADER *)entry;
+    /* A deny entry can only narrow access, so it cannot weaken an integrity-only audit. */
+    if (!private_state && header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
     if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) goto cleanup;
     ACCESS_ALLOWED_ACE *ace = (ACCESS_ALLOWED_ACE *)entry;
     PSID principal = &ace->SidStart;
@@ -208,7 +222,17 @@ static int audit_file(HANDLE handle, int private_state, BY_HANDLE_FILE_INFORMATI
       owner_rights |= rights;
     }
     else if (!IsWellKnownSid(principal, WinLocalSystemSid) &&
-        !IsWellKnownSid(principal, WinBuiltinAdministratorsSid)) goto cleanup;
+        !IsWellKnownSid(principal, WinBuiltinAdministratorsSid)) {
+      /* Outside private state only integrity matters: a read/execute-only grant to another
+         principal (e.g. CodexSandboxUsers inherited under the profile) cannot alter the file. */
+      DWORD rights = ace->Mask;
+      GENERIC_MAPPING mapping = { FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS };
+      MapGenericMask(&rights, &mapping);
+      const DWORD mutating = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
+        FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER;
+      if (private_state || (rights & mutating)) goto cleanup;
+    }
   }
   if ((owner_rights & FILE_READ_DATA) && (owner_rights & FILE_WRITE_DATA)) good = 1;
 cleanup:
@@ -725,9 +749,9 @@ static napi_value publish_new(napi_env env, napi_callback_info info) {
       napi_status status = napi_create_object(env, &observation);
       if (status == napi_ok) status = property(env, observation, "boundary",
         L"temp_flushed_before_publish") ? napi_ok : napi_generic_failure;
-      if (status == napi_ok) status = property(env, observation, "temporary", temporary)
-        ? napi_ok : napi_generic_failure;
-      if (status == napi_ok) status = property(env, observation, "target", target)
+      if (status == napi_ok) status = property(env, observation, "temporary",
+        temporary + EXTENDED_PREFIX_CHARS) ? napi_ok : napi_generic_failure;
+      if (status == napi_ok) status = property(env, observation, "target", target + EXTENDED_PREFIX_CHARS)
         ? napi_ok : napi_generic_failure;
       if (status == napi_ok) status = result_identity(env, observation,
         &flushed, &flushed_standard) ? napi_ok : napi_generic_failure;
@@ -755,7 +779,10 @@ static napi_value publish_new(napi_env env, napi_callback_info info) {
   }
   if (okay) {
     size_t name_bytes = wcslen(target) * sizeof(wchar_t);
-    size_t struct_bytes = offsetof(FILE_RENAME_INFO, FileName) + name_bytes;
+    /* kernel32 converts the path in FileName as a NUL-terminated string, so the
+       buffer must keep the terminator: sizeof includes FileName[1] and calloc zeroes it.
+       Without it, heap bytes past the name were appended to the published file name. */
+    size_t struct_bytes = sizeof(FILE_RENAME_INFO) + name_bytes;
     FILE_RENAME_INFO *rename = (FILE_RENAME_INFO *)calloc(1, struct_bytes);
     if (rename) {
       rename->ReplaceIfExists = FALSE;

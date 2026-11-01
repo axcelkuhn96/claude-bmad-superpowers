@@ -82,7 +82,15 @@ def private_atomic(path, writer):
             writer(stream)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        for attempt in range(8):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                # Antivirus and backup tools briefly hold a fresh file open on Windows.
+                if os.name != 'nt' or attempt == 7:
+                    raise
+                time.sleep(0.25 * (attempt + 1))
         if os.name != 'nt':
             parent_fd = os.open(path.parent, os.O_RDONLY)
             try:

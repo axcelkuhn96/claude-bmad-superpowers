@@ -1,6 +1,7 @@
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { ensureWindowsPrivateDirectory, hashWindowsFile, holdWindowsHash,
+import { deleteWindowsBinary, ensureWindowsPrivateDirectory, hashWindowsFile, holdWindowsHash,
   inspectWindowsPath, publishWindowsBinary, readWindowsBinary, windowsPathKey } from './windows-security.mjs';
 
 const names = new Set(['claude', 'codex', 'python']);
@@ -29,7 +30,13 @@ export async function enrollWindowsTool({ stateRoot, name, executable, sha256,
   if (!(await ensureWindowsPrivateDirectory(dir)).ok) throw new Error('windows_enrollment_state');
   const record = { version: 1, name, executable: key, fileId: identity.fileId,
     sha256, size: identity.size, ownerSid: audit.currentSid };
-  await publishWindowsBinary(recordFile(stateRoot, name), Buffer.from(JSON.stringify(record) + '\n'));
+  // Re-enrollment replaces the record: CLI updates swap the binary and invalidate its hash.
+  const file = recordFile(stateRoot, name);
+  if (await fs.lstat(file).then(() => true, () => false)) {
+    const previous = await readWindowsBinary(file, { length: 8192 });
+    await deleteWindowsBinary(file, previous.fileId, previous.bytes);
+  }
+  await publishWindowsBinary(file, Buffer.from(JSON.stringify(record) + '\n'));
   return record;
 }
 

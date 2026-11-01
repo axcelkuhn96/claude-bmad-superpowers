@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -112,13 +113,25 @@ async function persistCodexPolicy(env) {
   finally { if (temporary) await fs.rm(temporary, { force: true }).catch(() => {}); }
 }
 
-export async function registerReadonlyMcp(projectRoot, cli, { env = process.env } = {}) {
+export async function registerReadonlyMcp(projectRoot, cli, options = {}) {
+  if (process.platform !== 'win32') return registerAt(projectRoot, projectRoot, cli, options);
+  // projectRoot is the lower-cased canonical key on Windows, but the CLI scopes local servers
+  // by the spelling of its cwd: a lower-cased cwd registers for no real session.
+  let real = projectRoot;
+  try { real = realpathSync.native(projectRoot); } catch { /* registerAt reports the failure. */ }
+  const first = await registerAt(real, projectRoot, cli, options);
+  if (cli !== 'claude' || !['registered', 'existing'].includes(first.kind)) return first;
+  // VS Code starts the CLI with a lower-case drive letter, which is a distinct scope key.
+  return registerAt(real[0].toLowerCase() + real.slice(1), projectRoot, cli, options);
+}
+
+async function registerAt(cwd, projectRoot, cli, { env = process.env } = {}) {
   if (!['claude', 'codex'].includes(cli)) return unavailable('invalid_cli', cli, projectRoot);
   const args = cli === 'claude'
     ? [script, '--cli', 'claude', '--project', projectRoot]
     : [script, '--cli', 'codex'];
   const getArgs = ['mcp', 'get', 'cbs_memoria', ...(cli === 'codex' ? ['--json'] : [])];
-  const found = run(cli, getArgs, projectRoot, env);
+  const found = run(cli, getArgs, cwd, env);
   if (found.error) return unavailable('mcp_cli_unavailable', cli, projectRoot);
   if (found.status === 0) {
     if (!await matches(cli, found.stdout, process.execPath, args, env, projectRoot)) return unavailable('mcp_conflict', cli, projectRoot);
@@ -132,9 +145,9 @@ export async function registerReadonlyMcp(projectRoot, cli, { env = process.env 
   const addArgs = cli === 'claude'
     ? ['mcp', 'add', '--scope', 'local', 'cbs_memoria', '--', process.execPath, ...args]
     : ['mcp', 'add', 'cbs_memoria', '--', process.execPath, ...args];
-  const added = run(cli, addArgs, projectRoot, env);
+  const added = run(cli, addArgs, cwd, env);
   if (added.error || added.status !== 0) return unavailable('mcp_registration_failed', cli, projectRoot);
-  const verified = run(cli, getArgs, projectRoot, env);
+  const verified = run(cli, getArgs, cwd, env);
   return !verified.error && verified.status === 0 &&
     await matches(cli, verified.stdout, process.execPath, args, env, projectRoot) &&
     (cli !== 'codex' || await persistCodexPolicy(env))

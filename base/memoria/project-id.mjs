@@ -8,8 +8,9 @@ import { canonicalWindowsPath, resolveWindowsExecutable, windowsPathKey } from '
 
 const runFile = promisify(execFile);
 
-async function git(cwd, ...args) {
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+// On Windows each resolution spawns where.exe and audits the binary (~0.1 s), so one
+// identification resolves once and reuses it for its git calls on the same cwd.
+async function gitExecutable(cwd) {
   let executable = 'git';
   if (process.platform === 'win32') {
     let boundary = cwd;
@@ -36,6 +37,11 @@ async function git(cwd, ...args) {
     executable = await resolveWindowsExecutable('git.exe',
       forbidden);
   }
+  return executable;
+}
+
+async function git(cwd, executable, ...args) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
   const commandArgs = process.platform === 'win32'
     ? ['-c', 'core.fsmonitor=false', '-C', cwd, ...args] : ['-C', cwd, ...args];
   const { stdout } = await runFile(executable, commandArgs, { env, timeout: 5000, maxBuffer: 1024 * 1024 });
@@ -48,7 +54,11 @@ export async function identifyProject(cwd) {
   try { realCwd = await canonical(cwd); } catch { return { kind: 'invalid_cwd' }; }
   let activeRoot;
   let gitRoot;
-  try { gitRoot = await git(realCwd, 'rev-parse', '--show-toplevel'); }
+  let executable;
+  try {
+    executable = await gitExecutable(realCwd);
+    gitRoot = await git(realCwd, executable, 'rev-parse', '--show-toplevel');
+  }
   catch { return { kind: 'non_git', cwd: realCwd }; }
   try { activeRoot = await canonical(gitRoot); }
   catch { return { kind: 'unsupported_git' }; }
@@ -57,8 +67,8 @@ export async function identifyProject(cwd) {
     return { kind: 'unsupported_git' };
   }
   try {
-    if (await git(realCwd, 'rev-parse', '--is-bare-repository') !== 'false') return { kind: 'unsupported_git' };
-    const lines = (await git(realCwd, 'worktree', 'list', '--porcelain')).split('\n');
+    if (await git(realCwd, executable, 'rev-parse', '--is-bare-repository') !== 'false') return { kind: 'unsupported_git' };
+    const lines = (await git(realCwd, executable, 'worktree', 'list', '--porcelain')).split('\n');
     const listed = lines.filter((line) => line.startsWith('worktree ')).map((line) => line.slice(9));
     if (!listed.length) return { kind: 'unsupported_git' };
     const roots = await Promise.all(listed.map((root) => canonical(root).catch(() => null)));

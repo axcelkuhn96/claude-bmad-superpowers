@@ -12,8 +12,7 @@ const same = (a, b) => a?.provider === 'mem0' && b?.provider === 'mem0' &&
   JSON.stringify(a.destination) === JSON.stringify(b.destination);
 
 export async function activateProject(cwd, deps = {}) {
-  if (process.platform === 'win32') return blocked('windows_release_unproved');
-  if (!process.getuid) return blocked('native_windows_unproved');
+  if (process.platform !== 'win32' && !process.getuid) return blocked('native_windows_unproved');
   const resolution = await inspectConfiguration(cwd, deps);
   if (resolution.provider !== 'mem0') return blocked(resolution.reason);
   const current = async () => same(resolution, await inspectConfiguration(cwd, deps));

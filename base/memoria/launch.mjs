@@ -302,7 +302,6 @@ export async function buildLaunchCommand(cwd, cli, args = [], options = {}, made
 }
 
 export async function launchCli(cwd, cli, args = [], options = {}) {
-  if (process.platform === 'win32') return blocked('windows_release_unproved');
   if (cli === 'codex' && !safeCodexArgs(args)) return blocked('unsafe_cli_args');
   const made = await createLaunch(cwd, cli, options);
   if (made.kind !== 'created') return made;
@@ -323,7 +322,10 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
     catch { return blocked('broker_lease_unavailable'); }
     while (Date.now() < leaseDeadline) {
       const opened = await openBrokerLease(cwd, credential.digest, credential.secret,
-        { stateRoot: root, deadlineMs: Math.min(1000, Math.max(1, leaseDeadline - Date.now())) });
+        // Windows authorization revalidates git, config and trust in >1 s; the secret is
+        // one-use, so an attempt cut short would also burn every retry after it.
+        { stateRoot: root, deadlineMs: Math.min(process.platform === 'win32' ? 15000 : 1000,
+          Math.max(1, leaseDeadline - Date.now())) });
       if (opened.kind === 'leased') { lease = opened; credential.secret.fill(0); break; }
       if (opened.reason !== 'broker_unavailable') return blocked(opened.reason);
       await new Promise(resolve => setTimeout(resolve, Math.min(250,
@@ -355,8 +357,11 @@ export async function launchCli(cwd, cli, args = [], options = {}) {
                 closedAt: new Date().toISOString() }) + '\n');
               await handle.sync();
             } finally { await handle.close(); }
-            const directory = await fs.open(dir, 'r');
-            try { await directory.sync(); } finally { await directory.close(); }
+            // Windows refuses fsync on a directory handle (EPERM); the record itself is synced.
+            if (process.platform !== 'win32') {
+              const directory = await fs.open(dir, 'r');
+              try { await directory.sync(); } finally { await directory.close(); }
+            }
           }
         }
       }
