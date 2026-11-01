@@ -11,7 +11,7 @@ import { createRequire } from 'node:module';
 const runFile = promisify(execFile);
 const nativeFile = new URL('./bin/windows-native-x64.node', import.meta.url);
 const requireNative = createRequire(import.meta.url);
-export const WINDOWS_NATIVE_SHA256 = '33b49cb893fdeba04a2a598595e40c9232bb38185962b18f70cd902073c69978';
+export const WINDOWS_NATIVE_SHA256 = '03c857bd73e4457d2132782656454702254b4c1d6052dda10bf1f3754aa3ed9e';
 
 export function windowsGitPattern(root, target) {
   const relative = path.win32.relative(windowsPathKey(root), windowsPathKey(target));
@@ -188,6 +188,9 @@ function Audit([string]$value, [string]$kind, [bool]$privateState = $true,
   $ownerRead = $false
   $ownerWrite = $false
   foreach ($rule in $rules) {
+    # A deny entry can only narrow access, so it cannot weaken an integrity-only audit.
+    if (!$privateState -and
+        $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny) { continue }
     if (!$privateState -and
         $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
         $rule.IdentityReference.Value -notin $allowed -and

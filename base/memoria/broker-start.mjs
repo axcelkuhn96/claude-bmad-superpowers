@@ -12,7 +12,7 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export async function ensureBrokerReady(cwd, { stateRoot, bootstrapSessionId,
   deadlineMs = 30000, spawnBroker = spawn } = {}) {
-  if (process.platform === 'win32' || !process.getuid) return blocked('native_windows_unproved');
+  if (process.platform !== 'win32' && !process.getuid) return blocked('native_windows_unproved');
   const root = stateRoot ?? path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
   const deadline = Date.now() + deadlineMs;
   const device = process.env.CBS_MEMORIA_EMBEDDING_DEVICE ?? 'auto';
@@ -55,7 +55,11 @@ export async function ensureBrokerReady(cwd, { stateRoot, bootstrapSessionId,
       try {
         const script = fileURLToPath(new URL('./broker.mjs', import.meta.url));
         const child = spawnBroker(process.execPath, [script, root, cwd],
-          { detached: true, stdio: 'ignore', env: { PATH: process.env.PATH, HOME: process.env.HOME,
+          { detached: true, stdio: 'ignore', windowsHide: true, env: { PATH: process.env.PATH, HOME: process.env.HOME,
+            // Windows resolves the profile, temp and system paths from these, not from HOME.
+            ...(process.platform === 'win32' ? Object.fromEntries(['USERPROFILE', 'SystemRoot', 'WINDIR',
+              'TEMP', 'TMP', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramData', 'LOCALAPPDATA', 'APPDATA']
+              .filter(name => process.env[name]).map(name => [name, process.env[name]])) : {}),
             CBS_MEMORIA_EMBEDDING_DEVICE: device, ...(process.env.CBS_MEMORIA_CA_FILE ? {
               CBS_MEMORIA_CA_FILE: process.env.CBS_MEMORIA_CA_FILE,
             } : {}) } });

@@ -322,7 +322,19 @@ const leaseFile = (root, digest) => path.join(root, 'launches', `${digest}.lease
 const privateFile = stat => stat.isFile() && stat.uid === process.getuid() && !(stat.mode & 0o077);
 
 export async function createBrokerLeaseCredential(root, token) {
-  if (process.platform === 'win32' || !/^[a-f0-9]{64}$/.test(token ?? '')) throw new Error('unsafe_lease');
+  if (!/^[a-f0-9]{64}$/.test(token ?? '')) throw new Error('unsafe_lease');
+  if (process.platform === 'win32') {
+    const digest = launchDigest(token);
+    const secret = randomBytes(32);
+    const file = leaseFile(root, digest);
+    const published = await publishWindowsBinary(file, secret);
+    const stored = Buffer.from(secret);
+    return { digest, secret, async release() {
+      secret.fill(0);
+      await deleteWindowsBinary(file, published.fileId, stored).catch(() => {});
+      stored.fill(0);
+    } };
+  }
   const directory = path.join(root, 'launches');
   const dir = await fs.lstat(directory);
   if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o077)) throw new Error('unsafe_lease');
@@ -357,22 +369,29 @@ export async function createBrokerLeaseCredential(root, token) {
 
 // A one-use secret belongs to the launcher, never to the CLI environment or a worker request.
 export async function authorizeBrokerLease(root, cwd, resolution, digest, secret) {
-  if (process.platform === 'win32' || !/^[a-f0-9]{64}$/.test(digest ?? '') ||
+  if (!/^[a-f0-9]{64}$/.test(digest ?? '') ||
       !Buffer.isBuffer(secret) || secret.length !== 32 || typeof cwd !== 'string') return false;
+  const windows = process.platform === 'win32';
   const directory = path.join(root, 'launches');
   const recordFile = path.join(directory, `${digest}.json`);
   const sidecar = leaseFile(root, digest);
   const closedFile = path.join(directory, `${digest}.closed`);
   try {
-    const dir = await fs.lstat(directory);
-    if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o077)) return false;
-    const recordHandle = await fs.open(recordFile, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     let record;
-    try {
-      const stat = await recordHandle.stat();
-      if (!privateFile(stat) || stat.size > 8192) return false;
-      record = JSON.parse(await recordHandle.readFile('utf8'));
-    } finally { await recordHandle.close(); }
+    if (windows) {
+      const observed = await readWindowsBinary(recordFile, { length: 8192 });
+      if (observed.size !== observed.bytes.length) return false;
+      record = JSON.parse(observed.bytes.toString('utf8'));
+    } else {
+      const dir = await fs.lstat(directory);
+      if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o077)) return false;
+      const recordHandle = await fs.open(recordFile, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      try {
+        const stat = await recordHandle.stat();
+        if (!privateFile(stat) || stat.size > 8192) return false;
+        record = JSON.parse(await recordHandle.readFile('utf8'));
+      } finally { await recordHandle.close(); }
+    }
     const scope = await identifyProject(cwd);
     if (scope.kind !== 'git' || record.nativeRoot !== scope.activeRoot) return false;
     const currentProject = await inspectConfiguration(cwd, { stateRoot: root });
@@ -387,6 +406,14 @@ export async function authorizeBrokerLease(root, cwd, resolution, digest, secret
         !Number.isSafeInteger(record.createdAt) || record.createdAt > Date.now() + 5000 ||
         Date.now() - record.createdAt > 120000) return false;
     if (await fs.lstat(closedFile).then(() => true, error => error.code === 'ENOENT' ? false : true)) return false;
+    if (windows) {
+      // One-use like POSIX: the launcher's release tolerates the sidecar already being gone.
+      const stored = await readWindowsBinary(sidecar, { length: 64 });
+      const matched = stored.size === 32 && stored.bytes.length === 32 && timingSafeEqual(stored.bytes, secret);
+      if (matched) await deleteWindowsBinary(sidecar, stored.fileId, stored.bytes);
+      stored.bytes.fill(0);
+      return matched;
+    }
     const sidecarHandle = await fs.open(sidecar, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     let identity;
     let expected;
@@ -466,17 +493,31 @@ export function manageBrokerConnection(socket, onClose) {
 }
 
 export async function openBrokerLease(cwd, digest, secret, { stateRoot, deadlineMs = 1000 } = {}) {
-  if (process.platform === 'win32' || !/^[a-f0-9]{64}$/.test(digest ?? '') ||
+  if (!/^[a-f0-9]{64}$/.test(digest ?? '') ||
       !Buffer.isBuffer(secret) || secret.length !== 32) return blocked('lease_invalid');
+  const windows = process.platform === 'win32';
   const file = brokerPath(stateRoot);
   let socket;
   try {
-    const [dir, endpoint] = await Promise.all([fs.lstat(path.dirname(file)), fs.lstat(file)]);
-    if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o077) ||
-        !endpoint.isSocket() || endpoint.uid !== process.getuid() || (endpoint.mode & 0o077)) {
-      return blocked('unsafe_broker');
+    if (windows) {
+      const root = stateRoot ?? path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria');
+      const deadlineAt = Date.now() + deadlineMs;
+      const discovery = (await windowsDiscovery(root)).value;
+      socket = net.createConnection({ host: '127.0.0.1', port: discovery.port });
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('deadline')), Math.max(1, deadlineAt - Date.now()));
+        socket.once('connect', () => { clearTimeout(timer); resolve(); });
+        socket.once('error', error => { clearTimeout(timer); reject(error); });
+      });
+      await authenticateWindowsClient(socket, discovery, deadlineAt);
+    } else {
+      const [dir, endpoint] = await Promise.all([fs.lstat(path.dirname(file)), fs.lstat(file)]);
+      if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o077) ||
+          !endpoint.isSocket() || endpoint.uid !== process.getuid() || (endpoint.mode & 0o077)) {
+        return blocked('unsafe_broker');
+      }
+      socket = net.createConnection(file);
     }
-    socket = net.createConnection(file);
     const parser = new FrameReader({ response: true });
     const result = await new Promise(resolve => {
       let settled = false;
@@ -488,8 +529,9 @@ export async function openBrokerLease(cwd, digest, secret, { stateRoot, deadline
         resolve(value);
       };
       const timer = setTimeout(() => finish(blocked('broker_unavailable')), deadlineMs);
-      socket.once('connect', () => socket.write(encodeFrame({ kind: 'launch_lease', cwd,
-        launchDigest: digest }, secret)));
+      const send = () => socket.write(encodeFrame({ kind: 'launch_lease', cwd,
+        launchDigest: digest }, secret));
+      if (windows) { socket.resume(); send(); } else socket.once('connect', send);
       socket.on('data', chunk => {
         try {
           const frames = parser.push(chunk);

@@ -209,6 +209,8 @@ static int audit_file(HANDLE handle, int private_state, BY_HANDLE_FILE_INFORMATI
     void *entry = NULL;
     if (!GetAce(dacl, i, &entry)) goto cleanup;
     ACE_HEADER *header = (ACE_HEADER *)entry;
+    /* A deny entry can only narrow access, so it cannot weaken an integrity-only audit. */
+    if (!private_state && header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
     if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) goto cleanup;
     ACCESS_ALLOWED_ACE *ace = (ACCESS_ALLOWED_ACE *)entry;
     PSID principal = &ace->SidStart;

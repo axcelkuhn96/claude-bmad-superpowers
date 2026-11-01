@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { ensureWindowsPrivateDirectory, inspectWindowsPath, readWindowsPrivateFile,
-  writeWindowsPrivateFile } from './windows-security.mjs';
+import { deleteWindowsBinary, ensureWindowsPrivateDirectory, inspectWindowsPath,
+  readWindowsBinary, readWindowsPrivateFile, writeWindowsPrivateFile } from './windows-security.mjs';
 
 export const TRUST_VERSION = 1;
 
@@ -60,8 +60,14 @@ export async function writeLocalTrust(stateDir, tuple) {
     const file = path.join(stateDir, 'trust.json');
     const existing = await readWindowsPrivateFile(file);
     if (!existing.ok && existing.code !== 'missing') throw new Error('unsafe trust file');
-    const written = await writeWindowsPrivateFile(file, JSON.stringify(tuple) + '\n',
-      { replace: existing.ok, expectedText: existing.ok ? existing.text : null });
+    const text = JSON.stringify(tuple) + '\n';
+    if (existing.ok && existing.text === text) return;
+    // The helper has no replace: a crash between these steps leaves no trust, which fails closed.
+    if (existing.ok) {
+      const observed = await readWindowsBinary(file, { length: 1024 * 1024 });
+      await deleteWindowsBinary(file, observed.fileId, observed.bytes);
+    }
+    const written = await writeWindowsPrivateFile(file, text);
     if (!written.ok) throw new Error('unsafe trust file');
     return;
   }

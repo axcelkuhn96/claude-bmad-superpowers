@@ -8,3 +8,4 @@ node_modules/
 *.swo
 *Zone.Identifier
 .superpowers/
+__pycache__/
