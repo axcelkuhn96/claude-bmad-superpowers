@@ -8,7 +8,7 @@ import { identifyProject } from './project-id.mjs';
 import { readLocalTrust, sameTrustTuple, trustTuple, authorizeDestination } from './trust.mjs';
 import { verifyNativeCapture } from './native.mjs';
 import { readOwner, readAutoPublish } from './policy.mjs';
-import { assertWriter } from './authority.mjs';
+import { assertWriter, writerConnection } from './authority.mjs';
 import { pinDestination } from './activation.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
 import { selectSearchRecall, renderRecall } from './context.mjs';
@@ -107,7 +107,7 @@ function createLocalSearchWorker(resolution) {
     const key = Buffer.from(auth.key);
     try { return await worker.request({ ...request, projectId: resolution.projectId,
       collection: resolution.destination.collection,
-      connection: auth.connection, state: resolution.stateDir },
+      connection: writerConnection(resolution, auth.connection), state: resolution.stateDir },
     key, Date.now() + 120000, beforeDispatch); }
     finally { key.fill(0); }
   }, close: () => worker.close() };

@@ -6,7 +6,7 @@ import { runtimePython } from './runtime.mjs';
 import { requestBroker } from './broker.mjs';
 import { ensureBrokerReady } from './broker-start.mjs';
 import { createLedger, externalIdFor, reconcileStore, withProjectLock } from './ledger.mjs';
-import { assertWriter } from './authority.mjs';
+import { assertWriter, writerConnection } from './authority.mjs';
 import { targetVersion } from './correction.mjs';
 import { createOutbox } from './outbox.mjs';
 import { dedupKeyFor } from './dedup-key.mjs';
@@ -62,7 +62,8 @@ export async function runBridgeOperation(cwd, sessionId, operation, readSecret, 
   }
   const remaining = deadlineAt === null ? options.deadlineMs ?? undefined : Math.floor(deadlineAt - Date.now());
   if (deadlineAt !== null && remaining <= 0) return blocked('deadline');
-  const request = { ...operation, collection: resolution.destination.collection, connection: auth.connection };
+  const request = { ...operation, collection: resolution.destination.collection,
+    connection: writerConnection(resolution, auth.connection) };
   const env = { OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '1', MKL_NUM_THREADS: '1' };
   if (options.run) return options.run(runtimePython(resolution.stateDir), script, request, env, Buffer.from(auth.key));
   return requestBroker({ cwd, sessionId, operation,

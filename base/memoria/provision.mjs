@@ -10,6 +10,7 @@ import { runtimeEnvironment, runtimePython, verifyRuntimeArtifacts } from './run
 import { identifyProject } from './project-id.mjs';
 import { pinDestination } from './activation.mjs';
 import { readQdrantSecret } from './qdrant-key.mjs';
+import { assertWriter, writerConnection } from './authority.mjs';
 import { resolveEnrolledWindowsTool } from './windows-enrollment.mjs';
 import { ensureWindowsPrivateDirectory, windowsPathKey } from './windows-security.mjs';
 
@@ -67,8 +68,11 @@ export async function indexTextProject(cwd, options = {}) {
   const auth = authorizeDestination(current,
     await (options.trust ?? readLocalTrust)(current.stateDir), options.readSecret ?? readQdrantSecret);
   if (auth.kind !== 'authorized') return auth;
+  const writer = await assertWriter(current, { ...auth, connection: pin.connection });
+  if (writer.kind !== 'writer') return writer;
   const request = { op: 'index_text', projectId: current.projectId,
-    collection: current.destination.collection, connection: pin.connection };
+    collection: current.destination.collection,
+    connection: writerConnection(current, pin.connection) };
   try { return await (options.run ?? ((value, key) =>
     runIndexPython(value, key, current.stateDir)))(request, auth.key); }
   catch { return blocked('worker_failed'); }

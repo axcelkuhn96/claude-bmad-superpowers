@@ -16,6 +16,10 @@ function markerId(resolution) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+export function writerConnection(resolution, connection) {
+  return { ...connection, controlPointId: markerId(resolution) };
+}
+
 async function requestQdrant(resolution, auth, method, endpoint, body) {
   const connection = auth.connection;
   if (!connection?.url || !net.isIP(connection.address) ||
@@ -72,7 +76,7 @@ async function ensureWriterProtocol(resolution, auth) {
   const current = response.result[0];
   if (current && current.id !== id) return blocked('writer_protocol_mismatch');
   const legacy = current?.payload;
-  if (legacy && (legacy.projectId !== resolution.projectId ||
+  if (current && (!legacy || legacy.projectId !== resolution.projectId ||
       legacy.collection !== resolution.destination.collection ||
       !['writer_v1', 'writer_v2'].includes(legacy.cbs_control))) return blocked('writer_protocol_mismatch');
   const payload = { cbs_control: 'writer_v2', projectId: resolution.projectId,

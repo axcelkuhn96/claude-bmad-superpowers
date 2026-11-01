@@ -12,7 +12,7 @@ import { FrameReader, encodeFrame } from './frame.mjs';
 import { inspectConfiguration, resolveProject } from './provider.mjs';
 import { identifyProject } from './project-id.mjs';
 import { authorizeCurrentDestination } from './setup.mjs';
-import { assertWriter } from './authority.mjs';
+import { assertWriter, writerConnection } from './authority.mjs';
 import { readAutoPublish, readOwner } from './policy.mjs';
 import { readSessionCheckout } from './session-checkout.mjs';
 import { createOutbox } from './outbox.mjs';
@@ -812,7 +812,8 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
       }
     }
     const request = { ...operation, projectId: current.projectId, state: current.stateDir,
-      collection: current.destination.collection, connection: authorized.connection };
+      collection: current.destination.collection,
+      connection: writerConnection(current, authorized.connection) };
     if (signal.aborted || deadlineAt <= Date.now()) return blocked('deadline');
     const beforeDispatch = automatic
       ? async () => {
@@ -917,7 +918,8 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
       if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_authority_unavailable');
     }
     const request = { ...operation, projectId: current.projectId, state: current.stateDir,
-      collection: current.destination.collection, connection: auth.connection };
+      collection: current.destination.collection,
+      connection: writerConnection(current, auth.connection) };
     const beforeDispatch = async () => {
       if (!await artifacts.unchanged()) return blocked('artifact_changed');
       const live = await validate();
