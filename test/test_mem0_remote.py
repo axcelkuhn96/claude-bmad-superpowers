@@ -1,6 +1,7 @@
 """Opt-in integration test for a task-owned, authenticated Qdrant fixture."""
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -51,10 +52,18 @@ class RemoteSDKTest(unittest.TestCase):
                                      metadata={'cbs_embedding_fingerprint': adapter.FINGERPRINT})
             client.create_collection(wrong, vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE),
                                      metadata={'cbs_embedding_fingerprint': adapter.FINGERPRINT})
+            marker_raw = hashlib.sha256(json.dumps(['cbs-writer-v1', 'project-A',
+                connection['url'], collection], separators=(',', ':')).encode()).hexdigest()[:32]
+            marker_id = f'{marker_raw[:8]}-{marker_raw[8:12]}-{marker_raw[12:16]}-{marker_raw[16:20]}-{marker_raw[20:]}'
+            client.upsert(collection_name=collection, points=[models.PointStruct(
+                id=marker_id, vector=[0.0] * 384,
+                payload={'cbs_control': 'writer_v2', 'projectId': 'project-A',
+                         'collection': collection, 'mode': 'database', 'protocol': 2})], wait=True)
             base = {'collection': collection, 'connection': connection, 'projectId': 'project-A',
                     'externalId': 'source-claude-s1-0-25-policy1'}
             metadata = {'source': 'message-1', 'actor': 'owner', 'origin': 'user_direct',
-                        'scope': 'project', 'evidence_at': '2026-09-30T12:00:00Z'}
+                        'speaker_role': 'user', 'scope': 'project',
+                        'evidence_at': '2026-09-30T12:00:00Z'}
             with self.assertRaisesRegex(ValueError, 'collection_fingerprint_mismatch'):
                 adapter.execute({**base, 'collection': wrong, 'op': 'add', 'sessionId': 's1',
                                  'text': 'Review before release', 'metadata': metadata}, client, state)
@@ -73,13 +82,16 @@ class RemoteSDKTest(unittest.TestCase):
             late = adapter.execute({**base, 'op': 'add', 'sessionId': 's1',
                                     'text': 'Review before release', 'metadata': metadata}, client, state)
             rows = adapter.execute({**base, 'op': 'find'}, client, state)['items']
-            self.assertEqual({r['status'] for r in rows}, {'active', 'pending'})
+            self.assertEqual({r['status'] for r in rows}, {'active'})
             self.assertEqual(sum(r['status'] == 'active' for r in rows), 1)
-            self.assertNotEqual(late['sdkId'], added['sdkId'])
+            self.assertEqual(late['sdkId'], added['sdkId'])
             revised = {**base, 'externalId': 'source-codex-s2-0-28-policy2'}
+            target = adapter.execute({**base, 'op': 'mutation_target', 'memoryId': added['sdkId']}, client, state)['item']
             correction = adapter.execute({**revised, 'op': 'add', 'sessionId': 's2',
                                           'text': 'Review and test before release',
-                                          'metadata': {**metadata, 'supersedes_id': added['sdkId']}}, client, state)
+                                          'metadata': {**metadata, 'supersedes_id': added['sdkId'],
+                                              'correction_target_external_id': base['externalId'],
+                                              'correction_target_version': adapter._target_version(target)}}, client, state)
             adapter.execute({**revised, 'op': 'activate', 'sdkId': correction['sdkId']}, client, state)
             self.assertEqual(adapter.execute({**base, 'op': 'read', 'sdkId': added['sdkId']}, client, state)['item']['status'],
                              'superseded')

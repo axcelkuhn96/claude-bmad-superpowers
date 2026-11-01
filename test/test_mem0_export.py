@@ -32,7 +32,8 @@ class ExportTest(unittest.TestCase):
                    'text': 'safe fact', 'sessionId': 'session', 'externalId': 's'}
         memory = SimpleNamespace(get=lambda _id: {}, embedding_model=object(),
                                  add=lambda *args, **kwargs: {'results': [{'id': 'id'}]})
-        with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_memory', return_value=memory):
+        with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_memory', return_value=memory), \
+             patch.object(adapter, '_require_writer_v2'):
             with self.assertRaisesRegex(ValueError, 'derived_source'):
                 adapter.execute(request, object(), Path('/tmp'))
             request['op'] = 'activate'

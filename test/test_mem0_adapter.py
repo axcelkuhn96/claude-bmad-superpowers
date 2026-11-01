@@ -19,6 +19,11 @@ spec.loader.exec_module(adapter)
 
 
 class AdapterTest(unittest.TestCase):
+    def setUp(self):
+        marker = patch.object(adapter, '_require_writer_v2')
+        marker.start()
+        self.addCleanup(marker.stop)
+
     def test_delete_curated_removes_only_versioned_owned_target_and_confirms_absence(self):
         from qdrant_client.models import FilterSelector
         first = '64eef286-9f7e-4326-b137-5658f0286c46'
@@ -36,7 +41,7 @@ class AdapterTest(unittest.TestCase):
                 self.calls = []
             def retrieve(self, collection_name, ids, **kwargs):
                 return [self.points[key] for key in ids if key in self.points]
-            def delete(self, collection_name, points_selector, wait):
+            def delete(self, collection_name, points_selector, wait, ordering):
                 self_test.assertIsInstance(points_selector, FilterSelector)
                 self_test.assertTrue(wait)
                 self.calls.append(points_selector)
@@ -48,7 +53,8 @@ class AdapterTest(unittest.TestCase):
         request = {'op': 'delete_curated', 'collection': 'c', 'projectId': 'p',
                    'ownerId': 'alice', 'memoryId': first,
                    'expectedVersion': adapter._target_version(row), 'connection': {}}
-        with patch.object(adapter, 'verify_collection'):
+        request['requestId'] = 'request-1'
+        with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_target_claim', return_value=True):
             self.assertEqual(adapter.execute(request, client, Path('/tmp')),
                              {'kind': 'deleted', 'memoryId': first})
             self.assertEqual(set(client.points), {other})
@@ -76,7 +82,7 @@ class AdapterTest(unittest.TestCase):
                 request = {'op': 'delete_curated', 'collection': 'c',
                            'projectId': project, 'ownerId': owner,
                            'memoryId': identifier, 'expectedVersion': version,
-                           'connection': {}}
+                           'requestId': 'request-1', 'connection': {}}
                 self.assertNotEqual(adapter.execute(request, Client(), Path('/tmp'))['kind'], 'deleted')
 
     def test_delete_curated_does_not_ack_when_conditional_delete_misses_or_errors(self):
@@ -95,7 +101,8 @@ class AdapterTest(unittest.TestCase):
         request = {'op': 'delete_curated', 'collection': 'c', 'projectId': 'p',
                    'memoryId': identifier, 'expectedVersion': adapter._target_version(row),
                    'connection': {}}
-        with patch.object(adapter, 'verify_collection'):
+        request['requestId'] = 'request-1'
+        with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_target_claim', return_value=True):
             self.assertEqual(adapter.execute(request, Client(), Path('/tmp')),
                              {'kind': 'conflict', 'reason': 'target_changed'})
             class Failed(Client):
@@ -155,6 +162,7 @@ class AdapterTest(unittest.TestCase):
                    'connection': {}, 'sdkId': new_id, 'externalId': 'source-2'}
         with patch.object(adapter, 'verify_collection'), \
              patch.object(adapter, '_memory', return_value=memory), \
+             patch.object(adapter, '_target_claim', return_value=True), \
              patch.object(adapter, '_row', side_effect=lambda raw, *args: raw):
             memory.rows[old_id] = {**old, 'text': 'changed'}
             with self.assertRaisesRegex(ValueError, 'target_changed'):
@@ -212,7 +220,8 @@ class AdapterTest(unittest.TestCase):
         activate_request = {'op': 'activate', 'collection': 'c', 'projectId': 'p',
                             'sdkId': new_id, 'externalId': 'source-2', 'connection': {}}
         with patch.object(adapter, 'verify_collection'), \
-             patch.object(adapter, '_memory', return_value=Memory()):
+             patch.object(adapter, '_memory', return_value=Memory()), \
+             patch.object(adapter, '_target_claim', return_value=True):
             target = adapter.execute(target_request, client, Path('/tmp'))['item']
             payloads[new_id]['correction_target_version'] = adapter._target_version(target)
             payloads[old_id]['actor'] = 'changed'
@@ -633,8 +642,15 @@ class AdapterTest(unittest.TestCase):
         first = {'op': 'add', 'collection': 'native', 'projectId': 'p',
             'externalId': 'src-first', 'sessionId': 'session-one', 'text': text,
             'connection': {}, 'metadata': metadata}
+        def old_shape_add(client, collection, memory, request, metadata):
+            result = memory.add(request['text'], user_id=request['projectId'],
+                run_id=request['sessionId'], metadata={**metadata, 'status': 'pending',
+                    'source_record_id': request['externalId'], 'project_id': request['projectId']},
+                infer=False)
+            return {'kind': 'pending', 'sdkId': result['results'][0]['id']}
         with patch.object(adapter, 'verify_collection'), \
-             patch.object(adapter, '_memory', return_value=Memory()):
+             patch.object(adapter, '_memory', return_value=Memory()), \
+             patch.object(adapter, '_write_pending', side_effect=old_shape_add):
             self.assertEqual(adapter.execute(first, client, Path('/tmp'))['kind'], 'pending')
             points[0].payload['status'] = 'active'
             second = {**first, 'externalId': 'src-second', 'sessionId': 'session-two'}
@@ -1052,7 +1068,8 @@ class AdapterTest(unittest.TestCase):
             {'projectId': 'p', 'status': 'active', 'score': .9, 'metadata': {**metadata, 'valid_to': expires}},
         ]
         with patch.object(adapter, 'verify_collection'), patch.object(adapter, '_memory', return_value=Memory()), \
-             patch.object(adapter, '_row', side_effect=lambda row, *args: row):
+             patch.object(adapter, '_row', side_effect=lambda row, *args: row), \
+             patch.object(adapter, '_write_pending', return_value={'kind': 'pending', 'sdkId': 'episode-id'}):
             request = {'op': 'add', 'collection': 'c', 'projectId': 'p', 'externalId': 'e',
                        'connection': {}, 'sessionId': 's', 'text': 'fact', 'metadata': metadata}
             with self.assertRaisesRegex(ValueError, 'scope_invalid'):

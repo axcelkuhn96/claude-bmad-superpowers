@@ -278,6 +278,8 @@ def _row(raw: dict | None, client, collection: str, embedder) -> dict | None:
                                       for actual, wanted in zip(points[0].vector, expected)):
         raise ValueError('remote_vector_unverified')
     payload = points[0].payload or {}
+    if 'cbs_control' in payload:
+        raise ValueError('control_point_denied')
     if payload.get('data') != raw.get('memory') or payload.get('user_id') != raw.get('user_id') or \
             payload.get('project_id') != raw.get('user_id') or payload.get('status') != metadata.get('status') or \
             payload.get('source_record_id') != metadata.get('source_record_id'):
@@ -321,6 +323,145 @@ def _dedup_key(project: str, metadata: dict, text: str) -> str:
     return digest.hexdigest()
 
 
+def _point_id(kind: str, *parts: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, 'cbs-memoria-v2:' +
+        json.dumps([kind, *parts], ensure_ascii=False, separators=(',', ':'))))
+
+
+def _completed(result, reason: str) -> None:
+    status = getattr(result, 'status', None)
+    if getattr(status, 'value', status) != 'completed':
+        raise ValueError(reason)
+
+
+def _insert_only(client, collection: str, identifier: str, vector: list, payload: dict) -> None:
+    from qdrant_client.models import PointStruct, UpdateMode
+    try:
+        result = client.upsert(collection_name=collection,
+            points=[PointStruct(id=identifier, vector=vector, payload=payload)],
+            wait=True, ordering='strong', update_mode=UpdateMode.INSERT_ONLY)
+    except (AttributeError, TypeError) as error:
+        raise ValueError('qdrant_insert_only_unavailable') from error
+    _completed(result, 'remote_insert_unconfirmed')
+
+
+def _claim(client, collection: str, identifier: str, payload: dict) -> dict:
+    _insert_only(client, collection, identifier, [0.0] * 384, payload)
+    points = client.retrieve(collection_name=collection, ids=[identifier],
+                             with_payload=True, with_vectors=True)
+    if len(points) != 1 or str(points[0].id) != identifier or not isinstance(points[0].vector, list) or \
+            len(points[0].vector) != 384 or any(value != 0.0 for value in points[0].vector):
+        raise ValueError('remote_claim_unverified')
+    winner = points[0].payload
+    if not isinstance(winner, dict) or winner.get('cbs_control') != payload['cbs_control'] or \
+            winner.get('project_id') != payload['project_id']:
+        raise ValueError('remote_claim_mismatch')
+    return winner
+
+
+def _acquire_dedup(client, collection: str, project: str, external: str,
+                   key: str, digest: str) -> bool:
+    from qdrant_client.models import FieldCondition, Filter, HasIdCondition, MatchValue
+    identifier = _point_id('dedup', project, key)
+    payload = {'cbs_control': 'dedup_v2', 'project_id': project,
+               'owner_external_id': external, 'owner_digest': digest, 'retired': False}
+    winner = _claim(client, collection, identifier, payload)
+    if winner == payload:
+        return True
+    if winner.get('owner_external_id') == external:
+        if winner.get('owner_digest') != digest:
+            raise ValueError('source_changed')
+        if winner.get('retired') is not True:
+            return True
+        selector = Filter(must=[HasIdCondition(has_id=[identifier]),
+            FieldCondition(key='cbs_control', match=MatchValue(value='dedup_v2')),
+            FieldCondition(key='project_id', match=MatchValue(value=project)),
+            FieldCondition(key='owner_external_id', match=MatchValue(value=external)),
+            FieldCondition(key='owner_digest', match=MatchValue(value=digest)),
+            FieldCondition(key='retired', match=MatchValue(value=True))])
+        _completed(client.set_payload(collection_name=collection, payload={'retired': False},
+            points=selector, wait=True, ordering='strong'), 'remote_claim_unconfirmed')
+        after = client.retrieve(collection_name=collection, ids=[identifier], with_payload=True)
+        return len(after) == 1 and after[0].payload == payload
+    prior_id = _point_id('memory', project, winner.get('owner_external_id', ''))
+    if winner.get('retired') is not True:
+        previous = client.retrieve(collection_name=collection, ids=[prior_id], with_payload=True)
+        if len(previous) != 1 or not isinstance(previous[0].payload, dict) or \
+                previous[0].payload.get('project_id') != project or \
+                previous[0].payload.get('source_record_id') != winner.get('owner_external_id') or \
+                previous[0].payload.get('status') != 'superseded':
+            return False
+    selector = Filter(must=[HasIdCondition(has_id=[identifier]),
+        FieldCondition(key='cbs_control', match=MatchValue(value='dedup_v2')),
+        FieldCondition(key='project_id', match=MatchValue(value=project)),
+        FieldCondition(key='owner_external_id', match=MatchValue(value=winner['owner_external_id'])),
+        FieldCondition(key='owner_digest', match=MatchValue(value=winner['owner_digest'])),
+        FieldCondition(key='retired', match=MatchValue(value=winner.get('retired', False)))])
+    _completed(client.set_payload(collection_name=collection,
+        payload={'owner_external_id': external, 'owner_digest': digest, 'retired': False},
+        points=selector, wait=True, ordering='strong'), 'remote_claim_unconfirmed')
+    after = client.retrieve(collection_name=collection, ids=[identifier], with_payload=True)
+    if len(after) != 1 or after[0].payload != payload:
+        return False
+    return True
+
+
+def _write_pending(client, collection: str, memory, request: dict, metadata: dict) -> dict:
+    from mem0.utils.lemmatization import lemmatize_for_bm25
+    project, external, text = request['projectId'], request['externalId'], request['text']
+    if not isinstance(external, str) or not external or not isinstance(text, str) or not text.strip() or \
+            not isinstance(metadata, dict):
+        raise ValueError('invalid_source')
+    identifier = _point_id('memory', project, external)
+    digest = hashlib.sha256(json.dumps([project, external, request['sessionId'], text, metadata],
+        ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+    points = client.retrieve(collection_name=collection, ids=[identifier],
+                             with_payload=True, with_vectors=True)
+    if points:
+        if len(points) != 1 or str(points[0].id) != identifier or \
+                not isinstance(points[0].payload, dict) or \
+                points[0].payload.get('cbs_request_digest') != digest:
+            return {'kind': 'conflict', 'reason': 'source_changed'}
+        expected = memory.embedding_model.embed(text, 'add')
+        if not isinstance(points[0].vector, list) or len(points[0].vector) != 384 or \
+                len(expected) != 384 or not all(math.isclose(a, b, rel_tol=1e-4, abs_tol=1e-4)
+                    for a, b in zip(points[0].vector, expected)) or \
+                'cbs_control' in points[0].payload or \
+                any(points[0].payload.get(key) != value for key, value in metadata.items()) or \
+                points[0].payload.get('data') != text or points[0].payload.get('project_id') != project or \
+                points[0].payload.get('user_id') != project or \
+                points[0].payload.get('run_id') != request['sessionId'] or \
+                points[0].payload.get('source_record_id') != external or \
+                points[0].payload.get('status') not in ('pending', 'active', 'superseded'):
+            raise ValueError('remote_pending_unverified')
+        return {'kind': 'pending', 'sdkId': identifier}
+    if metadata.get('format_version') in (4, 5) and not _acquire_dedup(
+            client, collection, project, external, metadata['dedup_key'], digest):
+        return {'kind': 'pending', 'reason': 'duplicate_pending'}
+    vector = memory.embedding_model.embed(text, 'add')
+    if len(vector) != 384 or not all(math.isfinite(value) for value in vector):
+        raise ValueError('embedding_invalid')
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {**metadata, 'status': 'pending', 'source_record_id': external,
+               'project_id': project, 'user_id': project, 'run_id': request['sessionId'],
+               'role': 'user', 'data': text, 'hash': hashlib.md5(text.encode()).hexdigest(),
+               'created_at': now, 'updated_at': now, 'text_lemmatized': lemmatize_for_bm25(text),
+               'cbs_request_digest': digest}
+    _insert_only(client, collection, identifier, vector, payload)
+    points = client.retrieve(collection_name=collection, ids=[identifier],
+                             with_payload=True, with_vectors=True)
+    if len(points) != 1 or str(points[0].id) != identifier or \
+            not isinstance(points[0].payload, dict) or \
+            points[0].payload.get('cbs_request_digest') != digest or \
+            any(points[0].payload.get(key) != value for key, value in payload.items() if key not in
+                ('created_at', 'updated_at')) or \
+            not isinstance(points[0].vector, list) or len(points[0].vector) != 384 or \
+            not all(math.isclose(a, b, rel_tol=1e-4, abs_tol=1e-4)
+                for a, b in zip(points[0].vector, vector)):
+        raise ValueError('remote_pending_unverified')
+    return {'kind': 'pending', 'sdkId': identifier}
+
+
 def _find_duplicate(client, collection: str, request: dict) -> dict:
     """Exact metadata lookup; no semantic search or extra embedding."""
     from qdrant_client.models import FieldCondition, Filter, MatchValue
@@ -330,32 +471,42 @@ def _find_duplicate(client, collection: str, request: dict) -> dict:
     if metadata.get('format_version') not in (4, 5) or \
             key != _dedup_key(project, metadata, request['text']):
         raise ValueError('dedup_key_mismatch')
-    points, next_page = client.scroll(collection_name=collection,
-        scroll_filter=Filter(must=[
-            FieldCondition(key='project_id', match=MatchValue(value=project)),
-            FieldCondition(key='dedup_key', match=MatchValue(value=key))]),
-        limit=3, with_payload=True, with_vectors=False)
-    if next_page is not None or len(points) > 2:
-        raise ValueError('dedup_inventory_ambiguous')
+    selector = Filter(must=[
+        FieldCondition(key='project_id', match=MatchValue(value=project)),
+        FieldCondition(key='dedup_key', match=MatchValue(value=key))])
     active = []
     pending = False
-    for point in points:
-        payload = point.payload or {}
-        if payload.get('project_id') != project or payload.get('user_id') != project or \
-                payload.get('dedup_key') != key or not isinstance(payload.get('data'), str) or \
-                not isinstance(payload.get('source_record_id'), str) or \
-                _dedup_key(project, payload, payload['data']) != key:
-            raise ValueError('dedup_remote_mismatch')
-        if payload['source_record_id'] == request.get('externalId'):
-            continue  # Same source is reconciled by its existing external ID.
-        if payload.get('status') == 'pending':
-            pending = True
-        elif payload.get('status') == 'active':
-            try:
-                identifier = str(uuid.UUID(str(point.id)))
-            except (ValueError, TypeError, AttributeError):
+    offset = None
+    scanned = 0
+    pages = 0
+    while True:
+        pages += 1
+        kwargs = {'offset': offset} if offset is not None else {}
+        points, next_page = client.scroll(collection_name=collection,
+            scroll_filter=selector, limit=64, with_payload=True, with_vectors=False, **kwargs)
+        scanned += len(points)
+        if scanned > 2048 or pages > 33 or next_page == offset and next_page is not None:
+            raise ValueError('dedup_inventory_ambiguous')
+        for point in points:
+            payload = point.payload or {}
+            if 'cbs_control' in payload or payload.get('project_id') != project or payload.get('user_id') != project or \
+                    payload.get('dedup_key') != key or not isinstance(payload.get('data'), str) or \
+                    not isinstance(payload.get('source_record_id'), str) or \
+                    _dedup_key(project, payload, payload['data']) != key:
                 raise ValueError('dedup_remote_mismatch') from None
-            active.append((identifier, payload))
+            if payload['source_record_id'] == request.get('externalId'):
+                continue  # Same source is reconciled by its existing external ID.
+            if payload.get('status') == 'pending':
+                pending = True
+            elif payload.get('status') == 'active':
+                try:
+                    identifier = str(uuid.UUID(str(point.id)))
+                except (ValueError, TypeError, AttributeError):
+                    raise ValueError('dedup_remote_mismatch') from None
+                active.append((identifier, payload))
+        if next_page is None:
+            break
+        offset = next_page
     if len(active) != 1:
         if len(active) > 1:
             raise ValueError('dedup_inventory_ambiguous')
@@ -406,6 +557,8 @@ def _raw_collection(client, native: str) -> str | None:
 
 
 def _raw_payload(payload: dict, collection: str, identifier) -> bool:
+    if 'cbs_control' in payload:
+        return False
     try:
         anchor = str(uuid.UUID(str(payload.get('anchor_id'))))
         uuid.UUID(str(identifier))
@@ -558,7 +711,7 @@ def validate_curated_payload(point, project: str, owner: str | None,
     if purpose not in ('recall', 'history') or not isinstance(project, str) or not project:
         raise ValueError('invalid_curated_validation')
     payload = getattr(point, 'payload', None)
-    if not isinstance(payload, dict) or payload.get('project_id') != project or \
+    if not isinstance(payload, dict) or 'cbs_control' in payload or payload.get('project_id') != project or \
             payload.get('user_id') != project or 'expiration_date' in payload or \
             payload.get('source_type') in ('imported_legacy', 'derived_export'):
         return None
@@ -652,8 +805,80 @@ def _target_version(row: dict) -> str:
         separators=(',', ':')).encode('utf-8')).hexdigest()
 
 
+def _target_claim(client, collection: str, project: str, identifier: str,
+                  version: str, operation_id: str, operation_type: str,
+                  source_external: str | None = None, dedup_key: str | None = None) -> bool:
+    if not isinstance(operation_id, str) or not operation_id or \
+            (operation_type == 'delete' and re.fullmatch(r'[a-f0-9]{64}', operation_id) is None) or \
+            operation_type not in ('update', 'delete') or \
+            re.fullmatch(r'[a-f0-9]{64}', version or '') is None:
+        raise ValueError('mutation_identity_invalid')
+    payload = {'cbs_control': 'target_v2', 'project_id': project,
+               'target_id': identifier, 'target_version': version,
+               'operation_id': operation_id, 'operation_type': operation_type}
+    if operation_type == 'delete':
+        if not isinstance(source_external, str) or not source_external:
+            raise ValueError('mutation_identity_invalid')
+        payload['source_external_id'] = source_external
+        if dedup_key is not None:
+            if re.fullmatch(r'[a-f0-9]{64}', dedup_key) is None:
+                raise ValueError('mutation_identity_invalid')
+            payload['dedup_key_hash'] = dedup_key
+    winner = _claim(client, collection, _point_id('target', project, identifier, version), payload)
+    return winner == payload
+
+
+def _retire_dedup(client, collection: str, project: str,
+                  external: str, key: str | None) -> None:
+    if key is None:
+        return
+    from qdrant_client.models import FieldCondition, Filter, HasIdCondition, MatchValue
+    identifier = _point_id('dedup', project, key)
+    points = client.retrieve(collection_name=collection, ids=[identifier], with_payload=True)
+    if not points:
+        return  # A pre-upgrade memory has no dedup claim.
+    if len(points) != 1 or not isinstance(points[0].payload, dict):
+        raise ValueError('dedup_retirement_unverified')
+    claim = points[0].payload
+    if claim.get('cbs_control') != 'dedup_v2' or claim.get('project_id') != project:
+        raise ValueError('dedup_retirement_unverified')
+    if claim.get('owner_external_id') != external:
+        return  # A later source owns the dedup key.
+    if claim.get('retired') is True:
+        return
+    selector = Filter(must=[HasIdCondition(has_id=[identifier]),
+        FieldCondition(key='cbs_control', match=MatchValue(value='dedup_v2')),
+        FieldCondition(key='project_id', match=MatchValue(value=project)),
+        FieldCondition(key='owner_external_id', match=MatchValue(value=external)),
+        FieldCondition(key='owner_digest', match=MatchValue(value=claim.get('owner_digest'))),
+        FieldCondition(key='retired', match=MatchValue(value=False))])
+    _completed(client.set_payload(collection_name=collection, payload={'retired': True},
+        points=selector, wait=True, ordering='strong'), 'dedup_retirement_unverified')
+    after = client.retrieve(collection_name=collection, ids=[identifier], with_payload=True)
+    if len(after) != 1 or after[0].payload.get('owner_external_id') != external or \
+            after[0].payload.get('retired') is not True:
+        raise ValueError('dedup_retirement_unverified')
+
+
+def _require_writer_v2(client, request: dict) -> None:
+    version = getattr(client.info(), 'version', '')
+    match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)(?:[-+].*)?', version)
+    if not match or tuple(map(int, match.groups())) < (1, 16, 0):
+        raise ValueError('qdrant_insert_only_unavailable')
+    project, collection = request['projectId'], request['collection']
+    destination = request['connection']['url']
+    raw = hashlib.sha256(json.dumps(['cbs-writer-v1', project, destination, collection],
+        ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()[:32]
+    identifier = f'{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}'
+    points = client.retrieve(collection_name=collection, ids=[identifier], with_payload=True)
+    expected = {'cbs_control': 'writer_v2', 'projectId': project, 'collection': collection,
+                'mode': 'database', 'protocol': 2}
+    if len(points) != 1 or str(points[0].id) != identifier or points[0].payload != expected:
+        raise ValueError('writer_protocol_unavailable')
+
+
 def delete_curated(client, collection: str, project: str, owner: str | None,
-                   identifier: str, expected_version: str) -> dict:
+                   identifier: str, expected_version: str, operation_id: str) -> dict:
     """Delete one versioned curated point, then prove remote absence."""
     from qdrant_client.models import FieldCondition, Filter, FilterSelector, HasIdCondition, MatchValue
     identifier = str(uuid.UUID(identifier))
@@ -662,6 +887,15 @@ def delete_curated(client, collection: str, project: str, owner: str | None,
     points = client.retrieve(collection_name=collection, ids=[identifier],
                              with_payload=True, with_vectors=False)
     if not points:
+        claims = client.retrieve(collection_name=collection,
+            ids=[_point_id('target', project, identifier, expected_version)], with_payload=True)
+        if len(claims) == 1 and isinstance(claims[0].payload, dict):
+            claim = claims[0].payload
+            if claim.get('cbs_control') == 'target_v2' and claim.get('project_id') == project and \
+                    claim.get('target_id') == identifier and claim.get('target_version') == expected_version and \
+                    claim.get('operation_type') == 'delete' and claim.get('operation_id') == operation_id:
+                _retire_dedup(client, collection, project,
+                              claim.get('source_external_id'), claim.get('dedup_key_hash'))
         return {'kind': 'absent', 'memoryId': identifier}
     if len(points) != 1 or str(points[0].id) != identifier:
         return {'kind': 'conflict', 'reason': 'target_changed'}
@@ -670,6 +904,10 @@ def delete_curated(client, collection: str, project: str, owner: str | None,
         return {'kind': 'blocked', 'reason': 'target_unavailable'}
     if _target_version(row) != expected_version:
         return {'kind': 'conflict', 'reason': 'target_changed'}
+    dedup_key = row['metadata'].get('dedup_key') if row['metadata'].get('format_version') in (4, 5) else None
+    if not _target_claim(client, collection, project, identifier, expected_version,
+                         operation_id, 'delete', row['externalId'], dedup_key):
+        return {'kind': 'conflict', 'reason': 'concurrent_mutation'}
     payload = points[0].payload
     must = [HasIdCondition(has_id=[identifier])]
     for key in ('project_id', 'user_id', 'status', 'source_record_id',
@@ -677,7 +915,7 @@ def delete_curated(client, collection: str, project: str, owner: str | None,
         if key in payload:
             must.append(FieldCondition(key=key, match=MatchValue(value=payload[key])))
     result = client.delete(collection_name=collection,
-        points_selector=FilterSelector(filter=Filter(must=must)), wait=True)
+        points_selector=FilterSelector(filter=Filter(must=must)), wait=True, ordering='strong')
     status = getattr(result, 'status', None)
     if getattr(status, 'value', status) != 'completed':
         return {'kind': 'unavailable', 'reason': 'remote_delete_unconfirmed'}
@@ -685,6 +923,7 @@ def delete_curated(client, collection: str, project: str, owner: str | None,
                                 with_payload=True, with_vectors=False)
     if remaining:
         return {'kind': 'conflict', 'reason': 'target_changed'}
+    _retire_dedup(client, collection, project, row['externalId'], dedup_key)
     return {'kind': 'deleted', 'memoryId': identifier}
 
 
@@ -901,6 +1140,8 @@ def execute(request: dict, client, state: Path) -> dict:
         raise ValueError('invalid_identity')
     verify_collection(client, collection, FINGERPRINT)
     op = request['op']
+    if op in ('add', 'activate', 'delete_curated', 'index_text'):
+        _require_writer_v2(client, request)
     if op == 'index_text':
         return ensure_text_index(client, collection)
     if op == 'history_page':
@@ -914,7 +1155,7 @@ def execute(request: dict, client, state: Path) -> dict:
                                request['memoryId'])
     if op == 'delete_curated':
         return delete_curated(client, collection, project, request.get('ownerId'),
-                              request['memoryId'], request['expectedVersion'])
+                              request['memoryId'], request['expectedVersion'], request['requestId'])
     memory = _memory(client, collection, state, request['connection'], history_db_path=':memory:') \
         if op == 'search' else _memory(client, collection, state, request['connection'])
     if op == 'find':
@@ -928,12 +1169,16 @@ def execute(request: dict, client, state: Path) -> dict:
         return _find_duplicate(client, collection, request)
     if op == 'add':
         metadata = request['metadata']
+        if not isinstance(metadata, dict):
+            raise ValueError('metadata_invalid')
         if metadata.get('source_type') == 'derived_export':
             raise ValueError('derived_source')
         if 'context_generated' in metadata and not _valid_generated_context(
                 metadata['context_generated'], metadata.get('source_refs')):
             raise ValueError('context_generated_invalid')
-        if any(key in metadata for key in ('status', 'source_record_id', 'project_id', 'expiration_date')):
+        if any(key in metadata for key in ('status', 'source_record_id', 'project_id',
+                'expiration_date', 'cbs_control', 'cbs_request_digest', 'user_id',
+                'run_id', 'data', 'hash', 'created_at', 'updated_at', 'text_lemmatized', 'role')):
             raise ValueError('reserved_metadata')
         if metadata.get('scope') not in ('project', 'personal', 'episode') or \
                 (metadata.get('scope') == 'personal' and not metadata.get('owner_id')) or \
@@ -953,10 +1198,7 @@ def execute(request: dict, client, state: Path) -> dict:
             duplicate = _find_duplicate(client, collection, request)
             if duplicate['kind'] != 'clear':
                 return duplicate
-        metadata = {**metadata, 'status': 'pending', 'source_record_id': external, 'project_id': project}
-        result = memory.add(request['text'], user_id=project, run_id=request['sessionId'],
-                            metadata=metadata, infer=False)
-        return {'kind': 'pending', 'sdkId': result['results'][0]['id']}
+        return _write_pending(client, collection, memory, request, metadata)
     if op == 'activate':
         identifier = request['sdkId']
         row = _row(memory.get(identifier), client, collection, memory.embedding_model)
@@ -964,19 +1206,27 @@ def execute(request: dict, client, state: Path) -> dict:
             raise ValueError('canonical_mismatch')
         if row['metadata'].get('source_type') == 'derived_export':
             raise ValueError('derived_source')
+        supersedes = row['metadata'].get('supersedes_id')
+        if supersedes:
+            old = _row(memory.get(supersedes), client, collection, memory.embedding_model)
+            if old is None or old['projectId'] != project or \
+                    old['externalId'] != row['metadata'].get('correction_target_external_id') or \
+                    old['metadata'].get('scope') != row['metadata'].get('scope') or \
+                    (row['metadata'].get('scope') == 'personal' and
+                     old['metadata'].get('owner_id') != row['metadata'].get('owner_id')):
+                raise ValueError('superseded_target_invalid')
+            version = row['metadata'].get('correction_target_version')
+            if old['status'] == 'active' and _target_version(old) != version:
+                raise ValueError('target_changed')
+            if old['status'] == 'superseded' and (old['metadata'].get('superseded_by') != identifier or
+                    old['metadata'].get('superseded_by_external_id') != external):
+                raise ValueError('superseded_target_invalid')
+            if not _target_claim(client, collection, project, supersedes, version,
+                                 external, 'update'):
+                raise ValueError('concurrent_mutation')
         if row['status'] == 'pending':
-            supersedes = row['metadata'].get('supersedes_id')
             if supersedes:
-                old = _row(memory.get(supersedes), client, collection, memory.embedding_model)
-                if old is None or old['projectId'] != project or \
-                        old['externalId'] != row['metadata'].get('correction_target_external_id') or \
-                        old['metadata'].get('scope') != row['metadata'].get('scope') or \
-                        (row['metadata'].get('scope') == 'personal' and
-                         old['metadata'].get('owner_id') != row['metadata'].get('owner_id')):
-                    raise ValueError('superseded_target_invalid')
                 if old['status'] == 'active':
-                    if _target_version(old) != row['metadata'].get('correction_target_version'):
-                        raise ValueError('target_changed')
                     memory.update(supersedes, metadata={'status': 'superseded',
                         'superseded_by': identifier, 'superseded_by_external_id': external})
                     old = _row(memory.get(supersedes), client, collection, memory.embedding_model)
