@@ -2,7 +2,12 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
-## [Não publicado]
+## [0.17.0] - 2026-11-01
+
+### Memória em vários computadores
+- **Escrita por permissão do Qdrant:** qualquer computador com credencial de escrita no Qdrant, projeto confiável e ativado, identidade da fonte e consentimento de publicação automática pode usar `remember`, `update`, `delete` e os hooks. O ID do dispositivo fica para auditoria; não há designação, transferência ou lista de computadores escritores. O proprietário identifica a proveniência e filtra memórias pessoais, sem restringir a escrita da memória compartilhada do projeto.
+- **Migração do escritor:** a autoridade remota passa ao marcador `writer_v2` em modo `database`, protocolo 2, no Qdrant. O estado anterior `writer_v1` e caches locais deixam de designar um computador; `writer-bootstrap` e `writer-transfer-start`/`writer-transfer-complete` retornam `writer_designation_obsolete`, sem revogar a escrita de outro computador. Atualize todos os clientes para 0.17.0 antes da operação simultânea: depois de observar o marcador novo, um cliente antigo bloqueia a escrita com erro tipado. Operações antigas já em andamento durante a troca não têm garantia de ordem global.
+- **Confirmação e concorrência:** uma credencial somente leitura recebe `403` do Qdrant e não confirma gravação. `readwrite_configured` e os campos de configuração de `status` indicam apenas condições locais, nunca ACK remoto. IDs e reivindicações remotas determinísticos evitam duplicatas exatas e duas correções vencedoras entre clientes atualizados, usando inserção condicional nativa e ordenação forte do Qdrant 1.16+; o servidor 1.19.1 foi comprovado. Não há transação global entre pontos nem garantia contra clientes maliciosos fora do CBS.
 
 ### Corrigido
 - **Windows nativo — helper de segurança:** o programa PowerShell codificado (45.788 caracteres) excedia o limite de 32.767 da linha de comando (`spawn ENAMETOOLONG`) e derrubava toda operação de estado privado. O argv passa a levar só um bootstrap; o programa segue pelo stdin num helper persistente por processo, com requisições serializadas e prazo por requisição. A latência por operação caiu de ~650 ms para ~4 ms.
