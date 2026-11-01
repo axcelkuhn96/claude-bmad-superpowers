@@ -43,7 +43,7 @@ async function runClaudeExtraction(prompt, policy, route) {
       throw new Error('selected paths changed');
     }
     const metadata = process.platform === 'win32'
-      ? await inspectWindowsPath(profile, 'directory') : await fs.stat(profile);
+      ? await inspectWindowsPath(profile, 'directory', { privateState: false }) : await fs.stat(profile);
     if ((process.platform === 'win32' ? !metadata.ok :
       !metadata.isDirectory() || !process.getuid || metadata.uid !== process.getuid() ||
       (metadata.mode & 0o022)) || [scope.projectRoot, scope.activeRoot].some(root =>
@@ -58,7 +58,8 @@ async function runClaudeExtraction(prompt, policy, route) {
   }
   const windows = process.platform === 'win32';
   const conversation = route === 'haiku' && policy.mode === 'conversation';
-  const stateRoot = policy.stateRoot ?? process.env.CBS_MEMORIA_STATE_ROOT;
+  const stateRoot = policy.stateRoot ?? process.env.CBS_MEMORIA_STATE_ROOT ??
+    (windows ? path.join(os.homedir(), '.local', 'state', 'cbs', 'memoria') : undefined);
   if (windows && !stateRoot) return { kind: 'error', reason: 'cli_state_unselected' };
   const cwd = windows ? path.join(stateRoot, 'extraction-temp', randomUUID()) :
     await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-extract-'));
