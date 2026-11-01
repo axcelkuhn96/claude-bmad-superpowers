@@ -753,8 +753,7 @@ test('automatic consumer passes its custom state root through publisher and stor
         },
         authorize: async () => ({ kind: 'authorized', key: 'fixture-key',
           connection: { url: 'https://qdrant.internal' } }),
-        control: async () => ({ kind: 'authority', record: { state: 'active',
-          deviceId: device.deviceId, generation: 1 } }),
+        control: async () => ({ kind: 'protocol' }),
         ensureBrokerReady: async (_cwd, brokerOptions) => {
           assert.equal(brokerOptions.stateRoot, stateRoot);
           brokerStarts++;

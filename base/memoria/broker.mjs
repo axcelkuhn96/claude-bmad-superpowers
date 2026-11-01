@@ -801,7 +801,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     };
     if (writing) {
       const writer = await assertWriter(current, authorized, { stateRoot });
-      if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+      if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_authority_unavailable');
       const consent = await authorizeAutomaticBrokerWrite(current, operation, autoConsent);
       if (consent.kind !== 'allowed') return consent;
       if (automatic) {
@@ -821,7 +821,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
         if (live.provider !== 'mem0' || live.projectId !== current.projectId ||
             live.embeddingFingerprint !== current.embeddingFingerprint) return denied('project_mismatch');
         const writer = await assertWriter(live, authorized, { stateRoot });
-        if (writer.kind !== 'writer') return denied(writer.reason ?? 'writer_not_designated');
+        if (writer.kind !== 'writer') return denied(writer.reason ?? 'writer_authority_unavailable');
         const consent = await authorizeAutomaticBrokerWrite(live, operation, autoConsent);
         if (consent.kind !== 'allowed') return consent;
         const origin = await authorizeAutomaticOrigin(live, cwd, sessionId, operation);
@@ -914,7 +914,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
     if (auth.kind !== 'authorized') return blocked(auth.reason ?? 'authorization_failed');
     if (isWriteFlow) {
       const writer = await assertWriter(current, auth, { stateRoot });
-      if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+      if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_authority_unavailable');
     }
     const request = { ...operation, projectId: current.projectId, state: current.stateDir,
       collection: current.destination.collection, connection: auth.connection };
@@ -929,7 +929,7 @@ export async function serveBroker({ stateRoot, bootstrapCwd, bootstrapSessionId,
       }
       if (isWriteFlow) {
         const writer = await assertWriter(live, freshAuth, { stateRoot });
-        if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+        if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_authority_unavailable');
       }
       return signal.aborted || deadlineAt <= Date.now() ? blocked('deadline') : { kind: 'allowed' };
     };

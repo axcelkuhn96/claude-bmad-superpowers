@@ -101,8 +101,8 @@ test('read-only MCP status reports locally configured automatic writing without 
     autoPublish: async () => consent,
     authorize: async () => { remoteCalls++; throw Error('unexpected remote call'); } });
   assert.deepEqual(await mcp.call('status'), { kind: 'ready', provider: 'mem0',
-    mode: 'readonly', projectId: 'project-one', automaticWriteConfigured: true,
-    manualWriteConfigured: false });
+    mode: 'readwrite_configured', projectId: 'project-one', automaticWriteConfigured: true,
+    manualWriteConfigured: true });
   consent = null;
   assert.equal((await mcp.call('status')).automaticWriteConfigured, false);
   assert.equal(remoteCalls, 0);

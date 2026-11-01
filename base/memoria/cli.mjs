@@ -1,4 +1,3 @@
-import fs from 'node:fs/promises';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 import { spawn } from 'node:child_process';
@@ -11,8 +10,7 @@ import { registerOwner, configureExtractor, localDevice, readOwner, readExtracto
   configureExtractionSchedule } from './policy.mjs';
 import { authorizeCurrentDestination } from './setup.mjs';
 import { indexTextProject } from './provision.mjs';
-import { administrativeSession, assertWriter, bootstrapWriter, beginWriterTransfer,
-  completeWriterTransfer } from './authority.mjs';
+import { administrativeSession, assertWriter } from './authority.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const help = `Uso: cbs memoria <ação> [opções]
@@ -23,7 +21,7 @@ Ações: avaliar, status, check, indexar-texto, exportar, historico, provision, 
        writer-transfer-start, writer-transfer-complete, help
 Use --project /caminho/git nas ações de projeto. O cadastro pessoal e a seleção
 do extrator exigem declaração local explícita; publicação automática exige opt-in local
-por projeto, owner e writer designado.
+por projeto e owner; cada dispositivo usa sua credencial Qdrant autorizada.
 Activate aceita --allow-tracked-native para configuração nativa versionada autorizada.
 No Windows: cbs memoria enroll --tool claude|codex|python --executable caminho.exe --sha256 hash.
 Avaliar é offline: cbs memoria avaliar --outputs arquivo.json [--corpus arquivo.json] [--split dev|holdout|all].
@@ -51,6 +49,10 @@ async function subprocess(script, args) {
 export async function main(args = []) {
   const [action, ...rest] = args;
   if (!action || action === 'help' || action === '--help') { process.stdout.write(help); return 0; }
+  if (['writer-bootstrap', 'writer-transfer-start', 'writer-transfer-complete'].includes(action)) {
+    process.stdout.write('blocked: writer_designation_obsolete\n');
+    return 1;
+  }
   if (action === 'avaliar') {
     const { evaluateCli } = await import('./evaluation-cli.mjs');
     return evaluateCli(rest);
@@ -206,7 +208,7 @@ export async function main(args = []) {
     if (!ownerId || !['claude', 'codex'].includes(cli) ||
         !await askConfirmation(`Ativar publicação automática no projeto ${resolution.projectId}, ` +
           `Qdrant ${resolution.destination.url}/${resolution.destination.collection}, ` +
-          `owner ${ownerId}, após validação Haiku e writer designado. Digite ${resolution.projectId}: `,
+          `owner ${ownerId}, após validação Haiku e autorização Qdrant. Digite ${resolution.projectId}: `,
         resolution.projectId)) return 1;
     const admin = await administrativeSession(project);
     if (admin.kind !== 'session') {
@@ -223,35 +225,6 @@ export async function main(args = []) {
     const result = await enableAutoPublish(resolution, { ownerId, cli, profile });
     process.stdout.write(`${result.kind}: ${result.reason ?? result.consentHash}\n`);
     return result.kind === 'enabled' ? 0 : 1;
-  }
-  if (['writer-bootstrap', 'writer-transfer-start', 'writer-transfer-complete'].includes(action)) {
-    if (!process.stdin.isTTY || !process.stdout.isTTY) return 1;
-    const admin = await administrativeSession(project);
-    if (admin.kind !== 'session') { process.stdout.write(`${admin.kind}: ${admin.reason}\n`); return 1; }
-    const device = await localDevice(resolution.stateDir);
-    if (device.kind !== 'device') return 1;
-    process.stdout.write(`Projeto ${resolution.projectId}; Qdrant ${resolution.destination.url}; coleção ${resolution.destination.collection}; dispositivo ${device.deviceId}\n`);
-    if (!await askConfirmation(`Administrador único, clientes quiescentes: digite ${resolution.projectId}: `,
-      resolution.projectId)) return 1;
-    let result;
-    if (action === 'writer-bootstrap') result = await bootstrapWriter(project, admin.sessionId, readSecret,
-      { confirm: true, clientsQuiescent: true, singleAdministrator: true });
-    else if (action === 'writer-transfer-start') {
-      result = await beginWriterTransfer(project, admin.sessionId, value(rest, '--to-device'), readSecret,
-        { confirm: true });
-      if (result.kind === 'handoff') {
-        process.stdout.write(`handoff: ${result.bundleFile}; sha256 ${result.handoffDigest}\n`);
-        return 0;
-      }
-    } else {
-      const file = value(rest, '--bundle');
-      if (!file || !path.isAbsolute(file)) return 2;
-      const bundle = JSON.parse(await fs.readFile(file, 'utf8'));
-      result = await completeWriterTransfer(project, admin.sessionId, bundle, readSecret,
-        { confirm: true });
-    }
-    process.stdout.write(`${result.kind}: ${result.reason ?? result.generation ?? result.deviceId}\n`);
-    return ['designated', 'transferred'].includes(result.kind) ? 0 : 1;
   }
   process.stderr.write(help);
   return 2;

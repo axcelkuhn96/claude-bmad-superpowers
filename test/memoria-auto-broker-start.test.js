@@ -62,8 +62,7 @@ async function fixture(t) {
   const entry = (await outbox.readManifest(checkpoint.operationId)).candidates[0];
   const options = { stateRoot: root, resolve: async () => resolution,
     authorize: async () => ({ kind: 'authorized', key: 'fixture-key', connection: {} }),
-    control: async () => ({ kind: 'authority', record: {
-      state: 'active', deviceId: device.deviceId, generation: 1 } }),
+    control: async () => ({ kind: 'protocol' }),
     readAutoPublish: async () => consent, autoPublishConsent: consent,
     ackLocal: (id, proof) => id === entry.externalId
       ? outbox.ackCandidate(checkpoint.operationId, entry.candidateKey, proof)
@@ -118,7 +117,7 @@ test('automatic store checks consent and writer before trying to start the broke
   });
   assert.deepEqual(revoked, { kind: 'blocked', reason: 'auto_publish_unproved' });
   const fenced = await storeMemory('/project', 'session', operation, () => '', {
-    ...options, control: async () => ({ kind: 'missing' }), ensureBrokerReady: start,
+    ...options, control: async () => ({ kind: 'blocked', reason: 'writer_authority_missing' }), ensureBrokerReady: start,
   });
   assert.deepEqual(fenced, { kind: 'blocked', reason: 'writer_authority_missing' });
   assert.equal(starts, 0);

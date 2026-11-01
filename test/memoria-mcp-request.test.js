@@ -188,8 +188,7 @@ test('normal MCP remember uses bridge and confirms remote activation before repo
     owner: async () => ({ ownerId: 'axcel-local' }), autoPublish: async () => f.consent,
     authorize: async () => ({ kind: 'authorized', key: 'fixture', connection: {} }),
     writer: async () => ({ kind: 'writer' }),
-    writerControl: async () => ({ kind: 'authority', record: {
-      state: 'active', deviceId: device.deviceId, generation: 1 } }),
+    writerControl: async () => ({ kind: 'protocol' }),
     workerFactory: () => ({ close: async () => {}, request: async (request, _auth, beforeDispatch, sourceOperation) => {
       assert.equal(sourceOperation.op, 'add');
       assert.equal(sourceOperation.metadata.format_version, 5);

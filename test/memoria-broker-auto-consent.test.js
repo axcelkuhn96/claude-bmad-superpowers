@@ -122,8 +122,7 @@ test('bridge carries consent proof for both SDK writes and omits it for manual w
   const options = { stateRoot: root, resolve: async () => current,
     authorize: async () => ({ kind: 'authorized', key: 'key', connection: {} }),
     readAutoPublish: async () => consent,
-    control: async () => ({ kind: 'authority', record: {
-      state: 'active', deviceId: device.deviceId, generation: 1 } }),
+    control: async () => ({ kind: 'protocol' }),
   };
   await runBridgeOperation('/project', 'session', { ...add, projectId: 'project' },
     () => 'key', { ...options, autoPublishConsent: consent });

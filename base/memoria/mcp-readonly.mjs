@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import os from 'node:os';
 import path from 'node:path';
-import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { inspectConfiguration } from './provider.mjs';
@@ -178,19 +177,6 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
     if (!frozen) frozen = { resolution: current, activeRoot: scope.activeRoot, ownerId: read?.ownerId ?? null, profile };
     return { kind: 'ready', projectId: current.projectId, ownerId: frozen.ownerId, resolution: current };
   }
-  async function localWriter(resolution, consent) {
-    try {
-      const file = path.join(resolution.stateDir, 'ledger', 'writer.json');
-      const stat = await fs.lstat(file);
-      if (!stat.isFile() || stat.isSymbolicLink() ||
-          process.platform !== 'win32' && (stat.uid !== process.getuid() || (stat.mode & 0o077))) return false;
-      const record = JSON.parse(await fs.readFile(file, 'utf8'));
-      return record.projectId === resolution.projectId &&
-        record.collection === resolution.destination.collection &&
-        record.deviceId === consent.deviceId && record.revoked !== true &&
-        Number.isSafeInteger(record.generation) && record.generation > 0;
-    } catch { return false; }
-  }
   const consentMatches = (consent, ready) => consent?.version === 1 &&
     consent.enabled === true && consent.projectId === ready.projectId &&
     !!ready.ownerId && consent.ownerId === ready.ownerId &&
@@ -268,8 +254,7 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
       try {
         const consent = await autoPublish(ready.resolution);
         automaticWriteConfigured = consentMatches(consent, ready);
-        const manualWriteConfigured = automaticWriteConfigured &&
-          await localWriter(ready.resolution, consent);
+        const manualWriteConfigured = automaticWriteConfigured;
         return { kind: 'ready', provider: 'mem0',
           mode: manualWriteConfigured ? 'readwrite_configured' : 'readonly', projectId: ready.projectId,
           automaticWriteConfigured, manualWriteConfigured };
@@ -285,7 +270,7 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
         const auth = await authorizeReady(current);
         if (auth.kind !== 'authorized') return blocked(auth.reason);
         const designated = await writer(current.resolution, auth);
-        if (designated.kind !== 'writer') return blocked(designated.reason ?? 'writer_not_designated');
+        if (designated.kind !== 'writer') return blocked(designated.reason ?? 'writer_authority_unavailable');
         const beforeDispatch = async () => {
           const live = await writeReady(current.consent);
           if (live.kind !== 'ready') return blocked(live.reason);
@@ -293,7 +278,7 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
           if (freshAuth.kind !== 'authorized') return blocked(freshAuth.reason);
           const freshWriter = await writer(live.resolution, freshAuth);
           return freshWriter.kind === 'writer' ? { kind: 'allowed' } :
-            blocked(freshWriter.reason ?? 'writer_not_designated');
+            blocked(freshWriter.reason ?? 'writer_authority_unavailable');
         };
         const found = await dispatch({ op: 'mutation_target', memoryId,
           ownerId: current.ownerId }, auth, beforeDispatch);
@@ -394,7 +379,7 @@ export function createReadonlyMcp({ cwd = process.cwd(), cli, stateRoot,
           if (authorized.kind !== 'authorized') return authorized;
           const designated = await writer(latest.resolution, authorized);
           return designated.kind === 'writer' ? { kind: 'allowed' } :
-            blocked(designated.reason ?? 'writer_not_designated');
+            blocked(designated.reason ?? 'writer_authority_unavailable');
         };
         const operation = source.operation;
         const result = remember ? await remember(operation, { ready: live, auth,

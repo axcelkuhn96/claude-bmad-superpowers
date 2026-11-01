@@ -367,50 +367,37 @@ test('launch abortado antes do spawn deixa prova durável e permite deactivate',
     'deactivated');
 });
 
-test('designação Qdrant compartilhada bloqueia leitor e transfere só após handoff', async t => {
+test('APIs legadas de designação ficam inertes e dois dispositivos mantêm autorização local', async t => {
   const a = await project(t, 'writer-a');
   const b = await project(t, 'writer-b');
   const firstDevice = await localDevice(a.resolution.stateDir);
   const secondDevice = await localDevice(b.resolution.stateDir);
   assert.notEqual(firstDevice.deviceId, secondDevice.deviceId);
-  let remote;
-  const control = async (command, resolution, row) => {
-    if (command === 'read') return remote ? { kind: 'authority', record: remote } : { kind: 'missing' };
-    remote = { cbs_control: 'writer_v1', projectId: resolution.projectId,
-      collection: resolution.destination.collection, ...row };
-    return { kind: 'written' };
-  };
-  const options = fixture => ({ stateRoot: fixture.stateRoot,
-    lookup: async () => ['10.1.2.3'], control });
-  await initializeSession(a.gitRoot, 's', { event: 'SessionStart', stateRoot: a.stateRoot });
-  await initializeSession(b.gitRoot, 's', { event: 'SessionStart', stateRoot: b.stateRoot });
+  let calls = 0;
+  const control = async () => { calls++; return { kind: 'protocol' }; };
+  const options = fixture => ({ stateRoot: fixture.stateRoot, control });
+  const cacheFile = path.join(a.resolution.stateDir, 'ledger', 'writer.json');
+  await fs.mkdir(path.dirname(cacheFile), { recursive: true, mode: 0o700 });
+  await fs.writeFile(cacheFile, JSON.stringify({ revoked: true, deviceId: firstDevice.deviceId }),
+    { mode: 0o600 });
+  const before = await fs.readFile(cacheFile, 'utf8');
   const readSecret = () => 'fixture-secret';
-  assert.equal((await bootstrapWriter(a.gitRoot, 's', readSecret, {
-    ...options(a), confirm: true, clientsQuiescent: true, singleAdministrator: true })).kind, 'designated');
-  assert.equal((await bootstrapWriter(b.gitRoot, 's', readSecret, {
-    ...options(b), confirm: true, clientsQuiescent: true, singleAdministrator: true })).reason,
-  'writer_already_designated');
+  assert.equal((await bootstrapWriter(a.gitRoot, 's', readSecret,
+    { confirm: true, clientsQuiescent: true, singleAdministrator: true })).reason,
+  'writer_designation_obsolete');
+  assert.equal((await beginWriterTransfer(a.gitRoot, 's', secondDevice.deviceId, readSecret,
+    { confirm: true })).reason, 'writer_designation_obsolete');
+  assert.equal((await completeWriterTransfer(b.gitRoot, 's', { kind: 'cbs_writer_handoff_v1' },
+    readSecret, { confirm: true })).reason, 'writer_designation_obsolete');
+  assert.equal(calls, 0);
+  assert.equal(await fs.readFile(cacheFile, 'utf8'), before);
   const auth = { kind: 'authorized', key: 'fixture-secret' };
   assert.equal((await assertWriter(a.resolution, auth, options(a))).kind, 'writer');
-  assert.equal((await assertWriter(b.resolution, auth, options(b))).reason, 'writer_not_designated');
-  const inflight = path.join(a.resolution.stateDir, 'ledger', `${'e'.repeat(64)}.json`);
-  await fs.writeFile(inflight, JSON.stringify({ projectId: 'p', status: 'queued' }));
-  assert.equal((await beginWriterTransfer(a.gitRoot, 's', secondDevice.deviceId, readSecret,
-    { ...options(a), confirm: true })).reason, 'writer_operation_unsettled');
-  await fs.rm(inflight);
-  const transfer = await beginWriterTransfer(a.gitRoot, 's', secondDevice.deviceId, readSecret,
-    { ...options(a), confirm: true });
-  assert.equal(transfer.kind, 'handoff');
-  assert.equal((await assertWriter(a.resolution, auth, options(a))).reason, 'writer_not_designated');
-  assert.equal((await assertWriter(b.resolution, auth, options(b))).reason, 'writer_not_designated');
-  const bundle = JSON.parse(await fs.readFile(transfer.bundleFile, 'utf8'));
-  assert.equal((await completeWriterTransfer(b.gitRoot, 's', bundle, readSecret,
-    { ...options(b), confirm: true })).kind, 'transferred');
   assert.equal((await assertWriter(b.resolution, auth, options(b))).kind, 'writer');
-  assert.equal((await assertWriter(a.resolution, auth, options(a))).reason, 'writer_not_designated');
+  assert.equal(calls, 2);
 });
 
-test('autoridade lê registro por HTTPS com endereço pinado no Node atual', async t => {
+test('marcador v2 migra por HTTPS com endereço pinado no Node atual', async t => {
   if (spawnSync('openssl', ['version']).status !== 0) return t.skip('openssl unavailable');
   const root = await temporary(t, 'writer-pinned-tls');
   const key = path.join(root, 'key.pem');
@@ -427,25 +414,39 @@ test('autoridade lê registro por HTTPS com endereço pinado no Node atual', asy
     projectId: 'p', collection: 'cbs-p', deviceId: device.deviceId, generation: 1,
   }), { mode: 0o600 });
   let reads = 0;
+  let writes = 0;
+  let marker = { cbs_control: 'writer_v1', projectId: 'p', collection: 'cbs-p',
+    deviceId: device.deviceId, generation: 1, state: 'active' };
   const server = https.createServer({ key: await fs.readFile(key), cert: await fs.readFile(cert) },
     (req, res) => {
-      reads++;
       assert.equal(req.headers['api-key'], 'fixture-key');
       let body = '';
       req.setEncoding('utf8');
       req.on('data', chunk => { body += chunk; });
       req.on('end', () => {
-        const id = JSON.parse(body).ids[0];
-        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
-          result: [{ id, payload: { cbs_control: 'writer_v1', projectId: 'p',
-            collection: 'cbs-p', deviceId: device.deviceId, generation: 1, state: 'active' } }],
-        }));
+        if (req.method === 'GET' && req.url === '/') {
+          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ version: '1.19.1' }));
+        } else if (req.method === 'POST') {
+          reads++;
+          const id = JSON.parse(body).ids[0];
+          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+            status: 'ok', result: [{ id, payload: marker }],
+          }));
+        } else if (req.method === 'PUT') {
+          writes++;
+          marker = JSON.parse(body).points[0].payload;
+          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+            status: 'ok', result: { status: 'completed' },
+          }));
+        } else res.writeHead(405).end();
       });
     });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
-  const resolution = { stateDir, projectId: 'p', destination: { collection: 'cbs-p' } };
-  const auth = { key: 'fixture-key', connection: { url: `https://localhost:${server.address().port}`,
+  const url = `https://localhost:${server.address().port}`;
+  const resolution = { provider: 'mem0', stateDir, projectId: 'p',
+    destination: { url, collection: 'cbs-p' } };
+  const auth = { kind: 'authorized', key: 'fixture-key', connection: { url,
     address: '127.0.0.1' } };
   const script = `import { assertWriter } from ${JSON.stringify(new URL('../base/memoria/authority.mjs', import.meta.url).href)};
 process.stdout.write(JSON.stringify(await assertWriter(${JSON.stringify(resolution)}, ${JSON.stringify(auth)})));`;
@@ -463,69 +464,29 @@ process.stdout.write(JSON.stringify(await assertWriter(${JSON.stringify(resoluti
     assert.equal(code, 0, errors);
     assert.equal(JSON.parse(output).kind, 'writer', output + errors);
   }
-  assert.equal(reads, modes.length);
+  assert.equal(reads, modes.length * 2);
+  assert.equal(writes, modes.length);
+  assert.equal(marker.cbs_control, 'writer_v2');
 });
 
-test('handoff retoma só mesmo bundle após promoção remota e falha local', async t => {
+test('handoff legado não copia ledger nem outbox para outro dispositivo', async t => {
   const a = await project(t, 'writer-fault-a');
   const b = await project(t, 'writer-fault-b');
   const target = await localDevice(b.resolution.stateDir);
-  let remote;
-  let failAfterPromotion = true;
-  const control = async (command, resolution, row) => {
-    if (command === 'read') {
-      if (remote?.state === 'active' && remote.generation === 2 && failAfterPromotion) {
-        failAfterPromotion = false;
-        throw Object.assign(new Error('injected disk full after confirmed remote upsert'),
-          { code: 'ENOSPC' });
-      }
-      return remote ? { kind: 'authority', record: remote } : { kind: 'missing' };
-    }
-    remote = { cbs_control: 'writer_v1', projectId: resolution.projectId,
-      collection: resolution.destination.collection, ...row };
-    return { kind: 'written' };
-  };
-  const opts = fixture => ({ stateRoot: fixture.stateRoot,
-    lookup: async () => ['10.1.2.3'], control });
-  for (const fixture of [a, b]) await initializeSession(fixture.gitRoot, 's',
-    { event: 'SessionStart', stateRoot: fixture.stateRoot });
-  const readSecret = () => 'fixture-secret';
-  await bootstrapWriter(a.gitRoot, 's', readSecret,
-    { ...opts(a), confirm: true, clientsQuiescent: true, singleAdministrator: true });
   const outboxA = createOutbox(a.resolution.stateDir);
   const captured = await outboxA.enqueueCheckpoint({ cli: 'claude', sessionId: 's',
     start: 0, end: 1, sliceHash: 'd'.repeat(64), messages: [] },
   { projectId: 'p', policyVersion: 'native-v1' });
   assert.equal(captured.kind, 'queued');
   const claim = path.join(a.resolution.stateDir, 'ledger', `correction-${'f'.repeat(64)}.json`);
+  await fs.mkdir(path.dirname(claim), { recursive: true, mode: 0o700 });
   await fs.writeFile(claim, JSON.stringify({ externalId: 'src-' + 'a'.repeat(64) }) + '\n');
-  const handoff = await beginWriterTransfer(a.gitRoot, 's', target.deviceId, readSecret,
-    { ...opts(a), confirm: true });
-  const bundle = JSON.parse(await fs.readFile(handoff.bundleFile, 'utf8'));
-  await assert.rejects(completeWriterTransfer(b.gitRoot, 's', bundle, readSecret,
-    { ...opts(b), confirm: true }), { code: 'ENOSPC' });
-  const auth = { kind: 'authorized', key: 'fixture-secret' };
-  assert.equal((await assertWriter(a.resolution, auth, opts(a))).kind, 'blocked');
-  assert.equal((await assertWriter(b.resolution, auth, opts(b))).kind, 'blocked');
-  assert.equal(remote.state, 'active');
-  const cacheFile = path.join(b.resolution.stateDir, 'ledger', 'writer.json');
-  const prepared = await fs.readFile(cacheFile, 'utf8');
-  assert.equal(JSON.parse(prepared).revoked, true);
-  await fs.rm(cacheFile);
-  assert.equal((await completeWriterTransfer(b.gitRoot, 's', bundle, readSecret,
-    { ...opts(b), confirm: true })).reason, 'handoff_mismatch');
-  await fs.writeFile(cacheFile, prepared, { mode: 0o600 });
-  const different = { ...bundle, entries: [] };
-  assert.equal((await completeWriterTransfer(b.gitRoot, 's', different, readSecret,
-    { ...opts(b), confirm: true })).reason, 'handoff_mismatch');
-  assert.equal((await completeWriterTransfer(b.gitRoot, 's', bundle, readSecret,
-    { ...opts(b), confirm: true })).kind, 'transferred');
-  assert.equal((await assertWriter(b.resolution, auth, opts(b))).kind, 'writer');
-  assert.equal((await assertWriter(a.resolution, auth, opts(a))).kind, 'blocked');
-  assert.deepEqual(JSON.parse(await fs.readFile(path.join(b.resolution.stateDir, 'ledger',
-    path.basename(claim)), 'utf8')), { externalId: 'src-' + 'a'.repeat(64) });
-  assert.equal((await createOutbox(a.resolution.stateDir).pending())[0].operationId,
-    captured.operationId);
+  assert.equal((await completeWriterTransfer(b.gitRoot, 's', { kind: 'cbs_writer_handoff_v1',
+    entries: [{ name: path.basename(claim) }] }, () => 'fixture-secret',
+  { confirm: true })).reason, 'writer_designation_obsolete');
+  assert.equal(await fs.access(path.join(b.resolution.stateDir, 'ledger', path.basename(claim)))
+    .then(() => true, () => false), false);
+  assert.equal((await outboxA.pending())[0].operationId, captured.operationId);
 });
 
 test('correção só aceita alvo ativo no mesmo projeto/escopo/owner', () => {

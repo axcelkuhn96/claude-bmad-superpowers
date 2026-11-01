@@ -63,8 +63,7 @@ function mcpOptions(f, workerFactory, overrides = {}) {
     owner: async () => ({ ownerId: 'alice' }), autoPublish: async () => f.consent,
     authorize: async () => ({ kind: 'authorized', key: 'fixture', connection: {} }),
     writer: async () => ({ kind: 'writer' }),
-    writerControl: async () => ({ kind: 'authority', record: {
-      state: 'active', deviceId: f.device.deviceId, generation: 1 } }),
+    writerControl: async () => ({ kind: 'protocol' }),
     workerFactory, ...overrides };
 }
 

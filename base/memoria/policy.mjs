@@ -268,11 +268,6 @@ async function validConsent(resolution, consent) {
   const device = await localDevice(resolution.stateDir);
   if (device.kind !== 'device' || device.deviceId !== consent.deviceId) return false;
   try {
-    const writer = await readPrivate(path.join(resolution.stateDir, 'ledger', 'writer.json'));
-    if (writer?.projectId !== resolution.projectId ||
-        writer.collection !== resolution.destination.collection ||
-        writer.deviceId !== consent.deviceId || writer.revoked === true ||
-        !Number.isSafeInteger(writer.generation) || writer.generation < 1) return false;
     const legacyOwnerFile = path.join(resolution.stateDir, `owner-${consent.ownerCli}.json`);
     const record = consent.ownerProfileHash
       ? await readPrivate(path.join(resolution.stateDir,
@@ -304,13 +299,6 @@ export async function enableAutoPublish(resolution, { ownerId, cli, profile } = 
       if (!extractor || extractor.kind === 'blocked' || extractor.route !== 'haiku') return blocked('haiku_selection_required');
       const device = await localDevice(resolution.stateDir);
       if (device.kind !== 'device') return device;
-      let writer;
-      try { writer = await readPrivate(path.join(resolution.stateDir, 'ledger', 'writer.json')); }
-      catch { return blocked('writer_not_designated'); }
-      if (writer?.projectId !== resolution.projectId ||
-          writer.collection !== resolution.destination.collection ||
-          writer.deviceId !== device.deviceId || writer.revoked === true ||
-          !Number.isSafeInteger(writer.generation) || writer.generation < 1) return blocked('writer_not_designated');
       const consent = { version: 1, enabled: true, projectId: resolution.projectId,
         destinationHash: digest(resolution.destination), ownerId, deviceId: device.deviceId,
         ownerCli: cli, ownerProfileHash: profileHash(canonicalProfile),

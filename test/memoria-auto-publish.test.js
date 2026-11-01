@@ -576,7 +576,7 @@ test('temporary broker startup failure retries the same sealed operation without
   assert.equal((await outbox.readManifest(row.operationId)).candidates[0].status, 'pending');
 });
 
-test('real store refuses revoked consent and an unassigned writer before remote add', async t => {
+test('real store refuses revoked consent and missing database authority before remote add', async t => {
   const { outbox, stateDir, row } = await fixture(t);
   assert.equal((await extract(row, outbox, [choice(source.text)])).kind, 'manifested');
   let operation;
@@ -597,7 +597,7 @@ test('real store refuses revoked consent and an unassigned writer before remote 
     autoPublishConsent: consent,
   });
   assert.equal(fenced.kind, 'blocked');
-  assert.equal(fenced.reason, 'writer_not_designated');
+  assert.equal(fenced.reason, 'writer_authorization_missing');
 });
 
 test('missing local ACK retries sealed operation without a second remote add or extraction', async t => {

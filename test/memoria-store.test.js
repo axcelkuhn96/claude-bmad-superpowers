@@ -39,7 +39,7 @@ test('explicit MCP request stores only a sealed source and confirms the remote A
     resolve: async () => resolution, authorize: async () => ({ kind: 'authorized', key: 'test-key',
       connection: { url: resolution.destination.url } }),
     readAutoPublish: async () => consent, autoPublishConsent: consent,
-    control: async () => ({ kind: 'authority', record: { state: 'active', deviceId, generation: 1 } }),
+    control: async () => ({ kind: 'protocol' }),
     run: async (_python, _script, request) => {
       if (request.op === 'dedup_find') return { kind: 'clear' };
       if (request.op === 'find') return { kind: 'items', items: rows.filter(row =>
@@ -102,7 +102,7 @@ test('remote-add observation runs after real bridge add and before local ACK', a
     resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir,
       destination: { collection: 'fixture' } }),
     authorize: async () => ({ kind: 'authorized', key: 'key', connection: { url: 'http://127.0.0.1/' } }),
-    control: async () => ({ kind: 'authority', record: { state: 'active', deviceId, generation: 1 } }),
+    control: async () => ({ kind: 'protocol' }),
     run: async (_python, _script, request) => {
       if (request.op === 'find') return { kind: 'items', items: rows };
       if (request.op === 'add') { rows.push({ ...request, sdkId: 'sdk', qdrantId: 'q', status: 'pending' });
@@ -180,7 +180,7 @@ test('canonical persists before activation and a late pending never replaces it'
   assert.equal(rows.filter(r => r.status === 'active').length, 1);
 });
 
-test('timeout remains pending and cross writer is blocked', async (t) => {
+test('timeout remains pending and a second local device can retry the same ledger', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-ledger-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const op = { externalId: 'source-2-policy-1', projectId: 'p', sessionId: 's', text: 'rule' };
@@ -190,7 +190,7 @@ test('timeout remains pending and cross writer is blocked', async (t) => {
   assert.deepEqual(await reconcileStore(op, deps), { kind: 'pending', reason: 'remote_error' });
   assert.equal((await ledger.read(op.externalId)).attempts, 1);
   assert.deepEqual(await reconcileStore(op, { ...deps, ledger: createLedger(root, 'writer-b', 1) }),
-    { kind: 'pending', reason: 'writer_mismatch' });
+    { kind: 'pending', reason: 'remote_error' });
 });
 
 test('typed add failure is preserved and exact replay observes committed remote row without another add', async t => {
@@ -328,7 +328,7 @@ test('project lock serializes independent writer processes', async (t) => {
   assert.deepEqual(order, ['first', 'second']);
 });
 
-test('legacy local transfer cannot promote a writer', async (t) => {
+test('legacy local transfer is inert and local ledger is not bound to one writer', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cbs-ledger-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const operation = { projectId: 'p', externalId: 'source-policy', text: 'fact' };
@@ -338,10 +338,10 @@ test('legacy local transfer cannot promote a writer', async (t) => {
   record.canonicalId = 'uuid-canonical';
   await first.save(record);
   assert.deepEqual(await transferWriter(root, { projectId: 'p', fromWriterId: 'writer-a', toWriterId: 'writer-b' }),
-    { kind: 'pending', reason: 'administrative_transfer_required' });
+    { kind: 'blocked', reason: 'writer_designation_obsolete' });
   assert.deepEqual(await transferWriter(root, { projectId: 'p', fromWriterId: 'writer-a',
-    toWriterId: 'writer-b', quiescent: true }), { kind: 'pending', reason: 'administrative_transfer_required' });
+    toWriterId: 'writer-b', quiescent: true }), { kind: 'blocked', reason: 'writer_designation_obsolete' });
   assert.equal((await first.begin(operation)).canonicalId, 'uuid-canonical');
-  assert.deepEqual(await createLedger(root, 'writer-b', 1).begin(operation),
-    { kind: 'pending', reason: 'writer_mismatch' });
+  assert.equal((await createLedger(root, 'writer-b', 1).begin(operation)).canonicalId,
+    'uuid-canonical');
 });

@@ -570,7 +570,7 @@ test('terminal correction records bridge target_changed and replay stays termina
     `store: op => storeMemory('fixture', 's', op, () => 'key', { stateRoot: ${JSON.stringify(path.dirname(dir))}, ` +
     `resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir: ${JSON.stringify(dir)}, destination: { collection: 'fixture' } }), ` +
     `authorize: async () => ({ kind: 'authorized', key: 'key', connection: {} }), ` +
-    `control: async () => ({ kind: 'authority', record: { state: 'active', deviceId: ${JSON.stringify(deviceId)}, generation: 1 } }), ` +
+    `control: async () => ({ kind: 'protocol' }), ` +
     `run: async (_python, _script, request) => { await fs.appendFile(${JSON.stringify(path.join(dir, 'bridge-ops'))}, request.op + '\\n'); ` +
     `if (request.op === 'read') return { kind: 'item', item: { ...target, status: 'superseded' } }; ` +
     `throw new Error('unexpected remote mutation'); } }) });\n` +
@@ -972,8 +972,7 @@ test('canonical store reuses remote commit after failed local child ACK', async 
   await fs.mkdir(path.join(dir, 'ledger'), { recursive: true, mode: 0o700 });
   await fs.writeFile(path.join(dir, 'ledger', 'writer.json'), JSON.stringify({ projectId: 'p',
     deviceId, generation: 1, collection: 'private' }) + '\n', { mode: 0o600 });
-  const bridge = { control: async () => ({ kind: 'authority', record: { state: 'active', deviceId,
-    generation: 1 } }), resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir: dir,
+  const bridge = { control: async () => ({ kind: 'protocol' }), resolve: async () => ({ provider: 'mem0', projectId: 'p', stateDir: dir,
       destination: { collection: 'private' } }), authorize: async () => ({ kind: 'authorized', key: 'fixture-key',
       connection: { url: 'http://127.0.0.1:6333/' } }),
     run: async (_python, _program, request) => {

@@ -39,7 +39,7 @@ export async function runBridgeOperation(cwd, sessionId, operation, readSecret, 
   if (auth.kind !== 'authorized') return auth;
   if (['add', 'activate'].includes(operation.op)) {
     const writer = await assertWriter(resolution, auth, options);
-    if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+    if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_authority_unavailable');
     if (options.autoPublishConsent &&
         !await autoConsentCurrent(resolution, options.autoPublishConsent, options)) {
       return blocked('auto_publish_revoked');
@@ -134,7 +134,7 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
     const auth = await (options.authorize ?? authorizeCurrentDestination)(cwd, sessionId, readSecret, options);
     if (auth.kind !== 'authorized') return auth;
     const writer = await assertWriter(resolution, auth, options);
-    if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_not_designated');
+    if (writer.kind !== 'writer') return blocked(writer.reason ?? 'writer_authority_unavailable');
     if ((operation.approval?.mode === 'automatic' || explicitMcp) &&
         !await autoConsentCurrent(resolution, options.autoPublishConsent, options)) {
       return blocked('auto_publish_revoked');
@@ -183,7 +183,7 @@ export async function storeMemory(cwd, sessionId, operation, readSecret, options
     const target = await checkTarget();
     if (target.kind !== 'eligible') return target;
     return reconcileStore(operation, {
-    ledger: createLedger(resolution.stateDir, writer.deviceId, writer.generation),
+    ledger: createLedger(resolution.stateDir, writer.deviceId),
     findRemote: async externalId => {
       const result = await bridge({ op: 'find', projectId: operation.projectId, externalId });
       if (result.kind !== 'items') throw Object.assign(new Error('remote_read_failed'), { code: result.reason ?? 'remote_read_failed' });

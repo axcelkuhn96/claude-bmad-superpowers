@@ -29,8 +29,8 @@ export function externalIdFor(source) {
   return `src-${hash(JSON.stringify(identity))}`;
 }
 
-export function createLedger(stateDir, writerId, generation) {
-  if (!stateDir || !writerId || !Number.isSafeInteger(generation) || generation < 1) throw new Error('ledger_identity_required');
+export function createLedger(stateDir, deviceId) {
+  if (!stateDir || !deviceId) throw new Error('ledger_identity_required');
   const dir = path.join(stateDir, 'ledger');
   const file = externalId => path.join(dir, `${hash(externalId)}.json`);
   async function read(externalId) {
@@ -74,11 +74,6 @@ export function createLedger(stateDir, writerId, generation) {
     if (process.platform === 'win32') {
       if (!(await ensureWindowsPrivateDirectory(dir)).ok) throw new Error('unsafe_ledger_dir');
     } else await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-    const writerFile = path.join(dir, 'writer.json');
-    const owner = process.platform === 'win32' ? await createWindowsState(writerFile).read() :
-      await fs.readFile(writerFile, 'utf8').then(JSON.parse, error => error.code === 'ENOENT' ? null : Promise.reject(error));
-    if (!owner || owner.deviceId !== writerId || owner.projectId !== operation.projectId ||
-        owner.generation !== generation || owner.revoked === true) return pending('writer_mismatch');
     if (operation.metadata?.supersedes_id) {
       const correction = path.join(dir, `correction-${hash(operation.metadata.supersedes_id)}.json`);
       try { await exclusive(correction, { externalId: operation.externalId }); }
@@ -132,8 +127,8 @@ export async function withProjectLock(stateDir, callback, lockName = 'writer.loc
   }
 }
 
-export async function transferWriter(stateDir, { projectId, fromWriterId, toWriterId, quiescent }) {
-  return pending('administrative_transfer_required');
+export async function transferWriter() {
+  return { kind: 'blocked', reason: 'writer_designation_obsolete' };
 }
 
 function valid(row, operation, status) {

@@ -46,19 +46,22 @@ async function designated(f) {
   return device;
 }
 
-test('opt-in exige owner registrado e writer designado, e congela consentimento na sessão nova', async t => {
+test('opt-in exige owner registrado e congela consentimento local sem designação', async t => {
   const f = await fixture(t);
   assert.equal((await readAutoPublish(f.resolution)), null);
   assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
     cli: 'claude', profile: f.profile })).kind, 'blocked');
   assert.equal((await registerOwner(f.resolution, 'claude', f.profile,
     'axcel-local', true)).kind, 'registered');
-  assert.equal((await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
-    cli: 'claude', profile: f.profile })).reason, 'writer_not_designated');
-  const device = await designated(f);
+  const device = await localDevice(f.resolution.stateDir);
   const granted = await enableAutoPublish(f.resolution, { ownerId: 'axcel-local',
     cli: 'claude', profile: f.profile });
   assert.equal(granted.kind, 'enabled');
+  const legacy = path.join(f.resolution.stateDir, 'ledger');
+  await fs.mkdir(legacy, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(legacy, 'writer.json'), JSON.stringify({
+    projectId: f.resolution.projectId, collection: f.resolution.destination.collection,
+    deviceId: device.deviceId, generation: 1, revoked: true }), { mode: 0o600 });
   const consent = await readAutoPublish(f.resolution);
   assert.equal(consent.version, 1);
   assert.equal(consent.enabled, true);
@@ -148,7 +151,7 @@ test('orçamento recusa valores ilimitados ou malformados sem alterar política'
   assert.deepEqual(await readExtractor(f.resolution), before);
 });
 
-test('orçamento não grava consentimento saneado quando writer fica indisponível', async t => {
+test('orçamento mantém consentimento quando cache legado de writer some', async t => {
   const f = await fixture(t);
   await designated(f);
   await registerOwner(f.resolution, 'claude', f.profile, 'axcel-local', true);
@@ -160,8 +163,9 @@ test('orçamento não grava consentimento saneado quando writer fica indisponív
   const writerText = await fs.readFile(writer, 'utf8');
   await fs.rm(writer);
   assert.equal((await configureExtractionSchedule(f.resolution, {
-    maxCallsPerSession: 200, mode: 'conversation', conversationTurns: 5 })).kind, 'blocked');
-  assert.equal(await fs.readFile(file, 'utf8'), before);
+    maxCallsPerSession: 200, mode: 'conversation', conversationTurns: 5 })).kind, 'configured');
+  assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).autoPublishConsent.consentHash,
+    JSON.parse(before).autoPublishConsent.consentHash);
   await fs.writeFile(writer, writerText, { mode: 0o600 });
   assert.equal((await readAutoPublish(f.resolution)).consentHash,
     JSON.parse(before).autoPublishConsent.consentHash);
@@ -326,7 +330,7 @@ test('status CLI reflete consentimento real e disable revoga sem interação', a
   assert.equal(JSON.parse(run('check').stdout).autoPublish, true);
   assert.equal(JSON.parse(run('check').stdout).owner, 'axcel-local');
   await fs.rm(path.join(f.resolution.stateDir, 'ledger', 'writer.json'));
-  assert.equal(JSON.parse(run('status').stdout).autoPublish, false);
+  assert.equal(JSON.parse(run('status').stdout).autoPublish, true);
   const revoked = run('auto-publish-disable');
   assert.equal(revoked.status, 0, revoked.stdout + revoked.stderr);
   assert.equal(JSON.parse(run('status').stdout).autoPublish, false);
