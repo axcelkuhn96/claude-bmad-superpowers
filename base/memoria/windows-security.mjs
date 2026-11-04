@@ -538,10 +538,21 @@ export async function ensureWindowsPrivateDirectory(dir, { privateState = true }
   return invoke('ensure-directory', dir, { privateState });
 }
 
-export async function writeWindowsPrivateFile(file, text, { replace = false, privateState = true } = {}) {
-  if (replace) return { ok: false, code: 'unsupported_windows_replace' };
+export async function writeWindowsPrivateFile(file, text,
+  { replace = false, expectedText, privateState = true } = {}) {
   if (typeof text !== 'string' || Buffer.byteLength(text, 'utf8') > 1024 * 1024) {
     return { ok: false, code: 'oversize' };
+  }
+  if (replace) {
+    // The helper creates only new files, so a replace removes exactly the expected version
+    // first. A crash in between leaves the file missing, which callers treat as fail-closed.
+    if (typeof expectedText !== 'string') return { ok: false, code: 'unsupported_windows_replace' };
+    try {
+      const current = await readWindowsBinary(file, { length: 1024 * 1024, privateState });
+      if (current.size !== current.bytes.length ||
+          !current.bytes.equals(Buffer.from(expectedText, 'utf8'))) return { ok: false, code: 'changed' };
+      await deleteWindowsBinary(file, current.fileId, current.bytes);
+    } catch { return { ok: false, code: 'changed' }; }
   }
   return invoke('write-file', file, { text, replace: false, privateState });
 }

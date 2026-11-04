@@ -28,6 +28,9 @@ Avaliar é offline: cbs memoria avaliar --outputs arquivo.json [--corpus arquivo
 No automático por conversa, --max-calls vale por sessão/dia UTC; o histórico de chamadas é preservado.
 `;
 const value = (args, flag) => args.includes(flag) ? args[args.indexOf(flag) + 1] : null;
+// Same rule as policy.mjs, checked before asking: an invalid owner used to fail only after
+// the operator had typed the project ID.
+const ownerFormat = id => typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(id);
 const readSecret = readQdrantSecret;
 
 async function askConfirmation(message, expected) {
@@ -168,7 +171,8 @@ export async function main(args = []) {
     const ownerId = value(rest, '--owner');
     const cli = value(rest, '--cli');
     const profile = value(rest, '--profile');
-    if (!ownerId || !await askConfirmation(
+    if (!ownerFormat(ownerId)) { process.stdout.write('blocked: owner_id_invalid\n'); return 1; }
+    if (!await askConfirmation(
       `Declare que mensagens humanas nativas das novas sessões deste perfil pertencem a ${ownerId}. Digite ${resolution.projectId}: `,
       resolution.projectId)) return 1;
     const result = await registerOwner(resolution, cli, profile, ownerId, true);
@@ -205,7 +209,8 @@ export async function main(args = []) {
     const ownerId = value(rest, '--owner');
     const cli = value(rest, '--cli');
     const profile = value(rest, '--profile');
-    if (!ownerId || !['claude', 'codex'].includes(cli) ||
+    if (!ownerFormat(ownerId)) { process.stdout.write('blocked: owner_id_invalid\n'); return 1; }
+    if (!['claude', 'codex'].includes(cli) ||
         !await askConfirmation(`Ativar publicação automática no projeto ${resolution.projectId}, ` +
           `Qdrant ${resolution.destination.url}/${resolution.destination.collection}, ` +
           `owner ${ownerId}, após validação Haiku e autorização Qdrant. Digite ${resolution.projectId}: `,

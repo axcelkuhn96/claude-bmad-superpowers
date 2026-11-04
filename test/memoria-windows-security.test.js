@@ -74,7 +74,8 @@ test('Windows existing-file write refuses before touching the destination', asyn
     await fs.writeFile(file, 'external edit');
     const result = await security.writeWindowsPrivateFile(file, 'ours',
       { replace: true, expectedText: 'previous observation' });
-    assert.deepEqual(result, { ok: false, code: 'unsupported_windows_replace' });
+    // Replace is supported only for the exact expected version; anything else is refused untouched.
+    assert.deepEqual(result, { ok: false, code: 'changed' });
     assert.equal(await fs.readFile(file, 'utf8'), 'external edit');
     assert.deepEqual(await fs.readdir(root), ['config.json']);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
